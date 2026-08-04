@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true Commit Status POST and combined-status read-back on an isolated PR Head SHA",
+    "redactionMethod": "allowlist projection",
+    "removedFields": [
+      "commit SHA",
+      "creator login",
+      "URLs",
+      "node identifiers",
+      "repository identifiers"
+    ]
+  },
+  "probe": "commit-status",
+  "observed": {
+    "postExitCode": 0,
+    "postResponse": {
+      "state": "success",
+      "context": "agent-team/spike",
+      "shaFieldPresent": false
+    },
+    "readBack": {
+      "combinedState": "success",
+      "matchingContextFound": true,
+      "state": "success",
+      "headShaMatches": true
+    }
+  },
+  "expected": {
+    "classification": "status_supported_with_required_readback",
+    "postResponseAloneIsSufficient": false,
+    "bindReviewStatusToReadBackHeadSha": true
+  }
+}
