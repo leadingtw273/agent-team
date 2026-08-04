@@ -3,7 +3,7 @@
   "fixtureType": "observed-redacted",
   "capturedAt": "2026-08-04",
   "provenance": {
-    "source": "true local gh API repository capability probe",
+    "source": "true public repository gh API capability probe",
     "redactionMethod": "allowlist projection",
     "removedFields": [
       "account login",
@@ -15,9 +15,9 @@
   },
   "probe": "repository-capabilities",
   "observed": {
-    "visibility": "private",
+    "visibility": "public",
     "defaultBranch": "main",
-    "allowAutoMerge": false,
+    "allowAutoMerge": true,
     "viewerPermissions": {
       "admin": true,
       "maintain": true,
@@ -25,17 +25,19 @@
       "push": true
     },
     "rulesets": {
-      "available": false,
-      "failure": "requires_paid_plan_or_public_repo"
+      "available": true,
+      "count": 0,
+      "failure": null
     },
     "branchProtection": {
       "available": false,
-      "failure": "requires_paid_plan_or_public_repo"
+      "failure": "not_found_or_not_configured"
     }
   },
   "expected": {
-    "classification": "setup_incomplete_for_required_merge_gate",
-    "commitStatusCanStillBeProbed": true,
+    "classification": "capability_available_configuration_pending",
+    "canProvisionRuleset": true,
+    "requiredMergeGateConfigured": false,
     "mustNotClaimEnforcedRequiredStatus": true
   }
 }

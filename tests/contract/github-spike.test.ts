@@ -14,7 +14,13 @@ async function readFixture(name: string): Promise<Record<string, unknown>> {
 describe("GitHub spike evidence contract", () => {
   it("keeps fixtures versioned and free of account or token identifiers", async () => {
     const names = await readdir(fixtureDirectory);
-    expect(names).toHaveLength(5);
+    expect(names.sort()).toEqual([
+      "auto-merge-enabled.json",
+      "commit-status.json",
+      "draft-pr-checks.json",
+      "repository-capabilities.json",
+      "self-approval-denied.json",
+    ]);
 
     for (const name of names) {
       const text = await readFile(new URL(name, fixtureDirectory), "utf8");
@@ -35,29 +41,37 @@ describe("GitHub spike evidence contract", () => {
     }
   });
 
-  it("does not claim a required merge gate on the current private plan", async () => {
+  it("separates public repository capability from pending merge-gate configuration", async () => {
     const fixture = await readFixture("repository-capabilities.json");
     const observed = fixture["observed"] as {
       visibility: string;
       allowAutoMerge: boolean;
       viewerPermissions: { admin: boolean };
-      rulesets: { available: boolean; failure: string };
+      rulesets: { available: boolean; count: number; failure: null };
       branchProtection: { available: boolean; failure: string };
     };
     const expected = fixture["expected"] as {
       classification: string;
+      canProvisionRuleset: boolean;
+      requiredMergeGateConfigured: boolean;
       mustNotClaimEnforcedRequiredStatus: boolean;
     };
 
-    expect(observed.visibility).toBe("private");
+    expect(observed.visibility).toBe("public");
     expect(observed.viewerPermissions.admin).toBe(true);
-    expect(observed.allowAutoMerge).toBe(false);
+    expect(observed.allowAutoMerge).toBe(true);
     expect(observed.rulesets).toEqual({
-      available: false,
-      failure: "requires_paid_plan_or_public_repo",
+      available: true,
+      count: 0,
+      failure: null,
     });
-    expect(observed.branchProtection).toEqual(observed.rulesets);
-    expect(expected.classification).toBe("setup_incomplete_for_required_merge_gate");
+    expect(observed.branchProtection).toEqual({
+      available: false,
+      failure: "not_found_or_not_configured",
+    });
+    expect(expected.classification).toBe("capability_available_configuration_pending");
+    expect(expected.canProvisionRuleset).toBe(true);
+    expect(expected.requiredMergeGateConfigured).toBe(false);
     expect(expected.mustNotClaimEnforcedRequiredStatus).toBe(true);
   });
 
@@ -114,30 +128,30 @@ describe("GitHub spike evidence contract", () => {
     expect(expected.useStructuredReviewCommentAndCommitStatus).toBe(true);
   });
 
-  it("fails closed when auto-merge PATCH exits zero but read-back remains disabled", async () => {
-    const fixture = await readFixture("auto-merge-unavailable.json");
+  it("proves auto-merge is enabled with an idempotent PATCH and read-back", async () => {
+    const fixture = await readFixture("auto-merge-enabled.json");
     const observed = fixture["observed"] as {
       before: boolean;
-      patchExitCode: number;
-      patchResponse: boolean;
-      readBack: boolean;
+      first: { patchExitCode: number; patchResponse: boolean; readBack: boolean };
+      second: { patchExitCode: number; patchResponse: boolean; readBack: boolean };
+      idempotent: boolean;
       configurationDrift: boolean;
-      rulesetsAvailable: boolean;
-      branchProtectionAvailable: boolean;
     };
     const expected = fixture["expected"] as {
       classification: string;
-      mustNotClaimAutoMergeEnabled: boolean;
+      mustNotClaimRulesetConfigured: boolean;
     };
 
-    expect(observed.before).toBe(false);
-    expect(observed.patchExitCode).toBe(0);
-    expect(observed.patchResponse).toBe(false);
-    expect(observed.readBack).toBe(false);
+    expect(observed.before).toBe(true);
+    expect(observed.first).toEqual(
+      expect.objectContaining({ patchExitCode: 0, patchResponse: true, readBack: true }),
+    );
+    expect(observed.second).toEqual(
+      expect.objectContaining({ patchExitCode: 0, patchResponse: true, readBack: true }),
+    );
+    expect(observed.idempotent).toBe(true);
     expect(observed.configurationDrift).toBe(false);
-    expect(observed.rulesetsAvailable).toBe(false);
-    expect(observed.branchProtectionAvailable).toBe(false);
-    expect(expected.classification).toBe("blocked_by_private_repository_plan");
-    expect(expected.mustNotClaimAutoMergeEnabled).toBe(true);
+    expect(expected.classification).toBe("auto_merge_enabled_with_readback");
+    expect(expected.mustNotClaimRulesetConfigured).toBe(true);
   });
 });
