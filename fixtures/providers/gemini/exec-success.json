@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.52.0",
+  "provenance": {
+    "source": "true local Gemini headless stream-json probe",
+    "redactionMethod": "event allowlist projection",
+    "removedFields": ["session identifiers", "timestamps", "token usage", "raw stderr"]
+  },
+  "probe": "exec",
+  "observed": {
+    "exitCode": 0,
+    "eventTypes": ["init", "message", "result"],
+    "model": "auto",
+    "toolNames": [],
+    "assistantText": "GEMINI_PROBE_OK",
+    "finalStatus": "success"
+  },
+  "expected": {
+    "classification": "available",
+    "requiresSuccessfulResult": true,
+    "requiresExpectedArtifact": true
+  }
+}

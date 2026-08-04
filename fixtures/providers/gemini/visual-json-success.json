@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.52.0",
+  "provenance": {
+    "source": "true local Gemini JSON probe against a generated de-identified 96x96 PNG",
+    "redactionMethod": "stats allowlist and semantic response projection",
+    "removedFields": [
+      "session identifiers",
+      "token usage",
+      "latency",
+      "raw response prefix",
+      "absolute paths"
+    ]
+  },
+  "probe": "visual",
+  "observed": {
+    "exitCode": 0,
+    "modelNames": ["gemini-3.1-pro-preview-customtools"],
+    "semanticResponse": {
+      "redSquareTopLeft": true,
+      "blueSquareBottomRight": true,
+      "providerPrefixPresent": true
+    },
+    "tools": [
+      {
+        "name": "read_file",
+        "count": 1,
+        "success": 1,
+        "fail": 0
+      }
+    ],
+    "filesChanged": {
+      "linesAdded": 0,
+      "linesRemoved": 0
+    }
+  },
+  "expected": {
+    "classification": "visual_input_supported",
+    "preferredOutputFormat": "json",
+    "mustVerifyReadToolEvidence": true
+  }
+}
