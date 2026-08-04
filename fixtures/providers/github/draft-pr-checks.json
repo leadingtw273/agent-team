@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true isolated Draft PR and gh read-back probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["pull request number", "head SHA", "URLs", "actor login", "node identifiers"]
+  },
+  "probe": "draft-pr-checks",
+  "observed": {
+    "initial": {
+      "state": "OPEN",
+      "isDraft": true,
+      "headShaPresent": true,
+      "mergeStateStatus": "UNSTABLE",
+      "qualityGate": "IN_PROGRESS",
+      "commitStatus": "SUCCESS"
+    },
+    "afterChecks": {
+      "state": "OPEN",
+      "isDraft": true,
+      "mergeStateStatus": "CLEAN",
+      "qualityGate": "SUCCESS",
+      "commitStatus": "SUCCESS"
+    },
+    "afterReady": {
+      "state": "OPEN",
+      "isDraft": false,
+      "mergeStateStatus": "CLEAN",
+      "qualityGate": "SUCCESS",
+      "commitStatus": "SUCCESS"
+    }
+  },
+  "expected": {
+    "classification": "draft_and_checks_supported",
+    "reviewerStartsOnlyAfterReadyAndGreen": true
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true gh pr review --approve negative probe on the current account's isolated PR",
+    "redactionMethod": "normalized error classification and review-state projection",
+    "removedFields": ["account login", "pull request number", "GraphQL request identifiers"]
+  },
+  "probe": "self-approval",
+  "observed": {
+    "exitCode": 1,
+    "normalizedError": "cannot_approve_own_pull_request",
+    "reviewsAfterAttempt": []
+  },
+  "expected": {
+    "classification": "native_approval_unavailable_for_single_account",
+    "useStructuredReviewCommentAndCommitStatus": true
+  }
+}
