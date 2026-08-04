@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.146.0",
+  "provenance": {
+    "source": "true local app-server account probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["email", "account identifiers", "tokens", "thread identifiers"]
+  },
+  "probe": "account",
+  "observed": {
+    "auth": {
+      "authMode": "chatgpt",
+      "planType": "pro",
+      "requiresOpenaiAuth": true
+    },
+    "rateLimits": {
+      "current": {
+        "limitId": "codex",
+        "limitName": null,
+        "primary": {
+          "usedPercent": 11,
+          "windowDurationMins": 10080,
+          "resetsAt": 1786414133
+        },
+        "secondary": null,
+        "rateLimitReachedType": null
+      },
+      "buckets": [
+        {
+          "limitId": "codex",
+          "limitName": null,
+          "primary": {
+            "usedPercent": 11,
+            "windowDurationMins": 10080,
+            "resetsAt": 1786414133
+          },
+          "secondary": null,
+          "rateLimitReachedType": null
+        },
+        {
+          "limitId": "codex_bengalfox",
+          "limitName": "GPT-5.3-Codex-Spark",
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 10080,
+            "resetsAt": 1786444191
+          },
+          "secondary": null,
+          "rateLimitReachedType": null
+        }
+      ]
+    }
+  },
+  "expected": {
+    "weeklySignal": "fresh",
+    "fiveHourSignal": "unknown",
+    "mustNotTreatMissingBucketAsZero": true
+  }
+}

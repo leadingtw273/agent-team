@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.146.0",
+  "provenance": {
+    "source": "true local app-server approval probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["thread identifiers", "turn identifiers", "raw command"]
+  },
+  "probe": "approval",
+  "observed": {
+    "requestMethod": "item/commandExecution/requestApproval",
+    "hasCommand": true,
+    "cwdMatches": true,
+    "decision": "decline",
+    "markerExists": false,
+    "turnStatus": "completed"
+  },
+  "expected": {
+    "classification": "blocked_by_user_decision",
+    "safeToExecute": false
+  }
+}
