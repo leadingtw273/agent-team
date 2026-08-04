@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "local deterministic DeliveryTracker probe",
+    "redactionMethod": "state-transition projection",
+    "removedFields": ["delivery identifiers", "entity identifiers", "raw body"]
+  },
+  "probe": "ordering",
+  "observed": {
+    "newest": {
+      "classification": "accepted",
+      "persisted": true,
+      "projectionEligible": true
+    },
+    "older": {
+      "classification": "accepted_out_of_order",
+      "persisted": true,
+      "projectionEligible": false
+    },
+    "replay": {
+      "classification": "duplicate",
+      "persisted": false,
+      "projectionEligible": false
+    }
+  },
+  "expected": {
+    "dedupeKeyIncludesProviderAndDelivery": true,
+    "outOfOrderDeliveryMustBePersisted": true,
+    "outOfOrderDeliveryMustNotRegressProjection": true
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "deterministic post-ack processing timeout scenario",
+    "redactionMethod": "state and duration projection",
+    "removedFields": ["delivery identifiers", "payload", "webhook secret"]
+  },
+  "probe": "timeout",
+  "observed": {
+    "inboxPersistedBeforeAck": true,
+    "ackStatus": 200,
+    "ackTargetMs": 100,
+    "providerTimeoutMs": 5000,
+    "simulatedPostAckProcessingMs": 6000,
+    "processingRunsAfterAck": true,
+    "providerRetryRequiredForProcessingTimeout": false
+  },
+  "expected": {
+    "classification": "durable_inbox_decouples_provider_ack_from_processing",
+    "processingFailureMustRemainReplayable": true
+  }
+}
