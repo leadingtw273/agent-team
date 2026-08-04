@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "synthetic Linear payload exercised against the official HMAC and timestamp contract",
+    "redactionMethod": "boolean and normalized-reason projection",
+    "removedFields": [
+      "webhook secret",
+      "signature digest",
+      "delivery identifier",
+      "raw body",
+      "entity identifiers"
+    ]
+  },
+  "probe": "linear-signature",
+  "observed": {
+    "valid": true,
+    "rawBodyBytesPreserved": true,
+    "reserializedWithWhitespaceValid": false,
+    "staleTimestampReason": "stale_timestamp",
+    "missingDeliveryReason": "missing_required_header",
+    "deliveryIdPresent": true
+  },
+  "expected": {
+    "classification": "linear_raw_body_and_replay_window_supported",
+    "maximumClockSkewMs": 60000
+  }
+}

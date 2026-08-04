@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "official GitHub HMAC test vector exercised by the local Node probe",
+    "redactionMethod": "boolean outcome projection",
+    "removedFields": ["webhook secret", "signature digest", "delivery identifier", "raw body"]
+  },
+  "probe": "github-signature",
+  "observed": {
+    "officialVectorMatches": true,
+    "valid": true,
+    "modifiedRawBodyValid": false,
+    "missingPrefixValid": false,
+    "malformedValid": false,
+    "validSignatureInvalidJsonReason": "invalid_json",
+    "usesTimingSafeEqual": true
+  },
+  "expected": {
+    "classification": "github_raw_body_verification_supported",
+    "verifyBeforeJsonParse": true
+  }
+}

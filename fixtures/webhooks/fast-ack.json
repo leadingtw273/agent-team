@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "1000-iteration local raw-body verification and envelope benchmark",
+    "redactionMethod": "performance bucket projection",
+    "removedFields": ["exact timing samples", "delivery identifiers", "webhook secret", "raw body"]
+  },
+  "probe": "latency",
+  "observed": {
+    "iterations": 1000,
+    "p95Under100Ms": true,
+    "p95Bucket": "under_1ms"
+  },
+  "expected": {
+    "internalAckTargetMs": 100,
+    "benchmarkIsNotNetworkSla": true
+  }
+}
