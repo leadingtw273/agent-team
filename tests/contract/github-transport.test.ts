@@ -149,6 +149,24 @@ describe("gh transport", () => {
       z.unknown(),
     );
     expect(unsafe.ok ? "ok" : unsafe.error.code).toBe("external_failure");
+
+    const localFileField = await new GhTransport({ executable }).requestJson(
+      ["api", "user", "-F", "body=@/etc/passwd"],
+      z.unknown(),
+    );
+    expect(localFileField.ok ? "ok" : localFileField.error.code).toBe("external_failure");
+
+    const typedBoolean = await new GhTransport({ executable }).requestJson(
+      ["api", "user", "-F", "draft=true"],
+      z.object({ login: z.string(), id: z.number() }).strict(),
+    );
+    expect(typedBoolean.ok).toBe(true);
+
+    const multilineBody = await new GhTransport({ executable }).requestJson(
+      ["api", "user", "-f", "body=line one\nline two"],
+      z.object({ login: z.string(), id: z.number() }).strict(),
+    );
+    expect(multilineBody.ok).toBe(true);
   });
 
   it("maps timeout, abort, and missing executable deterministically", async () => {
