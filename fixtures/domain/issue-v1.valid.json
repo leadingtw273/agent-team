@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "externalId": "ENG-123",
+  "title": "建立登入流程",
+  "goal": "使用者可安全登入。",
+  "background": "目前尚未提供登入入口。",
+  "acceptanceCriteria": ["有效帳密可以登入。", "無效帳密顯示錯誤。"],
+  "inScope": ["登入 API", "登入表單"],
+  "outOfScope": ["社群登入"],
+  "dependencies": {
+    "kind": "issues",
+    "issueIds": ["issue_018f47d2-77a4-7cc1-8ef2-1123456789ab"]
+  },
+  "priority": "high",
+  "agentRole": "implementer",
+  "reviewRequirement": "dual_review",
+  "estimatedMinutes": 30,
+  "constraints": ["不得保存明文密碼。"],
+  "risks": ["既有 Session 相容性。"],
+  "changeRegions": [
+    { "path": "src/auth", "coverage": "subtree" },
+    { "path": "tests/auth.test.ts", "coverage": "exact" }
+  ]
+}
