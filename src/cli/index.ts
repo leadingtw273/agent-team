@@ -2,21 +2,12 @@
 
 import { createRequire } from "node:module";
 
-import { Command } from "commander";
-
-interface PackageMetadata {
-  readonly description: string;
-  readonly version: string;
-}
+import { createProgram, type PackageMetadata } from "./program.js";
 
 const require = createRequire(import.meta.url);
 const metadata = require("../../package.json") as PackageMetadata;
 
-const program = new Command()
-  .name("agent-team")
-  .description(metadata.description)
-  .version(metadata.version)
-  .showHelpAfterError();
+const program = createProgram(metadata);
 
 if (process.argv.length <= 2) {
   program.outputHelp();
