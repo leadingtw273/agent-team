@@ -72,6 +72,7 @@ describe("GitHub spike evidence contract", () => {
     const observedStatus = status["observed"] as {
       postResponse: { shaFieldPresent: boolean };
       readBack: { matchingContextFound: boolean; state: string; headShaMatches: boolean };
+      afterHeadChange: { oldStatusPresentOnNewHead: boolean; qualityGate: string };
     };
 
     expect(observedPull.initial).toEqual(
@@ -89,6 +90,10 @@ describe("GitHub spike evidence contract", () => {
       matchingContextFound: true,
       state: "success",
       headShaMatches: true,
+    });
+    expect(observedStatus.afterHeadChange).toEqual({
+      oldStatusPresentOnNewHead: false,
+      qualityGate: "IN_PROGRESS",
     });
   });
 

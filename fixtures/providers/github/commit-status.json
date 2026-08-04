@@ -26,11 +26,16 @@
       "matchingContextFound": true,
       "state": "success",
       "headShaMatches": true
+    },
+    "afterHeadChange": {
+      "oldStatusPresentOnNewHead": false,
+      "qualityGate": "IN_PROGRESS"
     }
   },
   "expected": {
     "classification": "status_supported_with_required_readback",
     "postResponseAloneIsSufficient": false,
-    "bindReviewStatusToReadBackHeadSha": true
+    "bindReviewStatusToReadBackHeadSha": true,
+    "newHeadInvalidatesOldStatus": true
   }
 }
