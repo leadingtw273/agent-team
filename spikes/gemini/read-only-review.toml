@@ -1,0 +1,12 @@
+[[rule]]
+toolName = ["read_file", "read_many_files"]
+decision = "allow"
+priority = 999
+interactive = false
+
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 900
+interactive = false
+denyMessage = "Agent Team visual review is read-only"

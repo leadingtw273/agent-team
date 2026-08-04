@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.52.0",
+  "provenance": {
+    "source": "true local Gemini stream-json visual probe using the same de-identified PNG",
+    "redactionMethod": "event allowlist projection",
+    "removedFields": [
+      "session identifiers",
+      "tool identifiers",
+      "timestamps",
+      "tool parameters",
+      "tool output"
+    ]
+  },
+  "probe": "visual-stream-negative",
+  "observed": {
+    "exitCode": 0,
+    "eventTypes": ["init", "message", "tool_use", "tool_result", "message", "result"],
+    "toolNames": ["read_file"],
+    "toolResultStatuses": ["success"],
+    "assistantChunks": [".", "jpeg"],
+    "finalStatus": "success"
+  },
+  "expected": {
+    "classification": "truncated_response_not_valid_success_evidence",
+    "streamJsonVisualOutputAdopted": false,
+    "processExitZeroIsNotEnough": true
+  }
+}

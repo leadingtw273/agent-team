@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.52.0",
+  "provenance": {
+    "source": "true local exact-PID signal probe",
+    "redactionMethod": "process outcome allowlist projection",
+    "removedFields": [
+      "process identifiers",
+      "process inventory",
+      "session identifiers",
+      "raw stderr"
+    ]
+  },
+  "probe": "signal",
+  "observed": {
+    "inventoryChecked": true,
+    "inventoryChecks": 2,
+    "termSent": true,
+    "termEffective": false,
+    "killEscalated": true,
+    "exitCode": null,
+    "exitSignal": "SIGKILL",
+    "resultEventObserved": false
+  },
+  "expected": {
+    "classification": "external_force_kill_required",
+    "gracefulInterruptSupported": false,
+    "externalCheckpointRequired": true
+  }
+}
