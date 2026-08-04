@@ -1,0 +1,90 @@
+[
+  {
+    "name": "repository root is not a project path",
+    "schema": "project",
+    "input": {
+      "schemaVersion": 1,
+      "id": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "displayName": "Unsafe root",
+      "localRepositoryPath": "/",
+      "defaultBranch": "main",
+      "workManagement": {
+        "provider": "linear",
+        "containerId": "team",
+        "projectId": "project"
+      },
+      "sourceControl": { "provider": "github", "repository": "example/repo" }
+    }
+  },
+  {
+    "name": "SCM repository cannot contain an empty namespace segment",
+    "schema": "project",
+    "input": {
+      "schemaVersion": 1,
+      "id": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "displayName": "Invalid repository",
+      "localRepositoryPath": "/home/example/project",
+      "defaultBranch": "main",
+      "workManagement": {
+        "provider": "linear",
+        "containerId": "team",
+        "projectId": "project"
+      },
+      "sourceControl": { "provider": "gitlab", "repository": "group//repository" }
+    }
+  },
+  {
+    "name": "unknown role is rejected",
+    "schema": "issue",
+    "input": {
+      "schemaVersion": 1,
+      "id": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "externalId": "ENG-123",
+      "title": "Invalid role",
+      "agentRole": "producer"
+    }
+  },
+  {
+    "name": "parent traversal region is rejected",
+    "schema": "issue",
+    "input": {
+      "schemaVersion": 1,
+      "id": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "externalId": "ENG-123",
+      "title": "Invalid region",
+      "changeRegions": [{ "path": "src/../secrets", "coverage": "subtree" }]
+    }
+  },
+  {
+    "name": "explicit no dependencies cannot carry issue IDs",
+    "schema": "issue",
+    "input": {
+      "schemaVersion": 1,
+      "id": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "externalId": "ENG-123",
+      "title": "Invalid dependencies",
+      "dependencies": {
+        "kind": "none",
+        "issueIds": ["issue_018f47d2-77a4-7cc1-8ef2-1123456789ab"]
+      }
+    }
+  },
+  {
+    "name": "issue cannot depend on itself",
+    "schema": "issue",
+    "input": {
+      "schemaVersion": 1,
+      "id": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      "externalId": "ENG-123",
+      "title": "Self dependency",
+      "dependencies": {
+        "kind": "issues",
+        "issueIds": ["issue_018f47d2-77a4-7cc1-8ef2-0123456789ab"]
+      }
+    }
+  }
+]

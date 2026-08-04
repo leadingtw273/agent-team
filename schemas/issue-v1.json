@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schemaVersion": { "type": "number", "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^issue_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "projectId": {
+      "type": "string",
+      "pattern": "^project_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "externalId": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "goal": { "type": "string", "minLength": 1, "maxLength": 10000 },
+    "background": { "type": "string", "minLength": 1, "maxLength": 10000 },
+    "acceptanceCriteria": {
+      "minItems": 1,
+      "maxItems": 100,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 10000 }
+    },
+    "inScope": {
+      "minItems": 1,
+      "maxItems": 100,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 10000 }
+    },
+    "outOfScope": {
+      "minItems": 1,
+      "maxItems": 100,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 10000 }
+    },
+    "dependencies": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": { "kind": { "type": "string", "const": "none" } },
+          "required": ["kind"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "type": "string", "const": "issues" },
+            "issueIds": {
+              "minItems": 1,
+              "maxItems": 100,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^issue_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+              }
+            }
+          },
+          "required": ["kind", "issueIds"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "priority": { "type": "string", "enum": ["urgent", "high", "medium", "low"] },
+    "agentRole": {
+      "type": "string",
+      "enum": [
+        "team_lead",
+        "implementer",
+        "code_reviewer",
+        "visual_reviewer",
+        "integration_engineer"
+      ]
+    },
+    "reviewRequirement": {
+      "type": "string",
+      "enum": ["code_review", "visual_review", "dual_review"]
+    },
+    "estimatedMinutes": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 1440
+    },
+    "constraints": {
+      "maxItems": 100,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 10000 }
+    },
+    "risks": {
+      "maxItems": 100,
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 10000 }
+    },
+    "changeRegions": {
+      "minItems": 1,
+      "maxItems": 100,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?!\\/)(?!.*\\\\)(?!.*(?:^|\\/)\\.{1,2}(?:\\/|$))(?!.*\\/\\/).+$"
+          },
+          "coverage": { "type": "string", "enum": ["exact", "subtree"] }
+        },
+        "required": ["path", "coverage"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schemaVersion", "id", "projectId", "externalId", "title"],
+  "additionalProperties": false
+}

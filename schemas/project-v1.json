@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schemaVersion": { "type": "number", "const": 1 },
+    "id": {
+      "type": "string",
+      "pattern": "^project_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "localRepositoryPath": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 1024,
+      "pattern": "^\\/.*"
+    },
+    "defaultBranch": { "type": "string", "minLength": 1, "maxLength": 255 },
+    "workManagement": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "containerId": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "projectId": { "type": "string", "minLength": 1, "maxLength": 255 }
+      },
+      "required": ["provider", "containerId", "projectId"],
+      "additionalProperties": false
+    },
+    "sourceControl": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        },
+        "repository": {
+          "type": "string",
+          "maxLength": 255,
+          "pattern": "^[^/\\s]+(?:\\/[^/\\s]+)+$"
+        }
+      },
+      "required": ["provider", "repository"],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "displayName",
+    "localRepositoryPath",
+    "defaultBranch",
+    "workManagement",
+    "sourceControl"
+  ],
+  "additionalProperties": false
+}

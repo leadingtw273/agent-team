@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "displayName": "Agent Team Sandbox",
+  "localRepositoryPath": "/home/example/project/agent-team-sandbox",
+  "defaultBranch": "main",
+  "workManagement": {
+    "provider": "linear",
+    "containerId": "linear-team-id",
+    "projectId": "linear-project-id"
+  },
+  "sourceControl": {
+    "provider": "github",
+    "repository": "example/agent-team-sandbox"
+  }
+}
