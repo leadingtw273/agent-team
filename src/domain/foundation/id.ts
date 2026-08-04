@@ -10,7 +10,14 @@ export type Identifier<Scope extends string> = string & {
 };
 
 const scopePattern = /^[a-z][a-z0-9-]{0,31}$/u;
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+export const identifierUuidBodyPattern =
+  "[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+
+const uuidPattern = new RegExp(`^${identifierUuidBodyPattern}$`, "u");
+
+export function scopedIdentifierPattern(scope: string): RegExp {
+  return new RegExp(`^${scope}_${identifierUuidBodyPattern}$`, "u");
+}
 
 export function parseIdentifier<Scope extends string>(
   scope: Scope,
