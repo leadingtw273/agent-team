@@ -31,6 +31,19 @@ export interface GitWorkingTreeSnapshot {
   readonly changes: readonly GitWorkingTreeChange[];
 }
 
+export interface ReadGitTextFileCommand extends GitRepositoryRef {
+  readonly revision: string;
+  readonly path: string;
+  readonly maxBytes: number;
+}
+
+export interface GitTextFileAtRevision {
+  readonly revisionSha: string;
+  readonly path: string;
+  readonly content: string;
+  readonly byteLength: number;
+}
+
 export interface CreateWorktreeCommand extends GitRepositoryRef {
   readonly path: string;
   readonly branch: string;
@@ -71,6 +84,10 @@ export interface GitPort {
     worktree: GitWorktree,
     options?: ReadOptions,
   ): AsyncPortResult<GitWorkingTreeSnapshot>;
+  readTextFileAtRevision(
+    command: ReadGitTextFileCommand,
+    options?: ReadOptions,
+  ): AsyncPortResult<GitTextFileAtRevision>;
   stagePaths(
     worktree: GitWorktree,
     paths: readonly string[],
