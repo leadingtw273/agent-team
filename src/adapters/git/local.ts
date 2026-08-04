@@ -10,9 +10,11 @@ import type {
   GitPushReceipt,
   GitRepositoryRef,
   GitRepositorySnapshot,
+  GitTextFileAtRevision,
   GitWorkingTreeChange,
   GitWorkingTreeSnapshot,
   GitWorktree,
+  ReadGitTextFileCommand,
 } from "../../application/ports/index.js";
 import {
   domainError,
@@ -591,6 +593,45 @@ export class LocalGitAdapter implements GitPort {
     return changes === undefined
       ? failure("external_failure")
       : ok({ headSha: snapshot.value.headSha, changes });
+  }
+
+  async readTextFileAtRevision(
+    command: ReadGitTextFileCommand,
+    options: ReadOptions = {},
+  ): Promise<Result<GitTextFileAtRevision, DomainError>> {
+    if (
+      !validRevision(command.revision) ||
+      !validRelativePath(command.path) ||
+      !Number.isSafeInteger(command.maxBytes) ||
+      command.maxBytes <= 0 ||
+      command.maxBytes > 16 * 1024 * 1024
+    ) {
+      return failure("external_failure");
+    }
+    const root = await this.#repositoryRoot(command, options);
+    if (!root.ok) return root;
+    const revisionSha = await this.#resolveCommit(root.value, command.revision, options);
+    if (!revisionSha.ok) return revisionSha;
+    const content = await this.#run(
+      root.value,
+      ["cat-file", "blob", `${revisionSha.value}:${command.path}`],
+      options,
+    );
+    if (!content.ok) return content;
+    const byteLength = Buffer.byteLength(content.value.stdout, "utf8");
+    if (
+      byteLength > command.maxBytes ||
+      content.value.stdout.includes("\u0000") ||
+      content.value.stdout.includes("\ufffd")
+    ) {
+      return failure("external_failure");
+    }
+    return ok({
+      revisionSha: revisionSha.value,
+      path: command.path,
+      content: content.value.stdout,
+      byteLength,
+    });
   }
 
   async stagePaths(
