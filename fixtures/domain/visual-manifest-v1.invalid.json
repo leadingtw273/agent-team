@@ -1,0 +1,18 @@
+[
+  {
+    "name": "unknown schema version",
+    "patch": { "schemaVersion": 2 }
+  },
+  {
+    "name": "malformed artifact hash",
+    "artifactPatch": { "sha256": "not-a-sha256" }
+  },
+  {
+    "name": "missing AC mapping",
+    "artifactPatch": { "acceptanceCriteria": [] }
+  },
+  {
+    "name": "unsupported evidence media type",
+    "artifactPatch": { "mediaType": "text/html" }
+  }
+]

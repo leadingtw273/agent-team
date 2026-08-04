@@ -27,7 +27,17 @@ export const requirementSnapshotSchema = z
     requirementsDigest: sha256Schema,
     issue: issueSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    const digest = sha256Digest(snapshot.issue);
+    if (!digest.ok || digest.value !== snapshot.requirementsDigest) {
+      context.addIssue({
+        code: "custom",
+        message: "Requirement digest must match the captured Issue.",
+        path: ["requirementsDigest"],
+      });
+    }
+  });
 
 export type RequirementSnapshot = z.infer<typeof requirementSnapshotSchema>;
 

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "issueId": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "generatedAt": "2026-08-04T12:00:00.000Z",
+  "environment": {
+    "runner": "playwright",
+    "operatingSystem": "linux",
+    "applicationVersion": "1.0.0",
+    "viewport": {
+      "width": 1440,
+      "height": 900,
+      "deviceScaleFactor": 1
+    }
+  },
+  "artifacts": [
+    {
+      "path": "artifacts/dashboard.png",
+      "mediaType": "image/png",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "title": "Dashboard desktop view",
+      "acceptanceCriteria": ["Dashboard has no horizontal overflow."]
+    }
+  ]
+}
