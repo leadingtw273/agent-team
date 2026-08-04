@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 0,
+  "id": "event_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "type": "github.pull_request.merged",
+  "occurredAt": "2026-08-04T12:00:00.000Z",
+  "recordedAt": "2026-08-04T12:00:01.000Z",
+  "source": {
+    "kind": "external",
+    "provider": "github",
+    "deliveryId": "delivery-123"
+  },
+  "subject": {
+    "kind": "pull_request",
+    "id": "17"
+  },
+  "correlationId": "issue-123",
+  "payload": {
+    "merged": true
+  }
+}
