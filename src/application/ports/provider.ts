@@ -48,6 +48,12 @@ export interface ProviderRunRequest {
 
 export type ProviderEvent =
   | Readonly<{ kind: "started"; observedAt: Instant; sessionId?: string }>
+  | Readonly<{
+      kind: "model_selected";
+      observedAt: Instant;
+      requestedModel: string;
+      actualModels: readonly string[];
+    }>
   | Readonly<{ kind: "output"; observedAt: Instant; stream: "stdout" | "stderr"; text: string }>
   | Readonly<{
       kind: "tool_request";
