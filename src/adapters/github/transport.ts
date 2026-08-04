@@ -116,24 +116,56 @@ function mapGhError(error: unknown, stderr: string): DomainError {
   return domainError("external_failure");
 }
 
+function safeTypedField(field: string): boolean {
+  const separator = field.indexOf("=");
+  if (separator <= 0) return false;
+  const name = field.slice(0, separator);
+  const value = field.slice(separator + 1);
+  return /^[A-Za-z][A-Za-z0-9_.\[\]-]{0,127}$/u.test(name) && !value.startsWith("@");
+}
+
+function safeRawField(field: string): boolean {
+  const separator = field.indexOf("=");
+  if (separator <= 0) return false;
+  return /^[A-Za-z][A-Za-z0-9_.\[\]-]{0,127}$/u.test(field.slice(0, separator));
+}
+
 function validArguments(arguments_: readonly string[]): boolean {
-  return (
-    arguments_.length > 0 &&
-    arguments_[0] === "api" &&
-    arguments_.length <= 1_000 &&
-    arguments_.every(
-      (argument) =>
-        argument.length <= 100_000 && !argument.includes("\u0000") && !/[\r\n]/u.test(argument),
-    ) &&
-    !arguments_.some(
-      (argument) =>
-        argument === "--input" ||
-        argument.startsWith("--input=") ||
-        argument === "-F" ||
-        argument.startsWith("-F"),
-    ) &&
-    arguments_.reduce((total, argument) => total + argument.length, 0) <= 1_000_000
-  );
+  if (
+    arguments_.length === 0 ||
+    arguments_[0] !== "api" ||
+    arguments_.length > 1_000 ||
+    arguments_.some((argument) => argument.length > 100_000 || argument.includes("\u0000")) ||
+    arguments_.reduce((total, argument) => total + argument.length, 0) > 1_000_000
+  ) {
+    return false;
+  }
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (argument === "--input" || argument?.startsWith("--input=") === true) return false;
+    if (argument === "-F" || argument === "--field") {
+      const field = arguments_[index + 1];
+      if (field === undefined || !safeTypedField(field)) return false;
+      index += 1;
+      continue;
+    }
+    if (argument === "-f" || argument === "--raw-field") {
+      const field = arguments_[index + 1];
+      if (field === undefined || !safeRawField(field)) return false;
+      index += 1;
+      continue;
+    }
+    if (argument?.startsWith("-F") === true && !safeTypedField(argument.slice(2))) return false;
+    if (argument?.startsWith("--field=") === true && !safeTypedField(argument.slice(8))) {
+      return false;
+    }
+    if (argument?.startsWith("-f") === true && !safeRawField(argument.slice(2))) return false;
+    if (argument?.startsWith("--raw-field=") === true && !safeRawField(argument.slice(12))) {
+      return false;
+    }
+    if (argument !== undefined && /[\r\n]/u.test(argument)) return false;
+  }
+  return true;
 }
 
 function capabilityFailure(error: DomainError): GhCapabilityAvailability["failure"] | undefined {
