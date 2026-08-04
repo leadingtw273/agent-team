@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "2.1.221",
+  "provenance": {
+    "source": "true local claude auth status --json probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["email", "organization identifiers", "organization name", "tokens"]
+  },
+  "probe": "auth",
+  "observed": {
+    "exitCode": 0,
+    "loggedIn": true,
+    "authMethod": "claude.ai",
+    "apiProvider": "firstParty",
+    "subscriptionType": "team"
+  },
+  "expected": {
+    "classification": "authenticated_team_account",
+    "accountIdentityPersisted": false
+  }
+}

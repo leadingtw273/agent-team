@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "2.1.221",
+  "provenance": {
+    "source": "true local interactive /status Usage tab read-back",
+    "redactionMethod": "manual allowlist transcription without account identity",
+    "removedFields": [
+      "email",
+      "organization identifiers",
+      "terminal control sequences",
+      "session identifiers"
+    ]
+  },
+  "probe": "quota-interactive-status",
+  "observed": {
+    "captureMethod": "interactive_tui_readback",
+    "structuredApi": false,
+    "currentSession": {
+      "usedPercent": 5,
+      "resetLocal": "2026-08-04T21:50:00+08:00"
+    },
+    "currentWeekAllModels": {
+      "usedPercent": 93,
+      "resetLocal": "2026-08-05T23:00:00+08:00"
+    },
+    "currentWeekFable": {
+      "usedPercent": 86,
+      "resetLocal": "2026-08-05T23:00:00+08:00"
+    },
+    "localContributionIsApproximate": true
+  },
+  "expected": {
+    "classification": "degraded_version_pinned_tui_signal",
+    "parseFailureClassification": "quota_unknown",
+    "mustRefreshAfterCliUpdate": true,
+    "mustNotStartFromStaleOrUnknownSample": true
+  }
+}

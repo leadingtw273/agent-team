@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "2.1.221",
+  "provenance": {
+    "source": "true local dontAsk permission probe in isolated temporary repo",
+    "redactionMethod": "event allowlist projection",
+    "removedFields": [
+      "session identifiers",
+      "message identifiers",
+      "raw tool input",
+      "model prose",
+      "token usage",
+      "cost"
+    ]
+  },
+  "probe": "permission",
+  "observed": {
+    "exitCode": 0,
+    "eventTypes": ["system", "rate_limit_event", "assistant", "user", "result"],
+    "contentBlockTypes": ["thinking", "tool_use", "tool_result", "text"],
+    "toolNames": ["Bash"],
+    "permissionDenialTools": ["Bash"],
+    "isError": false,
+    "markerExists": false
+  },
+  "expected": {
+    "classification": "blocked_by_permission",
+    "processExitZeroIsNotSuccess": true,
+    "safeToExecute": false
+  }
+}
