@@ -5,6 +5,8 @@ declare const instantBrand: unique symbol;
 
 export type Instant = string & { readonly [instantBrand]: true };
 
+export const canonicalInstantPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+
 export interface Clock {
   now(): Instant;
 }
