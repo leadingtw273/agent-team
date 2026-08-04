@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "2.1.221",
+  "provenance": {
+    "source": "true local Read-only review and resume probe",
+    "redactionMethod": "event and filesystem evidence allowlist projection",
+    "removedFields": [
+      "session identifiers",
+      "message identifiers",
+      "absolute paths",
+      "token usage",
+      "cost"
+    ]
+  },
+  "probe": "review-resume",
+  "observed": {
+    "review": {
+      "exitCode": 0,
+      "eventTypes": ["system", "rate_limit_event", "assistant", "user", "result"],
+      "contentBlockTypes": ["thinking", "tool_use", "tool_result", "text"],
+      "toolNames": ["Read"],
+      "permissionDenialTools": [],
+      "finalResult": "CLAUDE_REVIEW_OK",
+      "isError": false
+    },
+    "targetSha256Unchanged": true,
+    "gitStatusUnchanged": true,
+    "resume": {
+      "exitCode": 0,
+      "eventTypes": ["system", "rate_limit_event", "assistant", "result"],
+      "toolNames": [],
+      "finalResult": "CLAUDE_RESUME_OK",
+      "isError": false
+    }
+  },
+  "expected": {
+    "classification": "read_only_review_and_resume_supported",
+    "readEventRequired": true,
+    "externalCheckpointStillRequired": true
+  }
+}

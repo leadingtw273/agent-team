@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "2.1.221",
+  "provenance": {
+    "source": "true local claude print mode probe",
+    "redactionMethod": "event allowlist projection",
+    "removedFields": ["session identifiers", "message identifiers", "token usage", "cost"]
+  },
+  "probe": "exec",
+  "observed": {
+    "exitCode": 0,
+    "eventTypes": ["system", "rate_limit_event", "assistant", "result"],
+    "contentBlockTypes": ["thinking", "text"],
+    "toolNames": [],
+    "permissionDenialTools": [],
+    "rateLimitEvents": [
+      {
+        "status": "allowed_warning",
+        "rateLimitType": "seven_day",
+        "utilization": 0.93,
+        "resetsAt": 1785942000
+      }
+    ],
+    "finalResult": "CLAUDE_PROBE_OK",
+    "isError": false
+  },
+  "expected": {
+    "classification": "success",
+    "requiresResultEvent": true,
+    "requiresNoPermissionDenials": true
+  }
+}
