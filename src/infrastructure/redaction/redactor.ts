@@ -112,7 +112,6 @@ export class Redactor {
       /(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?)[^\s,;]+/giu,
       `$1${redactedValue}`,
     );
-    output = output.replace(/((?:x-api-key|api-key)\s*[:=]\s*)[^\s,;]+/giu, `$1${redactedValue}`);
     output = output.replace(/((?:set-cookie|cookie)\s*[:=]\s*)[^\r\n]*/giu, `$1${redactedValue}`);
     output = output.replace(
       /([a-z][a-z0-9+.-]*:\/\/)[^/\s:@]+(?::[^/\s@]*)?@/giu,
@@ -124,8 +123,9 @@ export class Redactor {
         this.isSensitiveKey(decodeQueryKey(key)) ? `${separator}${key}=${redactedValue}` : match,
     );
     output = output.replace(
-      /((?:^|[\s,{;])["']?(?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|password|passwd|private[_-]?key|secret|signature|token)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gimu,
-      `$1${redactedValue}`,
+      /(^|[\s,{;])(["']?)([a-z][a-z0-9_-]*)(\2\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gimu,
+      (match, boundary: string, quote: string, key: string, separator: string) =>
+        this.isSensitiveKey(key) ? `${boundary}${quote}${key}${separator}${redactedValue}` : match,
     );
     for (const pattern of tokenPatterns) output = output.replace(pattern, redactedValue);
     return output;

@@ -48,6 +48,8 @@ describe("text redaction", () => {
     const input = [
       "Authorization: Bearer bearer-value",
       "X-Api-Key=header-value",
+      "X-Auth-Token: custom-header-value",
+      "X-Session-Secret: custom-session-value",
       "Cookie: session=cookie-value; theme=dark",
       "clone https://user-name:password-value@example.test/repo",
       "GET https://example.test/hook?token=query-value&safe=visible&signature=signed-value",
@@ -60,6 +62,8 @@ describe("text redaction", () => {
     for (const secret of [
       "bearer-value",
       "header-value",
+      "custom-header-value",
+      "custom-session-value",
       "cookie-value",
       "user-name",
       "password-value",
@@ -78,7 +82,8 @@ describe("text redaction", () => {
   });
 
   it("does not redact ordinary short lookalikes or non-sensitive URLs", () => {
-    const input = "sk-short https://example.test/path?mode=safe ordinary-value";
+    const input =
+      "sk-short https://example.test/path?mode=safe X-Session-Secretive: visible ordinary-value";
     expect(new Redactor().redactText(input)).toBe(input);
   });
 });
@@ -179,6 +184,10 @@ describe("command and process output redaction", () => {
           "kebab-command-value",
           "--APIKey",
           "acronym-command-value",
+          "--custom-auth-token",
+          "custom-token-value",
+          "--internal-api-key",
+          "internal-key-value",
           "--webhookSecrets",
           "non-sensitive-value",
           "--mode=safe",
@@ -209,6 +218,10 @@ describe("command and process output redaction", () => {
       "--webhook-secret",
       redactedValue,
       "--APIKey",
+      redactedValue,
+      "--custom-auth-token",
+      redactedValue,
+      "--internal-api-key",
       redactedValue,
       "--webhookSecrets",
       "non-sensitive-value",

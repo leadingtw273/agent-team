@@ -55,8 +55,11 @@ export function redactCommand(command: CommandForLogging, redactor: Redactor): R
     const equalsIndex = argument.indexOf("=");
     const flag = normalizedFlag(equalsIndex === -1 ? argument : argument.slice(0, equalsIndex));
     const assignmentKey = equalsIndex === -1 ? undefined : argument.slice(0, equalsIndex);
+    const splitFlagKey =
+      equalsIndex === -1 && flag.startsWith("-") ? flag.replace(/^-+/u, "") : undefined;
     if (
       sensitiveFlags.has(flag) ||
+      (splitFlagKey !== undefined && redactor.isSensitiveKey(splitFlagKey)) ||
       (assignmentKey !== undefined && redactor.isSensitiveKey(assignmentKey))
     ) {
       if (equalsIndex === -1) {
