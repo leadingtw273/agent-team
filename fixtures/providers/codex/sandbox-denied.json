@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.146.0",
+  "provenance": {
+    "source": "true local codex sandbox probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["absolute executable paths"]
+  },
+  "probe": "sandbox",
+  "observed": {
+    "exitCode": 1,
+    "stderrIncludesReadOnly": true,
+    "markerExists": false
+  },
+  "expected": {
+    "classification": "blocked_by_os_sandbox",
+    "safeToExecute": false
+  }
+}

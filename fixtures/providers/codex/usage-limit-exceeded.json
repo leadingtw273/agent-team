@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "synthetic-official-schema",
+  "provenance": {
+    "source": "official Codex app-server error taxonomy",
+    "redactionMethod": "none; synthetic fixture contains no account data",
+    "removedFields": []
+  },
+  "probe": "usage-limit-failure",
+  "observed": {
+    "turnStatus": "failed",
+    "error": {
+      "message": "Usage limit exceeded",
+      "codexErrorInfo": "UsageLimitExceeded"
+    }
+  },
+  "expected": {
+    "classification": "quota_exhausted",
+    "startNewWork": false,
+    "checkpointCurrentWork": true
+  }
+}

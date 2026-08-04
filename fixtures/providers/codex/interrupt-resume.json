@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "cliVersion": "0.146.0",
+  "provenance": {
+    "source": "true local app-server interrupt probe",
+    "redactionMethod": "allowlist projection",
+    "removedFields": ["thread identifiers", "turn identifiers", "token usage"]
+  },
+  "probe": "interrupt",
+  "observed": {
+    "interruptedStatus": "interrupted",
+    "resumedStatus": "completed",
+    "resumedMessage": "INTERRUPT_RESUME_OK"
+  },
+  "expected": {
+    "classification": "interrupt_and_resume_supported",
+    "externalCheckpointStillRequired": true
+  }
+}
