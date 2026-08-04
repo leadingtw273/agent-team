@@ -64,6 +64,53 @@ function runRepoProbe() {
   };
 }
 
+function runAutoMergeProbe() {
+  const beforeRun = runGh(["api", `repos/${repository}`]);
+  if (beforeRun.exitCode !== 0) throw new Error("auto-merge preflight failed");
+  const before = parseJson(beforeRun.stdout).allow_auto_merge === true;
+
+  function runCycle(cycle) {
+    const patch = runGh([
+      "api",
+      "--method",
+      "PATCH",
+      `repos/${repository}`,
+      "-F",
+      "allow_auto_merge=true",
+    ]);
+    if (patch.exitCode !== 0) throw new Error(`auto-merge PATCH ${cycle} failed`);
+    const patchResponse = parseJson(patch.stdout).allow_auto_merge === true;
+    const readBackRun = runGh(["api", `repos/${repository}`]);
+    if (readBackRun.exitCode !== 0) throw new Error(`auto-merge read-back ${cycle} failed`);
+    const readBack = parseJson(readBackRun.stdout).allow_auto_merge === true;
+
+    return {
+      patchRequested: true,
+      patchExitCode: patch.exitCode,
+      patchResponse,
+      readBack,
+      configurationDrift: patchResponse !== readBack,
+    };
+  }
+
+  const first = runCycle("first cycle");
+  const second = runCycle("second cycle");
+
+  return {
+    before,
+    first,
+    second,
+    idempotent:
+      first.patchResponse &&
+      first.readBack &&
+      second.patchResponse &&
+      second.readBack &&
+      !first.configurationDrift &&
+      !second.configurationDrift,
+    configurationDrift: first.configurationDrift || second.configurationDrift,
+  };
+}
+
 function requireSha(value) {
   if (!/^[0-9a-f]{40}$/u.test(value ?? "")) throw new Error("a full 40-character SHA is required");
   return value;
@@ -140,11 +187,17 @@ function runPullRequestProbe() {
 }
 
 function main() {
-  if (!new Set(["repo", "status", "pr"]).has(mode)) {
-    throw new Error("usage: gh-probe.mjs <repo|status|pr> [sha|pull-number]");
+  if (!new Set(["repo", "auto-merge", "status", "pr"]).has(mode)) {
+    throw new Error("usage: gh-probe.mjs <repo|auto-merge|status|pr> [sha|pull-number]");
   }
   const result =
-    mode === "repo" ? runRepoProbe() : mode === "status" ? runStatusProbe() : runPullRequestProbe();
+    mode === "repo"
+      ? runRepoProbe()
+      : mode === "auto-merge"
+        ? runAutoMergeProbe()
+        : mode === "status"
+          ? runStatusProbe()
+          : runPullRequestProbe();
   console.log(JSON.stringify({ schemaVersion: 1, probe: mode, result }, null, 2));
 }
 

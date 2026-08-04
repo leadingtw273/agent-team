@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true public repository auto-merge PATCH and read-back probe",
+    "redactionMethod": "setting allowlist projection",
+    "removedFields": ["account login", "repository identifiers", "URLs", "node identifiers"]
+  },
+  "probe": "auto-merge",
+  "observed": {
+    "before": true,
+    "first": {
+      "patchRequested": true,
+      "patchExitCode": 0,
+      "patchResponse": true,
+      "readBack": true,
+      "configurationDrift": false
+    },
+    "second": {
+      "patchRequested": true,
+      "patchExitCode": 0,
+      "patchResponse": true,
+      "readBack": true,
+      "configurationDrift": false
+    },
+    "idempotent": true,
+    "configurationDrift": false
+  },
+  "expected": {
+    "classification": "auto_merge_enabled_with_readback",
+    "mustNotClaimRulesetConfigured": true
+  }
+}

@@ -3,7 +3,7 @@
   "fixtureType": "observed-redacted",
   "capturedAt": "2026-08-04",
   "provenance": {
-    "source": "true isolated Draft PR and gh read-back probe",
+    "source": "manual aggregation of true gh read-backs across isolated Draft, Checks, and Ready transitions",
     "redactionMethod": "allowlist projection",
     "removedFields": ["pull request number", "head SHA", "URLs", "actor login", "node identifiers"]
   },
