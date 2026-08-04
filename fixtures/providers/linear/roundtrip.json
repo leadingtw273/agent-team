@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true safe-default Linear round-trip probe",
+    "redactionMethod": "complete allowlist projection of the probe result",
+    "removedFields": ["API key", "object identifiers", "titles", "comments", "workspace data"]
+  },
+  "probe": "roundtrip",
+  "observed": {
+    "success": true,
+    "failure": null,
+    "issue": {
+      "created": true,
+      "labelAttached": true,
+      "commentReadBack": true
+    },
+    "labelGroup": {
+      "groupCreated": true,
+      "childCreated": true,
+      "parentBound": true
+    },
+    "template": {
+      "created": true,
+      "typeReadBack": true,
+      "teamBound": true
+    },
+    "upload": {
+      "signedUrlIssued": true,
+      "returnedHeadersApplied": false,
+      "bytesUploaded": false,
+      "putStatus": null,
+      "embeddedInComment": false,
+      "fullUploadSkipped": true,
+      "deleteClassification": "not_applicable_no_bytes"
+    },
+    "cleanup": {
+      "commentsDeleted": true,
+      "issueCanceled": true,
+      "uploadDeleted": false,
+      "templateDeleted": true,
+      "labelsDeleted": true
+    }
+  },
+  "expected": {
+    "classification": "linear_core_roundtrip_supported",
+    "falseUploadDeletionMustRemainVisible": true
+  }
+}

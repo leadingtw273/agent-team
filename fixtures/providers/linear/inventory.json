@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true Linear GraphQL viewer, workspace, inventory, and schema introspection probe",
+    "redactionMethod": "complete allowlist projection of the probe result",
+    "removedFields": ["API key", "user identity", "workspace identity", "team identifiers"]
+  },
+  "probe": "inventory",
+  "observed": {
+    "success": true,
+    "registrationReady": false,
+    "connection": {
+      "viewerReadable": true,
+      "workspaceReadable": true
+    },
+    "inventory": {
+      "teamCount": 1,
+      "projectCount": 0,
+      "templateCount": 0,
+      "selectedTeamCanceledStateAvailable": true,
+      "inventoryComplete": true
+    },
+    "mutationsPresent": {
+      "issueCreate": true,
+      "issueUpdate": true,
+      "commentCreate": true,
+      "commentDelete": true,
+      "issueLabelCreate": true,
+      "issueLabelDelete": true,
+      "templateCreate": true,
+      "templateDelete": true,
+      "fileUpload": true,
+      "fileUploadDangerouslyDelete": true
+    }
+  },
+  "expected": {
+    "zeroProjectClassification": "adopt_with_project_registration_prerequisite",
+    "schemaPresenceDoesNotProveAccess": true,
+    "mustNotClaimProjectConfigured": true
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "true roundtrip --with-upload plus deletion error-code diagnostic",
+    "redactionMethod": "complete allowlist projection matching roundtrip-with-upload output",
+    "removedFields": ["API key", "signed upload URL", "asset URL", "object identifiers"]
+  },
+  "probe": "roundtrip-with-upload",
+  "observed": {
+    "success": false,
+    "failure": null,
+    "issue": {
+      "created": true,
+      "labelAttached": true,
+      "commentReadBack": true
+    },
+    "labelGroup": {
+      "groupCreated": true,
+      "childCreated": true,
+      "parentBound": true
+    },
+    "template": {
+      "created": true,
+      "typeReadBack": true,
+      "teamBound": true
+    },
+    "upload": {
+      "signedUrlIssued": true,
+      "returnedHeadersApplied": true,
+      "bytesUploaded": true,
+      "putStatus": 200,
+      "embeddedInComment": true,
+      "fullUploadSkipped": false,
+      "deleteClassification": "graphql_feature_not_accessible"
+    },
+    "cleanup": {
+      "commentsDeleted": true,
+      "issueCanceled": true,
+      "uploadDeleted": false,
+      "templateDeleted": true,
+      "labelsDeleted": true
+    }
+  },
+  "expected": {
+    "classification": "adopt_upload_with_cleanup_degradation",
+    "mustNotClaimUploadedAssetDeleted": true,
+    "persistentUnreferencedAssetRemains": true
+  }
+}

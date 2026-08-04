@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "synthetic",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "synthetic GraphQL transport failure envelopes derived from the Linear response contract",
+    "redactionMethod": "contains no account or service data",
+    "removedFields": []
+  },
+  "probe": "graphql-failure-classification",
+  "cases": [
+    {
+      "case": "unauthorized",
+      "status": 401,
+      "body": { "errors": [{ "extensions": { "code": "AUTHENTICATION_ERROR" } }] },
+      "expectedError": "http_401"
+    },
+    {
+      "case": "rate-limited",
+      "status": 429,
+      "body": { "errors": [{ "extensions": { "code": "RATELIMITED" } }] },
+      "expectedError": "http_429"
+    },
+    {
+      "case": "http-200-partial-error",
+      "status": 200,
+      "body": {
+        "data": { "viewer": null },
+        "errors": [{ "extensions": { "code": "PARTIAL_ERROR" } }]
+      },
+      "expectedError": "graphql_partial_error"
+    },
+    {
+      "case": "graphql-error-without-code",
+      "status": 200,
+      "body": { "errors": [{}] },
+      "expectedError": "graphql_error"
+    }
+  ],
+  "nonJsonCases": [{ "status": 502, "expectedError": "http_502_non_json" }]
+}
