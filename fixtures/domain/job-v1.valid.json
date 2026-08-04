@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "projectId": "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "issueId": "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  "createdAt": "2026-08-04T12:00:00.000Z",
+  "startedAt": "2026-08-04T12:01:00.000Z",
+  "watchdogExtensionGranted": false,
+  "attempts": {
+    "processRecoveries": 0,
+    "ciFixRounds": 0,
+    "reviewerFixRounds": 0,
+    "reviewRuns": 0
+  }
+}
