@@ -35,6 +35,18 @@
       "status": 200,
       "body": { "errors": [{}] },
       "expectedError": "graphql_error"
+    },
+    {
+      "case": "graphql-forbidden",
+      "status": 200,
+      "body": { "errors": [{ "extensions": { "code": "FORBIDDEN" } }] },
+      "expectedError": "graphql_forbidden"
+    },
+    {
+      "case": "graphql-not-found",
+      "status": 200,
+      "body": { "errors": [{ "extensions": { "code": "NOTFOUND" } }] },
+      "expectedError": "graphql_notfound"
     }
   ],
   "nonJsonCases": [{ "status": 502, "expectedError": "http_502_non_json" }]
