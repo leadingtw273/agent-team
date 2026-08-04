@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "synthetic",
+  "capturedAt": "2026-08-04",
+  "provenance": {
+    "source": "synthetic Linear GraphQL read-model pages based on the S004 capability probe and official Relay pagination contract",
+    "redactionMethod": "contains no account, workspace, or service data",
+    "removedFields": []
+  },
+  "team": { "id": "team-fixture", "name": "Fixture Team", "key": "FIX" },
+  "project": { "id": "project-fixture", "name": "Fixture Project" },
+  "states": [
+    { "id": "state-backlog", "name": "待辦", "type": "backlog" },
+    { "id": "state-ready", "name": "待執行", "type": "unstarted" },
+    { "id": "state-progress", "name": "進行中", "type": "started" },
+    { "id": "state-review", "name": "審查中", "type": "started" },
+    { "id": "state-completed", "name": "已完成", "type": "completed" },
+    { "id": "state-canceled", "name": "已取消", "type": "canceled" }
+  ],
+  "labels": [
+    { "id": "group-role", "name": "Agent 角色", "isGroup": true, "parentId": null },
+    { "id": "role-lead", "name": "團隊管理者", "isGroup": false, "parentId": "group-role" },
+    { "id": "role-implementer", "name": "開發工程師", "isGroup": false, "parentId": "group-role" },
+    {
+      "id": "role-code-reviewer",
+      "name": "代碼審查者",
+      "isGroup": false,
+      "parentId": "group-role"
+    },
+    {
+      "id": "role-visual-reviewer",
+      "name": "視覺審查者",
+      "isGroup": false,
+      "parentId": "group-role"
+    },
+    { "id": "role-integration", "name": "整合工程師", "isGroup": false, "parentId": "group-role" },
+    { "id": "group-review", "name": "審查需求", "isGroup": true, "parentId": null },
+    { "id": "review-code", "name": "代碼審查", "isGroup": false, "parentId": "group-review" },
+    { "id": "review-visual", "name": "視覺審查", "isGroup": false, "parentId": "group-review" },
+    { "id": "review-dual", "name": "雙重審查", "isGroup": false, "parentId": "group-review" },
+    { "id": "group-agent-status", "name": "Agent 狀態", "isGroup": true, "parentId": null },
+    { "id": "agent-queued", "name": "排隊中", "isGroup": false, "parentId": "group-agent-status" },
+    {
+      "id": "agent-executing",
+      "name": "執行中",
+      "isGroup": false,
+      "parentId": "group-agent-status"
+    },
+    { "id": "agent-waiting", "name": "等待中", "isGroup": false, "parentId": "group-agent-status" },
+    { "id": "agent-paused", "name": "已暫停", "isGroup": false, "parentId": "group-agent-status" },
+    { "id": "agent-blocked", "name": "已阻塞", "isGroup": false, "parentId": "group-agent-status" },
+    { "id": "group-blocking", "name": "阻塞原因", "isGroup": true, "parentId": null },
+    {
+      "id": "block-dependency",
+      "name": "等待依賴",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    { "id": "block-weekly", "name": "週額度不足", "isGroup": false, "parentId": "group-blocking" },
+    {
+      "id": "block-five-hour",
+      "name": "5 小時額度限制",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    {
+      "id": "block-quota-unknown",
+      "name": "額度資訊無法確認",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    {
+      "id": "block-dangerous",
+      "name": "等待危險操作核可",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    {
+      "id": "block-integration",
+      "name": "整合異常",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    { "id": "block-conflict", "name": "合併衝突", "isGroup": false, "parentId": "group-blocking" },
+    {
+      "id": "block-change-closed",
+      "name": "變更請求已關閉",
+      "isGroup": false,
+      "parentId": "group-blocking"
+    },
+    { "id": "block-unknown", "name": "未知錯誤", "isGroup": false, "parentId": "group-blocking" },
+    { "id": "label-extra", "name": "額外標籤", "isGroup": false, "parentId": null }
+  ],
+  "issue": {
+    "id": "issue-fixture",
+    "identifier": "FIX-42",
+    "title": "Fixture issue",
+    "description": "Structured fixture description",
+    "priority": 2,
+    "updatedAt": "2026-08-04T12:00:00.000Z",
+    "teamId": "team-fixture",
+    "projectId": "project-fixture",
+    "stateId": "state-progress",
+    "labelIds": [
+      "role-implementer",
+      "review-code",
+      "agent-blocked",
+      "block-conflict",
+      "label-extra"
+    ]
+  },
+  "relations": [
+    {
+      "id": "relation-out",
+      "type": "blocks",
+      "relatedIssueId": "issue-dependent",
+      "relatedIssueIdentifier": "FIX-43",
+      "direction": "outbound"
+    },
+    {
+      "id": "relation-in",
+      "type": "blocks",
+      "relatedIssueId": "issue-dependency",
+      "relatedIssueIdentifier": "FIX-41",
+      "direction": "inbound"
+    }
+  ],
+  "comments": [
+    {
+      "id": "comment-1",
+      "body": "🤖 Agent Team｜團隊管理者 fixture",
+      "createdAt": "2026-08-04T11:00:00.000Z"
+    }
+  ]
+}
