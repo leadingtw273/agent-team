@@ -87,6 +87,40 @@
 | S006 | PR #10，Merge `b68f1b2` | GitHub／Linear Webhook 驗簽、dedupe、亂序、快速 ACK |
 | S007 | 本文件與 `docs/feasibility.md` | Spike Gate：PASS WITH DEGRADATIONS，可進 Phase 2 |
 
+## Phase 2 Foundation 已驗證證據
+
+| Task 範圍 | Merge／PR | 已驗證內容 |
+|---|---|---|
+| F001-F006 | PR #14-#19 | Foundation、Project／Issue、Eligibility、Workflow、Event、Job／Lease／Watchdog 契約 |
+| F007-F009 | PR #20-#22 | 需求快照、Diff Digest、Checkpoint／Visual Manifest、Provider-neutral Ports |
+| F010-F012 | PR #23-#26，main `9f610d3` | Crash-safe File State、Event Store／Inbox、Secret／輸出遮罩與複審修補 |
+
+Foundation Gate 在同步 main 上完成 lint、typecheck、unit、contract、integration、build、format 與 diff-check；F012 複審發現的複合 Header／自訂 split flag 遮罩缺口已由 PR #26 關閉。
+
+## Phase 3A Platform Adapter Track 已驗證證據
+
+| Task | Merge／PR | 已驗證內容 |
+|---|---|---|
+| A001-A004 | PR #27-#30，Merge `0ebf164`～`000900c` | Linear transport、read model、mutation、artifact upload；Fixture 與 mutation read-back |
+| A005-A006 | PR #31-#32，Merge `4d946c7`／`2a86bed` | Local Git Worktree／Commit／Push 與 Secret、Scope、並行碰撞 Preflight |
+| A007-A008 | PR #33-#34，Merge `dd0372f`／`d24cf4e` | `gh` transport、PR／CI／Status／Auto-merge／Conflict；精確 Head SHA gate |
+| A009-A010 | PR #35-#36，Merge `a90a2f`／`56f5fd` | Signed Webhook durable Inbox 與 Linear／GitHub authoritative reconcile read-back |
+
+## Phase 3B Provider、Quota、Safety Runtime 已驗證證據
+
+| Task | Merge／PR | 已驗證內容 |
+|---|---|---|
+| R001-R002 | PR #37-#38，Merge `cfde4d1`／`01d59bd` | Bounded Child Process、外部 Checkpoint、Provider Job Protocol、外部資料權限邊界 |
+| R003 | PR #39，Merge `a8896fd` | Codex app-server Runner、動態 Approval、結構化 Interrupt、Crash Checkpoint |
+| R004 | PR #40，Merge `4ae437c` | Claude stream-json Runner、唯讀 Reviewer、permission denial 優先於 exit 0 |
+| R005 | PR #41，Merge `df043b2` | Gemini JSON 視覺 Reviewer、read-only policy、實際模型證據與 zero-change proof |
+| R006 | PR #42，Merge `9f4b090` | 角色模型有序路由、不可用／Slot／額度備援、執行中不回切、Gemini visual-only |
+| R007 | PR #43，Merge `df1456a` | 帳號／CLI 版本／時間綁定的週與 5h 三態額度；unknown fail-closed、刷新一次、3% Checkpoint |
+| R008 | PR #44，Merge `8b9f8fe` | 七大危險類別、相似命令同類、未知 fail-closed、專案長期允許仍稽核、Process 前攔截 |
+| R009 | PR #45，Merge `9dc10e5` | Preflight→WIP Commit／Push→私有 YAML→Linear 摘要；Push／Crash 失敗仍保留可復航 Checkpoint |
+
+Track B Gate 在 main `9dc10e5` 上重跑 10 個相關測試檔、97／97 通過；R009 合併後 main CI Run `30957008043` 通過完整品質 Gate。R007-R009 各 PR 均綁定精確 Head SHA、CI 與 `agent-team/review` status；因本 session 的 Claude review 路徑持續回傳空結果，這三張採目前 Agent 的獨立 AC pass，並已在各 PR 證據留言揭露非 fresh-context 限制。
+
 ## 維護規則
 
 1. 新增或修改規格條款時，必須先更新需求基線並重新核可，再更新本矩陣。
