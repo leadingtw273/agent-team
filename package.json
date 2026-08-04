@@ -17,6 +17,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
+    "schemas:generate": "pnpm run build && node scripts/generate-domain-schemas.mjs",
     "start": "node dist/cli/index.js",
     "test": "pnpm run build && vitest run",
     "test:contract": "vitest run tests/contract --passWithNoTests",
