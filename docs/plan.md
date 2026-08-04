@@ -1,6 +1,6 @@
 # Agent Team 本機第一版：可執行實作 Plan v1
 
-狀態：Claude 初審與修訂驗證皆通過，待 leadi 核可  
+狀態：Claude 初審與修訂驗證皆通過，leadi 已核可，執行中  
 日期：2026-08-04  
 需求基線：`/tmp/agent-team-spec-v1.md`  
 需求 SHA-256：`d64ccc6e7e653a44fc7d043b6dd668156585628a4cb9bfcb75f8b23b7060f70f`  
@@ -22,8 +22,8 @@
 
 ### 2.1 Repository
 
-- 核心：`/home/markchou/project/agent-team`，GitHub Repository 名稱 `agent-team`，第一版預設 Private，不加入公開 License。
-- 驗證：`/home/markchou/project/agent-team-sandbox`，GitHub Repository 名稱 `agent-team-sandbox`，沿用 Private。
+- 核心：`/home/markchou/project/agent-team`，GitHub Repository 名稱 `agent-team`；S005 實測 Private Repo 在目前 GitHub 方案不能配置 required Ruleset，經 leadi 明確授權後已改為 Public 並重驗。不因 Public 自動加入 License。
+- 驗證：`/home/markchou/project/agent-team-sandbox`，GitHub Repository 名稱 `agent-team-sandbox`。建立前先 Probe Rulesets／Branch Protection capability；若仍使用目前方案，必須由 leadi 明確選擇 Public，或先升級支援 Private protection 的方案。不得自行改變可見性，條件未滿足時 Registration 保持 blocked。
 - 預設分支：`main`。
 - Node.js：24.x；Package Manager：Corepack 管理的 pnpm 10.x。
 - TypeScript：strict、ESM；正式 CLI 執行編譯後 JavaScript，不以 `tsx` 作正式 Runtime。
@@ -314,7 +314,7 @@ Sandbox 是獨立小型 Node 24 專案，提供一個可觀察功能、一個可
 
 | ID | Task 與輸出 | 依賴 | 修改範圍 | 驗證與證據 | 預估 |
 |---|---|---|---|---|---|
-| E001 | O001 的 Registration Contract 穩定後立即建立 Private `agent-team-sandbox` Repo、Node 24、最小 API／CLI、單元測試與真 GitHub CI | B004、F008、O001 | Sandbox repo | CI 首跑綠；功能可本機執行 | 30m |
+| E001 | O001 的 Registration Contract 穩定後，先確認可見性與 required Ruleset capability，再建立 `agent-team-sandbox` Repo、Node 24、最小 API／CLI、單元測試與真 GitHub CI | B004、F008、O001 | Sandbox repo | 可見性經使用者確認；Ruleset capability read-back；CI 首跑綠；功能可本機執行 | 30m |
 | E002 | 建立靜態視覺頁與決定性 Screenshot 指令 | E001 | Sandbox `src/ui/`、scripts | 固定 viewport 截圖、雜湊、重跑穩定 | 30m |
 | E003 | 建立 Visual Manifest generator 與 Artifact fixture | E002、F008 | Sandbox scripts | JSON Schema、SHA、AC mapping 全綠 | 25m |
 | E004 | 用 Registration Wizard 註冊 Sandbox，建立 Setup PR 並完成 Probe | O008、E001-E003 | 兩 Repo 的註冊輸出 | Linear／GitHub／Webhook／CI／Status 證據齊全 | 30m＋外部等待 |

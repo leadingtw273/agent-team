@@ -67,11 +67,25 @@
 
 | Task | Merge／Run | 已驗證內容 |
 |---|---|---|
-| B001 | Commit `30cb1fdfdda336ce9b28b6a84907873617419870` | Private Repo、`main`、需求／Plan SHA Read-back |
+| B001 | Commit `30cb1fdfdda336ce9b28b6a84907873617419870` | 初始 Private Repo、`main`、需求／Plan SHA Read-back；S005 經授權改為 Public 並重新驗證 |
 | B002 | PR #1，Merge `7ab3b1a50f007e6014780c8c84dbca59aab82a13` | Node 24、pnpm 10、TypeScript strict ESM、編譯 CLI |
 | B003 | PR #2，Merge `7e3fab4cedeaa560556398c2513036dd33f823b2` | 七類 Gate 紅燈與全綠、Fresh Review |
 | B004 | PR #3，Merge `144d0fd50d72193486c54adcecd315ca8b7f72af`；Run `30898284445` | Pinned Actions、最小權限、首個真 CI 27 秒全綠 |
 | B005 | PR #4，Merge `9638ec5200e6dbedf332b12cbd142fd594e2fafa`；Run `30898922226` | 五角色、權限層級、Contract 反向測試與 CI 全綠 |
+
+## Phase 1 已驗證證據
+
+完整 Adopt／Degrade／Block 裁決與後續約束見 [`docs/feasibility.md`](feasibility.md)。
+
+| Task | Merge／PR | 已驗證內容 |
+|---|---|---|
+| S001 | PR #6，Merge `55f1baf` | Codex JSONL、app-server Approval／Interrupt、週額度與 5h unknown |
+| S002 | PR #7，Merge `794bbe3` | Claude Team auth、唯讀 Review、permission denial、週額度事件與 5h unknown |
+| S003 | PR #8，Merge `f232d59` | Gemini JSON 視覺、read-only policy、unavailable 與 signal 限制 |
+| S004 | PR #11，Merge `d251d07` | Linear GraphQL、Label Group、Template、Upload；目前 0 Project |
+| S005 | PR #9／#12，Merge `4085a57`／`140f77f` | GitHub PR／CI／Status；Public 後 Auto-merge 可用、Ruleset 尚未配置 |
+| S006 | PR #10，Merge `b68f1b2` | GitHub／Linear Webhook 驗簽、dedupe、亂序、快速 ACK |
+| S007 | 本文件與 `docs/feasibility.md` | Spike Gate：PASS WITH DEGRADATIONS，可進 Phase 2 |
 
 ## 維護規則
 
