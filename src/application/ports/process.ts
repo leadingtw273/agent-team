@@ -10,6 +10,7 @@ export interface ProcessSpawnRequest {
   readonly environment?: Readonly<Record<string, string>>;
   readonly sensitiveEnvironmentKeys?: readonly string[];
   readonly stdin?: Uint8Array;
+  readonly keepStdinOpen?: boolean;
   readonly deadlineAt: Instant;
   readonly maxOutputBytes: number;
 }
@@ -32,6 +33,8 @@ export interface ProcessExit {
 export interface ChildProcessHandle {
   readonly pid: number;
   readonly output: AsyncIterable<ProcessOutputChunk>;
+  writeStdin(bytes: Uint8Array, options?: ReadOptions): AsyncPortResult<void>;
+  closeStdin(options?: ReadOptions): AsyncPortResult<void>;
   wait(options?: ReadOptions): AsyncPortResult<ProcessExit>;
   sendSignal(signal: ProcessSignal, options?: ReadOptions): AsyncPortResult<void>;
 }

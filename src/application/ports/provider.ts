@@ -70,6 +70,11 @@ export interface ProviderRunHandle {
   readonly runId: string;
   readonly events: AsyncIterable<ProviderEvent>;
   completion(options?: ReadOptions): AsyncPortResult<ProviderRunCompletion>;
+  respondToToolRequest(
+    requestId: string,
+    decision: "approve" | "decline",
+    options?: ReadOptions,
+  ): AsyncPortResult<void>;
   interrupt(options?: ReadOptions): AsyncPortResult<void>;
 }
 

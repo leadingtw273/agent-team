@@ -99,6 +99,30 @@ describe("child process runner", () => {
     expect(output).not.toContain(secret);
   });
 
+  it("supports bounded interactive stdin for JSON-RPC style processes", async () => {
+    const handle = await spawned(
+      new ChildProcessRunner(),
+      request('while IFS= read -r line; do printf "reply:%s\\n" "$line"; done', {
+        keepStdinOpen: true,
+      }),
+    );
+    expect(await handle.writeStdin(Buffer.from("one\n", "utf8"))).toEqual({
+      ok: true,
+      value: undefined,
+    });
+    expect(await handle.writeStdin(Buffer.from("two\n", "utf8"))).toEqual({
+      ok: true,
+      value: undefined,
+    });
+    expect(await handle.closeStdin()).toEqual({ ok: true, value: undefined });
+
+    const [output, exit] = await Promise.all([collect(handle), handle.wait()]);
+    expect(output).toContain("reply:one\n");
+    expect(output).toContain("reply:two\n");
+    expect(exit).toMatchObject({ ok: true, value: { exitCode: 0, signal: null } });
+    expect((await handle.writeStdin(Buffer.from("late\n"))).ok).toBe(false);
+  });
+
   it("reports a child crash signal and supports an exact-PID explicit signal", async () => {
     const crashed = await spawned(new ChildProcessRunner(), request("kill -TERM $$"));
     const crashExit = await crashed.wait();

@@ -153,19 +153,61 @@ class NodeChildProcessHandle implements ChildProcessHandle {
   readonly #child: ChildProcess;
   readonly #completion: Promise<Result<ProcessExit, DomainError>>;
   #exited = false;
+  #stdinClosed = false;
+  #inputBytes: number;
 
   constructor(
     child: ChildProcess,
     output: OutputLog,
     completion: Promise<Result<ProcessExit, DomainError>>,
+    inputBytes: number,
   ) {
     if (child.pid === undefined) throw new Error("child_pid_unavailable");
     this.pid = child.pid;
     this.#child = child;
     this.output = output;
     this.#completion = completion;
+    this.#inputBytes = inputBytes;
     child.once("close", () => {
       this.#exited = true;
+      this.#stdinClosed = true;
+    });
+  }
+
+  writeStdin(bytes: Uint8Array, options: ReadOptions = {}): Promise<Result<void, DomainError>> {
+    if (options.signal?.aborted === true) return Promise.resolve(failure("interrupted"));
+    if (
+      this.#exited ||
+      this.#stdinClosed ||
+      bytes.byteLength === 0 ||
+      this.#inputBytes + bytes.byteLength > maximumInputBytes
+    ) {
+      return Promise.resolve(failure("conflict"));
+    }
+    const stdin = this.#child.stdin;
+    if (stdin === null) return Promise.resolve(failure("conflict"));
+    this.#inputBytes += bytes.byteLength;
+    return new Promise((resolve) => {
+      stdin.write(Buffer.from(bytes), (error) => {
+        resolve(
+          error === null || error === undefined ? ok(undefined) : failure("external_failure"),
+        );
+      });
+    });
+  }
+
+  closeStdin(options: ReadOptions = {}): Promise<Result<void, DomainError>> {
+    if (options.signal?.aborted === true) return Promise.resolve(failure("interrupted"));
+    if (this.#exited || this.#stdinClosed) return Promise.resolve(failure("conflict"));
+    const stdin = this.#child.stdin;
+    if (stdin === null) return Promise.resolve(failure("conflict"));
+    this.#stdinClosed = true;
+    return new Promise((resolve) => {
+      stdin.end((error?: Error | null) => {
+        resolve(
+          error === null || error === undefined ? ok(undefined) : failure("external_failure"),
+        );
+      });
     });
   }
 
@@ -334,7 +376,12 @@ export class ChildProcessRunner implements ProcessPort {
       child.kill("SIGTERM");
       return failure("interrupted");
     }
-    const handle = new NodeChildProcessHandle(child, output, completion);
+    const handle = new NodeChildProcessHandle(
+      child,
+      output,
+      completion,
+      request.stdin?.byteLength ?? 0,
+    );
     const deadlineDelay = Math.max(0, deadlineMs - Date.now());
     timers.deadline = setTimeout(() => {
       if (child.exitCode !== null || child.signalCode !== null) return;
@@ -346,7 +393,9 @@ export class ChildProcessRunner implements ProcessPort {
     }, deadlineDelay);
     timers.deadline.unref();
 
-    if (request.stdin === undefined) child.stdin.end();
+    if (request.keepStdinOpen === true) {
+      if (request.stdin !== undefined) child.stdin.write(Buffer.from(request.stdin));
+    } else if (request.stdin === undefined) child.stdin.end();
     else child.stdin.end(Buffer.from(request.stdin));
     return ok(handle);
   }
