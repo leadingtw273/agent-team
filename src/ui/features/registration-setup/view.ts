@@ -38,9 +38,9 @@ export function renderRegistrationSetupPanel(model: RegistrationSetupControllerR
       <div class="ui-registration-setup-controls">
         ${canStart ? '<label for="registration-setup-confirmation">輸入 <code>CREATE SETUP DRAFT PR</code></label><input id="registration-setup-confirmation" class="form-control js-registration-setup-confirmation" autocomplete="off" spellcheck="false"><button class="btn btn-primary js-registration-setup-confirm" type="button">確認 Preview</button><button class="btn btn-primary js-registration-setup-start" type="button" disabled>建立 Draft PR</button>' : ""}
         ${canRefresh ? '<button class="btn btn-outline-primary js-registration-setup-refresh" type="button">重新讀取 CI／Review</button>' : ""}
-        ${canApprove ? '<label for="registration-setup-approval">輸入 <code>APPROVE SETUP MERGE</code></label><input id="registration-setup-approval" class="form-control js-registration-setup-approval" autocomplete="off" spellcheck="false"><button class="btn btn-warning js-registration-setup-approval-intent" type="button">簽發本機核可 Intent（不合併）</button>' : ""}
+        ${canApprove ? '<label for="registration-setup-approval">輸入 <code>APPROVE SETUP MERGE</code></label><input id="registration-setup-approval" class="form-control js-registration-setup-approval" autocomplete="off" spellcheck="false"><button class="btn btn-warning js-registration-setup-approval-intent" type="button">簽發本機核可 Intent</button><button class="btn btn-danger js-registration-setup-merge" type="button" disabled>確認 SQUASH 合併並啟用</button>' : ""}
       </div>
-      <p class="js-registration-setup-status" role="status" aria-live="polite">尚未執行 W3A action；merge／audit／activation 保持 configuration_incomplete。</p>
+      <p class="js-registration-setup-status" role="status" aria-live="polite">尚未執行 Setup action；所有階段以 authoritative read-back 為準。</p>
     </div>
   </section>`;
 }

@@ -25,6 +25,9 @@ import {
   type RegistrationSetupJournal,
   type RegistrationSetupJournalDraft,
   type RegistrationSetupJournalPort,
+  type RegistrationSetupMergeIntent,
+  type RegistrationSetupMergeReceipt,
+  type RegistrationSetupMergedConfigReceipt,
   type RegistrationSetupPreviewConfirmation,
   type RegistrationSetupPreviewConfirmationAuthorityPort,
   type RegistrationSetupPreviewConfirmationBinding,
@@ -48,6 +51,7 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import { projectSchema } from "../../domain/project/index.js";
+import { sha256Digest } from "../../domain/review/index.js";
 import {
   AtomicFileStore,
   withSecureDirectory,
@@ -285,6 +289,44 @@ const auditReceiptSchema = auditIntentObjectSchema
   })
   .strict() as unknown as z.ZodType<RegistrationSetupAuditReceipt>;
 
+const mergeIntentObjectSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    projectId: identifierSchema,
+    repository: z.string().min(1),
+    changeRequestId: identifierSchema,
+    expectedHeadSha: shaSchema,
+    mergeMethod: z.literal("SQUASH"),
+    idempotencyKey: mutationKeySchema,
+    mergeIntentDigest: digestSchema,
+  })
+  .strict();
+const mergeIntentSchema =
+  mergeIntentObjectSchema as unknown as z.ZodType<RegistrationSetupMergeIntent>;
+const mergeReceiptSchema = mergeIntentObjectSchema
+  .omit({ idempotencyKey: true })
+  .extend({
+    state: z.enum(["auto_merge_enabled", "merged"]),
+    idempotencyKeyDigest: digestSchema,
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupMergeReceipt>;
+const mergedConfigReceiptSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    source: z.literal("source_control_default_branch"),
+    projectId: identifierSchema,
+    repository: z.string().min(1),
+    changeRequestId: identifierSchema,
+    setupHeadSha: shaSchema,
+    mergeCommitSha: shaSchema,
+    defaultBranch: z.string().min(1),
+    authoritativeRevision: shaSchema,
+    path: z.literal(trustedProjectConfigPath),
+    configDigest: digestSchema,
+    config: trustedProjectConfigSchema,
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupMergedConfigReceipt>;
+
 const sessionSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -294,6 +336,7 @@ const sessionSchema = z
       "audit_pending",
       "awaiting_user_approval",
       "merge_authorized",
+      "merge_pending",
       "activated",
       "cancelled",
     ]),
@@ -324,11 +367,18 @@ const sessionSchema = z
     approvalNonceDigest: digestSchema.optional(),
     approvalAuthorityDigest: digestSchema.optional(),
     approvalSource: z.enum(["local_ui", "current_user_conversation"]).optional(),
+    approvalSetupRevision: z.number().int().positive().optional(),
+    mergeIntent: mergeIntentSchema.optional(),
+    mergeReceipt: mergeReceiptSchema.optional(),
+    mergedConfigReceipt: mergedConfigReceiptSchema.optional(),
     activatedRevisionSha: shaSchema.optional(),
   })
   .strict()
   .refine((session) => {
-    const approvalRequired = session.phase === "merge_authorized" || session.phase === "activated";
+    const approvalRequired =
+      session.phase === "merge_authorized" ||
+      session.phase === "merge_pending" ||
+      session.phase === "activated";
     const evidenceCodes = new Set(session.evidence.map((item) => item.code));
     const gate = session.gateEvidenceReceipt;
     const gateBound =
@@ -372,10 +422,15 @@ const sessionSchema = z
         (session.approvalReferenceDigest !== undefined &&
           session.approvalNonceDigest !== undefined &&
           session.approvalAuthorityDigest !== undefined &&
+          session.approvalSetupRevision !== undefined &&
           session.approvalSource !== undefined &&
           evidenceCodes.has("setup_user_approval_consumed"))) &&
+      ((session.phase !== "merge_pending" && session.phase !== "activated") ||
+        session.mergeIntent !== undefined) &&
       (session.phase !== "activated" ||
         (session.activatedRevisionSha !== undefined &&
+          session.mergeReceipt !== undefined &&
+          session.mergedConfigReceipt !== undefined &&
           session.changeRequest.state === "merged" &&
           evidenceCodes.has("setup_merge_verified") &&
           evidenceCodes.has("trusted_config_activated")))
@@ -388,9 +443,18 @@ const markerSchema = z
     source: z.literal("source_control_default_branch"),
     setupSessionId: identifierSchema,
     projectId: identifierSchema,
+    repository: z.string().min(1),
+    changeRequestId: identifierSchema,
+    setupHeadSha: shaSchema,
+    mergeCommitSha: shaSchema,
     authoritativeRevision: shaSchema,
     defaultBranch: z.string().min(1),
     configDigest: digestSchema,
+    linearAuditIssueId: identifierSchema,
+    gateEvidenceDigest: digestSchema,
+    auditReceiptsDigest: digestSchema,
+    approvalSource: z.enum(["local_ui", "current_user_conversation"]),
+    approvalReferenceDigest: digestSchema,
   })
   .strict() as unknown as z.ZodType<RegistrationSetupActivationMarker>;
 
@@ -402,10 +466,35 @@ const activationRecordSchema = z
       session.phase === "activated" &&
       session.setupSessionId === marker.setupSessionId &&
       session.project.id === marker.projectId &&
+      session.project.sourceControl.repository === marker.repository &&
+      session.changeRequest.id === marker.changeRequestId &&
+      session.headSha.toLowerCase() === marker.setupHeadSha.toLowerCase() &&
+      session.mergedConfigReceipt?.mergeCommitSha.toLowerCase() ===
+        marker.mergeCommitSha.toLowerCase() &&
       session.project.defaultBranch === marker.defaultBranch &&
       session.configDigest === marker.configDigest &&
+      session.linearAuditIssueId === marker.linearAuditIssueId &&
+      session.gateEvidenceReceipt?.evidenceDigest === marker.gateEvidenceDigest &&
+      durableAuditReceiptsDigest(session) === marker.auditReceiptsDigest &&
+      session.approvalSource === marker.approvalSource &&
+      session.approvalReferenceDigest === marker.approvalReferenceDigest &&
       session.activatedRevisionSha?.toLowerCase() === marker.authoritativeRevision.toLowerCase(),
   );
+
+function durableAuditReceiptsDigest(session: RegistrationSetupSession): string | undefined {
+  if (
+    session.audit?.linearReceipt === undefined ||
+    session.audit.pullRequestReceipt === undefined
+  ) {
+    return undefined;
+  }
+  const digest = sha256Digest({
+    kind: "registration_setup_audit_receipts",
+    linear: session.audit.linearReceipt,
+    pullRequest: session.audit.pullRequestReceipt,
+  });
+  return digest.ok ? digest.value : undefined;
+}
 
 const executionFenceSchema = z
   .object({
@@ -1100,6 +1189,11 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
       draft.phase !== "activated" ||
       "revision" in draft ||
       draft.activatedRevisionSha?.toLowerCase() !== revisionSha.toLowerCase() ||
+      draft.mergedConfigReceipt === undefined ||
+      draft.approvalSource === undefined ||
+      draft.approvalReferenceDigest === undefined ||
+      draft.gateEvidenceReceipt === undefined ||
+      durableAuditReceiptsDigest({ ...draft, revision: 1 }) === undefined ||
       !sessionSchema.safeParse({ ...draft, revision: 1 }).success
     ) {
       return err(domainError("invariant_violation"));
@@ -1126,9 +1220,18 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
           source: "source_control_default_branch",
           setupSessionId: session.setupSessionId,
           projectId: session.project.id,
+          repository: session.project.sourceControl.repository,
+          changeRequestId: session.changeRequest.id,
+          setupHeadSha: session.headSha,
+          mergeCommitSha: session.mergedConfigReceipt?.mergeCommitSha,
           authoritativeRevision: revisionSha,
           defaultBranch: session.project.defaultBranch,
           configDigest: session.configDigest,
+          linearAuditIssueId: session.linearAuditIssueId,
+          gateEvidenceDigest: session.gateEvidenceReceipt?.evidenceDigest,
+          auditReceiptsDigest: durableAuditReceiptsDigest(session),
+          approvalSource: session.approvalSource,
+          approvalReferenceDigest: session.approvalReferenceDigest,
         });
         const record = activationRecordSchema.parse({ schemaVersion: 1, session, marker });
         const persisted = await persistPrivate(
@@ -1159,6 +1262,22 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
         });
       },
     );
+  }
+
+  async readActivation(setupSessionId: string, options: ReadOptions = {}) {
+    if (!identifierPattern.test(setupSessionId) || options.signal?.aborted === true) {
+      return err(domainError("invariant_violation"));
+    }
+    const loaded = await withSecureDirectory(
+      this.#stateRoot,
+      ["registration-setup", setupSessionId],
+      { create: false },
+      async (directory) => {
+        const activation = await readPrivate(directory, "activation.json", activationRecordSchema);
+        return activation.ok ? ok(activation.value.marker) : activation;
+      },
+    );
+    return !loaded.ok && loaded.error.code === "not_found" ? ok(undefined) : loaded;
   }
 }
 

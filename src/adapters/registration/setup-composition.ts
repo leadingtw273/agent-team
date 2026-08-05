@@ -3,6 +3,7 @@ import { isAbsolute } from "node:path";
 import {
   RegistrationSetupController,
   RegistrationSetupCoordinator,
+  createRegistrationSetupControllerMergeOperation,
   HostRegistrationSetupConversationApprovalFacade,
   createUnwiredRegistrationSetupController,
   type RegistrationSetupControllerUseCase,
@@ -29,6 +30,9 @@ import {
   type PullRequestAuditCommentWriter,
 } from "./setup-audit.js";
 import { SourceControlRegistrationSetupGateEvidence } from "./setup-evidence.js";
+import { FileRegistrationSetupActivationRegistry } from "./setup-activation.js";
+import { GitHubRegistrationMergedConfigReadBackAdapter } from "./merged-config.js";
+import { domainError, err, ok } from "../../domain/foundation/index.js";
 
 export interface CreateProductionRegistrationSetupCompositionOptions {
   readonly stateRoot: string;
@@ -54,10 +58,10 @@ export interface ProductionRegistrationSetupComposition {
     state: "ready" | "configuration_incomplete";
     durableState: "w1_file_stores" | "unwired";
     mergedConfigReadBack: "w2_github_authoritative" | "unwired";
-    merge: "w3b_unwired";
+    merge: "w3b2_controller_squash" | "w3b_unwired";
     audit: "w3b1_receipts" | "unwired";
     conversationApproval: "w3b1_host_capability" | "unwired";
-    activation: "w3b_unwired";
+    activation: "w3b2_project_index" | "w3b_unwired";
   }>;
 }
 
@@ -105,10 +109,6 @@ export function createProductionRegistrationSetupComposition(
   const journal = new FileRegistrationSetupJournalStore(options.stateRoot);
   const execution = new FileRegistrationSetupExecutionStore(options.stateRoot);
   const sessionStore = new FileRegistrationSetupSessionStore(options.stateRoot);
-  const sessions = Object.freeze({
-    load: sessionStore.load.bind(sessionStore),
-    save: sessionStore.save.bind(sessionStore),
-  });
   const finalApproval = new FileRegistrationSetupFinalApprovalAuthority(
     options.stateRoot,
     options.clock,
@@ -131,6 +131,45 @@ export function createProductionRegistrationSetupComposition(
     options.linearAuditWriter,
     options.pullRequestAuditWriter,
   );
+  const squashMerge = Object.freeze({
+    enable: async (
+      command: Parameters<
+        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
+      >[0],
+      mutation: Parameters<
+        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
+      >[1],
+    ) => {
+      const rawCommand = command as unknown as Readonly<Record<string, unknown>>;
+      if (rawCommand["mergeMethod"] !== "SQUASH") {
+        return err(domainError("invariant_violation"));
+      }
+      const reference = { project: command.project, changeRequestId: command.changeRequestId };
+      const current = await github.getChangeRequest(reference, mutation);
+      if (!current.ok) return current;
+      if (current.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()) {
+        return err(domainError("conflict"));
+      }
+      if (current.value.state === "merged") {
+        return ok({ state: "merged" as const, snapshot: current.value });
+      }
+      if (current.value.state === "open" && current.value.autoMergeEnabled) {
+        return ok({ state: "auto_merge_enabled" as const, snapshot: current.value });
+      }
+      const enabled = await github.enableAutoMerge(reference, command.expectedHeadSha, mutation);
+      return enabled.ok
+        ? ok({
+            state:
+              enabled.value.state === "merged"
+                ? ("merged" as const)
+                : ("auto_merge_enabled" as const),
+            snapshot: enabled.value,
+          })
+        : enabled;
+    },
+  });
+  const mergedConfig = new GitHubRegistrationMergedConfigReadBackAdapter(options.githubTransport);
+  const activationRegistry = new FileRegistrationSetupActivationRegistry(options.stateRoot);
   const coordinator = new RegistrationSetupCoordinator({
     git,
     preflight: new GitPreflight(git),
@@ -141,9 +180,13 @@ export function createProductionRegistrationSetupComposition(
     audit,
     journal,
     execution,
-    sessions,
+    sessions: sessionStore,
     finalApproval,
+    squashMerge,
+    mergedConfig,
+    activationRegistry,
   });
+  const approveAndMerge = createRegistrationSetupControllerMergeOperation(coordinator);
 
   return Object.freeze({
     controller: new RegistrationSetupController({
@@ -151,22 +194,24 @@ export function createProductionRegistrationSetupComposition(
       draftSource,
       git,
       coordinator,
-      sessions,
+      sessions: sessionStore,
       previewConfirmation,
       finalApproval,
+      approveAndMerge,
     }),
     conversationApproval: new HostRegistrationSetupConversationApprovalFacade({
       coordinator,
       bridge: options.conversationApprovalBridge,
+      approveAndMerge,
     }),
     wiring: Object.freeze({
       state: "ready" as const,
       durableState: "w1_file_stores" as const,
-      mergedConfigReadBack: "unwired" as const,
-      merge: "w3b_unwired" as const,
+      mergedConfigReadBack: "w2_github_authoritative" as const,
+      merge: "w3b2_controller_squash" as const,
       audit: "w3b1_receipts" as const,
       conversationApproval: "w3b1_host_capability" as const,
-      activation: "w3b_unwired" as const,
+      activation: "w3b2_project_index" as const,
     }),
   });
 }

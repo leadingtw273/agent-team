@@ -69,6 +69,8 @@ function setupController(): RegistrationSetupControllerUseCase {
     refresh: () => Promise.resolve(setupPreviewModel),
     issueLocalUiApprovalIntent: () =>
       Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
+    approveAndMergeLocalUi: () =>
+      Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
   });
 }
 

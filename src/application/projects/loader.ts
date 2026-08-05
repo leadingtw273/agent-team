@@ -2,7 +2,12 @@ import type { GitPort } from "../ports/git.js";
 import type { ReadOptions } from "../ports/common.js";
 import { projectSchema, type Project } from "../../domain/project/index.js";
 import { Redactor } from "../../infrastructure/redaction/index.js";
-import { trustedProjectConfigSchema, type TrustedProjectConfig } from "./schema.js";
+import type { RegistrationSetupActivationMarker } from "../registration/setup-model.js";
+import {
+  serializeTrustedProjectConfig,
+  trustedProjectConfigSchema,
+  type TrustedProjectConfig,
+} from "./schema.js";
 
 export const trustedProjectConfigPath = ".agent-team/project.json";
 export const maximumTrustedProjectConfigBytes = 1024 * 1024;
@@ -16,6 +21,9 @@ export type TrustedProjectRejectionReason =
   | "project_id_mismatch"
   | "default_branch_mismatch"
   | "platform_mismatch"
+  | "activation_missing"
+  | "activation_unavailable"
+  | "activation_invalid"
   | "registry_conflict";
 
 export type TrustedProjectLoadResult =
@@ -32,6 +40,15 @@ export type TrustedProjectLoadResult =
     }>;
 
 export type TrustedProjectGitPort = Pick<GitPort, "readTextFileAtRevision">;
+export interface TrustedProjectActivationPort {
+  read(
+    projectId: Project["id"],
+    options?: ReadOptions,
+  ): Promise<
+    | Readonly<{ ok: true; value: RegistrationSetupActivationMarker | undefined }>
+    | Readonly<{ ok: false; error: unknown }>
+  >;
+}
 
 function equalRecord(
   left: Readonly<Record<string, string>>,
@@ -47,7 +64,10 @@ function equalRecord(
 }
 
 export class TrustedProjectConfigLoader {
-  constructor(readonly git: TrustedProjectGitPort) {}
+  constructor(
+    readonly git: TrustedProjectGitPort,
+    readonly activation?: TrustedProjectActivationPort,
+  ) {}
 
   async load(projectInput: Project, options: ReadOptions = {}): Promise<TrustedProjectLoadResult> {
     const project = projectSchema.safeParse(projectInput);
@@ -136,6 +156,86 @@ export class TrustedProjectConfigLoader {
         state: "rejected",
         project: project.data,
         reason: "platform_mismatch",
+      });
+    }
+    const serialized = serializeTrustedProjectConfig(config.data);
+    if (!serialized.ok) {
+      return Object.freeze({
+        state: "rejected",
+        project: project.data,
+        reason: "trusted_config_invalid",
+      });
+    }
+    if (this.activation === undefined) {
+      return Object.freeze({
+        state: "rejected",
+        project: project.data,
+        reason: "activation_missing",
+      });
+    }
+    const activated = await this.activation.read(project.data.id, options);
+    if (!activated.ok) {
+      return Object.freeze({
+        state: "rejected",
+        project: project.data,
+        reason: "activation_unavailable",
+      });
+    }
+    const marker = activated.value;
+    const digest = /^[0-9a-f]{64}$/u;
+    const sha = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+    if (marker === undefined) {
+      return Object.freeze({
+        state: "rejected",
+        project: project.data,
+        reason: "activation_missing",
+      });
+    }
+    const rawMarker = marker as unknown as Readonly<Record<string, unknown>>;
+    const identifier = /^[a-zA-Z0-9][a-zA-Z0-9_.:@+-]{0,220}$/u;
+    const expectedMarkerKeys = [
+      "approvalReferenceDigest",
+      "approvalSource",
+      "auditReceiptsDigest",
+      "authoritativeRevision",
+      "changeRequestId",
+      "configDigest",
+      "defaultBranch",
+      "gateEvidenceDigest",
+      "linearAuditIssueId",
+      "mergeCommitSha",
+      "projectId",
+      "repository",
+      "schemaVersion",
+      "setupHeadSha",
+      "setupSessionId",
+      "source",
+    ].sort();
+    if (
+      Object.keys(rawMarker).sort().join("\0") !== expectedMarkerKeys.join("\0") ||
+      rawMarker["schemaVersion"] !== 1 ||
+      rawMarker["source"] !== "source_control_default_branch" ||
+      marker.projectId !== project.data.id ||
+      marker.repository !== project.data.sourceControl.repository ||
+      marker.defaultBranch !== project.data.defaultBranch ||
+      marker.configDigest !== serialized.value.contentDigest ||
+      !sha.test(marker.setupHeadSha) ||
+      !sha.test(marker.mergeCommitSha) ||
+      !sha.test(marker.authoritativeRevision) ||
+      marker.mergeCommitSha.toLowerCase() !== marker.authoritativeRevision.toLowerCase() ||
+      !identifier.test(marker.setupSessionId) ||
+      !identifier.test(marker.changeRequestId) ||
+      !identifier.test(marker.linearAuditIssueId) ||
+      !digest.test(marker.gateEvidenceDigest) ||
+      !digest.test(marker.auditReceiptsDigest) ||
+      !digest.test(marker.approvalReferenceDigest) ||
+      (rawMarker["approvalSource"] !== "local_ui" &&
+        rawMarker["approvalSource"] !== "current_user_conversation")
+    ) {
+      return Object.freeze({
+        state: "rejected",
+        project: project.data,
+        reason: "activation_invalid",
       });
     }
     return Object.freeze({

@@ -278,6 +278,14 @@ describe("current-user conversation approval bridge contract", () => {
               options,
             );
       },
+      resolveAuthority: (capability) => {
+        const authorityDigest = capabilities.get(capability);
+        return Promise.resolve(
+          authorityDigest === undefined
+            ? err(domainError("permission_denied"))
+            : ok({ issuer: "current_user_conversation" as const, authorityDigest }),
+        );
+      },
     };
     const capability = hostCapability as RegistrationSetupConversationHostCapability;
     const issued = await bridge.issue(approvalBinding(), capability, {

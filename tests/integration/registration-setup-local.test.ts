@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   stat,
@@ -17,6 +18,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   FileRegistrationSetupFinalApprovalAuthority,
+  FileRegistrationSetupActivationRegistry,
   FileRegistrationSetupExecutionStore,
   FileRegistrationSetupJournalStore,
   FileRegistrationSetupSessionStore,
@@ -315,6 +317,42 @@ function sessionDraft(
           approvalNonceDigest: testDigest,
           approvalAuthorityDigest: testDigest,
           approvalSource: "local_ui" as const,
+          approvalSetupRevision: 1,
+          mergeIntent: {
+            schemaVersion: 1 as const,
+            projectId: project.id,
+            repository: project.sourceControl.repository,
+            changeRequestId: "PR_node_1",
+            expectedHeadSha: headSha,
+            mergeMethod: "SQUASH" as const,
+            idempotencyKey: "setup-merge:activation-test",
+            mergeIntentDigest: testDigest,
+          },
+          mergeReceipt: {
+            schemaVersion: 1 as const,
+            projectId: project.id,
+            repository: project.sourceControl.repository,
+            changeRequestId: "PR_node_1",
+            expectedHeadSha: headSha,
+            mergeMethod: "SQUASH" as const,
+            mergeIntentDigest: testDigest,
+            state: "merged" as const,
+            idempotencyKeyDigest: testDigest,
+          },
+          mergedConfigReceipt: {
+            schemaVersion: 1 as const,
+            source: "source_control_default_branch" as const,
+            projectId: project.id,
+            repository: project.sourceControl.repository,
+            changeRequestId: "PR_node_1",
+            setupHeadSha: headSha,
+            mergeCommitSha: mergedSha,
+            defaultBranch: project.defaultBranch,
+            authoritativeRevision: mergedSha,
+            path: ".agent-team/project.json" as const,
+            configDigest: serializedConfig.contentDigest,
+            config,
+          },
           activatedRevisionSha: mergedSha,
         }
       : {}),
@@ -463,6 +501,51 @@ describe("file-backed registration setup state", () => {
       value: { phase: "activated", activatedRevisionSha: mergedSha },
     });
     expect((await stat(store.paths(preview.setupSessionId).activation)).mode & 0o777).toBe(0o600);
+  });
+
+  it("publishes a digest-keyed project activation index with idempotent CAS", async () => {
+    const root = await temporaryRoot();
+    const sessions = new FileRegistrationSetupSessionStore(root);
+    const initial = await withExecution(root, (lease) =>
+      sessions.save(undefined, sessionDraft(), {
+        idempotencyKey: "activation-index:create",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!initial.ok) throw new Error(initial.error.code);
+    const activated = await withExecution(root, (lease) =>
+      sessions.activate(initial.value.session.revision, sessionDraft("activated"), mergedSha, {
+        idempotencyKey: "activation-index:marker",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!activated.ok) throw new Error(activated.error.code);
+    const registry = new FileRegistrationSetupActivationRegistry(root);
+    await expect(
+      registry.publish(activated.value.marker, { idempotencyKey: "activation-index:publish" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "confirmed" } });
+    await expect(
+      registry.publish(activated.value.marker, { idempotencyKey: "activation-index:retry" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "reused" } });
+    await expect(registry.read(project.id)).resolves.toEqual({
+      ok: true,
+      value: activated.value.marker,
+    });
+    await expect(
+      registry.publish(
+        { ...activated.value.marker, configDigest: testDigest },
+        { idempotencyKey: "activation-index:conflict" },
+      ),
+    ).resolves.toMatchObject({ ok: false, error: { code: "conflict" } });
+    const keys = await readdir(join(root, "registration-setup-activation"));
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^[0-9a-f]{64}$/u);
+    expect(keys[0]).not.toContain(project.id);
+    await rm(sessions.paths(preview.setupSessionId).activation);
+    await expect(registry.read(project.id)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
   });
 
   it.each(["state-root", "registration-parent", "session-child"] as const)(

@@ -5,7 +5,11 @@ import { projectSchema, type Project } from "../../domain/project/index.js";
 import type { TrustedProjectConfig } from "../projects/index.js";
 import { serializeTrustedProjectConfig, trustedProjectConfigSchema } from "../projects/index.js";
 import type { AsyncPortResult, GitPort, ReadOptions } from "../ports/index.js";
-import { createRegistrationSetupPreview, type RegistrationSetupCoordinator } from "./setup.js";
+import {
+  createRegistrationSetupPreview,
+  type RegistrationSetupControllerMergeOperation,
+  type RegistrationSetupCoordinator,
+} from "./setup.js";
 import {
   registrationSetupBranch,
   type RegistrationSetupApprovalBinding,
@@ -48,6 +52,8 @@ export interface RegistrationSetupControllerEvidence {
     | "local_repository_unavailable"
     | "default_branch_mismatch"
     | "working_tree_not_clean"
+    | "controller_only_squash_merge"
+    | "activation_index_required"
     | "merge_w3b_unwired"
     | "audit_w3b_unwired"
     | "activation_w3b_unwired"
@@ -74,7 +80,9 @@ export type RegistrationSetupControllerReadModel = Readonly<{
     | "ci_waiting"
     | "audit_pending"
     | "checks_pending"
-    | "awaiting_user_approval";
+    | "awaiting_user_approval"
+    | "merge_pending"
+    | "activated";
   evidence: readonly RegistrationSetupControllerEvidence[];
   nextStep: string;
   preview?: RegistrationSetupPreviewSummary;
@@ -135,6 +143,11 @@ export interface RegistrationSetupApprovalIntentCommand extends RegistrationSetu
   readonly idempotencyKey: string;
 }
 
+export interface RegistrationSetupApproveAndMergeCommand extends RegistrationSetupRefreshCommand {
+  readonly approvalId: string;
+  readonly expectedSetupRevision: number;
+}
+
 export interface RegistrationSetupControllerUseCase {
   read(
     context: RegistrationSetupControllerContext,
@@ -156,6 +169,10 @@ export interface RegistrationSetupControllerUseCase {
     command: RegistrationSetupApprovalIntentCommand,
     context: RegistrationSetupControllerContext,
   ): Promise<RegistrationSetupControllerActionResult>;
+  approveAndMergeLocalUi(
+    command: RegistrationSetupApproveAndMergeCommand,
+    context: RegistrationSetupControllerContext,
+  ): Promise<RegistrationSetupControllerActionResult>;
 }
 
 export interface RegistrationSetupControllerPorts {
@@ -163,6 +180,7 @@ export interface RegistrationSetupControllerPorts {
   readonly draftSource?: RegistrationSetupDraftSourcePort;
   readonly git: Pick<GitPort, "inspectRepository">;
   readonly coordinator: Pick<RegistrationSetupCoordinator, "begin" | "refresh">;
+  readonly approveAndMerge: RegistrationSetupControllerMergeOperation;
   readonly sessions: Pick<RegistrationSetupSessionPort, "load">;
   readonly previewConfirmation: RegistrationSetupPreviewConfirmationAuthorityPort;
   readonly finalApproval: RegistrationSetupFinalApprovalAuthorityPort;
@@ -173,21 +191,26 @@ export interface RegistrationSetupConversationApprovalFacade {
     command: RegistrationSetupApprovalIntentCommand,
     hostCapability: RegistrationSetupConversationHostCapability,
   ): Promise<RegistrationSetupControllerActionResult>;
+  approveAndMergeConversation(
+    command: RegistrationSetupApproveAndMergeCommand,
+    hostCapability: RegistrationSetupConversationHostCapability,
+  ): Promise<RegistrationSetupControllerActionResult>;
 }
 
 export interface RegistrationSetupConversationApprovalFacadePorts {
   readonly coordinator: Pick<RegistrationSetupCoordinator, "refresh">;
+  readonly approveAndMerge: RegistrationSetupControllerMergeOperation;
   readonly bridge: RegistrationSetupConversationApprovalBridgePort;
 }
 
 const w3bEvidence = Object.freeze([
   Object.freeze({
-    code: "merge_w3b_unwired" as const,
-    message: "合併能力留待 W3B；本頁不會執行 merge。",
+    code: "controller_only_squash_merge" as const,
+    message: "只有 controller 能使用 closure-private SQUASH merge capability。",
   }),
   Object.freeze({
-    code: "activation_w3b_unwired" as const,
-    message: "可信設定啟用與 loader gate 留待 W3B。",
+    code: "activation_index_required" as const,
+    message: "Loader 只接受 W1 marker 與 project activation index 一致的設定。",
   }),
 ]);
 
@@ -249,20 +272,28 @@ function readModel(
     });
   }
   const state =
-    session.phase === "awaiting_user_approval"
-      ? "awaiting_user_approval"
-      : session.phase === "ci_waiting"
-        ? "ci_waiting"
-        : session.phase === "audit_pending"
-          ? "audit_pending"
-          : "checks_pending";
+    session.phase === "activated"
+      ? "activated"
+      : session.phase === "merge_authorized" || session.phase === "merge_pending"
+        ? "merge_pending"
+        : session.phase === "awaiting_user_approval"
+          ? "awaiting_user_approval"
+          : session.phase === "ci_waiting"
+            ? "ci_waiting"
+            : session.phase === "audit_pending"
+              ? "audit_pending"
+              : "checks_pending";
   return Object.freeze({
     state,
     evidence: w3bEvidence,
     nextStep:
       state === "awaiting_user_approval"
-        ? "可簽發本機 UI 核可 intent；W3A 不會合併。"
-        : "重新讀取同一 Head 的 CI 與 agent-team/review 狀態。",
+        ? "先簽發本機 UI 核可 intent，再以第二次操作要求 SQUASH merge。"
+        : state === "merge_pending"
+          ? "等待 authoritative merged read-back；尚未啟用設定。"
+          : state === "activated"
+            ? "Default-branch 設定、activation marker 與 project index 已確認。"
+            : "重新讀取同一 Head 的 CI 與 agent-team/review 狀態。",
     preview: previewSummary(preview),
     session: sessionSummary(session),
   });
@@ -395,6 +426,20 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
         code: "draft_source_unavailable",
         message: "無法 read-back durable Setup session。",
       });
+    }
+    if (loaded.value?.phase === "activated") {
+      const verified = await this.#ports.coordinator.refresh({
+        setupSessionId: loaded.value.setupSessionId,
+        idempotencyKeyPrefix: `controller-read:${loaded.value.setupSessionId}`,
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
+      });
+      if (verified.state !== "activated") {
+        return incomplete({
+          code: "activation_index_required",
+          message: "W1 activation marker 與 project activation index 尚未一致。",
+        });
+      }
+      return readModel(preview, verified.session);
     }
     return readModel(preview, loaded.value);
   }
@@ -548,6 +593,34 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
           message: "無法簽發 durable local-UI approval intent。",
         });
   }
+
+  async approveAndMergeLocalUi(
+    command: RegistrationSetupApproveAndMergeCommand,
+    context: RegistrationSetupControllerContext,
+  ): Promise<RegistrationSetupControllerActionResult> {
+    if (
+      !identifierPattern.test(command.setupSessionId) ||
+      !identifierPattern.test(command.approvalId) ||
+      !Number.isSafeInteger(command.expectedSetupRevision) ||
+      command.expectedSetupRevision <= 0 ||
+      !operationIsValid(command.idempotencyKeyPrefix) ||
+      !validContext(context)
+    ) {
+      return incomplete({ code: "draft_invalid", message: "本機 UI merge request 無效。" });
+    }
+    return this.#ports.approveAndMerge(
+      {
+        setupSessionId: command.setupSessionId,
+        approval: {
+          approvalId: command.approvalId,
+          expectedSetupRevision: command.expectedSetupRevision,
+          userConfirmed: true,
+        },
+        idempotencyKeyPrefix: command.idempotencyKeyPrefix,
+      },
+      { issuer: "local_ui", authorityDigest: context.authorityDigest },
+    );
+  }
 }
 
 export function createUnwiredRegistrationSetupController(
@@ -560,6 +633,7 @@ export function createUnwiredRegistrationSetupController(
     start: () => Promise.resolve(model),
     refresh: () => Promise.resolve(model),
     issueLocalUiApprovalIntent: () => Promise.resolve(model),
+    approveAndMergeLocalUi: () => Promise.resolve(model),
   });
 }
 
@@ -610,5 +684,40 @@ export class HostRegistrationSetupConversationApprovalFacade implements Registra
           code: "draft_invalid",
           message: "Host conversation capability 無法簽發 durable approval intent。",
         });
+  }
+
+  async approveAndMergeConversation(
+    command: RegistrationSetupApproveAndMergeCommand,
+    hostCapability: RegistrationSetupConversationHostCapability,
+  ): Promise<RegistrationSetupControllerActionResult> {
+    if (
+      !identifierPattern.test(command.setupSessionId) ||
+      !identifierPattern.test(command.approvalId) ||
+      !Number.isSafeInteger(command.expectedSetupRevision) ||
+      command.expectedSetupRevision <= 0 ||
+      !operationIsValid(command.idempotencyKeyPrefix)
+    ) {
+      return incomplete({ code: "draft_invalid", message: "Conversation merge request 無效。" });
+    }
+    const authority = await this.#ports.bridge.resolveAuthority(hostCapability);
+    if (
+      !authority.ok ||
+      authority.value.issuer !== "current_user_conversation" ||
+      !digestPattern.test(authority.value.authorityDigest)
+    ) {
+      return incomplete({ code: "draft_invalid", message: "Host conversation authority 無效。" });
+    }
+    return this.#ports.approveAndMerge(
+      {
+        setupSessionId: command.setupSessionId,
+        approval: {
+          approvalId: command.approvalId,
+          expectedSetupRevision: command.expectedSetupRevision,
+          userConfirmed: true,
+        },
+        idempotencyKeyPrefix: command.idempotencyKeyPrefix,
+      },
+      authority.value,
+    );
   }
 }

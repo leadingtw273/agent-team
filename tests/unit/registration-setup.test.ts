@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   RegistrationSetupCoordinator,
+  createRegistrationSetupControllerMergeOperation,
   createRegistrationSetupPreview,
   type RegistrationSetupPorts,
   type RegistrationSetupJournal,
@@ -53,6 +54,11 @@ const configDigest = serializedConfig.value.contentDigest;
 const configContent = serializedConfig.value.content;
 const uiSessionDigest = "1".repeat(64);
 const approvalNonceDigest = "2".repeat(64);
+function digest(value: string) {
+  const result = sha256Digest(value);
+  if (!result.ok) throw new Error(result.error.code);
+  return result.value;
+}
 const previewResult = createRegistrationSetupPreview({
   schemaVersion: 1,
   setupSessionId: "setup-session-1",
@@ -134,6 +140,7 @@ interface HarnessOptions {
     | "wrong_branch"
     | "wrong_digest"
     | "wrong_session";
+  readonly activationIndexFailOnce?: boolean;
   readonly ownershipLossAt?: number;
   readonly journalIntentSaveFail?: RegistrationSetupJournalStep;
   readonly ownershipLossAfterEffect?: RegistrationSetupJournalStep;
@@ -154,6 +161,14 @@ function harness(options: HarnessOptions = {}) {
   let injectedCrash = false;
   let injectedConsumeSaveCrash = false;
   let injectedAuditReceiptSaveCrash = false;
+  let injectedMergeFailure = false;
+  let activationMarker:
+    | import("../../src/application/registration/index.js").RegistrationSetupActivationMarker
+    | undefined;
+  let activationIndex:
+    | import("../../src/application/registration/index.js").RegistrationSetupActivationMarker
+    | undefined;
+  let injectedActivationIndexFailure = false;
   let consumedApprovalOperation: string | undefined;
   let consumedApprovalReceipt: RegistrationSetupFinalApprovalReceipt | undefined;
   const publishedAudit = new Map<
@@ -596,6 +611,46 @@ function harness(options: HarnessOptions = {}) {
           }),
         );
       },
+      activate: (expectedRevision, draft, revisionSha) => {
+        calls.push("activate");
+        if (options.fail === "activation")
+          return Promise.resolve(err(domainError("external_failure")));
+        const currentSession = sessions.get(draft.setupSessionId);
+        if (currentSession?.revision !== expectedRevision) {
+          return Promise.resolve(err(domainError("conflict")));
+        }
+        const session = { ...draft, revision: expectedRevision + 1 };
+        const auditReceiptsDigest = sha256Digest({
+          kind: "registration_setup_audit_receipts",
+          linear: session.audit?.linearReceipt,
+          pullRequest: session.audit?.pullRequestReceipt,
+        });
+        if (!auditReceiptsDigest.ok || session.mergedConfigReceipt === undefined) {
+          return Promise.resolve(err(domainError("invariant_violation")));
+        }
+        const marker = {
+          schemaVersion: 1 as const,
+          source: "source_control_default_branch" as const,
+          setupSessionId: session.setupSessionId,
+          projectId: session.project.id,
+          repository: session.project.sourceControl.repository,
+          changeRequestId: session.changeRequest.id,
+          setupHeadSha: session.headSha,
+          mergeCommitSha: session.mergedConfigReceipt.mergeCommitSha,
+          authoritativeRevision: revisionSha,
+          defaultBranch: session.project.defaultBranch,
+          configDigest: session.configDigest,
+          linearAuditIssueId: session.linearAuditIssueId,
+          gateEvidenceDigest: session.gateEvidenceReceipt?.evidenceDigest ?? digest("missing-gate"),
+          auditReceiptsDigest: auditReceiptsDigest.value,
+          approvalSource: session.approvalSource ?? ("local_ui" as const),
+          approvalReferenceDigest: session.approvalReferenceDigest ?? digest("missing-approval"),
+        };
+        activationMarker = marker;
+        sessions.set(session.setupSessionId, session);
+        return Promise.resolve(ok({ durability: "confirmed" as const, session, marker }));
+      },
+      readActivation: () => Promise.resolve(ok(activationMarker)),
     },
     finalApproval: {
       issue: () =>
@@ -649,9 +704,82 @@ function harness(options: HarnessOptions = {}) {
         );
       },
     },
+    squashMerge: {
+      enable: (_command, mutationOptions) => {
+        calls.push("merge");
+        mutationKeys.push({ step: "merge", key: mutationOptions.idempotencyKey });
+        if (options.fail === "merge" || (options.mergeFailOnce === true && !injectedMergeFailure)) {
+          injectedMergeFailure = true;
+          return Promise.resolve(err(domainError("external_failure")));
+        }
+        current = changeRequest({ draft: false, autoMergeEnabled: true });
+        return Promise.resolve(ok({ state: "auto_merge_enabled" as const, snapshot: current }));
+      },
+    },
+    mergedConfig: {
+      read: () => {
+        calls.push("merged-config-read");
+        const mergeCommitSha = "c".repeat(40);
+        const receipt = {
+          schemaVersion: 1 as const,
+          source: "source_control_default_branch" as const,
+          projectId: project.id,
+          repository: project.sourceControl.repository,
+          changeRequestId: current.id,
+          setupHeadSha: headSha,
+          mergeCommitSha,
+          defaultBranch: project.defaultBranch,
+          authoritativeRevision: mergeCommitSha,
+          path: trustedProjectConfigPath,
+          configDigest,
+          config,
+        };
+        if (options.mergedConfigReadBack === "unavailable") {
+          return Promise.resolve(err(domainError("unavailable")));
+        }
+        return Promise.resolve(
+          ok({
+            ...receipt,
+            ...(options.mergedConfigReadBack === "config_drift"
+              ? { configDigest: digest("drift") }
+              : {}),
+            ...(options.mergedConfigReadBack === "wrong_branch" ? { defaultBranch: "other" } : {}),
+            ...(options.mergedConfigReadBack === "wrong_revision"
+              ? { authoritativeRevision: "d".repeat(40) }
+              : {}),
+            ...(options.mergedConfigReadBack === "wrong_source"
+              ? { source: "local" as never }
+              : {}),
+          }),
+        );
+      },
+    },
+    activationRegistry: {
+      publish: (marker) => {
+        calls.push("publish-activation-index");
+        if (options.activationIndexFailOnce === true && !injectedActivationIndexFailure) {
+          injectedActivationIndexFailure = true;
+          return Promise.resolve(err(domainError("external_failure")));
+        }
+        if (options.fail === "activation")
+          return Promise.resolve(err(domainError("external_failure")));
+        if (
+          activationIndex !== undefined &&
+          JSON.stringify(activationIndex) !== JSON.stringify(marker)
+        ) {
+          return Promise.resolve(err(domainError("conflict")));
+        }
+        const state = activationIndex === undefined ? ("confirmed" as const) : ("reused" as const);
+        activationIndex = marker;
+        return Promise.resolve(ok({ state, marker }));
+      },
+      read: () => Promise.resolve(ok(activationIndex)),
+    },
   };
+  const coordinator = new RegistrationSetupCoordinator(ports);
   return {
-    coordinator: new RegistrationSetupCoordinator(ports),
+    coordinator,
+    approveAndMerge: createRegistrationSetupControllerMergeOperation(coordinator),
     calls,
     sessions,
     journals,
@@ -1321,6 +1449,139 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls.filter((call) => call === "save:merge_authorized")).toHaveLength(1);
     expect(test.calls).not.toContain("merge");
     expect(test.calls).not.toContain("activate");
+  });
+
+  it("persists merge intent before controller-only SQUASH and activates only after W2 read-back", async () => {
+    const test = await prepared(harness({ mergedReadBack: true }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:b2-happy",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const result = await test.approveAndMerge(
+      {
+        setupSessionId: preview.setupSessionId,
+        approval: approval(ready.session),
+        idempotencyKeyPrefix: "merge:b2-happy",
+      },
+      trustedAuthority,
+    );
+    expect(result).toMatchObject({ state: "activated", revisionSha: "c".repeat(40) });
+    const intent = test.calls.indexOf("save:merge_pending");
+    const merge = test.calls.indexOf("merge");
+    const readBack = test.calls.indexOf("merged-config-read");
+    const marker = test.calls.indexOf("activate");
+    const index = test.calls.indexOf("publish-activation-index");
+    expect(intent).toBeGreaterThan(-1);
+    expect(intent).toBeLessThan(merge);
+    expect(merge).toBeLessThan(readBack);
+    expect(readBack).toBeLessThan(marker);
+    expect(marker).toBeLessThan(index);
+    const mergeMutations = test.mutationKeys.filter((item) => item.step === "merge");
+    expect(mergeMutations).toHaveLength(1);
+    expect(mergeMutations[0]?.key).toMatch(/^setup-merge:/u);
+  });
+
+  it("returns merge_pending without W2 or activation while GitHub is not merged", async () => {
+    const test = await prepared(harness());
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:b2-pending",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    await expect(
+      test.approveAndMerge(
+        {
+          setupSessionId: preview.setupSessionId,
+          approval: approval(ready.session),
+          idempotencyKeyPrefix: "merge:b2-pending",
+        },
+        trustedAuthority,
+      ),
+    ).resolves.toMatchObject({ state: "merge_pending" });
+    expect(test.calls).not.toContain("merged-config-read");
+    expect(test.calls).not.toContain("activate");
+    expect(test.calls).not.toContain("publish-activation-index");
+  });
+
+  it("reuses the durable merge operation after a pre-response failure", async () => {
+    const test = await prepared(harness({ mergeFailOnce: true, mergedReadBack: true }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:b2-retry",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const request = {
+      setupSessionId: preview.setupSessionId,
+      approval: approval(ready.session),
+      idempotencyKeyPrefix: "merge:b2-retry",
+    };
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "failed",
+      stage: "merge",
+    });
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "activated",
+    });
+    const mergeKeys = test.mutationKeys
+      .filter((item) => item.step === "merge")
+      .map((item) => item.key);
+    expect(mergeKeys).toHaveLength(2);
+    expect(new Set(mergeKeys).size).toBe(1);
+    expect(test.calls.filter((call) => call === "save:merge_pending")).toHaveLength(2);
+  });
+
+  it("repairs only the project index after a W1-marker-to-index crash", async () => {
+    const test = await prepared(harness({ mergedReadBack: true, activationIndexFailOnce: true }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:index-crash",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const request = {
+      setupSessionId: preview.setupSessionId,
+      approval: approval(ready.session),
+      idempotencyKeyPrefix: "merge:index-crash",
+    };
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "failed",
+      stage: "activation",
+    });
+    expect(test.calls.filter((call) => call === "activate")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "activated",
+    });
+    expect(test.calls.filter((call) => call === "activate")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "publish-activation-index")).toHaveLength(2);
+  });
+
+  it.each([
+    "unavailable",
+    "config_drift",
+    "wrong_branch",
+    "wrong_revision",
+    "wrong_source",
+  ] as const)("fails closed for W2 authoritative read-back %s", async (mergedConfigReadBack) => {
+    const test = await prepared(harness({ mergedReadBack: true, mergedConfigReadBack }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: `refresh:w2:${mergedConfigReadBack}`,
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    await expect(
+      test.approveAndMerge(
+        {
+          setupSessionId: preview.setupSessionId,
+          approval: approval(ready.session),
+          idempotencyKeyPrefix: `merge:w2:${mergedConfigReadBack}`,
+        },
+        trustedAuthority,
+      ),
+    ).resolves.toMatchObject({ state: "failed", stage: "trusted_config_readback" });
+    expect(test.calls).not.toContain("activate");
+    expect(test.calls).not.toContain("publish-activation-index");
   });
 
   it("cancels fail-closed and never resumes mutations", async () => {

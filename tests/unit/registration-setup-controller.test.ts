@@ -68,6 +68,10 @@ function fixture(
         );
       },
     },
+    approveAndMerge: (request, authority) => {
+      calls.push(["merge", request, authority]);
+      return Promise.resolve({ state: "blocked", reason: "not_found" });
+    },
     sessions: {
       load: (setupSessionId) => Promise.resolve(ok(sessions.get(setupSessionId))),
     },
@@ -222,8 +226,8 @@ describe("W3A Registration Setup production controller", () => {
     });
     expect(result.preview?.setupSessionId).toMatch(/^setup-[0-9a-f]{64}$/u);
     expect(result.evidence.map((item) => item.code)).toEqual([
-      "merge_w3b_unwired",
-      "activation_w3b_unwired",
+      "controller_only_squash_merge",
+      "activation_index_required",
     ]);
     expect(controller).not.toHaveProperty("ports");
     expect(controller).not.toHaveProperty("approveAndMerge");

@@ -85,6 +85,12 @@ function fixture() {
         Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
       );
     },
+    approveAndMergeLocalUi: (command, context) => {
+      calls.push(["merge", command, context]);
+      return Promise.resolve(
+        Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
+      );
+    },
   };
   return { contribution: createRegistrationSetupUiContribution(controller), calls };
 }
@@ -151,6 +157,45 @@ describe("O005 Registration Setup Wizard contribution", () => {
           previewDigest,
           confirmation: "CREATE SETUP DRAFT PR",
           idempotencyKey: "ui:operation-1:confirm-preview",
+        },
+        { authorityDigest },
+      ],
+    ]);
+  });
+
+  it("accepts only a durable approval ID for the second local-UI merge step", async () => {
+    const { contribution, calls } = fixture();
+    const handler = contribution.routes[2]?.handler;
+    if (handler === undefined) throw new Error("missing setup API handler");
+    const body = {
+      action: "approve_and_merge",
+      setupSessionId,
+      expectedSetupRevision: 7,
+      approvalId: "approval-1",
+      operationId: "operation-merge-1",
+    };
+    for (const injected of [
+      { confirmation: "APPROVE SETUP MERGE" },
+      { source: "current_user_conversation" },
+      { pullRequestComment: "APPROVE SETUP MERGE" },
+    ]) {
+      await expect(
+        handler(request("PUT", "session", { ...body, ...injected }), {
+          session: { authorityDigest },
+        }),
+      ).resolves.toMatchObject({ statusCode: 422 });
+    }
+    await expect(
+      handler(request("PUT", "session", body), { session: { authorityDigest } }),
+    ).resolves.toMatchObject({ statusCode: 409 });
+    expect(calls).toEqual([
+      [
+        "merge",
+        {
+          setupSessionId,
+          expectedSetupRevision: 7,
+          approvalId: "approval-1",
+          idempotencyKeyPrefix: "ui:operation-merge-1:approve-merge",
         },
         { authorityDigest },
       ],

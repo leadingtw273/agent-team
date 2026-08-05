@@ -128,6 +128,7 @@ export type RegistrationSetupPhase =
   | "audit_pending"
   | "awaiting_user_approval"
   | "merge_authorized"
+  | "merge_pending"
   | "activated"
   | "cancelled";
 
@@ -155,6 +156,10 @@ export interface RegistrationSetupSession {
   readonly approvalNonceDigest?: string;
   readonly approvalAuthorityDigest?: string;
   readonly approvalSource?: RegistrationSetupApprovalSource;
+  readonly approvalSetupRevision?: number;
+  readonly mergeIntent?: RegistrationSetupMergeIntent;
+  readonly mergeReceipt?: RegistrationSetupMergeReceipt;
+  readonly mergedConfigReceipt?: RegistrationSetupMergedConfigReceipt;
   readonly activatedRevisionSha?: string;
 }
 
@@ -195,9 +200,68 @@ export interface RegistrationSetupActivationMarker {
   readonly source: "source_control_default_branch";
   readonly setupSessionId: string;
   readonly projectId: Project["id"];
+  readonly repository: string;
+  readonly changeRequestId: string;
+  readonly setupHeadSha: string;
+  readonly mergeCommitSha: string;
   readonly authoritativeRevision: string;
   readonly defaultBranch: string;
   readonly configDigest: string;
+  readonly linearAuditIssueId: string;
+  readonly gateEvidenceDigest: Sha256Digest;
+  readonly auditReceiptsDigest: Sha256Digest;
+  readonly approvalSource: RegistrationSetupApprovalSource;
+  readonly approvalReferenceDigest: Sha256Digest;
+}
+
+export interface RegistrationSetupMergeIntent {
+  readonly schemaVersion: 1;
+  readonly projectId: Project["id"];
+  readonly repository: string;
+  readonly changeRequestId: string;
+  readonly expectedHeadSha: string;
+  readonly mergeMethod: "SQUASH";
+  readonly idempotencyKey: string;
+  readonly mergeIntentDigest: Sha256Digest;
+}
+
+export interface RegistrationSetupMergeReceipt extends Omit<
+  RegistrationSetupMergeIntent,
+  "idempotencyKey"
+> {
+  readonly state: "auto_merge_enabled" | "merged";
+  readonly idempotencyKeyDigest: Sha256Digest;
+}
+
+export interface RegistrationSetupSquashMergePort {
+  enable(
+    command: Readonly<{
+      project: Project;
+      changeRequestId: string;
+      expectedHeadSha: string;
+      mergeMethod: "SQUASH";
+      mergeIntentDigest: Sha256Digest;
+    }>,
+    options: MutationOptions,
+  ): AsyncPortResult<
+    Readonly<{
+      state: "auto_merge_enabled" | "merged";
+      snapshot: ChangeRequestSnapshot;
+    }>
+  >;
+}
+
+export interface RegistrationSetupActivationRegistryPort {
+  publish(
+    marker: RegistrationSetupActivationMarker,
+    options: MutationOptions,
+  ): AsyncPortResult<
+    Readonly<{ state: "confirmed" | "reused"; marker: RegistrationSetupActivationMarker }>
+  >;
+  read(
+    projectId: Project["id"],
+    options?: ReadOptions,
+  ): AsyncPortResult<RegistrationSetupActivationMarker | undefined>;
 }
 
 export interface RegistrationSetupExecutionFence {
@@ -315,6 +379,10 @@ export interface RegistrationSetupConversationApprovalBridgePort {
     | Readonly<{ state: "issued"; grant: RegistrationSetupFinalApprovalGrant }>
     | Readonly<{ state: "rejected" | "unknown" }>
   >;
+  resolveAuthority(
+    hostCapability: RegistrationSetupConversationHostCapability,
+    options?: ReadOptions,
+  ): AsyncPortResult<RegistrationSetupFinalApprovalAuthority>;
 }
 
 export interface RegistrationSetupFilePort {
@@ -378,6 +446,10 @@ export interface RegistrationSetupSessionPort {
       marker: RegistrationSetupActivationMarker;
     }>
   >;
+  readActivation(
+    setupSessionId: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<RegistrationSetupActivationMarker | undefined>;
 }
 
 export interface RegistrationSetupJournalPort {
@@ -486,8 +558,11 @@ export interface RegistrationSetupPorts {
   readonly audit: RegistrationSetupAuditPort;
   readonly journal: RegistrationSetupJournalPort;
   readonly execution: RegistrationSetupExecutionPort;
-  readonly sessions: Pick<RegistrationSetupSessionPort, "load" | "save">;
+  readonly sessions: RegistrationSetupSessionPort;
   readonly finalApproval: RegistrationSetupFinalApprovalAuthorityPort;
+  readonly squashMerge: RegistrationSetupSquashMergePort;
+  readonly mergedConfig: RegistrationSetupMergedConfigReadBackPort;
+  readonly activationRegistry: RegistrationSetupActivationRegistryPort;
 }
 
 export interface RegistrationSetupBeginRequest {

@@ -103,7 +103,9 @@
 
   const approvalInput = section.querySelector(".js-registration-setup-approval");
   const approvalButton = section.querySelector(".js-registration-setup-approval-intent");
+  const mergeButton = section.querySelector(".js-registration-setup-merge");
   const expectedSetupRevision = Number(section.dataset.setupRevision);
+  let approvalId;
   if (
     approvalInput instanceof HTMLInputElement &&
     approvalButton instanceof HTMLButtonElement &&
@@ -125,10 +127,40 @@
           operationId: operationId(),
         });
         if (result.state !== "approval_intent_issued") throw new Error("not_issued");
-        setStatus("本機核可 intent 已保存；W3A 仍不會合併、寫稽核或啟用設定。");
+        approvalId = result.approvalId;
+        if (mergeButton instanceof HTMLButtonElement) mergeButton.disabled = false;
+        setStatus("本機核可 intent 已保存；請再次點擊確認 SQUASH 合併與啟用。");
       } catch {
         setStatus("核可 intent 未簽發；merge 仍保持 configuration_incomplete。");
         approvalButton.disabled = false;
+      }
+    });
+  }
+
+  if (
+    mergeButton instanceof HTMLButtonElement &&
+    setupSessionId &&
+    Number.isSafeInteger(expectedSetupRevision)
+  ) {
+    mergeButton.addEventListener("click", async () => {
+      if (!approvalId) return;
+      mergeButton.disabled = true;
+      try {
+        const result = await send({
+          action: "approve_and_merge",
+          setupSessionId,
+          expectedSetupRevision,
+          approvalId,
+          operationId: operationId(),
+        });
+        setStatus(
+          result.state === "activated"
+            ? "SQUASH merge 與 authoritative activation 已確認。"
+            : `合併狀態：${String(result.state)}；尚未 activated。`,
+        );
+      } catch {
+        setStatus("無法確認 authoritative merge/activation；設定仍不會載入。");
+        mergeButton.disabled = false;
       }
     });
   }

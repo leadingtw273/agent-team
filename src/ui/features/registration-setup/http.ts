@@ -121,6 +121,30 @@ export async function handleRegistrationSetupRequest(
       },
       trusted,
     );
+  } else if (
+    action === "approve_and_merge" &&
+    exactKeys(body, [
+      "action",
+      "setupSessionId",
+      "expectedSetupRevision",
+      "approvalId",
+      "operationId",
+    ]) &&
+    typeof body?.["expectedSetupRevision"] === "number" &&
+    Number.isSafeInteger(body["expectedSetupRevision"]) &&
+    body["expectedSetupRevision"] > 0 &&
+    typeof body["approvalId"] === "string" &&
+    identifierPattern.test(body["approvalId"])
+  ) {
+    result = await controller.approveAndMergeLocalUi(
+      {
+        setupSessionId,
+        expectedSetupRevision: body["expectedSetupRevision"],
+        approvalId: body["approvalId"],
+        idempotencyKeyPrefix: `ui:${operationId}:approve-merge`,
+      },
+      trusted,
+    );
   } else {
     return response(request, 422, { state: "error", code: "invalid_setup_action" });
   }

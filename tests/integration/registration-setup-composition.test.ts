@@ -135,19 +135,23 @@ describe("W3A production Registration Setup composition", () => {
       },
       conversationApprovalBridge: {
         issue: () => Promise.resolve(err(domainError("unavailable"))),
+        resolveAuthority: () => Promise.resolve(err(domainError("permission_denied"))),
       },
     };
     const composition = createProductionRegistrationSetupComposition(options);
     expect(composition.wiring).toEqual({
       state: "ready",
       durableState: "w1_file_stores",
-      mergedConfigReadBack: "unwired",
-      merge: "w3b_unwired",
+      mergedConfigReadBack: "w2_github_authoritative",
+      merge: "w3b2_controller_squash",
       audit: "w3b1_receipts",
       conversationApproval: "w3b1_host_capability",
-      activation: "w3b_unwired",
+      activation: "w3b2_project_index",
     });
-    expect(composition.controller).not.toHaveProperty("approveAndMerge");
+    expect(composition.controller).toHaveProperty("approveAndMergeLocalUi");
+    expect(composition).not.toHaveProperty("coordinator");
+    expect(composition).not.toHaveProperty("sourceControl");
+    expect(composition).not.toHaveProperty("mergePort");
     const model = await composition.controller.read({ authorityDigest });
     expect(model).toMatchObject({ state: "preview_ready" });
     if (model.preview === undefined) throw new Error("missing preview");

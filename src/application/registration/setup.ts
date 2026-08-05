@@ -20,13 +20,14 @@ import {
   trustedProjectConfigPath,
   trustedProjectConfigSchema,
 } from "../projects/index.js";
-import type { MutationOptions } from "../ports/index.js";
+import type { ChangeRequestSnapshot, MutationOptions } from "../ports/index.js";
 import {
   registrationSetupBranch,
   registrationSetupEvidenceCodes,
   registrationSetupReviewStatus,
   type RegistrationSetupAuditIntent,
   type RegistrationSetupAuditReceipt,
+  type RegistrationSetupActivationMarker,
   type RegistrationSetupApprovalBinding,
   type RegistrationSetupBeginRequest,
   type RegistrationSetupEvidence,
@@ -38,6 +39,9 @@ import {
   type RegistrationSetupJournal,
   type RegistrationSetupJournalDraft,
   type RegistrationSetupMergeRequest,
+  type RegistrationSetupMergeIntent,
+  type RegistrationSetupMergeReceipt,
+  type RegistrationSetupMergedConfigReceipt,
   type RegistrationSetupOutcome,
   type RegistrationSetupPorts,
   type RegistrationSetupPreview,
@@ -366,6 +370,120 @@ function auditReceiptMatches(
   );
 }
 
+function auditReceiptsDigest(session: RegistrationSetupSession): Sha256Digest | undefined {
+  const linear = session.audit?.linearReceipt;
+  const pullRequest = session.audit?.pullRequestReceipt;
+  if (
+    !auditReceiptMatches(session, linear, "linear") ||
+    !auditReceiptMatches(session, pullRequest, "pull_request")
+  ) {
+    return undefined;
+  }
+  const digest = sha256Digest({
+    kind: "registration_setup_audit_receipts",
+    linear,
+    pullRequest,
+  });
+  return digest.ok ? digest.value : undefined;
+}
+
+function createMergeIntent(
+  session: RegistrationSetupSession,
+): RegistrationSetupMergeIntent | undefined {
+  if (session.approvalReferenceDigest === undefined) return undefined;
+  const idempotencyKey = `setup-merge:${session.setupSessionId}:${session.approvalReferenceDigest.slice(0, 16)}`;
+  const binding = {
+    schemaVersion: 1 as const,
+    projectId: session.project.id,
+    repository: session.project.sourceControl.repository,
+    changeRequestId: session.changeRequest.id,
+    expectedHeadSha: session.headSha,
+    mergeMethod: "SQUASH" as const,
+    idempotencyKey,
+  };
+  const digest = sha256Digest({ kind: "registration_setup_merge_intent", ...binding });
+  return digest.ok ? Object.freeze({ ...binding, mergeIntentDigest: digest.value }) : undefined;
+}
+
+function mergeIntentMatches(
+  session: RegistrationSetupSession,
+  intent: RegistrationSetupMergeIntent | undefined,
+): intent is RegistrationSetupMergeIntent {
+  const expected = createMergeIntent(session);
+  return expected !== undefined && intent !== undefined && sameValue(expected, intent);
+}
+
+function mergeReceiptMatches(
+  intent: RegistrationSetupMergeIntent,
+  receipt: RegistrationSetupMergeReceipt | undefined,
+): receipt is RegistrationSetupMergeReceipt {
+  if (receipt === undefined) return false;
+  const operationDigest = sha256Digest(intent.idempotencyKey);
+  const { idempotencyKey: _idempotencyKey, ...intentBinding } = intent;
+  void _idempotencyKey;
+  const { state: _state, idempotencyKeyDigest: _keyDigest, ...receiptBinding } = receipt;
+  const rawReceipt = receipt as unknown as Readonly<Record<string, unknown>>;
+  void _state;
+  void _keyDigest;
+  return (
+    operationDigest.ok &&
+    receipt.idempotencyKeyDigest === operationDigest.value &&
+    (rawReceipt["state"] === "auto_merge_enabled" || rawReceipt["state"] === "merged") &&
+    sameValue(intentBinding, receiptBinding)
+  );
+}
+
+function mergedConfigMatches(
+  session: RegistrationSetupSession,
+  receipt: RegistrationSetupMergedConfigReceipt,
+): boolean {
+  const rawReceipt = receipt as unknown as Readonly<Record<string, unknown>>;
+  return (
+    rawReceipt["schemaVersion"] === 1 &&
+    rawReceipt["source"] === "source_control_default_branch" &&
+    receipt.projectId === session.project.id &&
+    receipt.repository === session.project.sourceControl.repository &&
+    receipt.changeRequestId === session.changeRequest.id &&
+    sameSha(receipt.setupHeadSha, session.headSha) &&
+    receipt.defaultBranch === session.project.defaultBranch &&
+    receipt.path === trustedProjectConfigPath &&
+    receipt.configDigest === session.configDigest &&
+    sameValue(receipt.config, session.config) &&
+    shaPattern.test(receipt.mergeCommitSha) &&
+    sameSha(receipt.authoritativeRevision, receipt.mergeCommitSha)
+  );
+}
+
+function activationMarkerMatches(
+  session: RegistrationSetupSession,
+  marker: RegistrationSetupActivationMarker | undefined,
+): marker is RegistrationSetupActivationMarker {
+  const merged = session.mergedConfigReceipt;
+  const auditDigest = auditReceiptsDigest(session);
+  const rawMarker = marker as unknown as Readonly<Record<string, unknown>> | undefined;
+  return (
+    marker !== undefined &&
+    merged !== undefined &&
+    auditDigest !== undefined &&
+    rawMarker?.["schemaVersion"] === 1 &&
+    rawMarker["source"] === "source_control_default_branch" &&
+    marker.setupSessionId === session.setupSessionId &&
+    marker.projectId === session.project.id &&
+    marker.repository === session.project.sourceControl.repository &&
+    marker.changeRequestId === session.changeRequest.id &&
+    sameSha(marker.setupHeadSha, session.headSha) &&
+    sameSha(marker.mergeCommitSha, merged.mergeCommitSha) &&
+    sameSha(marker.authoritativeRevision, merged.authoritativeRevision) &&
+    marker.defaultBranch === session.project.defaultBranch &&
+    marker.configDigest === session.configDigest &&
+    marker.linearAuditIssueId === session.linearAuditIssueId &&
+    marker.gateEvidenceDigest === session.gateEvidenceReceipt?.evidenceDigest &&
+    marker.auditReceiptsDigest === auditDigest &&
+    marker.approvalSource === session.approvalSource &&
+    marker.approvalReferenceDigest === session.approvalReferenceDigest
+  );
+}
+
 function validSession(session: RegistrationSetupSession): boolean {
   const raw = session as unknown as Readonly<Record<string, unknown>>;
   const project = projectSchema.safeParse(session.project);
@@ -410,7 +528,9 @@ function validSession(session: RegistrationSetupSession): boolean {
       (session.audit?.pending === undefined &&
         auditReceiptMatches(session, session.audit?.linearReceipt, "linear") &&
         auditReceiptMatches(session, session.audit?.pullRequestReceipt, "pull_request"))) &&
-    (session.phase !== "merge_authorized" ||
+    ((session.phase !== "merge_authorized" &&
+      session.phase !== "merge_pending" &&
+      session.phase !== "activated") ||
       (session.approvalReferenceDigest !== undefined &&
         digestPattern.test(session.approvalReferenceDigest) &&
         session.approvalNonceDigest !== undefined &&
@@ -418,9 +538,20 @@ function validSession(session: RegistrationSetupSession): boolean {
         session.approvalAuthorityDigest !== undefined &&
         digestPattern.test(session.approvalAuthorityDigest) &&
         (session.approvalSource === "local_ui" ||
-          session.approvalSource === "current_user_conversation"))) &&
+          session.approvalSource === "current_user_conversation") &&
+        session.approvalSetupRevision !== undefined &&
+        Number.isSafeInteger(session.approvalSetupRevision) &&
+        session.approvalSetupRevision > 0)) &&
+    ((session.phase !== "merge_pending" && session.phase !== "activated") ||
+      (mergeIntentMatches(session, session.mergeIntent) &&
+        (session.mergeReceipt === undefined ||
+          mergeReceiptMatches(session.mergeIntent, session.mergeReceipt)))) &&
     (session.phase !== "activated" ||
-      (session.activatedRevisionSha !== undefined && shaPattern.test(session.activatedRevisionSha)))
+      (session.activatedRevisionSha !== undefined &&
+        shaPattern.test(session.activatedRevisionSha) &&
+        session.mergeReceipt !== undefined &&
+        session.mergedConfigReceipt !== undefined &&
+        mergedConfigMatches(session, session.mergedConfigReceipt)))
   );
 }
 
@@ -437,6 +568,24 @@ function finalApprovalMatches(
     rawApproval["userConfirmed"] === true &&
     approval.expectedSetupRevision ===
       (session.phase === "merge_authorized" ? session.revision - 1 : session.revision)
+  );
+}
+
+function durableApprovalMatches(
+  approval: RegistrationSetupFinalApprovalRequest | undefined,
+  session: RegistrationSetupSession,
+  authority: RegistrationSetupFinalApprovalAuthority,
+): approval is RegistrationSetupFinalApprovalRequest {
+  if (approval === undefined || session.approvalSetupRevision === undefined) return false;
+  const reference = approvalReferenceDigest(approval.approvalId);
+  const rawApproval = approval as unknown as Readonly<Record<string, unknown>>;
+  return (
+    reference.ok &&
+    rawApproval["userConfirmed"] === true &&
+    approval.expectedSetupRevision === session.approvalSetupRevision &&
+    session.approvalReferenceDigest === reference.value &&
+    session.approvalSource === authority.issuer &&
+    session.approvalAuthorityDigest === authority.authorityDigest
   );
 }
 
@@ -502,11 +651,21 @@ function bumped(
   return Object.freeze({ ...session, ...update, revision: session.revision + 1 });
 }
 
+export type RegistrationSetupControllerMergeOperation = (
+  request: RegistrationSetupMergeRequest,
+  authority: RegistrationSetupFinalApprovalAuthority,
+) => Promise<RegistrationSetupOutcome>;
+
+const controllerMergeOperations = new WeakMap<object, RegistrationSetupControllerMergeOperation>();
+
 export class RegistrationSetupCoordinator {
   readonly #ports: RegistrationSetupPorts;
 
   constructor(ports: RegistrationSetupPorts) {
     this.#ports = Object.freeze(ports);
+    controllerMergeOperations.set(this, (request, authority) =>
+      this.#approveAndMerge(request, authority),
+    );
   }
 
   async #runExclusive(
@@ -1130,13 +1289,24 @@ export class RegistrationSetupCoordinator {
     if (session.phase === "cancelled")
       return Object.freeze({ state: "blocked", reason: "cancelled" });
     if (session.phase === "activated") {
-      return Object.freeze({
-        state: "activated",
-        session,
-        revisionSha: session.activatedRevisionSha ?? "",
-      });
+      const marker = await this.#owned(lease, () =>
+        this.#ports.sessions.readActivation(session.setupSessionId),
+      );
+      if (!marker.ok || !activationMarkerMatches(session, marker.value)) {
+        return failed("activation", session);
+      }
+      const indexed = await this.#owned(lease, () =>
+        this.#ports.activationRegistry.read(session.project.id),
+      );
+      return indexed.ok && sameValue(indexed.value, marker.value)
+        ? Object.freeze({
+            state: "activated" as const,
+            session,
+            revisionSha: session.activatedRevisionSha ?? "",
+          })
+        : Object.freeze({ state: "merge_pending" as const, session });
     }
-    if (session.phase === "merge_authorized")
+    if (session.phase === "merge_authorized" || session.phase === "merge_pending")
       return Object.freeze({ state: "merge_pending", session });
     return this.#readGatesAndAdvance(session, request, lease);
   }
@@ -1446,6 +1616,7 @@ export class RegistrationSetupCoordinator {
         approvalNonceDigest: consumed.value.receipt.approvalNonceDigest,
         approvalAuthorityDigest: consumed.value.receipt.authorityDigest,
         approvalSource: consumed.value.receipt.issuer,
+        approvalSetupRevision: expectedBinding.setupSessionRevision,
         evidence: Object.freeze([
           ...session.evidence,
           Object.freeze({
@@ -1484,6 +1655,359 @@ export class RegistrationSetupCoordinator {
       }
     }
     return Object.freeze({ state: "merge_pending", session });
+  }
+
+  /**
+   * The only merge-bearing application operation. Production composition exposes it through the
+   * controller while keeping the narrow SQUASH capability closure-private.
+   */
+  async #approveAndMerge(
+    request: RegistrationSetupMergeRequest,
+    authority: RegistrationSetupFinalApprovalAuthority,
+  ): Promise<RegistrationSetupOutcome> {
+    const rawAuthority = authority as unknown as Readonly<Record<string, unknown>>;
+    if (
+      !identifierPattern.test(request.setupSessionId) ||
+      !validPrefix(request.idempotencyKeyPrefix) ||
+      !digestPattern.test(authority.authorityDigest) ||
+      (rawAuthority["issuer"] !== "local_ui" &&
+        rawAuthority["issuer"] !== "current_user_conversation")
+    ) {
+      return failed("request");
+    }
+    const authorized = await this.authorizeMerge(request, authority);
+    if (authorized.state === "merge_pending") {
+      return this.#resumeMerge(request, authority);
+    }
+    if (
+      authorized.state !== "blocked" ||
+      (authorized.reason !== "approval_replay" && authorized.reason !== "user_approval_invalid")
+    ) {
+      return authorized;
+    }
+    // A retry after merge_pending or W1 activation legitimately observes the already-consumed
+    // grant. The continuation independently verifies its durable reference and authority.
+    return this.#resumeMerge(request, authority, authorized);
+  }
+
+  async #resumeMerge(
+    request: RegistrationSetupMergeRequest,
+    authority: RegistrationSetupFinalApprovalAuthority,
+    fallback?: RegistrationSetupOutcome,
+  ): Promise<RegistrationSetupOutcome> {
+    return this.#runExclusive(request.setupSessionId, request.signal, async (lease) => {
+      const loaded = await this.#owned(lease, () =>
+        this.#ports.sessions.load(request.setupSessionId),
+      );
+      if (!loaded.ok) return portFailure("session", loaded.error);
+      if (loaded.value === undefined) {
+        return (
+          fallback ?? Object.freeze({ state: "blocked" as const, reason: "not_found" as const })
+        );
+      }
+      const session = loaded.value;
+      if (!validSession(session)) return failed("session", session);
+      if (
+        (session.phase !== "merge_authorized" &&
+          session.phase !== "merge_pending" &&
+          session.phase !== "activated") ||
+        !durableApprovalMatches(request.approval, session, authority)
+      ) {
+        return (
+          fallback ??
+          Object.freeze({ state: "blocked" as const, reason: "user_approval_invalid" as const })
+        );
+      }
+      return this.#continueMergeExclusive(session, request, lease);
+    });
+  }
+
+  async #revalidateMergeAuthority(
+    session: RegistrationSetupSession,
+    request: RegistrationSetupSessionRequest,
+    lease: RegistrationSetupExecutionLease,
+  ): Promise<Result<ChangeRequestSnapshot, DomainError>> {
+    if (
+      !gateEvidenceMatches(session) ||
+      auditReceiptsDigest(session) === undefined ||
+      session.approvalReferenceDigest === undefined ||
+      session.approvalNonceDigest === undefined ||
+      session.approvalAuthorityDigest === undefined ||
+      session.approvalSource === undefined
+    ) {
+      return Object.freeze({ ok: false, error: domainError("invariant_violation") });
+    }
+    const reference = { project: session.project, changeRequestId: session.changeRequest.id };
+    const current = await this.#owned(lease, () =>
+      this.#ports.sourceControl.getChangeRequest(reference),
+    );
+    if (!current.ok) return current;
+    if (
+      current.value.state !== "open" ||
+      current.value.draft ||
+      current.value.baseBranch !== session.project.defaultBranch ||
+      current.value.headBranch !== registrationSetupBranch ||
+      !sameSha(current.value.headSha, session.headSha)
+    ) {
+      return Object.freeze({ ok: false, error: domainError("conflict") });
+    }
+    const diff = await this.#owned(lease, () =>
+      this.#ports.git.getEffectiveTreeDiff(
+        { rootPath: session.project.localRepositoryPath },
+        session.baseRevision,
+        session.headSha,
+      ),
+    );
+    if (!diff.ok) return diff;
+    const serialized = serializeTrustedProjectConfig(session.config);
+    const digest = createDiffDigest(diff.value);
+    if (
+      !serialized.ok ||
+      serialized.value.contentDigest !== session.configDigest ||
+      !isExactTrustedConfigDiff(diff.value, serialized.value.content) ||
+      !digest.ok ||
+      digest.value !== session.diffDigest
+    ) {
+      return Object.freeze({ ok: false, error: domainError("conflict") });
+    }
+    const gate = await this.#owned(lease, () =>
+      this.#ports.gateEvidence.read({
+        project: session.project,
+        changeRequestId: session.changeRequest.id,
+        expectedHeadSha: session.headSha,
+        requirementsDigest: session.requirementsDigest,
+        diffDigest: session.diffDigest,
+      }),
+    );
+    if (
+      !gate.ok ||
+      gate.value.state !== "ready" ||
+      !sameValue(gate.value.receipt, session.gateEvidenceReceipt)
+    ) {
+      return Object.freeze({
+        ok: false,
+        error: gate.ok ? domainError("conflict") : gate.error,
+      });
+    }
+    void request;
+    return current;
+  }
+
+  async #continueMergeExclusive(
+    initial: RegistrationSetupSession,
+    request: RegistrationSetupSessionRequest,
+    lease: RegistrationSetupExecutionLease,
+  ): Promise<RegistrationSetupOutcome> {
+    let session = initial;
+    if (session.phase === "activated") {
+      return this.#publishActivationIndex(session, request, lease);
+    }
+    if (session.phase === "merge_authorized") {
+      const revalidated = await this.#revalidateMergeAuthority(session, request, lease);
+      if (!revalidated.ok) return portFailure("merge", revalidated.error, session);
+      const intent = createMergeIntent(session);
+      if (intent === undefined) return failed("merge", session);
+      const pending = bumped(session, {
+        phase: "merge_pending",
+        changeRequest: revalidated.value,
+        mergeIntent: intent,
+      });
+      const saved = await this.#saveSession(session, pending, request, "save-merge-intent", lease);
+      if (!saved.ok) return portFailure("session", saved.error, session);
+      session = saved.value;
+    }
+    const intent = session.mergeIntent;
+    if (session.phase !== "merge_pending" || !mergeIntentMatches(session, intent)) {
+      return failed("merge", session);
+    }
+    if (session.mergeReceipt === undefined) {
+      const enabled = await this.#owned(lease, () =>
+        this.#ports.squashMerge.enable(
+          {
+            project: session.project,
+            changeRequestId: session.changeRequest.id,
+            expectedHeadSha: session.headSha,
+            mergeMethod: "SQUASH",
+            mergeIntentDigest: intent.mergeIntentDigest,
+          },
+          exactMutation(intent.idempotencyKey, request.signal),
+        ),
+      );
+      if (!enabled.ok) return portFailure("merge", enabled.error, session);
+      if (
+        enabled.value.snapshot.id !== session.changeRequest.id ||
+        !sameSha(enabled.value.snapshot.headSha, session.headSha) ||
+        (enabled.value.state === "auto_merge_enabled" &&
+          (!enabled.value.snapshot.autoMergeEnabled || enabled.value.snapshot.state !== "open")) ||
+        (enabled.value.state === "merged" && enabled.value.snapshot.state !== "merged")
+      ) {
+        return failed("merge_readback", session);
+      }
+      const operationDigest = sha256Digest(intent.idempotencyKey);
+      if (!operationDigest.ok) return failed("merge", session);
+      const receipt: RegistrationSetupMergeReceipt = Object.freeze({
+        schemaVersion: intent.schemaVersion,
+        projectId: intent.projectId,
+        repository: intent.repository,
+        changeRequestId: intent.changeRequestId,
+        expectedHeadSha: intent.expectedHeadSha,
+        mergeMethod: intent.mergeMethod,
+        mergeIntentDigest: intent.mergeIntentDigest,
+        state: enabled.value.state,
+        idempotencyKeyDigest: operationDigest.value,
+      });
+      const receipted = bumped(session, {
+        changeRequest: enabled.value.snapshot,
+        mergeReceipt: receipt,
+      });
+      const saved = await this.#saveSession(
+        session,
+        receipted,
+        request,
+        "save-merge-receipt",
+        lease,
+      );
+      if (!saved.ok) return portFailure("session", saved.error, session);
+      session = saved.value;
+    } else if (!mergeReceiptMatches(intent, session.mergeReceipt)) {
+      return failed("merge", session);
+    }
+
+    const merged = await this.#owned(lease, () =>
+      this.#ports.sourceControl.getChangeRequest({
+        project: session.project,
+        changeRequestId: session.changeRequest.id,
+      }),
+    );
+    if (!merged.ok) return portFailure("merge_readback", merged.error, session);
+    if (!sameSha(merged.value.headSha, session.headSha)) {
+      return failed("merge_readback", session);
+    }
+    if (merged.value.state === "open" && merged.value.autoMergeEnabled) {
+      return Object.freeze({ state: "merge_pending", session });
+    }
+    if (
+      merged.value.state !== "merged" ||
+      merged.value.baseBranch !== session.project.defaultBranch ||
+      merged.value.headBranch !== registrationSetupBranch
+    ) {
+      return failed("merge_readback", session);
+    }
+    const authoritative = await this.#owned(lease, () =>
+      this.#ports.mergedConfig.read({
+        project: session.project,
+        changeRequestId: session.changeRequest.id,
+        expectedHeadSha: session.headSha,
+        defaultBranch: session.project.defaultBranch,
+        path: trustedProjectConfigPath,
+      }),
+    );
+    if (!authoritative.ok) {
+      return portFailure("trusted_config_readback", authoritative.error, session);
+    }
+    if (!mergedConfigMatches(session, authoritative.value)) {
+      return failed("trusted_config_readback", session);
+    }
+    const preview: RegistrationSetupPreview = {
+      schemaVersion: 1,
+      setupSessionId: session.setupSessionId,
+      project: session.project,
+      config: session.config,
+      baseRevision: session.baseRevision,
+      worktreePath: session.worktree.path,
+      branch: registrationSetupBranch,
+      remote: session.remote,
+      linearAuditIssueId: session.linearAuditIssueId,
+      previewDigest: session.previewDigest,
+      requirementsDigest: session.requirementsDigest,
+    };
+    const activatedDraft: RegistrationSetupSessionDraft = Object.freeze({
+      ...withoutSessionRevision(session),
+      phase: "activated",
+      changeRequest: merged.value,
+      mergedConfigReceipt: authoritative.value,
+      activatedRevisionSha: authoritative.value.authoritativeRevision,
+      evidence: Object.freeze([
+        ...session.evidence,
+        evidence("setup_merge_verified", preview, {
+          headSha: session.headSha,
+          diffDigest: session.diffDigest,
+          changeRequestId: session.changeRequest.id,
+        }),
+        evidence("trusted_config_activated", preview, {
+          headSha: session.headSha,
+          diffDigest: session.diffDigest,
+          changeRequestId: session.changeRequest.id,
+        }),
+      ]),
+    });
+    const activated = await this.#owned(lease, () =>
+      this.#ports.sessions.activate(
+        session.revision,
+        activatedDraft,
+        authoritative.value.authoritativeRevision,
+        fencedMutation(request, "activate-session-marker", lease),
+      ),
+    );
+    if (!activated.ok) return portFailure("activation", activated.error, session);
+    let activatedSession = activated.value.session;
+    let marker: RegistrationSetupActivationMarker | undefined = activated.value.marker;
+    if (activated.value.durability !== "confirmed") {
+      const sessionRead = await this.#owned(lease, () =>
+        this.#ports.sessions.load(session.setupSessionId),
+      );
+      const markerRead = await this.#owned(lease, () =>
+        this.#ports.sessions.readActivation(session.setupSessionId),
+      );
+      if (!sessionRead.ok || sessionRead.value?.phase !== "activated" || !markerRead.ok) {
+        return failed("activation", session);
+      }
+      activatedSession = sessionRead.value;
+      marker = markerRead.value;
+    }
+    if (!activationMarkerMatches(activatedSession, marker)) {
+      return failed("activation", activatedSession);
+    }
+    return this.#publishActivationIndex(activatedSession, request, lease, marker);
+  }
+
+  async #publishActivationIndex(
+    session: RegistrationSetupSession,
+    request: RegistrationSetupSessionRequest,
+    lease: RegistrationSetupExecutionLease,
+    knownMarker?: RegistrationSetupActivationMarker,
+  ): Promise<RegistrationSetupOutcome> {
+    const readMarker =
+      knownMarker === undefined
+        ? await this.#owned(lease, () =>
+            this.#ports.sessions.readActivation(session.setupSessionId),
+          )
+        : Object.freeze({ ok: true as const, value: knownMarker });
+    if (!readMarker.ok || !activationMarkerMatches(session, readMarker.value)) {
+      return failed("activation", session);
+    }
+    const marker = readMarker.value;
+    const published = await this.#owned(lease, () =>
+      this.#ports.activationRegistry.publish(marker, mutation(request, "publish-activation-index")),
+    );
+    if (!published.ok || !sameValue(published.value.marker, marker)) {
+      return portFailure(
+        "activation",
+        published.ok ? domainError("conflict") : published.error,
+        session,
+      );
+    }
+    const indexed = await this.#owned(lease, () =>
+      this.#ports.activationRegistry.read(session.project.id),
+    );
+    if (!indexed.ok || !sameValue(indexed.value, marker)) {
+      return failed("activation", session);
+    }
+    return Object.freeze({
+      state: "activated",
+      session,
+      revisionSha: session.activatedRevisionSha ?? "",
+    });
   }
 
   async cancel(request: RegistrationSetupSessionRequest): Promise<RegistrationSetupOutcome> {
@@ -1539,4 +2063,13 @@ export class RegistrationSetupCoordinator {
     }
     return Object.freeze({ state: "cancelled", session: cancelledSession });
   }
+}
+
+/** Composition-only extraction; the coordinator object itself has no merge-bearing property. */
+export function createRegistrationSetupControllerMergeOperation(
+  coordinator: RegistrationSetupCoordinator,
+): RegistrationSetupControllerMergeOperation {
+  const operation = controllerMergeOperations.get(coordinator);
+  if (operation === undefined) throw new TypeError("invalid_registration_setup_coordinator");
+  return operation;
 }
