@@ -108,6 +108,15 @@ async function computedFocusAppearance(target: Locator): Promise<FocusAppearance
   });
 }
 
+async function hasKeyboardFocus(target: Locator): Promise<boolean> {
+  return target.evaluate((element) => {
+    const browser = globalThis as typeof globalThis & {
+      readonly document?: Readonly<{ readonly activeElement?: unknown }>;
+    };
+    return browser.document?.activeElement === element;
+  });
+}
+
 function shellBaseUrl(): string {
   if (shell === undefined) throw new Error("UI shell did not start.");
   return shell.baseUrl;

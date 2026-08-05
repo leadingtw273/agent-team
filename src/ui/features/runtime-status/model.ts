@@ -1,0 +1,161 @@
+import type { Checkpoint } from "../../../domain/checkpoint/index.js";
+import type { Instant } from "../../../domain/foundation/index.js";
+import type {
+  Job,
+  JobAttemptCounters,
+  Lease,
+  ProgressEvidenceKind,
+  WatchdogDecision,
+} from "../../../domain/jobs/index.js";
+import type { ReconcileBlockReason } from "../../../application/reconcile/index.js";
+
+export const runtimeBlockKinds = ["crash", "quota", "danger_approval", "unknown"] as const;
+
+export type RuntimeBlockKind = (typeof runtimeBlockKinds)[number];
+export type RuntimeQuotaWindow = "weekly" | "five_hour";
+export type RuntimeDangerCategory =
+  | "project_destructive"
+  | "git_destructive"
+  | "local_environment"
+  | "deployment"
+  | "external_write"
+  | "secret_access"
+  | "paid_action";
+
+/**
+ * A small, deliberately safe projection of an active Job. It contains no runner
+ * handle, process output, command, credential, or model conversation fields.
+ */
+export interface RuntimeJobSummary {
+  readonly id: Job["id"];
+  readonly projectId: Job["projectId"];
+  readonly issueId: Job["issueId"];
+  readonly startedAt: NonNullable<Job["startedAt"]>;
+}
+
+/** The role and model name are display labels, never account names or configuration. */
+export interface RuntimeRoleModelSummary {
+  readonly role: string;
+  readonly provider: string;
+  readonly model: string;
+}
+
+/** Lease holder identifiers are intentionally omitted from the UI projection. */
+export interface RuntimeLeaseSummary {
+  readonly id: Lease["id"];
+  readonly state: "active" | "expired" | "released";
+  readonly acquiredAt: Lease["acquiredAt"];
+  readonly expiresAt: Lease["expiresAt"];
+}
+
+export type RuntimeAttemptSummary = Readonly<Pick<JobAttemptCounters, keyof JobAttemptCounters>>;
+
+/** Only C012's effective progress evidence kinds can reach this projection. */
+export interface RuntimeEffectiveProgress {
+  readonly kind: ProgressEvidenceKind;
+  readonly occurredAt: Instant;
+  readonly summary: string;
+}
+
+export interface RuntimeWatchdogSummary {
+  readonly elapsedMinutes: number;
+  readonly decision: WatchdogDecision;
+  readonly extensionGranted: Job["watchdogExtensionGranted"];
+}
+
+/**
+ * A Checkpoint projection deliberately omits worktree paths, raw test commands,
+ * full error logs, requirement content, and model conversation data.
+ */
+export interface RuntimeCheckpointSummary {
+  readonly id: Checkpoint["id"];
+  readonly createdAt: Checkpoint["createdAt"];
+  readonly reason: Checkpoint["reason"];
+  readonly completedItemCount: number;
+  readonly remainingItemCount: number;
+  readonly testCounts: Readonly<{
+    readonly passed: number;
+    readonly failed: number;
+    readonly notRun: number;
+  }>;
+  readonly nextStep: string;
+}
+
+interface RuntimeBlockBase {
+  readonly summary: string;
+  readonly nextStep: string;
+}
+
+export type RuntimeBlock =
+  | (RuntimeBlockBase &
+      Readonly<{
+        readonly kind: "crash";
+        readonly reconcileReason: Extract<
+          ReconcileBlockReason,
+          "checkpoint_missing" | "lease_unavailable" | "recovery_limit_reached"
+        >;
+        readonly processRecoveriesUsed: number;
+        readonly processRecoveriesLimit: number;
+      }>)
+  | (RuntimeBlockBase &
+      Readonly<{
+        readonly kind: "quota";
+        readonly quotaWindows: readonly RuntimeQuotaWindow[];
+      }>)
+  | (RuntimeBlockBase &
+      Readonly<{
+        readonly kind: "danger_approval";
+        readonly category: RuntimeDangerCategory;
+      }>)
+  | (RuntimeBlockBase &
+      Readonly<{
+        readonly kind: "unknown";
+        readonly reconcileReason: Extract<
+          ReconcileBlockReason,
+          "source_unavailable" | "event_repair_unconfirmed"
+        >;
+      }>);
+
+export interface RuntimeStatusItem {
+  readonly state: "running" | "checkpointed" | "blocked";
+  readonly job: RuntimeJobSummary;
+  readonly roleModel: RuntimeRoleModelSummary;
+  readonly lease: RuntimeLeaseSummary;
+  readonly attempts: RuntimeAttemptSummary;
+  readonly lastEffectiveProgress?: RuntimeEffectiveProgress;
+  readonly watchdog: RuntimeWatchdogSummary;
+  readonly checkpoint?: RuntimeCheckpointSummary;
+  readonly block?: RuntimeBlock;
+  readonly nextStep: string;
+}
+
+export interface RuntimeStatusReadModel {
+  readonly source: "fixture" | "runtime";
+  readonly listRuntimeStatuses: () => readonly RuntimeStatusItem[];
+}
+
+const unsafeRawContentPattern =
+  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|(?:^|\s)(?:curl|wget|rm|bash|zsh|sh|node|pnpm|git)\b|hidden\s+reasoning|chain\s+of\s+thought)/iu;
+const safeSummaryMaximumLength = 240;
+
+/**
+ * Read models must provide human-readable summaries, not raw diagnostic payloads.
+ * The view applies this final defensive check so a mistaken adapter value becomes a
+ * fixed safe placeholder rather than content exposed in the localhost UI.
+ */
+export function safeRuntimeSummary(value: string): string {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  if (
+    normalized.length === 0 ||
+    normalized.length > safeSummaryMaximumLength ||
+    unsafeRawContentPattern.test(normalized)
+  ) {
+    return "已隱藏不安全的原始內容";
+  }
+  return normalized;
+}
+
+export function safeRuntimeLabel(value: string): string {
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  return /^[\p{L}\p{N}][\p{L}\p{N}_. -]{0,79}$/u.test(normalized) ? normalized : "未提供安全摘要";
+}
