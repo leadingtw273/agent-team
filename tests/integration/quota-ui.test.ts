@@ -3,14 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseInstant, type Instant } from "../../src/domain/foundation/index.js";
 import {
   createQuotaUiFeature,
-  quotaUiSecurityRoutes,
   QuotaDashboardUseCase,
   type QuotaDashboardPort,
   type QuotaProviderRecord,
 } from "../../src/ui/features/quota/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 import {
-  createUiShellHandler,
-  createUiSecurityPolicy,
+  createUiApplication,
   fixtureUiShellReadModel,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -72,11 +71,11 @@ async function start(
   options: Readonly<{ clock?: UiServerClock; idleTimeoutMs?: number }> = {},
 ): Promise<LocalUiServerHandle> {
   const feature = createQuotaUiFeature(useCase(port));
+  const application = createUiApplication({ features: [feature] });
   const handle = await startLocalUiServer({
     ...options,
-    securityPolicy: createUiSecurityPolicy({ routes: quotaUiSecurityRoutes }),
-    handler: async (request) =>
-      (await feature.handle(request)) ?? { statusCode: 404, body: "Not Found\n" },
+    securityPolicy: application.securityPolicy,
+    handler: application.handler,
   });
   handles.push(handle);
   return handle;
@@ -102,7 +101,10 @@ afterEach(async () => {
 
 describe("quota UI secured mutations", () => {
   it("declares exact read and POST-only mutation methods for every feature route", () => {
-    expect(quotaUiSecurityRoutes).toEqual(
+    const routes = createUiApplication({
+      features: [createQuotaUiFeature(useCase(new RecordingQuotaPort()))],
+    }).routeContracts;
+    expect(routes).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           path: "/api/quota/refresh",
@@ -117,7 +119,7 @@ describe("quota UI secured mutations", () => {
       ]),
     );
     expect(
-      quotaUiSecurityRoutes
+      routes
         .filter((route) => !route.path.startsWith("/api/"))
         .every((route) => route.allowedMethods?.join(",") === "GET"),
     ).toBe(true);
@@ -272,7 +274,7 @@ describe("quota UI secured mutations", () => {
     expect(port.resumed).toEqual([]);
   });
 
-  it("mounts the quota read model and local client in the authenticated shell", async () => {
+  it("keeps feature assets page-owned while mounting quota beside Role Model", async () => {
     const port = new RecordingQuotaPort([
       {
         provider: "gemini",
@@ -285,27 +287,50 @@ describe("quota UI secured mutations", () => {
       },
     ]);
     const feature = createQuotaUiFeature(useCase(port));
+    const application = createUiApplication({
+      readModel: fixtureUiShellReadModel,
+      features: [createRoleModelFeature(), feature],
+    });
     const handle = await startLocalUiServer({
-      securityPolicy: createUiSecurityPolicy({ routes: quotaUiSecurityRoutes }),
-      handler: createUiShellHandler(fixtureUiShellReadModel, { quota: feature }),
+      securityPolicy: application.securityPolicy,
+      handler: application.handler,
     });
     handles.push(handle);
     const authenticated = await session(handle);
     const page = await fetch(`${handle.baseUrl}/quota`, {
       headers: { cookie: authenticated.cookie },
     });
-    const style = await fetch(`${handle.baseUrl}/assets/ui-shell.css`, {
+    const rolePage = await fetch(`${handle.baseUrl}/roles-models`, {
+      headers: { cookie: authenticated.cookie },
+    });
+    const style = await fetch(`${handle.baseUrl}/assets/quota.css`, {
+      headers: { cookie: authenticated.cookie },
+    });
+    const shellStyle = await fetch(`${handle.baseUrl}/assets/ui-shell.css`, {
       headers: { cookie: authenticated.cookie },
     });
     const html = await page.text();
+    const roleHtml = await rolePage.text();
+    const shellCss = await shellStyle.text();
 
     expect(page.status).toBe(200);
     expect(html).toContain("<title>額度｜Agent Team</title>");
     expect(html).toContain('src="/assets/quota.js"');
+    expect(html).toContain('href="/assets/quota.css"');
+    expect(html).not.toContain('src="/assets/role-model.js"');
+    expect(html).not.toContain('href="/assets/role-model.css"');
     expect(html).toContain('href="/quota" aria-current="page"');
     expect(html).toContain("偵測到帳號切換");
     expect(style.status).toBe(200);
     expect(style.headers.get("content-type")).toBe("text/css; charset=utf-8");
+    expect(await style.text()).toContain(".ui-quota-grid");
+    expect(rolePage.status).toBe(200);
+    expect(roleHtml).toContain('src="/assets/role-model.js"');
+    expect(roleHtml).toContain('href="/assets/role-model.css"');
+    expect(roleHtml).not.toContain('src="/assets/quota.js"');
+    expect(roleHtml).not.toContain('href="/assets/quota.css"');
+    expect(shellStyle.status).toBe(200);
+    expect(shellCss).not.toContain(".ui-quota-");
     expect(html).not.toContain("gemini-new-account-002");
     expect(html).not.toContain("gemini-old-account-001");
     expect(port.invalidated).toEqual([]);

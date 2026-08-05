@@ -14,7 +14,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["src/ui/assets/role-model.js"],
+    files: ["src/ui/assets/role-model.js", "src/ui/assets/quota.js"],
     languageOptions: { globals: globals.browser },
   },
   ...tseslint.configs.strictTypeChecked.map((config) => ({

@@ -1,18 +1,21 @@
-export const quotaClientScript = `(() => {
+(() => {
   "use strict";
   const endpoints = Object.freeze({
     refresh: "/api/quota/refresh",
-    resume: "/api/quota/resume"
+    resume: "/api/quota/resume",
   });
   const successMessages = Object.freeze({
     refresh_sample: "刷新樣本已完成 read-back。",
-    resume_dispatch: "手動覆核已記錄；恢復派工狀態已 read-back。"
+    resume_dispatch: "手動覆核已記錄；恢復派工狀態已 read-back。",
   });
 
   async function csrfToken() {
     const stored = sessionStorage.getItem("agent-team-csrf");
     if (stored) return stored;
-    const response = await fetch("/__session/csrf", { method: "GET", credentials: "same-origin" });
+    const response = await fetch("/__session/csrf", {
+      method: "GET",
+      credentials: "same-origin",
+    });
     if (!response.ok) throw new Error("csrf-unavailable");
     const token = response.headers.get("x-csrf-token");
     if (!token) throw new Error("csrf-unavailable");
@@ -29,7 +32,7 @@ export const quotaClientScript = `(() => {
     const provider = button.dataset.quotaProvider;
     const endpoint = action ? endpoints[action] : undefined;
     if (!endpoint || !provider) return;
-    const status = document.getElementById("quota-" + provider + "-action-status");
+    const status = document.getElementById(`quota-${provider}-action-status`);
     button.disabled = true;
     if (status) status.textContent = "處理中…";
     try {
@@ -38,12 +41,11 @@ export const quotaClientScript = `(() => {
         method: "POST",
         credentials: "same-origin",
         headers: { "content-type": "application/json", "x-csrf-token": csrf },
-        body: JSON.stringify({ provider })
+        body: JSON.stringify({ provider }),
       });
       const result = await response.json();
-      const message = result && typeof result.action === "string"
-        ? successMessages[result.action]
-        : undefined;
+      const message =
+        result && typeof result.action === "string" ? successMessages[result.action] : undefined;
       if (!response.ok || !message) throw new Error("action-rejected");
       if (status) {
         status.textContent = message;
@@ -59,4 +61,3 @@ export const quotaClientScript = `(() => {
     }
   });
 })();
-`;

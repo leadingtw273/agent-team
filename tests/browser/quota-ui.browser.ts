@@ -8,15 +8,14 @@ import { parseInstant, type Instant } from "../../src/domain/foundation/index.js
 import {
   createQuotaUiFeature,
   QuotaDashboardUseCase,
-  quotaUiSecurityRoutes,
   type QuotaDashboardPort,
   type QuotaMutationResult,
   type QuotaProviderId,
   type QuotaProviderRecord,
 } from "../../src/ui/features/quota/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 import {
-  createUiSecurityPolicy,
-  createUiShellHandler,
+  createUiApplication,
   fixtureUiShellReadModel,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -250,9 +249,13 @@ test.describe("U005 quota management UI", () => {
         expectedCliVersions: { codex: "0.146.0", claude: "2.1.221", gemini: "0.52.0" },
       }),
     );
+    const application = createUiApplication({
+      readModel: fixtureUiShellReadModel,
+      features: [createRoleModelFeature(), quota],
+    });
     shell = await startLocalUiServer({
-      securityPolicy: createUiSecurityPolicy({ routes: quotaUiSecurityRoutes }),
-      handler: createUiShellHandler(fixtureUiShellReadModel, { quota }),
+      securityPolicy: application.securityPolicy,
+      handler: application.handler,
     });
   });
 
@@ -377,4 +380,37 @@ test.describe("U005 quota management UI", () => {
     await expectNoAxeViolations(page);
     await copyReviewScreenshot(page, "u005-quota-mobile.png");
   });
+
+  for (const width of [390, 320]) {
+    test(`shares one responsive shell with Role Model at ${String(width)}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 844 });
+      await visitQuota(page);
+
+      await expect(page.locator("html")).toHaveCount(1);
+      await expect(page.locator("body.ui-shell")).toHaveCount(1);
+      await expect(page.locator(".ui-brand")).toHaveCount(1);
+      await expect(page.locator('a[href="#main-content"]')).toHaveCount(1);
+      await expect(page.locator("details.ui-mobile-nav")).toHaveCount(1);
+      await expect(page.locator('.ui-nav--mobile a[href="/quota"]')).toHaveAttribute(
+        "aria-current",
+        "page",
+      );
+      expect(await hasNoHorizontalOverflow(page)).toBe(true);
+
+      const disclosure = page.locator("details.ui-mobile-nav");
+      await disclosure.locator("summary").click();
+      await expect(disclosure).toHaveAttribute("open", "");
+      await page.locator('.ui-nav--mobile a[href="/roles-models"]').click();
+      await expect(page).toHaveURL(/\/roles-models$/u);
+      await expect(page.getByRole("heading", { level: 1, name: "角色與模型" })).toBeVisible();
+      await expect(page.locator("html")).toHaveCount(1);
+      await expect(page.locator("body.ui-shell")).toHaveCount(1);
+      await expect(page.locator("details.ui-mobile-nav")).toHaveCount(1);
+      await expect(page.locator('.ui-nav--mobile a[href="/roles-models"]')).toHaveAttribute(
+        "aria-current",
+        "page",
+      );
+      expect(await hasNoHorizontalOverflow(page)).toBe(true);
+    });
+  }
 });

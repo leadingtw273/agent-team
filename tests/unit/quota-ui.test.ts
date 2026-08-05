@@ -4,11 +4,14 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { QuotaSnapshot } from "../../src/application/ports/index.js";
 import {
+  createQuotaUiFeature,
   QuotaDashboardUseCase,
   renderQuotaDashboard,
   type QuotaDashboardPort,
   type QuotaProviderRecord,
 } from "../../src/ui/features/quota/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
+import { createUiApplication } from "../../src/ui/index.js";
 import { parseInstant, type Instant } from "../../src/domain/foundation/index.js";
 
 function instant(value: string): Instant {
@@ -347,6 +350,66 @@ describe("quota UI read model", () => {
 });
 
 describe("quota UI actions", () => {
+  it("registers quota beside Role Model through the shared route union", () => {
+    const quota = createQuotaUiFeature(createUseCase(new FakeQuotaDashboardPort([])));
+    const registration = quota.uiFeatureRegistration();
+    const application = createUiApplication({
+      features: [createRoleModelFeature(), registration],
+    });
+    const paths = application.routeContracts.map((route) => route.path);
+
+    expect(registration).toMatchObject({
+      slot: "quota",
+      page: {
+        path: "/quota",
+        styles: ["/assets/quota.css"],
+        scripts: ["/assets/quota.js"],
+      },
+    });
+    expect(paths).toEqual([
+      "/",
+      "/projects",
+      "/events",
+      "/assets/icons.svg",
+      "/assets/tabler-1.4.0.min.css",
+      "/assets/ui-shell.css",
+      "/roles-models",
+      "/assets/role-model.css",
+      "/assets/role-model.js",
+      "/api/role-models",
+      "/quota",
+      "/assets/quota.css",
+      "/assets/quota.js",
+      "/api/quota/refresh",
+      "/api/quota/resume",
+    ]);
+    expect(new Set(paths).size).toBe(paths.length);
+    expect(registration.routes.map((route) => route.contract.path)).toEqual([
+      "/assets/quota.css",
+      "/assets/quota.js",
+      "/api/quota/refresh",
+      "/api/quota/resume",
+    ]);
+    expect(() =>
+      createUiApplication({
+        features: [registration, { ...registration, id: "quota-collision" }],
+      }),
+    ).toThrow(/duplicate UI feature slot/iu);
+    expect(() =>
+      createUiApplication({
+        features: [
+          registration,
+          {
+            ...registration,
+            id: "quota-route-collision",
+            slot: "settings",
+            page: { ...registration.page, path: "/quota-collision" },
+          },
+        ],
+      }),
+    ).toThrow(/duplicate UI route path/iu);
+  });
+
   it("keeps refresh and manual resume as independent mutations", async () => {
     const port = new FakeQuotaDashboardPort([]);
     const useCase = createUseCase(port);
