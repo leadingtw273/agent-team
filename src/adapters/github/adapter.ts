@@ -8,6 +8,7 @@ import type {
   ChangeRequestRef,
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
+  CommitStatusesSnapshot,
   CommitStatusCommand,
   CreateDraftChangeRequestCommand,
   SourceControlPort,
@@ -410,10 +411,29 @@ export class GitHubAdapter implements SourceControlPort {
     if (result.value.context !== command.context || result.value.state !== command.state) {
       return failure();
     }
+    const readBack = await this.getCommitStatuses(command, command.headSha, options);
+    if (!readBack.ok) return readBack;
+    const status = readBack.value.statuses.find(
+      (candidate) => candidate.context === command.context,
+    );
+    return readBack.value.headSha.toLowerCase() === command.headSha.toLowerCase() &&
+      status?.state === command.state &&
+      status.description === command.description &&
+      status.targetUrl === command.targetUrl
+      ? ok(undefined)
+      : failure();
+  }
+
+  async getCommitStatuses(
+    repository: SourceControlRepositoryRef,
+    headSha: string,
+    options: ReadOptions = {},
+  ): Promise<Result<CommitStatusesSnapshot, DomainError>> {
+    if (!validRepository(repository) || !shaPattern.test(headSha)) return failure();
     const readBack = await this.transport.requestJson(
       [
         "api",
-        `repos/${repositoryPath(command)}/commits/${command.headSha}/status`,
+        `repos/${repositoryPath(repository)}/commits/${headSha}/status`,
         "--jq",
         statusesProjection,
       ],
@@ -421,15 +441,20 @@ export class GitHubAdapter implements SourceControlPort {
       options,
     );
     if (!readBack.ok) return readBack;
-    const status = readBack.value.statuses.find(
-      (candidate) => candidate.context === command.context,
-    );
-    return readBack.value.sha.toLowerCase() === command.headSha.toLowerCase() &&
-      status?.state === command.state &&
-      status.description === command.description &&
-      (status.targetUrl ?? undefined) === command.targetUrl
-      ? ok(undefined)
-      : failure();
+    if (readBack.value.sha.toLowerCase() !== headSha.toLowerCase()) return failure("conflict");
+    return ok({
+      headSha: readBack.value.sha.toLowerCase(),
+      statuses: Object.freeze(
+        readBack.value.statuses.map((status) =>
+          Object.freeze({
+            context: status.context,
+            state: status.state,
+            ...(status.description === null ? {} : { description: status.description }),
+            ...(status.targetUrl === null ? {} : { targetUrl: status.targetUrl }),
+          }),
+        ),
+      ),
+    });
   }
 
   async appendChangeRequestComment(

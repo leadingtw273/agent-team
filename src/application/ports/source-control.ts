@@ -52,6 +52,18 @@ export interface CommitStatusCommand extends SourceControlRepositoryRef {
   readonly targetUrl?: string;
 }
 
+export interface CommitStatus {
+  readonly context: string;
+  readonly state: "pending" | "success" | "failure" | "error";
+  readonly description?: string;
+  readonly targetUrl?: string;
+}
+
+export interface CommitStatusesSnapshot {
+  readonly headSha: string;
+  readonly statuses: readonly CommitStatus[];
+}
+
 export interface ChangeRequestCommentCommand {
   readonly changeRequest: ChangeRequestRef;
   readonly expectedHeadSha: string;
@@ -79,6 +91,11 @@ export interface SourceControlPort {
     headSha: string,
     options?: ReadOptions,
   ): AsyncPortResult<CommitChecksSnapshot>;
+  getCommitStatuses(
+    repository: SourceControlRepositoryRef,
+    headSha: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<CommitStatusesSnapshot>;
   setCommitStatus(command: CommitStatusCommand, options: MutationOptions): AsyncPortResult<void>;
   appendChangeRequestComment(
     command: ChangeRequestCommentCommand,

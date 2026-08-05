@@ -188,6 +188,49 @@ describe("GitHub source-control adapter", () => {
     transport.expectDone();
   });
 
+  it("reads commit statuses as an exact-SHA source-control snapshot", async () => {
+    const transport = new ScriptedTransport([
+      {
+        value: {
+          sha,
+          statuses: [
+            {
+              context: "agent-team/review",
+              state: "success",
+              description: "Reviewer accepted this SHA",
+              targetUrl: "https://example.invalid/review/42",
+            },
+          ],
+        },
+      },
+    ]);
+    const result = await new GitHubAdapter(transport).getCommitStatuses({ project }, sha);
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        headSha: sha,
+        statuses: [
+          {
+            context: "agent-team/review",
+            state: "success",
+            description: "Reviewer accepted this SHA",
+            targetUrl: "https://example.invalid/review/42",
+          },
+        ],
+      },
+    });
+    transport.expectDone();
+  });
+
+  it("rejects a commit-status read-back for a different SHA", async () => {
+    const transport = new ScriptedTransport([{ value: { sha: nextSha, statuses: [] } }]);
+    const result = await new GitHubAdapter(transport).getCommitStatuses({ project }, sha);
+
+    expect(result.ok ? "ok" : result.error.code).toBe("conflict");
+    transport.expectDone();
+  });
+
   it("marks a Draft ready only for the exact Head SHA and confirms read-back", async () => {
     const transport = new ScriptedTransport([
       { value: pull({ draft: true }) },
