@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { projectInboxDelivery, type InboxDelivery } from "../../src/application/inbox/index.js";
+import { parseProviderRevisionIdentity } from "../../src/application/reconcile/index.js";
 import { parseInstant } from "../../src/domain/foundation/index.js";
 
 const rawBody = Buffer.from(
@@ -50,6 +51,88 @@ describe("Inbox delivery projection", () => {
         providerEventType: "UnknownFutureEvent",
         body: { action: "update", type: "Issue", data: { id: "issue-1" } },
       },
+    });
+    expect(first.value.payload).not.toHaveProperty("providerEventId");
+  });
+
+  it("projects matching provider revision metadata only from complete authoritative payloads", () => {
+    const githubBody = Buffer.from(
+      JSON.stringify({
+        action: "synchronize",
+        repository: { full_name: "owner/repository" },
+        pull_request: {
+          node_id: "PR_kwDO_fixture_42",
+          number: 42,
+          state: "open",
+          draft: false,
+          merged: false,
+          created_at: "2026-08-05T11:00:00Z",
+          updated_at: "2026-08-05T12:00:00Z",
+          closed_at: null,
+          merged_at: null,
+          base: { sha: "0123456789abcdef0123456789abcdef01234567" },
+          head: { sha: "fedcba9876543210fedcba9876543210fedcba98" },
+        },
+      }),
+      "utf8",
+    );
+    const linearBody = Buffer.from(
+      JSON.stringify({
+        action: "update",
+        type: "Issue",
+        webhookTimestamp: Date.parse("2026-08-05T12:00:00.000Z"),
+        data: {
+          id: "issue-42",
+          identifier: "AT-42",
+          title: "Recover a missed webhook",
+          description: "Authoritative issue snapshot",
+          priority: 2,
+          updatedAt: "2026-08-05T12:00:00Z",
+          teamId: "linear-team-fixture",
+          projectId: "linear-project-fixture",
+          stateId: "state-in-progress",
+        },
+      }),
+      "utf8",
+    );
+    const github = projectInboxDelivery(
+      delivery({
+        provider: "github",
+        deliveryId: "github-complete-delivery",
+        eventType: "pull_request",
+        streamKey: "PR_kwDO_fixture_42",
+        sha256: createHash("sha256").update(githubBody).digest("hex"),
+        bodyBase64: githubBody.toString("base64"),
+      }),
+    );
+    const linear = projectInboxDelivery(
+      delivery({
+        eventType: "Issue",
+        streamKey: "issue-42",
+        sha256: createHash("sha256").update(linearBody).digest("hex"),
+        bodyBase64: linearBody.toString("base64"),
+      }),
+    );
+
+    expect(github.ok && linear.ok).toBe(true);
+    if (!github.ok || !linear.ok) return;
+    const githubIdentity = parseProviderRevisionIdentity(
+      (github.value.payload as Record<string, unknown>)["providerEventId"],
+    );
+    const linearIdentity = parseProviderRevisionIdentity(
+      (linear.value.payload as Record<string, unknown>)["providerEventId"],
+    );
+    expect(githubIdentity).toMatchObject({
+      provider: "github",
+      resourceType: "pull_request",
+      resourceId: "PR_kwDO_fixture_42",
+      updatedAt: "2026-08-05T12:00:00.000Z",
+    });
+    expect(linearIdentity).toMatchObject({
+      provider: "linear",
+      resourceType: "issue",
+      resourceId: "issue-42",
+      updatedAt: "2026-08-05T12:00:00.000Z",
     });
   });
 

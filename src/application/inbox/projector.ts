@@ -8,12 +8,16 @@ import {
   domainError,
   err,
   instantFromDate,
+  generateDeterministicIdentifier,
   ok,
-  parseIdentifier,
   parseInstant,
   type Instant,
 } from "../../domain/foundation/index.js";
 import type { InboxDelivery, InboxProjectionResult } from "./model.js";
+import {
+  normalizeGitHubPullRequestRevision,
+  normalizeLinearIssueRevision,
+} from "../reconcile/provider-revision.js";
 
 const eventTypePattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u;
 const boundedIdentifierPattern = /^(?:\S|\S[\s\S]*\S)$/u;
@@ -36,14 +40,6 @@ const inboxDeliverySchema = z
   })
   .strict() as unknown as z.ZodType<InboxDelivery>;
 
-function deterministicEventId(provider: string, deliveryId: string) {
-  const digest = createHash("sha256")
-    .update(JSON.stringify([provider, deliveryId]), "utf8")
-    .digest("hex");
-  const versioned = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
-  return parseIdentifier("event", `event_${versioned}`);
-}
-
 function decodeBody(delivery: InboxDelivery): Readonly<Record<string, unknown>> | undefined {
   const body = Buffer.from(delivery.bodyBase64, "base64");
   if (
@@ -63,15 +59,78 @@ function decodeBody(delivery: InboxDelivery): Readonly<Record<string, unknown>> 
   }
 }
 
+function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : undefined;
+}
+
+function githubProviderEventId(body: Readonly<Record<string, unknown>>): string | undefined {
+  const pullRequest = record(body["pull_request"]);
+  const repository = record(body["repository"]);
+  const base = record(pullRequest?.["base"]);
+  const head = record(pullRequest?.["head"]);
+  if (pullRequest === undefined || repository === undefined) return undefined;
+  const mergedAt = pullRequest["merged_at"];
+  const state =
+    mergedAt !== null || pullRequest["merged"] === true ? "merged" : pullRequest["state"];
+  const normalized = normalizeGitHubPullRequestRevision({
+    repository: repository["full_name"],
+    nodeId: pullRequest["node_id"],
+    number: pullRequest["number"],
+    state,
+    draft: pullRequest["draft"],
+    createdAt: pullRequest["created_at"],
+    updatedAt: pullRequest["updated_at"],
+    closedAt: pullRequest["closed_at"],
+    mergedAt,
+    baseSha: base?.["sha"],
+    headSha: head?.["sha"],
+  });
+  return normalized.ok ? normalized.value.providerEventId : undefined;
+}
+
+function linearProviderEventId(body: Readonly<Record<string, unknown>>): string | undefined {
+  if (body["type"] !== "Issue") return undefined;
+  const data = record(body["data"]);
+  if (data === undefined) return undefined;
+  const normalized = normalizeLinearIssueRevision({
+    id: data["id"],
+    identifier: data["identifier"],
+    title: data["title"],
+    description: data["description"],
+    priority: data["priority"],
+    updatedAt: data["updatedAt"],
+    teamId: data["teamId"],
+    projectId: data["projectId"],
+    stateId: data["stateId"],
+  });
+  return normalized.ok ? normalized.value.providerEventId : undefined;
+}
+
+function providerEventId(
+  delivery: InboxDelivery,
+  body: Readonly<Record<string, unknown>>,
+): string | undefined {
+  if (delivery.provider === "github") {
+    return delivery.eventType === "pull_request" ? githubProviderEventId(body) : undefined;
+  }
+  return delivery.eventType === "Issue" ? linearProviderEventId(body) : undefined;
+}
+
 export function projectInboxDelivery(input: unknown): InboxProjectionResult {
   const parsed = inboxDeliverySchema.safeParse(input);
   if (!parsed.success) return err(domainError("invariant_violation"));
   const delivery = parsed.data;
   const body = decodeBody(delivery);
   if (body === undefined) return err(domainError("invariant_violation"));
-  const eventId = deterministicEventId(delivery.provider, delivery.deliveryId);
+  const eventId = generateDeterministicIdentifier(
+    "event",
+    JSON.stringify([delivery.provider, delivery.deliveryId]),
+  );
   const occurredAt = instantFromDate(new Date(delivery.sourceTimestampMs));
   if (!eventId.ok || !occurredAt.ok) return err(domainError("invariant_violation"));
+  const revisionIdentity = providerEventId(delivery, body);
 
   const event = eventEnvelopeV1Schema.safeParse({
     schemaVersion: 1,
@@ -86,7 +145,11 @@ export function projectInboxDelivery(input: unknown): InboxProjectionResult {
     },
     subject: { kind: "webhook", id: delivery.streamKey },
     correlationId: delivery.streamKey,
-    payload: { providerEventType: delivery.eventType, body },
+    payload: {
+      providerEventType: delivery.eventType,
+      ...(revisionIdentity === undefined ? {} : { providerEventId: revisionIdentity }),
+      body,
+    },
   });
   return event.success ? ok(event.data) : err(domainError("invariant_violation"));
 }

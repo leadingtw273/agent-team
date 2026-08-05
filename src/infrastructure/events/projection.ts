@@ -4,6 +4,7 @@ import {
   type EventEnvelopeV1,
 } from "../../domain/events/index.js";
 import { ok, type DomainError, type Result } from "../../domain/foundation/index.js";
+import { semanticProviderRevisionKey } from "../../application/reconcile/provider-revision.js";
 import { readEventLog } from "./log.js";
 
 export type ProjectionReducer<State> = (
@@ -39,6 +40,7 @@ export async function replayProjection<State>(
   if (!log.ok) return log;
 
   const seen = new Set<DeliveryDedupeKey>();
+  const seenSemanticRevisions = new Set<string>();
   const events: EventEnvelopeV1[] = [];
   let duplicatesSkipped = 0;
   for (const event of log.value.events) {
@@ -48,6 +50,12 @@ export async function replayProjection<State>(
       continue;
     }
     seen.add(key);
+    const semanticKey = semanticProviderRevisionKey(event);
+    if (semanticKey !== undefined && seenSemanticRevisions.has(semanticKey)) {
+      duplicatesSkipped += 1;
+      continue;
+    }
+    if (semanticKey !== undefined) seenSemanticRevisions.add(semanticKey);
     events.push(event);
   }
   events.sort(compareEvents);

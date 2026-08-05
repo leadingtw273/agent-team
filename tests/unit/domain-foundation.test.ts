@@ -7,6 +7,7 @@ import {
   domainErrorDefinitions,
   err,
   flatMapResult,
+  generateDeterministicIdentifier,
   generateIdentifier,
   mapResult,
   ok,
@@ -27,6 +28,19 @@ describe("domain foundation", () => {
     if (!generated.ok) throw new Error("expected identifier generation to succeed");
     expect(parseIdentifier("job", generated.value)).toEqual(generated);
     expect(JSON.stringify({ id: generated.value })).toBe(`{"id":"job_${fixedUuid}"}`);
+  });
+
+  it("derives stable scoped identifiers from content without collisions across seeds", () => {
+    const first = generateDeterministicIdentifier("event", "provider:delivery-1");
+    const replay = generateDeterministicIdentifier("event", "provider:delivery-1");
+    const second = generateDeterministicIdentifier("event", "provider:delivery-2");
+
+    expect(first).toEqual(replay);
+    expect(first.ok && second.ok && first.value !== second.value).toBe(true);
+    expect(generateDeterministicIdentifier("event", "")).toEqual({
+      ok: false,
+      error: domainError("invalid_identifier"),
+    });
   });
 
   it.each([
