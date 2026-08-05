@@ -13,7 +13,7 @@
   },
   "packageManager": "pnpm@10.34.5",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && cp -R src/ui/assets dist/ui/",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
@@ -22,6 +22,7 @@
     "test": "pnpm run build && vitest run",
     "test:contract": "vitest run tests/contract --passWithNoTests",
     "test:integration": "vitest run tests/integration --passWithNoTests",
+    "test:browser": "playwright test",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit"
   },
   "dependencies": {
@@ -30,7 +31,9 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@playwright/test": "1.59.1",
     "@types/node": "^26.1.2",
+    "axe-core": "4.11.0",
     "eslint": "^10.8.0",
     "globals": "^17.9.0",
     "prettier": "^3.9.6",

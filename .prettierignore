@@ -3,3 +3,5 @@ dist/
 docs/
 node_modules/
 pnpm-lock.yaml
+test-results/
+src/ui/assets/tabler-1.4.0.min.css
