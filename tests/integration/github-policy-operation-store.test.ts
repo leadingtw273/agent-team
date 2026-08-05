@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -68,6 +68,15 @@ async function directory(): Promise<string> {
   return value;
 }
 
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories.splice(0).map((value) => rm(value, { recursive: true, force: true })),
@@ -75,6 +84,89 @@ afterEach(async () => {
 });
 
 describe("O004 file GitHub policy operation store", () => {
+  it("rejects a symlinked journal root instead of writing through it", async () => {
+    const base = await directory();
+    const target = join(base, "target");
+    const linked = join(base, "linked");
+    await mkdir(target, { mode: 0o700 });
+    await symlink(target, linked, "dir");
+
+    const result = await new FileGitHubPolicyOperationStore(linked).compareAndSwap({
+      operationId,
+      expectedRevision: null,
+      next: initial,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(await exists(join(target, `${operationId}.json`))).toBe(false);
+  });
+
+  it("rejects a symlinked parent component instead of creating a journal below it", async () => {
+    const base = await directory();
+    const targetParent = join(base, "target-parent");
+    const linkedParent = join(base, "linked-parent");
+    await mkdir(targetParent, { mode: 0o700 });
+    await symlink(targetParent, linkedParent, "dir");
+
+    const result = await new FileGitHubPolicyOperationStore(
+      join(linkedParent, "journal"),
+    ).compareAndSwap({
+      operationId,
+      expectedRevision: null,
+      next: initial,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(await exists(join(targetParent, "journal", `${operationId}.json`))).toBe(false);
+  });
+
+  it("holds the constructor directory inode across a pathname replacement", async () => {
+    const base = await directory();
+    const root = join(base, "journal");
+    const heldOriginal = join(base, "journal-original");
+    await mkdir(root, { mode: 0o700 });
+    const store = new FileGitHubPolicyOperationStore(root);
+    await rename(root, heldOriginal);
+    await mkdir(root, { mode: 0o700 });
+
+    const result = await store.compareAndSwap({
+      operationId,
+      expectedRevision: null,
+      next: initial,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(await exists(join(heldOriginal, `${operationId}.json`))).toBe(true);
+    expect(await exists(join(root, `${operationId}.json`))).toBe(false);
+    expect(await exists(join(root, `${operationId}.lock`))).toBe(false);
+  });
+
+  it("fails closed for direct journal and lock symlinks", async () => {
+    const root = await directory();
+    const outsideJournal = join(root, "outside-journal");
+    const outsideLock = join(root, "outside-lock");
+    const journalRoot = join(root, "journal");
+    await mkdir(journalRoot, { mode: 0o700 });
+    await writeFile(outsideJournal, "outside\n", { mode: 0o600 });
+    await writeFile(outsideLock, "outside\n", { mode: 0o600 });
+    await symlink(outsideJournal, join(journalRoot, `${operationId}.json`));
+    await symlink(outsideLock, join(journalRoot, `${operationId}.lock`));
+
+    const store = new FileGitHubPolicyOperationStore(journalRoot);
+    expect((await store.read(operationId)).ok).toBe(false);
+    expect(
+      (
+        await store.compareAndSwap({
+          operationId,
+          expectedRevision: null,
+          next: initial,
+        })
+      ).ok,
+    ).toBe(false);
+    expect(await readFile(outsideJournal, "utf8")).toBe("outside\n");
+    expect(await readFile(outsideLock, "utf8")).toBe("outside\n");
+  });
+
   it("persists a strict private schema with store-owned monotonic revisions", async () => {
     const root = await directory();
     const firstProcess = new FileGitHubPolicyOperationStore(root);
