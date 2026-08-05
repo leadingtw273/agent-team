@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
   link,
   lstat,
@@ -7,13 +8,14 @@ import {
   mkdtemp,
   open,
   readFile,
+  rename,
   rm,
   unlink,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type { CliCommandOutcome } from "../program.js";
@@ -23,10 +25,13 @@ export const systemdUnitNames = Object.freeze({
   timer: "agent-team-reconcile.timer",
 });
 
-export const systemdOwnershipMarkers = Object.freeze({
-  service: "# agent-team-managed: agent-team-reconcile.service v1",
-  timer: "# agent-team-managed: agent-team-reconcile.timer v1",
-});
+export const runtimeEnvironmentNames = Object.freeze([
+  "PATH",
+  "HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_RUNTIME_DIR",
+  "AGENT_TEAM_HOME",
+] as const);
 
 export type SystemdCommandInput =
   | Readonly<{ action: "install"; dryRun: boolean }>
@@ -45,12 +50,27 @@ export interface CommandRunRequest {
   readonly environment: NodeJS.ProcessEnv;
 }
 
+export type CommandClassification = "exited" | "signal" | "spawn_error" | "timeout";
+
 export interface CommandRunResult {
+  readonly classification: CommandClassification;
   readonly exitCode: number | null;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly stdoutTruncated: boolean;
+  readonly stderrTruncated: boolean;
+  readonly signal?: NodeJS.Signals;
+  readonly spawnErrorCode?: string;
 }
 
 export interface CommandRunner {
   readonly run: (request: CommandRunRequest) => Promise<CommandRunResult>;
+}
+
+export interface CommandRunnerOptions {
+  readonly deadlineMs?: number;
+  readonly maxOutputBytes?: number;
+  readonly terminateGraceMs?: number;
 }
 
 export interface RenderedSystemdUnits {
@@ -60,6 +80,7 @@ export interface RenderedSystemdUnits {
   readonly service: string;
   readonly timer: string;
   readonly runtimeCommand: readonly string[];
+  readonly runtimeEnvironment: NodeJS.ProcessEnv;
 }
 
 export interface SystemdManagerOptions {
@@ -68,45 +89,111 @@ export interface SystemdManagerOptions {
   readonly templateDirectory?: string;
 }
 
-type UnitOwnership = "missing" | "owned" | "foreign";
+type UnitObservationKind = "missing" | "canonical" | "untrusted";
+type InstallationState = "not_installed" | "installed" | "untrusted_units";
 
-interface UnitInspection {
-  readonly ownership: UnitOwnership;
-  readonly content?: string;
+interface DirectoryIdentity {
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
 }
 
-type InstallationState =
-  "not_installed" | "installed" | "managed_drifted" | "partial_installation" | "foreign_units";
+interface FileIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly nlink: number;
+}
+
+interface CanonicalUnit {
+  readonly path: string;
+  readonly expected: Buffer;
+  readonly identity: FileIdentity;
+}
+
+interface UnitObservation {
+  readonly kind: UnitObservationKind;
+  readonly unit?: CanonicalUnit;
+}
+
+interface UnitPair<T> {
+  readonly service: T;
+  readonly timer: T;
+}
+
+interface QuarantinedUnit {
+  readonly unit: CanonicalUnit;
+  readonly quarantinePath: string;
+}
+
+interface QuarantineResult {
+  readonly entries?: readonly QuarantinedUnit[];
+  readonly restored: boolean;
+}
+
+interface RemovalResult {
+  readonly removed: boolean;
+  readonly restored: boolean;
+}
+
+interface RollbackResult {
+  readonly rolledBack: boolean;
+  readonly reason?: "disable_failed" | "remove_failed" | "reload_failed";
+}
+
+interface BoundedOutput {
+  readonly content: Buffer;
+  readonly bytes: number;
+  readonly truncated: boolean;
+}
 
 const defaultTemplateDirectory = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../../systemd",
 );
-
-const defaultCommandRunner: CommandRunner = Object.freeze({
-  run: async (request: CommandRunRequest) =>
-    new Promise<CommandRunResult>((resolveResult) => {
-      const child = spawn(request.executable, request.arguments, {
-        env: request.environment,
-        stdio: "ignore",
-      });
-      let settled = false;
-      const settle = (result: CommandRunResult): void => {
-        if (settled) return;
-        settled = true;
-        resolveResult(result);
-      };
-      child.once("error", () => {
-        settle({ exitCode: null });
-      });
-      child.once("close", (exitCode) => {
-        settle({ exitCode });
-      });
-    }),
-});
+const defaultRuntimePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const defaultDeadlineMs = 10_000;
+const defaultOutputLimit = 8_192;
+const defaultTerminateGraceMs = 500;
+const maximumDeadlineMs = 60_000;
+const maximumOutputLimit = 1_048_576;
+const maximumTerminateGraceMs = 5_000;
 
 function isErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function codeFromError(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+function spawnErrorResult(
+  error: unknown,
+  stdout: string,
+  stderr: string,
+  stdoutTruncated: boolean,
+  stderrTruncated: boolean,
+): CommandRunResult {
+  const spawnErrorCode = codeFromError(error);
+  if (spawnErrorCode === undefined) {
+    return {
+      classification: "spawn_error",
+      exitCode: null,
+      stdout,
+      stderr,
+      stdoutTruncated,
+      stderrTruncated,
+    };
+  }
+  return {
+    classification: "spawn_error",
+    exitCode: null,
+    stdout,
+    stderr,
+    stdoutTruncated,
+    stderrTruncated,
+    spawnErrorCode,
+  };
 }
 
 function outcome(
@@ -116,15 +203,231 @@ function outcome(
   return { state, message: JSON.stringify(payload) };
 }
 
+function successful(result: CommandRunResult): boolean {
+  return result.classification === "exited" && result.exitCode === 0;
+}
+
+function commandSummary(result: CommandRunResult): Readonly<Record<string, unknown>> {
+  return {
+    classification: result.classification,
+    exitCode: result.exitCode,
+    ...(result.signal === undefined ? {} : { signal: result.signal }),
+    ...(result.spawnErrorCode === undefined ? {} : { spawnErrorCode: result.spawnErrorCode }),
+    stdoutTruncated: result.stdoutTruncated,
+    stderrTruncated: result.stderrTruncated,
+  };
+}
+
+function systemdStateOutput(result: CommandRunResult): string | undefined {
+  return result.stdoutTruncated ? undefined : result.stdout.trim();
+}
+
+function enabledState(result: CommandRunResult): "enabled" | "disabled" | "unknown" {
+  const state = systemdStateOutput(result);
+  if (
+    result.exitCode === 0 &&
+    (state === "enabled" ||
+      state === "enabled-runtime" ||
+      state === "linked" ||
+      state === "linked-runtime" ||
+      state === "alias")
+  ) {
+    return "enabled";
+  }
+  return result.exitCode === 1 && state === "disabled" ? "disabled" : "unknown";
+}
+
+function activityState(
+  active: CommandRunResult,
+  failed: CommandRunResult,
+): "active" | "failed" | "inactive" | "unknown" {
+  const activeOutput = systemdStateOutput(active);
+  const failedOutput = systemdStateOutput(failed);
+  if (failed.exitCode === 0 && failedOutput === "failed") return "failed";
+  if (active.exitCode === 0 && activeOutput === "active") return "active";
+  return active.exitCode === 3 &&
+    activeOutput === "inactive" &&
+    failed.exitCode === 1 &&
+    failedOutput === "inactive"
+    ? "inactive"
+    : "unknown";
+}
+
+function appendBoundedOutput(
+  output: BoundedOutput,
+  chunk: Buffer,
+  maxOutputBytes: number,
+): BoundedOutput {
+  const remaining = Math.max(0, maxOutputBytes - output.bytes);
+  const included = chunk.subarray(0, remaining);
+  return {
+    content: Buffer.concat([output.content, included]),
+    bytes: output.bytes + included.byteLength,
+    truncated: output.truncated || chunk.byteLength > remaining,
+  };
+}
+
+function boundedOutputText(output: BoundedOutput): string {
+  let text = output.content.toString("utf8");
+  while (Buffer.byteLength(text, "utf8") > output.bytes) {
+    text = Array.from(text).slice(0, -1).join("");
+  }
+  return text;
+}
+
+export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): CommandRunner {
+  const deadlineMs = options.deadlineMs ?? defaultDeadlineMs;
+  const maxOutputBytes = options.maxOutputBytes ?? defaultOutputLimit;
+  const terminateGraceMs = options.terminateGraceMs ?? defaultTerminateGraceMs;
+  if (
+    !Number.isSafeInteger(deadlineMs) ||
+    deadlineMs <= 0 ||
+    deadlineMs > maximumDeadlineMs ||
+    !Number.isSafeInteger(maxOutputBytes) ||
+    maxOutputBytes < 0 ||
+    maxOutputBytes > maximumOutputLimit ||
+    !Number.isSafeInteger(terminateGraceMs) ||
+    terminateGraceMs < 0 ||
+    terminateGraceMs > maximumTerminateGraceMs
+  ) {
+    throw new Error("Invalid command runner limits.");
+  }
+
+  return Object.freeze({
+    run: async (request: CommandRunRequest) =>
+      new Promise<CommandRunResult>((resolveResult) => {
+        let child;
+        try {
+          child = spawn(request.executable, request.arguments, {
+            env: request.environment,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
+        } catch (error) {
+          resolveResult(spawnErrorResult(error, "", "", false, false));
+          return;
+        }
+
+        let stdout: BoundedOutput = { content: Buffer.alloc(0), bytes: 0, truncated: false };
+        let stderr: BoundedOutput = { content: Buffer.alloc(0), bytes: 0, truncated: false };
+        let settled = false;
+        let timedOut = false;
+        let terminateTimer: NodeJS.Timeout | undefined;
+        const settle = (result: CommandRunResult): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(deadlineTimer);
+          if (terminateTimer !== undefined) clearTimeout(terminateTimer);
+          resolveResult(result);
+        };
+        const deadlineTimer = setTimeout(() => {
+          timedOut = true;
+          try {
+            child.kill("SIGTERM");
+          } catch {
+            // The close/error handler classifies the process result.
+          }
+          terminateTimer = setTimeout(() => {
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // The forced timeout result below is authoritative.
+            }
+            settle({
+              classification: "timeout",
+              exitCode: child.exitCode,
+              stdout: boundedOutputText(stdout),
+              stderr: boundedOutputText(stderr),
+              stdoutTruncated: stdout.truncated,
+              stderrTruncated: stderr.truncated,
+              ...(child.signalCode === null ? {} : { signal: child.signalCode }),
+            });
+          }, terminateGraceMs);
+        }, deadlineMs);
+
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdout = appendBoundedOutput(stdout, chunk, maxOutputBytes);
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+          stderr = appendBoundedOutput(stderr, chunk, maxOutputBytes);
+        });
+        child.once("error", (error) => {
+          settle(
+            spawnErrorResult(
+              error,
+              boundedOutputText(stdout),
+              boundedOutputText(stderr),
+              stdout.truncated,
+              stderr.truncated,
+            ),
+          );
+        });
+        child.once("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
+          const base = {
+            exitCode,
+            stdout: boundedOutputText(stdout),
+            stderr: boundedOutputText(stderr),
+            stdoutTruncated: stdout.truncated,
+            stderrTruncated: stderr.truncated,
+            ...(signal === null ? {} : { signal }),
+          };
+          if (timedOut) {
+            settle({ classification: "timeout", ...base });
+          } else if (signal !== null) {
+            settle({ classification: "signal", ...base });
+          } else {
+            settle({ classification: "exited", ...base });
+          }
+        });
+      }),
+  });
+}
+
+const defaultCommandRunner = createBoundedCommandRunner();
+
+function assertSafeEnvironmentValue(name: string, value: string): void {
+  if (/[\u0000\r\n]/u.test(value)) {
+    throw new Error(`${name} contains an unsafe control character.`);
+  }
+}
+
+export function buildRuntimeEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const home = source["HOME"] ?? homedir();
+  const xdgConfigHome = source["XDG_CONFIG_HOME"] ?? join(home, ".config");
+  const environment: NodeJS.ProcessEnv = {
+    PATH: source["PATH"] ?? defaultRuntimePath,
+    HOME: home,
+    XDG_CONFIG_HOME: xdgConfigHome,
+  };
+  for (const name of ["XDG_RUNTIME_DIR", "AGENT_TEAM_HOME"] as const) {
+    const value = source[name];
+    if (value !== undefined) environment[name] = value;
+  }
+  for (const name of runtimeEnvironmentNames) {
+    const value = environment[name];
+    if (value !== undefined) assertSafeEnvironmentValue(name, value);
+  }
+  if (!isAbsolute(environment["HOME"] ?? "") || !isAbsolute(environment["XDG_CONFIG_HOME"] ?? "")) {
+    throw new Error("HOME and XDG_CONFIG_HOME must be absolute paths.");
+  }
+  for (const name of ["XDG_RUNTIME_DIR", "AGENT_TEAM_HOME"] as const) {
+    const value = environment[name];
+    if (value !== undefined && !isAbsolute(value)) {
+      throw new Error(`${name} must be an absolute path when set.`);
+    }
+  }
+  return Object.freeze(environment);
+}
+
 function quoteSystemdArgument(value: string): string {
   if (value.length === 0 || /[\u0000\r\n]/u.test(value)) {
     throw new Error("Systemd command contains an unsafe argument.");
   }
-  return `"${value
+  const escaped = value
     .replaceAll("\\", "\\\\")
     .replaceAll('"', '\\"')
-    .replaceAll("$", "$$")
-    .replaceAll("%", "%%")}"`;
+    .replace(/\$/gu, () => "$$")
+    .replace(/%/gu, () => "%%");
+  return `"${escaped}"`;
 }
 
 function renderExecStart(runtimeCommand: RuntimeCommand): string {
@@ -140,10 +443,15 @@ function renderExecStart(runtimeCommand: RuntimeCommand): string {
   return [runtimeCommand.executable, ...arguments_].map(quoteSystemdArgument).join(" ");
 }
 
-function renderAgentTeamHome(runtimeCommand: RuntimeCommand): string {
-  const agentTeamHome = runtimeCommand.environment["AGENT_TEAM_HOME"];
-  if (agentTeamHome === undefined) return "";
-  return `Environment=${quoteSystemdArgument(`AGENT_TEAM_HOME=${agentTeamHome}`)}\n`;
+function renderRuntimeEnvironment(environment: NodeJS.ProcessEnv): string {
+  return runtimeEnvironmentNames
+    .flatMap((name) => {
+      const value = environment[name];
+      return value === undefined
+        ? []
+        : [`Environment=${quoteSystemdArgument(`${name}=${value}`)}\n`];
+    })
+    .join("");
 }
 
 function renderTemplate(template: string, replacements: Readonly<Record<string, string>>): string {
@@ -152,7 +460,7 @@ function renderTemplate(template: string, replacements: Readonly<Record<string, 
     if (!rendered.includes(placeholder)) {
       throw new Error(`Systemd template is missing ${placeholder}.`);
     }
-    rendered = rendered.replaceAll(placeholder, value);
+    rendered = rendered.replaceAll(placeholder, () => value);
   }
   if (/\{\{[A-Z_]+\}\}/u.test(rendered)) {
     throw new Error("Systemd template contains an unresolved placeholder.");
@@ -160,8 +468,76 @@ function renderTemplate(template: string, replacements: Readonly<Record<string, 
   return rendered;
 }
 
-function hasStrictOwnershipMarker(content: string, marker: string): boolean {
-  return content.startsWith(`${marker}\n`);
+function fileIdentity(entry: Stats): FileIdentity {
+  return { dev: entry.dev, ino: entry.ino, nlink: entry.nlink };
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+}
+
+function isSafeRegularFile(entry: Stats): boolean {
+  return entry.isFile() && !entry.isSymbolicLink() && entry.nlink === 1;
+}
+
+function directoryIdentity(path: string, entry: Stats): DirectoryIdentity {
+  return { path, dev: entry.dev, ino: entry.ino };
+}
+
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.path === right.path && left.dev === right.dev && left.ino === right.ino;
+}
+
+function pathComponents(path: string): readonly string[] {
+  const parsed = parse(path);
+  const pathFromRoot = relative(parsed.root, path);
+  return pathFromRoot.length === 0 ? [] : pathFromRoot.split(sep).filter((part) => part.length > 0);
+}
+
+async function lstatOrMissing(path: string): Promise<Stats | undefined> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (isErrorWithCode(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+async function ensureSafeDirectory(
+  path: string,
+  create: boolean,
+): Promise<DirectoryIdentity | undefined> {
+  if (!isAbsolute(path)) throw new Error("Systemd unit directory must be absolute.");
+  const parsed = parse(path);
+  let current = parsed.root;
+  for (const component of pathComponents(path)) {
+    current = join(current, component);
+    let entry = await lstatOrMissing(current);
+    if (entry === undefined) {
+      if (!create) return undefined;
+      try {
+        await mkdir(current, { mode: 0o700 });
+      } catch (error) {
+        if (!isErrorWithCode(error, "EEXIST")) throw error;
+      }
+      entry = await lstatOrMissing(current);
+    }
+    if (entry === undefined || !entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error("Systemd unit directory contains a symlink or non-directory.");
+    }
+  }
+  const finalEntry = await lstat(path);
+  if (!finalEntry.isDirectory() || finalEntry.isSymbolicLink()) {
+    throw new Error("Systemd unit directory is unsafe.");
+  }
+  return directoryIdentity(path, finalEntry);
+}
+
+async function assertStableDirectory(identity: DirectoryIdentity): Promise<void> {
+  const current = await ensureSafeDirectory(identity.path, false);
+  if (current === undefined || !sameDirectoryIdentity(identity, current)) {
+    throw new Error("Systemd unit directory changed during operation.");
+  }
 }
 
 async function closeQuietly(handle: FileHandle | undefined): Promise<void> {
@@ -169,7 +545,7 @@ async function closeQuietly(handle: FileHandle | undefined): Promise<void> {
   try {
     await handle.close();
   } catch {
-    // The caller's primary failure is more useful than a cleanup failure.
+    // The primary filesystem failure remains authoritative.
   }
 }
 
@@ -177,7 +553,7 @@ async function unlinkQuietly(path: string): Promise<void> {
   try {
     await unlink(path);
   } catch {
-    // A missing temporary file does not affect the authoritative unit file.
+    // Temporary and quarantine cleanup is best effort only.
   }
 }
 
@@ -190,31 +566,46 @@ async function syncDirectory(directory: string): Promise<void> {
   }
 }
 
-async function inspectUnit(path: string, marker: string): Promise<UnitInspection> {
-  try {
-    const entry = await lstat(path);
-    if (!entry.isFile() || entry.isSymbolicLink()) return { ownership: "foreign" };
-    const content = await readFile(path, "utf8");
-    return hasStrictOwnershipMarker(content, marker)
-      ? { ownership: "owned", content }
-      : { ownership: "foreign" };
-  } catch (error) {
-    if (isErrorWithCode(error, "ENOENT")) return { ownership: "missing" };
-    throw error;
+async function observeUnit(
+  path: string,
+  expected: Buffer,
+  directory: DirectoryIdentity,
+): Promise<UnitObservation> {
+  await assertStableDirectory(directory);
+  const before = await lstatOrMissing(path);
+  if (before === undefined) return { kind: "missing" };
+  if (!isSafeRegularFile(before) || before.dev !== directory.dev) return { kind: "untrusted" };
+  const bytes = await readFile(path);
+  const after = await lstatOrMissing(path);
+  await assertStableDirectory(directory);
+  if (
+    after === undefined ||
+    !isSafeRegularFile(after) ||
+    !sameFileIdentity(fileIdentity(before), fileIdentity(after)) ||
+    !bytes.equals(expected)
+  ) {
+    return { kind: "untrusted" };
   }
+  return {
+    kind: "canonical",
+    unit: { path, expected, identity: fileIdentity(after) },
+  };
 }
 
-async function writeNewUnit(path: string, content: string): Promise<"written" | "exists"> {
-  const directory = dirname(path);
+async function writeNewCanonicalUnit(
+  path: string,
+  expected: Buffer,
+  directory: DirectoryIdentity,
+): Promise<"exists" | CanonicalUnit> {
+  await assertStableDirectory(directory);
   const temporaryPath = join(
-    directory,
-    `.${basename(path)}.${randomUUID().replaceAll("-", "")}.tmp`,
+    directory.path,
+    `.${basename(path)}.agent-team-write-${randomUUID().replaceAll("-", "")}.tmp`,
   );
   let handle: FileHandle | undefined;
   try {
-    await mkdir(directory, { recursive: true, mode: 0o755 });
     handle = await open(temporaryPath, "wx", 0o644);
-    await handle.writeFile(content, "utf8");
+    await handle.writeFile(expected);
     await handle.chmod(0o644);
     await handle.sync();
     await handle.close();
@@ -225,21 +616,159 @@ async function writeNewUnit(path: string, content: string): Promise<"written" | 
       if (isErrorWithCode(error, "EEXIST")) return "exists";
       throw error;
     }
-    await syncDirectory(directory);
-    return "written";
   } finally {
     await closeQuietly(handle);
     await unlinkQuietly(temporaryPath);
   }
+  await syncDirectory(directory.path);
+  const observation = await observeUnit(path, expected, directory);
+  if (observation.kind !== "canonical" || observation.unit === undefined) {
+    throw new Error("Systemd unit changed while being written.");
+  }
+  return observation.unit;
+}
+
+async function restoreCanonicalUnit(
+  unit: CanonicalUnit,
+  directory: DirectoryIdentity,
+): Promise<boolean> {
+  const existing = await observeUnit(unit.path, unit.expected, directory);
+  if (existing.kind === "canonical") return true;
+  if (existing.kind !== "missing") return false;
+  const written = await writeNewCanonicalUnit(unit.path, unit.expected, directory);
+  return written !== "exists";
+}
+
+async function restoreQuarantinedUnit(
+  quarantined: QuarantinedUnit,
+  directory: DirectoryIdentity,
+): Promise<boolean> {
+  const source = await observeUnit(
+    quarantined.quarantinePath,
+    quarantined.unit.expected,
+    directory,
+  );
+  if (
+    source.kind !== "canonical" ||
+    source.unit === undefined ||
+    !sameFileIdentity(source.unit.identity, quarantined.unit.identity)
+  ) {
+    return false;
+  }
+  const target = await observeUnit(quarantined.unit.path, quarantined.unit.expected, directory);
+  if (target.kind !== "missing") return false;
+  try {
+    await rename(quarantined.quarantinePath, quarantined.unit.path);
+  } catch {
+    return false;
+  }
+  const restored = await observeUnit(quarantined.unit.path, quarantined.unit.expected, directory);
+  return (
+    restored.kind === "canonical" &&
+    restored.unit !== undefined &&
+    sameFileIdentity(restored.unit.identity, quarantined.unit.identity)
+  );
+}
+
+async function restoreTransaction(
+  removed: readonly CanonicalUnit[],
+  quarantined: readonly QuarantinedUnit[],
+  directory: DirectoryIdentity,
+): Promise<boolean> {
+  let restored = true;
+  for (const unit of removed) {
+    restored = (await restoreCanonicalUnit(unit, directory)) && restored;
+  }
+  for (const unit of quarantined) {
+    restored = (await restoreQuarantinedUnit(unit, directory)) && restored;
+  }
+  return restored;
+}
+
+async function quarantineUnits(
+  units: readonly CanonicalUnit[],
+  directory: DirectoryIdentity,
+): Promise<QuarantineResult> {
+  await assertStableDirectory(directory);
+  const quarantined: QuarantinedUnit[] = [];
+  try {
+    for (const unit of units) {
+      const current = await observeUnit(unit.path, unit.expected, directory);
+      if (
+        current.kind !== "canonical" ||
+        current.unit === undefined ||
+        !sameFileIdentity(current.unit.identity, unit.identity)
+      ) {
+        throw new Error("Systemd unit changed before quarantine.");
+      }
+      const quarantinePath = join(
+        directory.path,
+        `.${basename(unit.path)}.agent-team-quarantine-${randomUUID().replaceAll("-", "")}`,
+      );
+      if ((await lstatOrMissing(quarantinePath)) !== undefined) {
+        throw new Error("Systemd quarantine path already exists.");
+      }
+      await rename(unit.path, quarantinePath);
+      quarantined.push({ unit, quarantinePath });
+    }
+    await syncDirectory(directory.path);
+    for (const entry of quarantined) {
+      const moved = await observeUnit(entry.quarantinePath, entry.unit.expected, directory);
+      if (
+        moved.kind !== "canonical" ||
+        moved.unit === undefined ||
+        !sameFileIdentity(moved.unit.identity, entry.unit.identity)
+      ) {
+        throw new Error("Systemd quarantined unit did not retain canonical identity.");
+      }
+    }
+    return { entries: Object.freeze(quarantined), restored: false };
+  } catch {
+    return { restored: await restoreTransaction([], quarantined, directory) };
+  }
+}
+
+async function removeCanonicalUnits(
+  units: readonly CanonicalUnit[],
+  directory: DirectoryIdentity,
+): Promise<RemovalResult> {
+  const quarantine = await quarantineUnits(units, directory);
+  if (quarantine.entries === undefined) {
+    return { removed: false, restored: quarantine.restored };
+  }
+  const quarantined = quarantine.entries;
+  const removed: CanonicalUnit[] = [];
+  try {
+    for (const entry of quarantined) {
+      const current = await observeUnit(entry.quarantinePath, entry.unit.expected, directory);
+      if (
+        current.kind !== "canonical" ||
+        current.unit === undefined ||
+        !sameFileIdentity(current.unit.identity, entry.unit.identity)
+      ) {
+        throw new Error("Systemd quarantine changed before removal.");
+      }
+      await unlink(entry.quarantinePath);
+      removed.push(entry.unit);
+    }
+    await syncDirectory(directory.path);
+    return { removed: true, restored: false };
+  } catch {
+    return {
+      removed: false,
+      restored: await restoreTransaction(
+        removed,
+        quarantined.filter((entry) => !removed.some((unit) => unit.path === entry.unit.path)),
+        directory,
+      ),
+    };
+  }
 }
 
 export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv): string {
-  const xdgConfigHome = environment["XDG_CONFIG_HOME"];
-  const configHome =
-    xdgConfigHome === undefined || xdgConfigHome.length === 0
-      ? join(environment["HOME"] ?? homedir(), ".config")
-      : xdgConfigHome;
-  if (!isAbsolute(configHome)) {
+  const runtimeEnvironment = buildRuntimeEnvironment(environment);
+  const configHome = runtimeEnvironment["XDG_CONFIG_HOME"];
+  if (configHome === undefined || !isAbsolute(configHome)) {
     throw new Error("XDG_CONFIG_HOME must be an absolute path.");
   }
   return join(configHome, "systemd", "user");
@@ -247,11 +776,17 @@ export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv):
 
 export class SystemdManager {
   readonly #runtimeCommand: RuntimeCommand;
+  readonly #runtimeEnvironment: NodeJS.ProcessEnv;
   readonly #commandRunner: CommandRunner;
   readonly #templateDirectory: string;
 
   constructor(options: SystemdManagerOptions) {
-    this.#runtimeCommand = options.runtimeCommand;
+    this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
+    this.#runtimeCommand = Object.freeze({
+      executable: options.runtimeCommand.executable,
+      arguments: Object.freeze([...options.runtimeCommand.arguments]),
+      environment: this.#runtimeEnvironment,
+    });
     this.#commandRunner = options.commandRunner ?? defaultCommandRunner;
     this.#templateDirectory = options.templateDirectory ?? defaultTemplateDirectory;
   }
@@ -261,9 +796,9 @@ export class SystemdManager {
       readFile(join(this.#templateDirectory, systemdUnitNames.service), "utf8"),
       readFile(join(this.#templateDirectory, systemdUnitNames.timer), "utf8"),
     ]);
-    const unitDirectory = resolveSystemdUserUnitDirectory(this.#runtimeCommand.environment);
+    const unitDirectory = resolveSystemdUserUnitDirectory(this.#runtimeEnvironment);
     const service = renderTemplate(serviceTemplate, {
-      "{{AGENT_TEAM_HOME_ENVIRONMENT}}": renderAgentTeamHome(this.#runtimeCommand),
+      "{{RUNTIME_ENVIRONMENT}}": renderRuntimeEnvironment(this.#runtimeEnvironment),
       "{{EXEC_START}}": renderExecStart(this.#runtimeCommand),
     });
     const timer = renderTemplate(timerTemplate, {});
@@ -277,6 +812,7 @@ export class SystemdManager {
         this.#runtimeCommand.executable,
         ...this.#runtimeCommand.arguments,
       ]),
+      runtimeEnvironment: this.#runtimeEnvironment,
     });
   }
 
@@ -298,42 +834,49 @@ export class SystemdManager {
     }
   }
 
-  async #inspect(
+  async #directory(
     preview: RenderedSystemdUnits,
-  ): Promise<Readonly<{ service: UnitInspection; timer: UnitInspection }>> {
+    create: boolean,
+  ): Promise<DirectoryIdentity | undefined> {
+    return ensureSafeDirectory(preview.unitDirectory, create);
+  }
+
+  async #observePair(
+    preview: RenderedSystemdUnits,
+    directory: DirectoryIdentity | undefined,
+  ): Promise<UnitPair<UnitObservation>> {
+    if (directory === undefined) {
+      return Object.freeze({
+        service: { kind: "missing" as const },
+        timer: { kind: "missing" as const },
+      });
+    }
     const [service, timer] = await Promise.all([
-      inspectUnit(preview.servicePath, systemdOwnershipMarkers.service),
-      inspectUnit(preview.timerPath, systemdOwnershipMarkers.timer),
+      observeUnit(preview.servicePath, Buffer.from(preview.service, "utf8"), directory),
+      observeUnit(preview.timerPath, Buffer.from(preview.timer, "utf8"), directory),
     ]);
     return Object.freeze({ service, timer });
   }
 
-  #installationState(
-    inspection: Readonly<{ service: UnitInspection; timer: UnitInspection }>,
-    preview: RenderedSystemdUnits,
-  ): InstallationState {
-    const ownership = [inspection.service.ownership, inspection.timer.ownership];
-    if (ownership.every((value) => value === "missing")) return "not_installed";
-    if (ownership.includes("foreign")) return "foreign_units";
-    if (ownership.includes("missing")) return "partial_installation";
-    if (
-      inspection.service.content !== preview.service ||
-      inspection.timer.content !== preview.timer
-    ) {
-      return "managed_drifted";
-    }
-    return "installed";
+  #installationState(observed: UnitPair<UnitObservation>): InstallationState {
+    const values = [observed.service.kind, observed.timer.kind];
+    if (values.every((value) => value === "missing")) return "not_installed";
+    if (values.every((value) => value === "canonical")) return "installed";
+    return "untrusted_units";
   }
 
-  async #run(request: CommandRunRequest): Promise<CommandRunResult> {
-    return this.#commandRunner.run(request);
+  #unitSummary(observed: UnitPair<UnitObservation>): Readonly<Record<string, UnitObservationKind>> {
+    return { service: observed.service.kind, timer: observed.timer.kind };
+  }
+
+  async #run(request: Omit<CommandRunRequest, "environment">): Promise<CommandRunResult> {
+    return this.#commandRunner.run({ ...request, environment: this.#runtimeEnvironment });
   }
 
   async #runPreflight(): Promise<CommandRunResult> {
     return this.#run({
       executable: this.#runtimeCommand.executable,
       arguments: this.#runtimeCommand.arguments,
-      environment: this.#runtimeCommand.environment,
     });
   }
 
@@ -349,78 +892,49 @@ export class SystemdManager {
       return await this.#run({
         executable: "systemd-analyze",
         arguments: ["verify", servicePath, timerPath],
-        environment: this.#runtimeCommand.environment,
       });
     } finally {
       await rm(validationRoot, { recursive: true, force: true });
     }
   }
 
+  async #systemctl(arguments_: readonly string[]): Promise<CommandRunResult> {
+    return this.#run({ executable: "systemctl", arguments: ["--user", ...arguments_] });
+  }
+
   async #reloadUserManager(): Promise<CommandRunResult> {
-    return this.#run({
-      executable: "systemctl",
-      arguments: ["--user", "daemon-reload"],
-      environment: this.#runtimeCommand.environment,
-    });
-  }
-
-  async #enableTimer(): Promise<CommandRunResult> {
-    return this.#run({
-      executable: "systemctl",
-      arguments: ["--user", "enable", "--now", systemdUnitNames.timer],
-      environment: this.#runtimeCommand.environment,
-    });
-  }
-
-  async #disableTimer(): Promise<void> {
-    await this.#run({
-      executable: "systemctl",
-      arguments: ["--user", "disable", "--now", systemdUnitNames.timer],
-      environment: this.#runtimeCommand.environment,
-    });
-  }
-
-  async #removeCreatedUnits(
-    createdPaths: readonly string[],
-    preview: RenderedSystemdUnits,
-  ): Promise<void> {
-    const expected = new Map([
-      [preview.servicePath, preview.service],
-      [preview.timerPath, preview.timer],
-    ]);
-    for (const path of createdPaths) {
-      const marker =
-        path === preview.servicePath
-          ? systemdOwnershipMarkers.service
-          : systemdOwnershipMarkers.timer;
-      const inspection = await inspectUnit(path, marker);
-      if (inspection.ownership === "owned" && inspection.content === expected.get(path)) {
-        await unlinkQuietly(path);
-      }
-    }
-    if (createdPaths.length > 0) {
-      await this.#reloadUserManager();
-    }
+    return this.#systemctl(["daemon-reload"]);
   }
 
   async #rollbackInstall(
-    createdPaths: readonly string[],
-    preview: RenderedSystemdUnits,
-  ): Promise<void> {
-    if (createdPaths.includes(preview.timerPath)) {
-      await this.#disableTimer();
+    created: readonly CanonicalUnit[],
+    directory: DirectoryIdentity,
+    requiresDisable: boolean,
+  ): Promise<RollbackResult> {
+    if (requiresDisable) {
+      const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+      if (!successful(disable)) return { rolledBack: false, reason: "disable_failed" };
     }
-    await this.#removeCreatedUnits(createdPaths, preview);
+    if (created.length === 0) return { rolledBack: true };
+    const removed = await removeCanonicalUnits(created, directory);
+    if (!removed.removed) return { rolledBack: false, reason: "remove_failed" };
+    const reload = await this.#reloadUserManager();
+    if (successful(reload)) return { rolledBack: true };
+    const restored = await restoreTransaction(created, [], directory);
+    if (restored) await this.#reloadUserManager();
+    return { rolledBack: false, reason: "reload_failed" };
   }
 
   async #install(dryRun: boolean): Promise<CliCommandOutcome> {
     const preview = await this.preview();
+    await this.#directory(preview, false);
     if (dryRun) {
       return outcome("success", {
         operation: "install",
         dryRun: true,
         unitDirectory: preview.unitDirectory,
         runtimeCommand: preview.runtimeCommand,
+        runtimeEnvironment: preview.runtimeEnvironment,
         service: preview.service,
         timer: preview.timer,
         nextSteps: ["preflight", "systemd-analyze verify", "safe_write", "daemon-reload", "enable"],
@@ -428,81 +942,88 @@ export class SystemdManager {
     }
 
     const preflight = await this.#runPreflight();
-    if (preflight.exitCode !== 0) {
+    if (!successful(preflight)) {
       return outcome("blocked", {
         operation: "install",
         state: "runtime_unavailable",
-        preflightExitCode: preflight.exitCode,
+        preflight: commandSummary(preflight),
       });
     }
 
-    const inspection = await this.#inspect(preview);
-    const installationState = this.#installationState(inspection, preview);
-    if (installationState === "foreign_units" || installationState === "partial_installation") {
-      return outcome("blocked", {
-        operation: "install",
-        state: installationState,
-        unitDirectory: preview.unitDirectory,
-      });
+    const directory = await this.#directory(preview, true);
+    if (directory === undefined) {
+      return outcome("failed", { operation: "install", state: "unit_directory_unavailable" });
     }
-    if (installationState === "managed_drifted") {
+    const observed = await this.#observePair(preview, directory);
+    const installationState = this.#installationState(observed);
+    if (installationState === "untrusted_units") {
       return outcome("blocked", {
         operation: "install",
-        state: "managed_drifted",
-        hint: "Run --dry-run, inspect the managed units, then resolve the drift manually.",
+        state: "untrusted_units",
+        units: this.#unitSummary(observed),
       });
     }
 
     const verification = await this.#verify(preview);
-    if (verification.exitCode !== 0) {
+    if (!successful(verification)) {
       return outcome("blocked", {
         operation: "install",
         state: "unit_verification_failed",
-        verificationExitCode: verification.exitCode,
+        verification: commandSummary(verification),
       });
     }
 
-    const createdPaths: string[] = [];
+    const created: CanonicalUnit[] = [];
     try {
       if (installationState === "not_installed") {
-        const serviceWrite = await writeNewUnit(preview.servicePath, preview.service);
-        if (serviceWrite === "exists") {
+        const service = await writeNewCanonicalUnit(
+          preview.servicePath,
+          Buffer.from(preview.service, "utf8"),
+          directory,
+        );
+        if (service === "exists") {
           return outcome("blocked", {
             operation: "install",
             state: "unit_write_conflict",
             unit: systemdUnitNames.service,
           });
         }
-        createdPaths.push(preview.servicePath);
-
-        const timerWrite = await writeNewUnit(preview.timerPath, preview.timer);
-        if (timerWrite === "exists") {
-          await this.#rollbackInstall(createdPaths, preview);
+        created.push(service);
+        const timer = await writeNewCanonicalUnit(
+          preview.timerPath,
+          Buffer.from(preview.timer, "utf8"),
+          directory,
+        );
+        if (timer === "exists") {
+          const rollback = await this.#rollbackInstall(created, directory, false);
           return outcome("blocked", {
             operation: "install",
-            state: "unit_write_conflict",
+            state: rollback.rolledBack ? "unit_write_conflict" : "rollback_failed",
             unit: systemdUnitNames.timer,
+            ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
           });
         }
-        createdPaths.push(preview.timerPath);
+        created.push(timer);
       }
 
       const reload = await this.#reloadUserManager();
-      if (reload.exitCode !== 0) {
-        await this.#rollbackInstall(createdPaths, preview);
+      if (!successful(reload)) {
+        const rollback = await this.#rollbackInstall(created, directory, false);
         return outcome("failed", {
           operation: "install",
-          state: "daemon_reload_failed",
-          systemctlExitCode: reload.exitCode,
+          state: rollback.rolledBack ? "daemon_reload_failed" : "rollback_failed",
+          reload: commandSummary(reload),
+          ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
         });
       }
-      const enable = await this.#enableTimer();
-      if (enable.exitCode !== 0) {
-        await this.#rollbackInstall(createdPaths, preview);
+      const enable = await this.#systemctl(["enable", "--now", systemdUnitNames.timer]);
+      if (!successful(enable)) {
+        const rollback = await this.#rollbackInstall(created, directory, true);
         return outcome("failed", {
           operation: "install",
-          state: "timer_enable_failed",
-          systemctlExitCode: enable.exitCode,
+          state: rollback.rolledBack ? "timer_enable_failed" : "rollback_failed",
+          enable: commandSummary(enable),
+          ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
         });
       }
       return outcome("success", {
@@ -512,98 +1033,146 @@ export class SystemdManager {
         timer: systemdUnitNames.timer,
       });
     } catch {
-      await this.#rollbackInstall(createdPaths, preview);
-      return outcome("failed", { operation: "install", state: "safe_write_failed" });
+      const rollback = await this.#rollbackInstall(created, directory, created.length === 2);
+      return outcome("failed", {
+        operation: "install",
+        state: rollback.rolledBack ? "safe_write_failed" : "rollback_failed",
+        ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
+      });
     }
   }
 
   async #uninstall(dryRun: boolean): Promise<CliCommandOutcome> {
     const preview = await this.preview();
-    const inspection = await this.#inspect(preview);
-    const installationState = this.#installationState(inspection, preview);
+    const directory = await this.#directory(preview, false);
+    const observed = await this.#observePair(preview, directory);
+    const installationState = this.#installationState(observed);
     if (dryRun) {
       return outcome("success", {
         operation: "uninstall",
         dryRun: true,
         state: installationState,
+        units: this.#unitSummary(observed),
         unitDirectory: preview.unitDirectory,
       });
     }
     if (installationState === "not_installed") {
       return outcome("success", { operation: "uninstall", state: "not_installed" });
     }
-    if (inspection.service.ownership !== "owned" || inspection.timer.ownership !== "owned") {
+    if (
+      directory === undefined ||
+      observed.service.kind !== "canonical" ||
+      observed.service.unit === undefined ||
+      observed.timer.kind !== "canonical" ||
+      observed.timer.unit === undefined
+    ) {
       return outcome("blocked", {
         operation: "uninstall",
-        state: "mixed_or_foreign_ownership",
+        state: "untrusted_units",
+        units: this.#unitSummary(observed),
       });
     }
-
-    const disable = await this.#run({
-      executable: "systemctl",
-      arguments: ["--user", "disable", "--now", systemdUnitNames.timer],
-      environment: this.#runtimeCommand.environment,
-    });
-    if (disable.exitCode !== 0) {
+    const original = Object.freeze({ service: observed.service.unit, timer: observed.timer.unit });
+    const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+    if (!successful(disable)) {
       return outcome("failed", {
         operation: "uninstall",
         state: "timer_disable_failed",
-        systemctlExitCode: disable.exitCode,
+        disable: commandSummary(disable),
       });
     }
-    try {
-      await unlink(preview.servicePath);
-      await unlink(preview.timerPath);
-      const reload = await this.#reloadUserManager();
-      if (reload.exitCode !== 0) {
-        return outcome("failed", {
-          operation: "uninstall",
-          state: "daemon_reload_failed",
-          systemctlExitCode: reload.exitCode,
-        });
-      }
-      return outcome("success", { operation: "uninstall", state: "uninstalled" });
-    } catch {
-      return outcome("failed", { operation: "uninstall", state: "unit_remove_failed" });
+
+    const afterDisable = await this.#observePair(preview, directory);
+    if (
+      afterDisable.service.kind !== "canonical" ||
+      afterDisable.service.unit === undefined ||
+      !sameFileIdentity(afterDisable.service.unit.identity, original.service.identity) ||
+      afterDisable.timer.kind !== "canonical" ||
+      afterDisable.timer.unit === undefined ||
+      !sameFileIdentity(afterDisable.timer.unit.identity, original.timer.identity)
+    ) {
+      return outcome("blocked", {
+        operation: "uninstall",
+        state: "unit_changed_after_disable",
+        units: this.#unitSummary(afterDisable),
+      });
     }
+
+    const removal = await removeCanonicalUnits([original.service, original.timer], directory);
+    if (!removal.removed) {
+      return outcome("failed", {
+        operation: "uninstall",
+        state: removal.restored ? "unit_remove_failed_recovered" : "rollback_failed",
+      });
+    }
+    const reload = await this.#reloadUserManager();
+    if (!successful(reload)) {
+      const restored = await restoreTransaction([original.service, original.timer], [], directory);
+      const recoveryReload = restored ? await this.#reloadUserManager() : undefined;
+      const recovered = restored && recoveryReload !== undefined && successful(recoveryReload);
+      return outcome("failed", {
+        operation: "uninstall",
+        state: recovered ? "daemon_reload_failed_recovered" : "rollback_failed",
+        reload: commandSummary(reload),
+      });
+    }
+    return outcome("success", { operation: "uninstall", state: "uninstalled" });
   }
 
   async #status(): Promise<CliCommandOutcome> {
     const preview = await this.preview();
-    const inspection = await this.#inspect(preview);
-    const installationState = this.#installationState(inspection, preview);
+    const directory = await this.#directory(preview, false);
+    const observed = await this.#observePair(preview, directory);
+    const installationState = this.#installationState(observed);
     const preflight = await this.#runPreflight();
-    if (preflight.exitCode !== 0) {
+    if (!successful(preflight)) {
       return outcome("success", {
         operation: "status",
         installation: installationState,
+        units: this.#unitSummary(observed),
         runtime: "runtime_unavailable",
-        preflightExitCode: preflight.exitCode,
+        preflight: commandSummary(preflight),
       });
     }
     if (installationState !== "installed") {
       return outcome("success", {
         operation: "status",
         installation: installationState,
+        units: this.#unitSummary(observed),
         runtime: "available",
         timer: "not_checked",
       });
     }
-    const timerStatus = await this.#run({
-      executable: "systemctl",
-      arguments: ["--user", "is-enabled", systemdUnitNames.timer],
-      environment: this.#runtimeCommand.environment,
-    });
+
+    const [enabled, active, failed] = await Promise.all([
+      this.#systemctl(["is-enabled", systemdUnitNames.timer]),
+      this.#systemctl(["is-active", systemdUnitNames.timer]),
+      this.#systemctl(["is-failed", systemdUnitNames.timer]),
+    ]);
+    const queryError = [enabled, active, failed].some(
+      (result) => result.classification !== "exited",
+    );
+    const timer = queryError
+      ? {
+          state: "query_error",
+          enabled: commandSummary(enabled),
+          active: commandSummary(active),
+          failed: commandSummary(failed),
+        }
+      : {
+          state: "queried",
+          enabled: enabledState(enabled),
+          activity: activityState(active, failed),
+          enabledQuery: commandSummary(enabled),
+          activeQuery: commandSummary(active),
+          failedQuery: commandSummary(failed),
+        };
     return outcome("success", {
       operation: "status",
       installation: installationState,
+      units: this.#unitSummary(observed),
       runtime: "available",
-      timer:
-        timerStatus.exitCode === 0
-          ? "enabled"
-          : timerStatus.exitCode === null
-            ? "systemd_unavailable"
-            : "disabled",
+      timer,
     });
   }
 }
