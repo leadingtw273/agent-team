@@ -1,0 +1,11 @@
+# agent-team-managed: agent-team-reconcile.timer v1
+[Unit]
+Description=Run Agent Team reconcile every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Unit=agent-team-reconcile.service
+
+[Install]
+WantedBy=timers.target
