@@ -23,7 +23,7 @@ export type CliCommandOutcome = Readonly<
 export interface CliHandlers {
   readonly run: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
   readonly ingest: (
-    input: Readonly<{ provider: "github" | "linear" }>,
+    input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly reconcile: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
@@ -118,8 +118,9 @@ export function createProgram(
     .addArgument(
       new Command().createArgument("<provider>", "Webhook provider").choices(["github", "linear"]),
     )
-    .action((provider: "github" | "linear") =>
-      action(state, io, () => handlers.ingest({ provider }))(),
+    .requiredOption("--headers-file <path>", "含原始 HTTP Headers 的 JSON 檔案")
+    .action((provider: "github" | "linear", options: { readonly headersFile: string }) =>
+      action(state, io, () => handlers.ingest({ provider, headersFile: options.headersFile }))(),
     );
 
   program

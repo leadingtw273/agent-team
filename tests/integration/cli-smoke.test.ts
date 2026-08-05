@@ -24,7 +24,7 @@ describe("compiled CLI smoke", () => {
     expect(reconcileHelp.error).toBeUndefined();
     expect(version).toMatchObject({ status: 0, stdout: "0.1.0\n", stderr: "" });
     expect(help.status).toBe(0);
-    expect(help.stdout).toContain("ingest <provider>");
+    expect(help.stdout).toContain("ingest [options] <provider>");
     expect(reconcileHelp.status).toBe(0);
     expect(reconcileHelp.stdout).toContain("--all");
   });

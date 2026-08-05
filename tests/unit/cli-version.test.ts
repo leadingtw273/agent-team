@@ -48,16 +48,16 @@ describe("agent-team CLI contract", () => {
       Local-first agent team controller for Linear and GitHub workflows.
 
       Options:
-        -V, --version         output the version number
-        -h, --help            display help for command
+        -V, --version                output the version number
+        -h, --help                   display help for command
 
       Commands:
-        run [project-id]      執行一次派工與 Controller pipeline
-        ingest <provider>     接收已由外部 HTTPS Runtime 轉交的 Webhook
-        reconcile [options]   對帳本機狀態、事件與權威服務
-        project [project-id]  讀取指定專案或列出專案摘要
-        ui                    啟動按需 localhost 管理介面
-        help [command]        display help for command
+        run [project-id]             執行一次派工與 Controller pipeline
+        ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
+        reconcile [options]          對帳本機狀態、事件與權威服務
+        project [project-id]         讀取指定專案或列出專案摘要
+        ui                           啟動按需 localhost 管理介面
+        help [command]               display help for command
       "
     `);
   });
@@ -75,13 +75,23 @@ describe("agent-team CLI contract", () => {
     const sink = output();
 
     await expect(runCli(metadata, ["run", "project-a"], commands, sink.io)).resolves.toBe(0);
-    await expect(runCli(metadata, ["ingest", "github"], commands, sink.io)).resolves.toBe(0);
+    await expect(
+      runCli(
+        metadata,
+        ["ingest", "github", "--headers-file", "/tmp/headers.json"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
     await expect(runCli(metadata, ["reconcile", "--all"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["ui"], commands, sink.io)).resolves.toBe(0);
 
     expect(commands.run).toHaveBeenCalledWith({ projectId: "project-a" });
-    expect(commands.ingest).toHaveBeenCalledWith({ provider: "github" });
+    expect(commands.ingest).toHaveBeenCalledWith({
+      provider: "github",
+      headersFile: "/tmp/headers.json",
+    });
     expect(commands.reconcile).toHaveBeenCalledWith({ all: true });
     expect(commands.project).toHaveBeenCalledWith({});
     expect(commands.ui).toHaveBeenCalledOnce();
