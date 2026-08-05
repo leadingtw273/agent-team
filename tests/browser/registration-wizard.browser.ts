@@ -5,7 +5,7 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureRegistrationReadOnlyScanUseCase,
   fixtureUiShellReadModel,
@@ -210,7 +210,7 @@ async function startRegistrationShell(
   const application = createUiApplication({
     readModel: fixtureUiShellReadModel,
     features: [
-      createRegistrationWizardUiFeatureRegistration(
+      createFixtureRegistrationWizardUiFeatureRegistration(
         useCase,
         undefined,
         undefined,

@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -13,7 +13,7 @@ let shell: LocalUiServerHandle | undefined;
 test.describe("O004 GitHub registration policy component", () => {
   test.beforeEach(async ({ page }) => {
     const application = createUiApplication({
-      features: [createRegistrationWizardUiFeatureRegistration()],
+      features: [createFixtureRegistrationWizardUiFeatureRegistration()],
     });
     shell = await startLocalUiServer({
       handler: application.handler,

@@ -6,7 +6,7 @@ import axe from "axe-core";
 
 import {
   createFixtureLinearProvisionUseCaseFactory,
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureManualRemoteId,
   fixtureRegistrationReadOnlyScanUseCase,
@@ -112,7 +112,7 @@ test.describe("O003 Linear provision UI", () => {
     const application = createUiApplication({
       readModel: fixtureUiShellReadModel,
       features: [
-        createRegistrationWizardUiFeatureRegistration(
+        createFixtureRegistrationWizardUiFeatureRegistration(
           fixtureRegistrationReadOnlyScanUseCase,
           createFixtureLinearProvisionUseCaseFactory(),
         ),

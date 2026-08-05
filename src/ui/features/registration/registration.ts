@@ -42,6 +42,14 @@ import {
   registrationSetupScriptPath,
 } from "../registration-setup/index.js";
 
+export type RegistrationLinearUseCaseFactory = (
+  context: LinearProvisionConfirmationContext,
+) => LinearProvisionUseCase;
+
+export type RegistrationGitHubUseCaseFactory = (
+  context: LinearProvisionConfirmationContext,
+) => GitHubRegistrationPolicyUseCase;
+
 const registrationWizardCss = readFileSync(
   new URL("../../assets/registration.css", import.meta.url),
   "utf8",
@@ -76,19 +84,11 @@ function assetResponse(request: UiRequest, content: string, contentType: string)
  * preview/provision section into that page without creating another Shell.
  */
 export function createRegistrationWizardUiFeatureRegistration(
-  useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
-  linearUseCaseFactory: (
-    context: LinearProvisionConfirmationContext,
-  ) => LinearProvisionUseCase = createFixtureLinearProvisionUseCaseFactory(),
-  githubUseCaseFactory: (
-    context: LinearProvisionConfirmationContext,
-  ) => GitHubRegistrationPolicyUseCase = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
-  githubTarget: GitHubRegistrationTarget = Object.freeze({
-    projectId: "fixture-agent-team-project",
-    repository: "fixture/registered-project",
-    defaultBranch: "main",
-  }),
-  setupController: RegistrationSetupControllerUseCase = createUnwiredRegistrationSetupController(),
+  useCase: RegistrationReadOnlyScanUseCase,
+  linearUseCaseFactory: RegistrationLinearUseCaseFactory,
+  githubUseCaseFactory: RegistrationGitHubUseCaseFactory,
+  githubTarget: GitHubRegistrationTarget,
+  setupController: RegistrationSetupControllerUseCase,
 ): UiFeatureRegistration {
   const sessionUseCase = (
     trustedContext: UiTrustedRequestContext,
@@ -195,4 +195,25 @@ export function createRegistrationWizardUiFeatureRegistration(
     }),
     routes,
   });
+}
+
+/** Synthetic UI-only assembly; production hosts must use the explicit factory above. */
+export function createFixtureRegistrationWizardUiFeatureRegistration(
+  useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
+  linearUseCaseFactory: RegistrationLinearUseCaseFactory = createFixtureLinearProvisionUseCaseFactory(),
+  githubUseCaseFactory: RegistrationGitHubUseCaseFactory = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+  githubTarget: GitHubRegistrationTarget = Object.freeze({
+    projectId: "fixture-agent-team-project",
+    repository: "fixture/registered-project",
+    defaultBranch: "main",
+  }),
+  setupController: RegistrationSetupControllerUseCase = createUnwiredRegistrationSetupController(),
+): UiFeatureRegistration {
+  return createRegistrationWizardUiFeatureRegistration(
+    useCase,
+    linearUseCaseFactory,
+    githubUseCaseFactory,
+    githubTarget,
+    setupController,
+  );
 }

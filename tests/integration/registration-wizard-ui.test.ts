@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureRegistrationReadOnlyScanUseCase,
   startLocalUiServer,
@@ -11,7 +11,7 @@ import {
 const handles: LocalUiServerHandle[] = [];
 
 async function registrationFixture() {
-  const registration = createRegistrationWizardUiFeatureRegistration(
+  const registration = createFixtureRegistrationWizardUiFeatureRegistration(
     fixtureRegistrationReadOnlyScanUseCase,
   );
   const application = createUiApplication({ features: [registration] });

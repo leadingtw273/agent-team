@@ -12,6 +12,12 @@ import type { GhJsonTransport } from "../../src/adapters/github/adapter.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { projectSchema } from "../../src/domain/project/index.js";
+import {
+  createFixtureGitHubRegistrationPolicyUseCaseFactory,
+  createFixtureLinearProvisionUseCaseFactory,
+  createProductionRegistrationWizardUiComposition,
+  fixtureRegistrationReadOnlyScanUseCase,
+} from "../../src/ui/features/registration/index.js";
 
 const run = promisify(execFile);
 const authorityDigest = "a".repeat(64);
@@ -83,6 +89,20 @@ describe("W3A production Registration Setup composition", () => {
         expect.objectContaining({ code: "production_dependencies_unwired" }),
       ]),
     );
+    const wizard = createProductionRegistrationWizardUiComposition({
+      readOnlyScan: fixtureRegistrationReadOnlyScanUseCase,
+      linearUseCaseFactory: createFixtureLinearProvisionUseCaseFactory(),
+      githubUseCaseFactory: createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+      githubTarget: Object.freeze({
+        projectId: "sandbox-project",
+        repository: "owner/sandbox",
+        defaultBranch: "main",
+      }),
+      setup: { stateRoot: "/tmp/agent-team-state" },
+    });
+    expect(wizard.setupWiring.state).toBe("configuration_incomplete");
+    const html = await wizard.feature.page.render({ session: { authorityDigest } });
+    expect(html).toContain("production_dependencies_unwired");
   });
 
   it("constructs W1 durable state and W2 authoritative read-back behind a non-merge controller", async () => {
@@ -116,6 +136,25 @@ describe("W3A production Registration Setup composition", () => {
     const second = await restarted.controller.confirmPreview(command, { authorityDigest });
     expect(second).toEqual(first);
     expect(first).toMatchObject({ state: "preview_confirmation_issued" });
+    expect(setup.transportCalls).toEqual([]);
+
+    const wizard = createProductionRegistrationWizardUiComposition({
+      readOnlyScan: fixtureRegistrationReadOnlyScanUseCase,
+      linearUseCaseFactory: createFixtureLinearProvisionUseCaseFactory(),
+      githubUseCaseFactory: createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+      githubTarget: Object.freeze({
+        projectId: "sandbox-project",
+        repository: "owner/sandbox",
+        defaultBranch: "main",
+      }),
+      setup: options,
+    });
+    expect(wizard.setupWiring.state).toBe("ready");
+    expect(wizard.feature).toMatchObject({ id: "registration-wizard", slot: "registration" });
+    const html = await wizard.feature.page.render({ session: { authorityDigest } });
+    expect(html).toContain("可信設定 Setup");
+    expect(html).toContain("preview_ready");
+    expect(html).not.toContain("production_dependencies_unwired");
     expect(setup.transportCalls).toEqual([]);
   });
 });

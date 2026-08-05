@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   fixtureRegistrationReadOnlyScanUseCase,
   githubRegistrationPolicyApiPath,
   githubRegistrationPolicyScriptPath,
@@ -25,7 +25,7 @@ function joined(...parts: readonly string[]): string {
 
 describe("O002/O003/O004 registration wizard UI", () => {
   it("keeps every O001 Gate and composes the Linear and GitHub previews in the same Registry feature", async () => {
-    const registration = createRegistrationWizardUiFeatureRegistration(
+    const registration = createFixtureRegistrationWizardUiFeatureRegistration(
       fixtureRegistrationReadOnlyScanUseCase,
     );
     const content = await registration.page.render({
