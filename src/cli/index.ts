@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
+import { createSystemdHandler } from "./systemd/index.js";
 
 const require = createRequire(import.meta.url);
 const metadata = require("../../package.json") as PackageMetadata;
@@ -15,4 +17,5 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
       ? {}
       : { agentTeamHome: process.env["AGENT_TEAM_HOME"] }),
   }),
+  systemd: createSystemdHandler(fileURLToPath(import.meta.url)),
 });

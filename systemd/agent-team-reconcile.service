@@ -1,0 +1,7 @@
+# agent-team-managed: agent-team-reconcile.service v1
+[Unit]
+Description=Agent Team deterministic reconcile
+
+[Service]
+Type=oneshot
+ExecStart={{EXEC_START}}

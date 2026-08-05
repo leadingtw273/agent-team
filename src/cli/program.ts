@@ -1,5 +1,7 @@
 import { Command, CommanderError, Option } from "commander";
 
+import type { SystemdCommandInput } from "./systemd/index.js";
+
 export interface PackageMetadata {
   readonly description: string;
   readonly version: string;
@@ -28,6 +30,7 @@ export interface CliHandlers {
   readonly reconcile: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
   readonly ui: () => Promise<CliCommandOutcome>;
+  readonly systemd: (input: SystemdCommandInput) => Promise<CliCommandOutcome>;
 }
 
 export interface CliIo {
@@ -52,6 +55,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   reconcile: () => blocked("reconcile"),
   project: () => blocked("project"),
   ui: () => blocked("ui"),
+  systemd: () => blocked("systemd"),
 });
 
 const defaultIo: CliIo = Object.freeze({
@@ -141,6 +145,45 @@ export function createProgram(
     .command("ui")
     .description("啟動按需 localhost 管理介面")
     .action(action(state, io, handlers.ui));
+
+  const systemd = program.command("systemd").description("管理 Agent Team 的 systemd user timer");
+  const dryRunOptions = (command: Command): Command =>
+    command
+      .option("--dry-run", "只輸出預覽，不寫入檔案或呼叫 systemd")
+      .option("--preview", "--dry-run 的別名");
+
+  dryRunOptions(
+    systemd
+      .command("install")
+      .description("驗證並安全安裝五分鐘 reconcile timer")
+      .action((options: Readonly<{ dryRun?: boolean; preview?: boolean }>) =>
+        action(state, io, () =>
+          handlers.systemd({
+            action: "install",
+            dryRun: options.dryRun === true || options.preview === true,
+          }),
+        )(),
+      ),
+  );
+
+  dryRunOptions(
+    systemd
+      .command("uninstall")
+      .description("只移除兩個可確認為 Agent Team 所有的 units")
+      .action((options: Readonly<{ dryRun?: boolean; preview?: boolean }>) =>
+        action(state, io, () =>
+          handlers.systemd({
+            action: "uninstall",
+            dryRun: options.dryRun === true || options.preview === true,
+          }),
+        )(),
+      ),
+  );
+
+  systemd
+    .command("status")
+    .description("顯示 unit ownership、timer 與 Runtime preflight 狀態")
+    .action(() => action(state, io, () => handlers.systemd({ action: "status" }))());
 
   return program;
 }

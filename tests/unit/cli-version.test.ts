@@ -37,6 +37,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     project: vi.fn(() => Promise.resolve(outcome)),
     ui: vi.fn(() => Promise.resolve(outcome)),
+    systemd: vi.fn(() => Promise.resolve(outcome)),
   } satisfies CliHandlers;
 }
 
@@ -57,6 +58,7 @@ describe("agent-team CLI contract", () => {
         reconcile [options]          對帳本機狀態、事件與權威服務
         project [project-id]         讀取指定專案或列出專案摘要
         ui                           啟動按需 localhost 管理介面
+        systemd                      管理 Agent Team 的 systemd user timer
         help [command]               display help for command
       "
     `);
@@ -86,6 +88,13 @@ describe("agent-team CLI contract", () => {
     await expect(runCli(metadata, ["reconcile", "--all"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["ui"], commands, sink.io)).resolves.toBe(0);
+    await expect(
+      runCli(metadata, ["systemd", "install", "--preview"], commands, sink.io),
+    ).resolves.toBe(0);
+    await expect(
+      runCli(metadata, ["systemd", "uninstall", "--dry-run"], commands, sink.io),
+    ).resolves.toBe(0);
+    await expect(runCli(metadata, ["systemd", "status"], commands, sink.io)).resolves.toBe(0);
 
     expect(commands.run).toHaveBeenCalledWith({ projectId: "project-a" });
     expect(commands.ingest).toHaveBeenCalledWith({
@@ -95,7 +104,10 @@ describe("agent-team CLI contract", () => {
     expect(commands.reconcile).toHaveBeenCalledWith({ all: true });
     expect(commands.project).toHaveBeenCalledWith({});
     expect(commands.ui).toHaveBeenCalledOnce();
-    expect(sink.stdout()).toBe("完成\n".repeat(5));
+    expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
+    expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
+    expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
+    expect(sink.stdout()).toBe("完成\n".repeat(8));
   });
 
   it.each([
