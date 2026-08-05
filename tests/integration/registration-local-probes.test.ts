@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -125,5 +125,50 @@ describe("O002 concrete local read-only probes", () => {
     expect(repositoryProbe).toMatchObject({ ok: true, value: { state: "unknown" } });
     expect(nodeProbe).toMatchObject({ ok: true, value: { state: "failed" } });
     expect(cliProbe).toMatchObject({ ok: true, value: { state: "unknown" } });
+  });
+
+  it("rejects repository roots that are symlinks or non-directories before invoking Git", async () => {
+    const parent = await temporaryDirectory();
+    const target = join(parent, "target");
+    const linked = join(parent, "linked");
+    const regularFile = join(parent, "repository.txt");
+    await mkdir(target);
+    await symlink(target, linked, "dir");
+    await writeFile(regularFile, "not a directory\n", "utf8");
+    let gitCalls = 0;
+    const gitAdapter = Object.freeze({
+      inspectRepository: () => {
+        gitCalls += 1;
+        return Promise.resolve(
+          ok({ rootPath: target, clean: true, headSha: "unused", branch: "main" }),
+        );
+      },
+    });
+
+    const [symlinkResult, fileResult] = await Promise.all([
+      new LocalRegistrationReadOnlyProbeAdapter({
+        repositoryRoot: linked,
+        git: gitAdapter,
+      }).localRepository.inspect(),
+      new LocalRegistrationReadOnlyProbeAdapter({
+        repositoryRoot: regularFile,
+        git: gitAdapter,
+      }).localRepository.inspect(),
+    ]);
+
+    expect(symlinkResult).toMatchObject({ ok: false, error: { code: "not_found" } });
+    expect(fileResult).toMatchObject({ ok: false, error: { code: "not_found" } });
+    expect(gitCalls).toBe(0);
+  });
+
+  it("rejects Node version text containing a valid version as only a substring", async () => {
+    const adapter = new LocalRegistrationReadOnlyProbeAdapter({
+      nodeVersion: () => "prefix 24.0.0 suffix",
+      requiredNodeMajor: 24,
+    });
+
+    const result = await adapter.nodeRuntime.inspect();
+
+    expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
   });
 });

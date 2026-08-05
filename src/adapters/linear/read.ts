@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import type { ReadOptions } from "../../application/ports/common.js";
 import {
   domainError,
   err,
@@ -224,15 +225,19 @@ export class LinearReadModel {
   async readContext(
     teamId: string,
     projectId: string,
+    options: ReadOptions = {},
   ): Promise<Result<LinearProjectContext, DomainError>> {
     const identityResult = await this.transport.request<
       unknown,
       { teamId: string; projectId: string }
-    >({
-      operationName: "AgentTeamReadIdentity",
-      query: identityQuery,
-      variables: { teamId, projectId },
-    });
+    >(
+      {
+        operationName: "AgentTeamReadIdentity",
+        query: identityQuery,
+        variables: { teamId, projectId },
+      },
+      options,
+    );
     if (!identityResult.ok) return identityResult;
     const identity = parse(identitySchema, identityResult.value);
     if (!identity.ok) return identity;
@@ -241,37 +246,46 @@ export class LinearReadModel {
     if (identity.value.team.id !== teamId || identity.value.project.id !== projectId)
       return failure();
 
-    const projectTeams = await this.transport.paginate<unknown, { readonly id: string }>({
-      operationName: "AgentTeamReadProjectTeams",
-      query: projectTeamsQuery,
-      variables: { projectId },
-      selectConnection: (data) => {
-        const page = projectTeamsPageSchema.parse(data);
-        if (page.project === null) throw new Error("linear_project_not_found");
-        return page.project.teams;
+    const projectTeams = await this.transport.paginate<unknown, { readonly id: string }>(
+      {
+        operationName: "AgentTeamReadProjectTeams",
+        query: projectTeamsQuery,
+        variables: { projectId },
+        selectConnection: (data) => {
+          const page = projectTeamsPageSchema.parse(data);
+          if (page.project === null) throw new Error("linear_project_not_found");
+          return page.project.teams;
+        },
       },
-    });
+      options,
+    );
     if (!projectTeams.ok) return projectTeams;
     if (!projectTeams.value.some((team) => team.id === teamId)) return failure();
 
-    const statesResult = await this.transport.paginate<unknown, z.infer<typeof stateSchema>>({
-      operationName: "AgentTeamReadStates",
-      query: statesQuery,
-      variables: { teamId },
-      selectConnection: (data) => {
-        const page = statesPageSchema.parse(data);
-        if (page.team === null) throw new Error("linear_team_not_found");
-        return connectionSchema(stateSchema).parse(page.team.states);
+    const statesResult = await this.transport.paginate<unknown, z.infer<typeof stateSchema>>(
+      {
+        operationName: "AgentTeamReadStates",
+        query: statesQuery,
+        variables: { teamId },
+        selectConnection: (data) => {
+          const page = statesPageSchema.parse(data);
+          if (page.team === null) throw new Error("linear_team_not_found");
+          return connectionSchema(stateSchema).parse(page.team.states);
+        },
       },
-    });
+      options,
+    );
     if (!statesResult.ok) return statesResult;
-    const labelsResult = await this.transport.paginate<unknown, z.infer<typeof labelSchema>>({
-      operationName: "AgentTeamReadLabels",
-      query: labelsQuery,
-      variables: { teamId },
-      selectConnection: (data) =>
-        connectionSchema(labelSchema).parse(labelsPageSchema.parse(data).issueLabels),
-    });
+    const labelsResult = await this.transport.paginate<unknown, z.infer<typeof labelSchema>>(
+      {
+        operationName: "AgentTeamReadLabels",
+        query: labelsQuery,
+        variables: { teamId },
+        selectConnection: (data) =>
+          connectionSchema(labelSchema).parse(labelsPageSchema.parse(data).issueLabels),
+      },
+      options,
+    );
     if (!labelsResult.ok) return labelsResult;
 
     const states: LinearWorkflowStateRecord[] = statesResult.value.map((state) => ({ ...state }));

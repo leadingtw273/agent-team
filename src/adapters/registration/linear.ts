@@ -15,6 +15,7 @@ export interface LinearRegistrationReadOnlyClient {
   readonly readContext: (
     teamId: string,
     projectId: string,
+    options?: ReadOptions,
   ) => Promise<Result<unknown, DomainError>>;
 }
 
@@ -72,7 +73,7 @@ export class LinearRegistrationReadOnlyProbeAdapter implements RegistrationLinea
       });
     }
     if (options.signal?.aborted === true) return err(domainError("interrupted"));
-    const context = await this.#client.readContext(this.#teamId, this.#projectId);
+    const context = await this.#client.readContext(this.#teamId, this.#projectId, options);
     if (!context.ok) return context;
     return ok({
       state: "passed",
@@ -88,6 +89,7 @@ export function asLinearRegistrationReadOnlyClient(
   readModel: Pick<LinearReadModel, "readContext">,
 ): LinearRegistrationReadOnlyClient {
   return Object.freeze({
-    readContext: (teamId: string, projectId: string) => readModel.readContext(teamId, projectId),
+    readContext: (teamId: string, projectId: string, options?: ReadOptions) =>
+      readModel.readContext(teamId, projectId, options),
   });
 }

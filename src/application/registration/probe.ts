@@ -22,10 +22,23 @@ import {
 } from "./model.js";
 
 const registrationProbeTimeoutMs = 4_000;
+const probeSettlementGraceMs = 150;
 const maximumEvidenceItems = 4;
 const maximumEvidenceLength = 280;
 const unsafeProbeTextPattern =
-  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|(?:^|\s)(?:(?:curl|wget|rm|bash|zsh|sh)\s+|git\s+(?:reset|clean|checkout|switch|push|commit|merge|rebase)\b|node\s+--|pnpm\s+(?:run|exec|install|add|remove|test)\b)|hidden\s+reasoning|chain\s+of\s+thought)/iu;
+  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|hidden\s+reasoning|chain\s+of\s+thought)/iu;
+const completeCommandPattern =
+  /(?:^|\s)(?:gh|curl|wget|git|systemctl|node|pnpm|npm|npx|yarn|bun|codex|claude|gemini|bash|zsh|sh|rm)\s+\S/u;
+
+const gateProvenance = Object.freeze({
+  local_repository: "local_git",
+  node_runtime: "node_runtime",
+  agent_cli: "compiled_cli",
+  github_access: "github_read_only",
+  linear_access: "linear_read_only",
+  continuous_integration: "ci_read_only",
+  webhook_runtime: "webhook_configuration",
+} satisfies Readonly<Record<RegistrationReadOnlyScanGateId, RegistrationProbeProvenance>>);
 
 export const registrationReadOnlyScanGateIds = [
   "local_repository",
@@ -178,7 +191,8 @@ function safeEvidence(value: unknown): readonly string[] | undefined {
       normalized.length === 0 ||
       normalized.length > maximumEvidenceLength ||
       containsSensitiveValue(normalized) ||
-      unsafeProbeTextPattern.test(normalized)
+      unsafeProbeTextPattern.test(normalized) ||
+      completeCommandPattern.test(normalized)
     ) {
       return undefined;
     }
@@ -210,7 +224,11 @@ function unknownGate(
   });
 }
 
-function normalizedGate(id: RegistrationGateId, observation: unknown): RegistrationScanGate {
+function normalizedGate(
+  id: RegistrationReadOnlyScanGateId,
+  observation: unknown,
+  source: RegistrationScanSource,
+): RegistrationScanGate {
   if (typeof observation !== "object" || observation === null || Array.isArray(observation)) {
     return unknownGate(id, "not_scanned", "invalid_evidence", "Probe 回傳格式無法安全驗證。");
   }
@@ -218,15 +236,17 @@ function normalizedGate(id: RegistrationGateId, observation: unknown): Registrat
   const evidence = safeEvidence(candidate["evidence"]);
   const provenance = candidate["provenance"];
   const observedAt = safeObservedAt(candidate["observedAt"]);
+  const expectedProvenance = source === "fixture" ? "fixture" : gateProvenance[id];
   if (
     !isRegistrationGateState(candidate["state"]) ||
     evidence === undefined ||
     !isProbeProvenance(provenance) ||
+    provenance !== expectedProvenance ||
     observedAt === undefined
   ) {
     return unknownGate(
       id,
-      isProbeProvenance(provenance) ? provenance : "not_scanned",
+      "not_scanned",
       "invalid_evidence",
       "Probe 證據無法安全顯示，未將此 Gate 視為通過。",
     );
@@ -328,6 +348,7 @@ function invokeProbe(
 async function inspectBounded(
   id: RegistrationReadOnlyScanGateId,
   ports: RegistrationReadOnlyScanPorts,
+  source: RegistrationScanSource,
   timeoutMs: number,
   options: ReadOptions,
 ): Promise<RegistrationScanGate> {
@@ -335,34 +356,58 @@ async function inspectBounded(
     return unknownGate(id, "not_scanned", "interrupted", errorEvidence("interrupted"));
   }
   const controller = new AbortController();
+  let resolveInterrupted: (() => void) | undefined;
+  const interrupted = new Promise<"interrupted">((resolve) => {
+    resolveInterrupted = () => {
+      resolve("interrupted");
+    };
+  });
   const forwardAbort = () => {
-    controller.abort();
+    controller.abort(domainError("interrupted"));
+    resolveInterrupted?.();
   };
   options.signal?.addEventListener("abort", forwardAbort, { once: true });
   let timer: NodeJS.Timeout | undefined;
   try {
     const timedOut = new Promise<"timeout">((resolve) => {
       timer = setTimeout(() => {
-        controller.abort();
+        controller.abort(domainError("timeout"));
         resolve("timeout");
       }, timeoutMs);
-      timer.unref();
     });
     const probeOutcome = Promise.resolve()
       .then(() => invokeProbe(id, ports, { signal: controller.signal }))
       .catch(() => err(domainError("external_failure")));
-    const outcome = await Promise.race([probeOutcome, timedOut]);
-    if (outcome === "timeout") {
-      return unknownGate(id, "not_scanned", "timeout", errorEvidence("timeout"));
+    const outcome = await Promise.race([probeOutcome, timedOut, interrupted]);
+    if (outcome === "timeout" || outcome === "interrupted") {
+      await waitForProbeSettlement(probeOutcome);
+      return unknownGate(id, "not_scanned", outcome, errorEvidence(outcome));
     }
     if (!outcome.ok) {
       const kind = errorKind(outcome.error);
       return unknownGate(id, "not_scanned", kind, errorEvidence(kind));
     }
-    return normalizedGate(id, outcome.value);
+    return normalizedGate(id, outcome.value, source);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     options.signal?.removeEventListener("abort", forwardAbort);
+  }
+}
+
+async function waitForProbeSettlement(probe: Promise<unknown>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      probe.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, probeSettlementGraceMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -385,7 +430,7 @@ export function createRegistrationReadOnlyScanUseCase(
     scan: async (readOptions: ReadOptions = {}) => {
       const scanned = await Promise.all(
         registrationReadOnlyScanGateIds.map((id) =>
-          inspectBounded(id, options.ports, timeoutMs, readOptions),
+          inspectBounded(id, options.ports, options.source, timeoutMs, readOptions),
         ),
       );
       const scannedById = new Map(scanned.map((gate) => [gate.id, gate]));

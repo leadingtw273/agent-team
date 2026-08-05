@@ -84,5 +84,7 @@ describe("O002 registration wizard UI", () => {
       "已確認本機 Git Repository；Node.js 24.x 符合要求。",
     );
     expect(safeRegistrationText("git reset --hard")).toBe("已隱藏不安全的原始內容");
+    expect(safeRegistrationText("gh repo view")).toBe("已隱藏不安全的原始內容");
+    expect(safeRegistrationText("codex exec review")).toBe("已隱藏不安全的原始內容");
   });
 });

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { lstat } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { isAbsolute, normalize } from "node:path";
 
 import type {
   GitPort,
@@ -20,7 +20,8 @@ import {
 
 const defaultCliTimeoutMs = 3_000;
 const defaultRequiredNodeMajor = 24;
-const versionPattern = /\b([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+][0-9A-Za-z.-]+)?\b/u;
+const versionPattern =
+  /^([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 const exactCliVersionPattern = /^v?([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?)\s*$/u;
 
 export interface LocalRegistrationReadOnlyProbeOptions {
@@ -164,7 +165,16 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
         observedAt: at,
       });
     }
-    const result = await this.#git.inspectRepository({ rootPath: repositoryRoot }, options);
+    let canonicalRoot: string;
+    try {
+      const entry = await lstat(repositoryRoot);
+      if (!entry.isDirectory() || entry.isSymbolicLink()) return err(domainError("not_found"));
+      canonicalRoot = await realpath(repositoryRoot);
+      if (canonicalRoot !== normalize(repositoryRoot)) return err(domainError("not_found"));
+    } catch {
+      return err(domainError("not_found"));
+    }
+    const result = await this.#git.inspectRepository({ rootPath: canonicalRoot }, options);
     if (!result.ok) return result;
     return ok({
       state: "passed",

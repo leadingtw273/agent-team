@@ -167,9 +167,13 @@ describe("Linear GraphQL transport contract", () => {
   });
 
   it("keeps the response body under the same deadline", async () => {
+    let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({
       start() {
         // Deliberately leave the body open to exercise the transport deadline.
+      },
+      cancel() {
+        cancelled = true;
       },
     });
     const transport = new LinearGraphqlTransport({
@@ -183,6 +187,7 @@ describe("Linear GraphQL transport contract", () => {
       variables: {},
     });
     expect(result.ok ? "ok" : result.error.code).toBe("timeout");
+    expect(cancelled).toBe(true);
   });
 
   it("distinguishes caller interruption from transport timeout", async () => {
@@ -200,6 +205,82 @@ describe("Linear GraphQL transport contract", () => {
 
     const result = await pending;
     expect(result.ok ? "ok" : result.error.code).toBe("interrupted");
+  });
+
+  it("rejects an oversized declared Content-Length before reading and cancels the body", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start() {
+        // The precheck must reject before this body is consumed.
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const transport = new LinearGraphqlTransport({
+      apiKey: "linear-test-key",
+      maxResponseBytes: 32,
+      fetch: vi.fn<LinearFetch>().mockResolvedValue(
+        new Response(stream, {
+          headers: { "content-length": "33", "content-type": "application/json" },
+        }),
+      ),
+    });
+
+    const result = await transport.request({
+      query: "query Oversized { viewer { id } }",
+      variables: {},
+    });
+
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
+    expect(cancelled).toBe(true);
+  });
+
+  it("caps a chunked response by cumulative bytes and cancels the stream", async () => {
+    const encoder = new TextEncoder();
+    const chunks = [encoder.encode('{"data":{"value":"'), encoder.encode("a".repeat(24))];
+    let index = 0;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[index];
+        index += 1;
+        if (chunk !== undefined) controller.enqueue(chunk);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const transport = new LinearGraphqlTransport({
+      apiKey: "linear-test-key",
+      maxResponseBytes: 32,
+      fetch: vi.fn<LinearFetch>().mockResolvedValue(new Response(stream)),
+    });
+
+    const result = await transport.request({
+      query: "query Chunked { viewer { id } }",
+      variables: {},
+    });
+
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
+    expect(cancelled).toBe(true);
+  });
+
+  it("counts multibyte UTF-8 payload bytes rather than JavaScript characters", async () => {
+    const body = JSON.stringify({ data: { value: "🙂🙂🙂" } });
+    expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(body.length);
+    const transport = new LinearGraphqlTransport({
+      apiKey: "linear-test-key",
+      maxResponseBytes: body.length,
+      fetch: vi.fn<LinearFetch>().mockResolvedValue(new Response(body)),
+    });
+
+    const result = await transport.request({
+      query: "query Multibyte { viewer { id } }",
+      variables: {},
+    });
+
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
   });
 
   it("paginates by cursor without duplicating or silently truncating nodes", async () => {

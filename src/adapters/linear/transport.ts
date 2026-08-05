@@ -5,10 +5,14 @@ import {
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
+import type { ReadOptions } from "../../application/ports/common.js";
 
 const defaultEndpoint = "https://api.linear.app/graphql";
 const defaultTimeoutMs = 15_000;
 const defaultMaxPages = 100;
+const defaultMaxResponseBytes = 2 * 1024 * 1024;
+const maximumConfiguredResponseBytes = 16 * 1024 * 1024;
+const abortSettlementGraceMs = 100;
 
 export type LinearTransportResult<Value> = Result<Value, DomainError>;
 
@@ -20,9 +24,7 @@ export interface LinearGraphqlRequest<Variables extends Record<string, unknown>>
   readonly operationName?: string;
 }
 
-export interface LinearRequestOptions {
-  readonly signal?: AbortSignal;
-}
+export type LinearRequestOptions = ReadOptions;
 
 export interface LinearGraphqlConnection<Node> {
   readonly nodes: readonly Node[];
@@ -45,6 +47,7 @@ export interface LinearGraphqlTransportOptions {
   readonly apiKey: string;
   readonly endpoint?: string;
   readonly timeoutMs?: number;
+  readonly maxResponseBytes?: number;
   readonly fetch?: LinearFetch;
 }
 
@@ -62,6 +65,8 @@ class RequestStopped extends Error {
     super(reason);
   }
 }
+
+class ResponseBodyRejected extends Error {}
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -132,10 +137,117 @@ function validConnection<Node>(value: unknown): value is LinearGraphqlConnection
   return endCursor === undefined || endCursor === null || typeof endCursor === "string";
 }
 
+function validMaxResponseBytes(value: number | undefined): number {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 1 &&
+    value <= maximumConfiguredResponseBytes
+    ? value
+    : defaultMaxResponseBytes;
+}
+
+function declaredContentLength(response: Response): number | undefined {
+  const header = response.headers.get("content-length");
+  if (header === null) return undefined;
+  if (!/^(?:0|[1-9][0-9]{0,15})$/u.test(header)) throw new ResponseBodyRejected();
+  const length = Number(header);
+  if (!Number.isSafeInteger(length)) throw new ResponseBodyRejected();
+  return length;
+}
+
+async function cancelBody(response: Response): Promise<void> {
+  if (response.body === null || response.body.locked) return;
+  try {
+    await response.body.cancel();
+  } catch {
+    // Cancellation is best-effort; callers still fail closed without echoing the body.
+  }
+}
+
+async function readBoundedResponseBody(
+  response: Response,
+  maximumBytes: number,
+  signal: AbortSignal,
+): Promise<string> {
+  const declaredBytes = declaredContentLength(response);
+  if (declaredBytes !== undefined && declaredBytes > maximumBytes) {
+    await cancelBody(response);
+    throw new ResponseBodyRejected();
+  }
+  if (response.body === null) return "";
+
+  const body: ReadableStream<Uint8Array> = response.body;
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let byteLength = 0;
+  let text = "";
+  let cancellation: Promise<void> | undefined;
+  const cancelReader = () => {
+    cancellation ??= reader.cancel().catch(() => undefined);
+  };
+  const onAbort = () => {
+    cancelReader();
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  const requireActiveRequest = () => {
+    if (signal.aborted) throw new RequestStopped("interrupted");
+  };
+  try {
+    for (;;) {
+      requireActiveRequest();
+      const chunk = await reader.read();
+      requireActiveRequest();
+      if (chunk.done) {
+        text += decoder.decode();
+        return text;
+      }
+      byteLength += chunk.value.byteLength;
+      if (byteLength > maximumBytes) {
+        cancelReader();
+        if (cancellation !== undefined) await cancellation;
+        throw new ResponseBodyRejected();
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+  } catch (error) {
+    if (error instanceof RequestStopped || error instanceof ResponseBodyRejected) throw error;
+    throw new ResponseBodyRejected();
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    if (signal.aborted) {
+      cancelReader();
+      if (cancellation !== undefined) await cancellation;
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      // A cancelled stream may already have released its reader.
+    }
+  }
+}
+
+async function waitForSettlement(promise: Promise<unknown>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise.then(
+        () => undefined,
+        () => undefined,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, abortSettlementGraceMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export class LinearGraphqlTransport {
   readonly #apiKey: string;
   readonly #endpoint: string;
   readonly #timeoutMs: number;
+  readonly #maxResponseBytes: number;
   readonly #fetch: LinearFetch;
 
   constructor(options: LinearGraphqlTransportOptions) {
@@ -143,6 +255,7 @@ export class LinearGraphqlTransport {
     this.#apiKey = options.apiKey.trim();
     this.#endpoint = options.endpoint ?? defaultEndpoint;
     this.#timeoutMs = Math.max(1, Math.trunc(options.timeoutMs ?? defaultTimeoutMs));
+    this.#maxResponseBytes = validMaxResponseBytes(options.maxResponseBytes);
     this.#fetch = options.fetch ?? fetch;
   }
 
@@ -160,46 +273,67 @@ export class LinearGraphqlTransport {
     }
 
     const controller = new AbortController();
+    let stoppedReason: RequestStopped["reason"] | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
     let removeExternalAbort: (() => void) | undefined;
     const stopped = new Promise<never>((_resolve, reject) => {
       timeout = setTimeout(() => {
-        reject(new RequestStopped("timeout"));
-        controller.abort();
+        stoppedReason = "timeout";
+        const stoppedError = new RequestStopped(stoppedReason);
+        controller.abort(stoppedError);
+        reject(stoppedError);
       }, this.#timeoutMs);
       if (options.signal !== undefined) {
         const onAbort = () => {
-          reject(new RequestStopped("interrupted"));
-          controller.abort();
+          stoppedReason = "interrupted";
+          const stoppedError = new RequestStopped(stoppedReason);
+          controller.abort(stoppedError);
+          reject(stoppedError);
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
         removeExternalAbort = () => options.signal?.removeEventListener("abort", onAbort);
       }
     });
 
+    const operation = (async () => {
+      const fetched = await this.#fetch(this.#endpoint, {
+        method: "POST",
+        headers: Object.freeze({
+          authorization: this.#apiKey,
+          "content-type": "application/json",
+        }),
+        body,
+        signal: controller.signal,
+      });
+      if (!fetched.ok) {
+        await cancelBody(fetched);
+        return { response: fetched, bodyText: undefined };
+      }
+      return {
+        response: fetched,
+        bodyText: await readBoundedResponseBody(fetched, this.#maxResponseBytes, controller.signal),
+      };
+    })();
+
     let response: Response;
     let bodyText: string | undefined;
     try {
-      ({ response, bodyText } = await Promise.race([
-        (async () => {
-          const fetched = await this.#fetch(this.#endpoint, {
-            method: "POST",
-            headers: Object.freeze({
-              authorization: this.#apiKey,
-              "content-type": "application/json",
-            }),
-            body,
-            signal: controller.signal,
-          });
-          return {
-            response: fetched,
-            bodyText: fetched.ok ? await fetched.text() : undefined,
-          };
-        })(),
-        stopped,
-      ]));
+      ({ response, bodyText } = await Promise.race([operation, stopped]));
     } catch (error) {
-      if (error instanceof RequestStopped) return err(domainError(error.reason));
+      if (error instanceof RequestStopped || stoppedReason !== undefined) {
+        controller.abort(error);
+        await waitForSettlement(operation);
+        return err(
+          domainError(
+            stoppedReason ?? (error instanceof RequestStopped ? error.reason : "timeout"),
+          ),
+        );
+      }
+      if (error instanceof ResponseBodyRejected) {
+        controller.abort(error);
+        await waitForSettlement(operation);
+        return err(domainError("external_failure"));
+      }
       return err(domainError("unavailable"));
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
