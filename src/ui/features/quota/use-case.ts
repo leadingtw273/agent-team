@@ -42,24 +42,17 @@ export class QuotaDashboardUseCase {
   async read(): Promise<QuotaDashboardReadModel> {
     try {
       const providers = await this.port.listProviders();
-      return await buildQuotaDashboardReadModel(
-        providers,
-        this.policy,
-        this.port.invalidateSnapshot.bind(this.port),
-      );
+      return buildQuotaDashboardReadModel(providers, this.policy);
     } catch {
-      return await buildQuotaDashboardReadModel(
-        [],
-        this.policy,
-        this.port.invalidateSnapshot.bind(this.port),
-      );
+      return buildQuotaDashboardReadModel([], this.policy);
     }
   }
 
   async refresh(provider: string): Promise<QuotaUiActionReadModel> {
-    return this.runAction("refresh_sample", provider, (verifiedProvider) =>
-      this.port.refreshSample(verifiedProvider),
-    );
+    return this.runAction("refresh_sample", provider, async (verifiedProvider) => {
+      await this.invalidateSwitchedSnapshot(verifiedProvider);
+      return this.port.refreshSample(verifiedProvider);
+    });
   }
 
   async resume(provider: string): Promise<QuotaUiActionReadModel> {
@@ -85,6 +78,21 @@ export class QuotaDashboardUseCase {
       return actionResult(action, provider, await mutation(provider));
     } catch {
       return Object.freeze({ action, provider, state: "rejected", reason: "action_failed" });
+    }
+  }
+
+  private async invalidateSwitchedSnapshot(provider: QuotaProviderId): Promise<void> {
+    const matches = (await this.port.listProviders()).filter(
+      (record) => record.provider === provider,
+    );
+    if (matches.length !== 1) return;
+    const record = matches[0];
+    if (
+      record?.snapshot?.provider === provider &&
+      record.activeIdentity.provider === provider &&
+      record.snapshot.accountFingerprint !== record.activeIdentity.accountFingerprint
+    ) {
+      await this.port.invalidateSnapshot(provider, "account_switched");
     }
   }
 }

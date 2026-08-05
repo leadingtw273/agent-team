@@ -131,19 +131,20 @@ describe("quota UI read model", () => {
     expect(codex.buckets.every((bucket) => bucket.remainingPercent === undefined)).toBe(true);
   });
 
-  it("invalidates a switched account's old snapshot without refreshing or resuming it", async () => {
+  it("keeps GET pure and invalidates a switched account only within explicit refresh", async () => {
     const switched = (await fixture("quota-account-switch.json")).record;
     const port = new FakeQuotaDashboardPort([switched]);
+    const quota = createUseCase(port);
 
-    const dashboard = await createUseCase(port).read();
+    const dashboard = await quota.read();
     const gemini = dashboard.providers.find((provider) => provider.provider === "gemini");
     if (gemini === undefined) throw new Error("Gemini read model is missing.");
 
-    expect(port.invalidated).toEqual([["gemini", "account_switched"]]);
+    expect(port.invalidated).toEqual([]);
     expect(port.refreshed).toEqual([]);
     expect(port.resumed).toEqual([]);
     expect(gemini.accountSwitch).toEqual(
-      expect.objectContaining({ state: "invalidated", reason: "account_switched" }),
+      expect.objectContaining({ state: "detected", reason: "account_switched" }),
     );
     expect(gemini.buckets).toEqual([
       expect.objectContaining({
@@ -153,9 +154,15 @@ describe("quota UI read model", () => {
       }),
     ]);
     const rendered = renderQuotaDashboard(dashboard);
-    expect(rendered).toContain("偵測到帳號切換，舊樣本已失效");
+    expect(rendered).toContain("偵測到帳號切換");
+    expect(rendered).toContain("舊樣本不採用");
     expect(rendered).not.toContain("gemini-old-account-001");
     expect(rendered).not.toContain("gemini-new-account-002");
+
+    await quota.refresh("gemini");
+    expect(port.invalidated).toEqual([["gemini", "account_switched"]]);
+    expect(port.refreshed).toEqual(["gemini"]);
+    expect(port.resumed).toEqual([]);
   });
 
   it("shows only allowlisted source labels and never echoes raw provider output or identities", async () => {
@@ -192,14 +199,150 @@ describe("quota UI read model", () => {
         ],
       } satisfies QuotaSnapshot,
     };
-    const rendered = renderQuotaDashboard(
-      await createUseCase(new FakeQuotaDashboardPort([record])).read(),
-    );
+    const dashboard = await createUseCase(new FakeQuotaDashboardPort([record])).read();
+    const rendered = renderQuotaDashboard(dashboard);
+    const codex = dashboard.providers.find((provider) => provider.provider === "codex");
+    if (codex === undefined) throw new Error("Codex read model is missing.");
 
     expect(rendered).toContain("未驗證來源");
+    expect(codex.buckets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          bucket: "weekly",
+          state: "unknown",
+          reason: "source_unverified",
+        }),
+      ]),
+    );
+    expect(codex.buckets.every((bucket) => bucket.remainingPercent === undefined)).toBe(true);
+    expect(rendered).not.toContain("64% 剩餘");
     expect(rendered).not.toContain("raw provider output");
     expect(rendered).not.toContain("secret-value");
     expect(rendered).not.toContain("codex-private-account-9900");
+
+    if (record.snapshot === undefined) throw new Error("Snapshot is missing.");
+    const inheritedKeyRecord: QuotaProviderRecord = {
+      ...record,
+      snapshot: {
+        ...record.snapshot,
+        samples: record.snapshot.samples.map((sample) => ({
+          ...sample,
+          source: "toString",
+        })),
+      },
+    };
+    const inheritedKeyDashboard = await createUseCase(
+      new FakeQuotaDashboardPort([inheritedKeyRecord]),
+    ).read();
+    const inheritedKeyCodex = inheritedKeyDashboard.providers.find(
+      (provider) => provider.provider === "codex",
+    );
+    if (inheritedKeyCodex === undefined) throw new Error("Codex read model is missing.");
+    expect(inheritedKeyCodex.buckets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ state: "unknown", reason: "source_unverified" }),
+      ]),
+    );
+    expect(() => renderQuotaDashboard(inheritedKeyDashboard)).not.toThrow();
+  });
+
+  it("fails closed when an active, snapshot, or sample account fingerprint is invalid", async () => {
+    const freshRecord = (): QuotaProviderRecord => ({
+      provider: "codex",
+      activeIdentity: { provider: "codex", accountFingerprint: "codex-account-001" },
+      weeklyUsageLimitPercent: 80,
+      snapshot: {
+        provider: "codex",
+        accountFingerprint: "codex-account-001",
+        samples: [
+          {
+            provider: "codex",
+            accountFingerprint: "codex-account-001",
+            cliVersion: "0.146.0",
+            source: "provider-structured-event",
+            observedAt: instant("2026-08-04T12:00:00.000Z"),
+            kind: "usage",
+            bucket: "weekly",
+            state: "confirmed",
+            remainingPercent: 64,
+          },
+          {
+            provider: "codex",
+            accountFingerprint: "codex-account-001",
+            cliVersion: "0.146.0",
+            source: "provider-structured-event",
+            observedAt: instant("2026-08-04T12:00:00.000Z"),
+            kind: "usage",
+            bucket: "five_hour",
+            state: "confirmed",
+            remainingPercent: 50,
+          },
+        ],
+      },
+    });
+
+    const activeBase = freshRecord();
+    if (activeBase.snapshot === undefined) throw new Error("Snapshot is missing.");
+    const activeInvalid: QuotaProviderRecord = {
+      ...activeBase,
+      activeIdentity: { provider: "codex", accountFingerprint: "<script>" },
+      snapshot: {
+        ...activeBase.snapshot,
+        accountFingerprint: "<script>",
+        samples: activeBase.snapshot.samples.map((sample) => ({
+          ...sample,
+          accountFingerprint: "<script>",
+        })),
+      },
+    };
+
+    const snapshotBase = freshRecord();
+    if (snapshotBase.snapshot === undefined) throw new Error("Snapshot is missing.");
+    const snapshotInvalid: QuotaProviderRecord = {
+      ...snapshotBase,
+      snapshot: {
+        ...snapshotBase.snapshot,
+        accountFingerprint: "!",
+      },
+    };
+
+    const sampleBase = freshRecord();
+    if (sampleBase.snapshot === undefined) throw new Error("Snapshot is missing.");
+    const sampleInvalid: QuotaProviderRecord = {
+      ...sampleBase,
+      snapshot: {
+        ...sampleBase.snapshot,
+        samples: sampleBase.snapshot.samples.map((sample) =>
+          sample.kind === "usage" && sample.bucket === "weekly"
+            ? { ...sample, accountFingerprint: "!" }
+            : sample,
+        ),
+      },
+    };
+
+    for (const [name, record] of [
+      ["active", activeInvalid],
+      ["snapshot", snapshotInvalid],
+      ["sample", sampleInvalid],
+    ] as const) {
+      const dashboard = await createUseCase(new FakeQuotaDashboardPort([record])).read();
+      const codex = dashboard.providers.find((provider) => provider.provider === "codex");
+      if (codex === undefined) throw new Error(`Codex read model is missing for ${name}.`);
+      const affected =
+        name === "sample"
+          ? codex.buckets.filter((bucket) => bucket.bucket === "weekly")
+          : codex.buckets;
+      expect(affected, name).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ state: "unknown", reason: "identity_invalid" }),
+        ]),
+      );
+      expect(
+        affected.every((bucket) => bucket.remainingPercent === undefined),
+        name,
+      ).toBe(true);
+      expect(renderQuotaDashboard(dashboard), name).not.toContain("64% 剩餘");
+    }
   });
 });
 

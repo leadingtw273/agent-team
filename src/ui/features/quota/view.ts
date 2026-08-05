@@ -43,17 +43,29 @@ const reasonLabels: Readonly<Record<QuotaReadModelReason, string>> = Object.free
   sample_marked_stale: "此樣本已被標為失效，不採用其中數值。",
   sample_missing: "Provider 沒有提供此 bucket 的樣本。",
   sample_provider_mismatch: "樣本 Provider 與目前設定不一致。",
+  source_unverified: "樣本來源不在可信清單中，因此不採用其中數值。",
   snapshot_missing: "尚未取得可用樣本。",
 });
 
 function stateLabel(state: QuotaBucketReadModel["state"]): string {
   switch (state) {
     case "fresh":
-      return "新鮮";
+      return "已確認";
     case "stale":
       return "已過期";
     case "unknown":
       return "無法確認";
+  }
+}
+
+function stateSymbol(state: QuotaBucketReadModel["state"]): string {
+  switch (state) {
+    case "fresh":
+      return "✓";
+    case "stale":
+      return "↻";
+    case "unknown":
+      return "?";
   }
 }
 
@@ -83,7 +95,7 @@ function renderBucket(provider: QuotaProviderId, bucket: QuotaBucketReadModel): 
   const label = quotaBucketLabel(provider, bucket.bucket);
   const state = stateLabel(bucket.state);
   return `<section class="ui-quota-bucket" aria-labelledby="quota-${provider}-${bucket.bucket}">
-    <div class="ui-section-heading"><div><h3 id="quota-${provider}-${bucket.bucket}">${label}</h3><p>Provider 觀測結果</p></div><span class="badge ui-status-badge ui-status--${statusClass(bucket.state)}" data-quota-state="${bucket.state}">${state}</span></div>
+    <div class="ui-section-heading"><div><h3 id="quota-${provider}-${bucket.bucket}">${label}</h3><p>Provider 觀測結果</p></div><span class="badge ui-status-badge ui-status--${statusClass(bucket.state)} ui-quota-state-badge ui-quota-state--${bucket.state}" data-quota-state="${bucket.state}"><span class="ui-quota-state-symbol" aria-hidden="true">${stateSymbol(bucket.state)}</span><span>${state}</span></span></div>
     <dl class="ui-quota-details">
       <div><dt>觀測結果</dt><dd>${observedUsage(bucket)}</dd></div>
       <div><dt>樣本來源</dt><dd>${escapeHtml(bucket.source)}</dd></div>
@@ -108,8 +120,8 @@ function renderWeeklyConfiguration(
 
 function renderProvider(provider: QuotaDashboardReadModel["providers"][number]): string {
   const switchNotice =
-    provider.accountSwitch.state === "invalidated"
-      ? `<aside class="ui-fixture-notice" aria-label="帳號切換警示"><span>${reasonLabels[provider.accountSwitch.reason]}</span><span>先前帳號：${escapeHtml(provider.accountSwitch.previousIdentity)}</span></aside>`
+    provider.accountSwitch.state === "detected"
+      ? `<aside class="ui-fixture-notice" aria-label="帳號切換警示"><span>${reasonLabels[provider.accountSwitch.reason]}</span><span>先前帳號：${escapeHtml(provider.accountSwitch.previousIdentity)}；舊樣本不採用，請刷新樣本完成失效與重新觀測。</span></aside>`
       : "";
   return `<article class="card ui-panel ui-quota-provider" aria-labelledby="quota-${provider.provider}-title">
     <div class="card-body">

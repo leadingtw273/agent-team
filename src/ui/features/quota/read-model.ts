@@ -23,6 +23,7 @@ export type QuotaReadModelReason =
   | "sample_marked_stale"
   | "sample_provider_mismatch"
   | "sample_duplicated"
+  | "source_unverified"
   | "snapshot_missing";
 
 export interface QuotaBucketReadModel {
@@ -45,8 +46,8 @@ export type WeeklyConfigurationReadModel =
 export type AccountSwitchReadModel =
   | Readonly<{ state: "none" }>
   | Readonly<{
-      state: "invalidated";
-      reason: "account_switched" | "account_switch_invalidation_failed";
+      state: "detected";
+      reason: "account_switched";
       previousIdentity: string;
     }>;
 
@@ -120,7 +121,12 @@ function displayTime(value: string | undefined): string {
 }
 
 function sourceLabel(value: string | undefined): string {
-  return value === undefined ? "尚未取得" : (sourceLabels[value] ?? "未驗證來源");
+  if (value === undefined) return "尚未取得";
+  return trustedSourceLabel(value) ?? "未驗證來源";
+}
+
+function trustedSourceLabel(value: string): string | undefined {
+  return Object.hasOwn(sourceLabels, value) ? sourceLabels[value] : undefined;
 }
 
 function bucketLabel(provider: QuotaProviderId, bucket: QuotaBucketId): string {
@@ -233,6 +239,9 @@ function normalizeBucket(
   if (matching.length !== 1) return unknownFromSample(matching[0], bucket, "sample_duplicated");
   const sample = matching[0];
   if (sample === undefined) return defaultBucket(bucket, "sample_missing");
+  if (!validFingerprint(sample.accountFingerprint)) {
+    return unknownFromSample(sample, bucket, "identity_invalid");
+  }
   if (!sameIdentity(provider, accountFingerprint, sample)) {
     return unknownFromSample(sample, bucket, "sample_identity_mismatch");
   }
@@ -242,6 +251,9 @@ function normalizeBucket(
   if (sample.state === "stale") return staleBucket(sample, bucket, "sample_marked_stale");
   if (!confirmedSample(sample)) {
     return unknownFromSample(sample, bucket, "provider_signal_unknown");
+  }
+  if (trustedSourceLabel(sample.source) === undefined) {
+    return unknownFromSample(sample, bucket, "source_unverified");
   }
   const expectedCliVersion = policy.expectedCliVersions[provider];
   if (expectedCliVersion === undefined) {
@@ -287,14 +299,17 @@ function unknownProvider(
   });
 }
 
-async function providerReadModel(
+function providerReadModel(
   record: QuotaProviderRecord,
   policy: QuotaReadModelPolicy,
-  invalidateSnapshot: QuotaDashboardInvalidator,
-): Promise<QuotaProviderReadModel> {
+): QuotaProviderReadModel {
   const { provider, activeIdentity, snapshot } = record;
   const activeFingerprint = activeIdentity.accountFingerprint;
-  if (!validPolicy(policy) || !sameIdentity(provider, activeFingerprint, activeIdentity)) {
+  if (
+    !validPolicy(policy) ||
+    !validFingerprint(activeFingerprint) ||
+    !sameIdentity(provider, activeFingerprint, activeIdentity)
+  ) {
     return Object.freeze({
       provider,
       label: providerLabels[provider],
@@ -318,6 +333,18 @@ async function providerReadModel(
       ),
     });
   }
+  if (!validFingerprint(snapshot.accountFingerprint)) {
+    return Object.freeze({
+      provider,
+      label: providerLabels[provider],
+      activeIdentity: maskedIdentity(activeFingerprint),
+      weeklyConfiguration: weeklyConfiguration(provider, record.weeklyUsageLimitPercent),
+      accountSwitch: Object.freeze({ state: "none" }),
+      buckets: Object.freeze(
+        expectedBuckets[provider].map((bucket) => defaultBucket(bucket, "identity_invalid")),
+      ),
+    });
+  }
   if (snapshot.provider !== provider) {
     return Object.freeze({
       provider,
@@ -333,28 +360,22 @@ async function providerReadModel(
     });
   }
   if (snapshot.accountFingerprint !== activeFingerprint) {
-    let reason: "account_switched" | "account_switch_invalidation_failed" = "account_switched";
-    try {
-      await invalidateSnapshot(provider, "account_switched");
-    } catch {
-      reason = "account_switch_invalidation_failed";
-    }
     return Object.freeze({
       provider,
       label: providerLabels[provider],
       activeIdentity: maskedIdentity(activeFingerprint),
       weeklyConfiguration: weeklyConfiguration(provider, record.weeklyUsageLimitPercent),
       accountSwitch: Object.freeze({
-        state: "invalidated",
-        reason,
+        state: "detected",
+        reason: "account_switched",
         previousIdentity: maskedIdentity(snapshot.accountFingerprint),
       }),
       buckets: Object.freeze(
         expectedBuckets[provider].map((bucket) => {
           const sample = snapshot.samples.find((candidate) => sampleBucket(candidate) === bucket);
-          return reason === "account_switched" && sample !== undefined
-            ? staleBucket(sample, bucket, "account_switched")
-            : unknownFromSample(sample, bucket, reason);
+          return sample === undefined
+            ? unknownFromSample(sample, bucket, "account_switched")
+            : staleBucket(sample, bucket, "account_switched");
         }),
       ),
     });
@@ -373,28 +394,20 @@ async function providerReadModel(
   });
 }
 
-type QuotaDashboardInvalidator = (
-  provider: QuotaProviderId,
-  reason: "account_switched",
-) => Promise<void>;
-
-export async function buildQuotaDashboardReadModel(
+export function buildQuotaDashboardReadModel(
   records: readonly QuotaProviderRecord[],
   policy: QuotaReadModelPolicy,
-  invalidateSnapshot: QuotaDashboardInvalidator,
-): Promise<QuotaDashboardReadModel> {
-  const providers = await Promise.all(
-    (Object.keys(providerLabels) as QuotaProviderId[]).map(async (provider) => {
-      const recordsForProvider = records.filter((record) => record.provider === provider);
-      if (recordsForProvider.length === 0)
-        return unknownProvider(provider, "provider_record_missing");
-      if (recordsForProvider.length !== 1)
-        return unknownProvider(provider, "provider_record_ambiguous");
-      const record = recordsForProvider[0];
-      if (record === undefined) return unknownProvider(provider, "provider_record_missing");
-      return providerReadModel(record, policy, invalidateSnapshot);
-    }),
-  );
+): QuotaDashboardReadModel {
+  const providers = (Object.keys(providerLabels) as QuotaProviderId[]).map((provider) => {
+    const recordsForProvider = records.filter((record) => record.provider === provider);
+    if (recordsForProvider.length === 0)
+      return unknownProvider(provider, "provider_record_missing");
+    if (recordsForProvider.length !== 1)
+      return unknownProvider(provider, "provider_record_ambiguous");
+    const record = recordsForProvider[0];
+    if (record === undefined) return unknownProvider(provider, "provider_record_missing");
+    return providerReadModel(record, policy);
+  });
   return Object.freeze({ providers: Object.freeze(providers) });
 }
 
