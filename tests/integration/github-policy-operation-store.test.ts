@@ -1,14 +1,5 @@
-import {
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  stat,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -23,9 +14,11 @@ import {
 } from "../../src/application/registration/index.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import {
-  acquireFileLock,
   AtomicFileStore,
+  openHeldSecureDirectory,
   type AtomicWriteOptions,
+  type HeldSecureDirectory,
+  type SecureFileLockHandle,
 } from "../../src/infrastructure/files/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -94,7 +87,9 @@ async function exists(path: string): Promise<boolean> {
 
 class AbaReplacingWriter extends AtomicFileStore {
   readonly #root: string;
-  replacement: Awaited<ReturnType<typeof acquireFileLock>> | undefined;
+  replacement: SecureFileLockHandle | undefined;
+  replacementDirectory: HeldSecureDirectory | undefined;
+  #replaced = false;
 
   constructor(root: string) {
     super();
@@ -102,11 +97,24 @@ class AbaReplacingWriter extends AtomicFileStore {
   }
 
   override async write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    if (!targetPath.endsWith(`/${operationId}.json`) || this.#replaced) {
+      return super.write(targetPath, content, options);
+    }
+    this.#replaced = true;
     const canonical = join(this.#root, `${operationId}.lock`);
     await rename(canonical, join(this.#root, `${operationId}.lock.displaced`));
-    this.replacement = await acquireFileLock(canonical, "replacement-owner");
-    if (!this.replacement.ok) throw new Error(this.replacement.error.code);
-    return super.write(targetPath, content, options);
+    const opened = openHeldSecureDirectory(this.#root, [], { create: false });
+    if (!opened.ok) return opened;
+    this.replacementDirectory = opened.value;
+    const replacement = await opened.value.acquireLock(`${operationId}.lock`, "replacement-owner");
+    if (!replacement.ok) return replacement;
+    this.replacement = replacement.value;
+    return err(domainError("external_failure"));
+  }
+
+  async close(): Promise<void> {
+    if (this.replacement !== undefined) await this.replacement.release();
+    if (this.replacementDirectory !== undefined) await this.replacementDirectory.close();
   }
 }
 
@@ -200,31 +208,122 @@ describe("O004 file GitHub policy operation store", () => {
     expect(await readFile(outsideLock, "utf8")).toBe("outside\n");
   });
 
-  it("fails the CAS without unlinking a replacement lock owner during release ABA", async () => {
+  it("holds the kernel lock across a store mutation so another instance waits for a later CAS", async () => {
     const root = await directory();
+    const second = new FileGitHubPolicyOperationStore(root);
+    const child = spawn(
+      process.execPath,
+      [
+        join(process.cwd(), "tests/fixtures/github-policy-operation-store-child.mjs"),
+        root,
+        operationId,
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on("data", () => {
+        if (stdout.includes("held\n")) resolve();
+      });
+      child.once("error", reject);
+      child.once("exit", (code) => {
+        if (!stdout.includes("held\n")) {
+          reject(new Error(`child exited before holding lock: ${String(code)} ${stderr}`));
+        }
+      });
+    });
+
+    expect(
+      await second.compareAndSwap({
+        operationId,
+        expectedRevision: null,
+        next: initial,
+      }),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(await exists(join(root, `${operationId}.json`))).toBe(false);
+
+    child.stdin.write("continue\n");
+    const childExit = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    expect(childExit, stderr).toBe(0);
+    const childResult = JSON.parse(stdout.trim().split("\n").at(-1) ?? "null") as unknown;
+    expect(childResult).toMatchObject({ ok: true, value: { revision: 1 } });
+    expect(
+      await second.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: true, value: { revision: 2, phase: "mutation_started" } });
+    await second.close();
+  });
+
+  it("rejects lock-path ABA without moving B's lock or changing the journal", async () => {
+    const root = await directory();
+    const initialized = new FileGitHubPolicyOperationStore(root);
+    expect(
+      await initialized.compareAndSwap({
+        operationId,
+        expectedRevision: null,
+        next: initial,
+      }),
+    ).toMatchObject({ ok: true, value: { revision: 1 } });
+    await initialized.close();
+
     const writer = new AbaReplacingWriter(root);
     const store = new FileGitHubPolicyOperationStore(root, writer);
 
     const result = await store.compareAndSwap({
       operationId,
-      expectedRevision: null,
-      next: initial,
+      expectedRevision: 1,
+      next: Object.freeze({ ...initial, phase: "mutation_started" }),
     });
 
     expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
-    const entries = await readdir(root);
-    const quarantined = entries.find((entry) => entry.includes(".release-"));
-    if (quarantined === undefined) throw new Error("replacement lock quarantine missing");
+    expect(writer.replacement).toBeDefined();
+    expect(await writer.replacement?.assertOwnership()).toEqual({ ok: true, value: undefined });
+    const competitor = new FileGitHubPolicyOperationStore(root);
     expect(
-      JSON.parse(await readFile(join(root, `${operationId}.lock.displaced`), "utf8")),
-    ).toMatchObject({ holderId: `github-policy-operation:${String(process.pid)}` });
-    expect(JSON.parse(await readFile(join(root, quarantined), "utf8"))).toMatchObject({
-      holderId: "replacement-owner",
+      await competitor.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
     });
-    if (writer.replacement?.ok) {
-      expect(await writer.replacement.value.release()).toMatchObject({ ok: false });
-    }
+    expect((await stat(join(root, `${operationId}.lock`))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(root, `${operationId}.lock.displaced`))).mode & 0o777).toBe(0o600);
+
+    await writer.close();
+    expect(
+      await competitor.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
+    });
+    expect((await stat(join(root, `${operationId}.lock`))).mode & 0o777).toBe(0o600);
     await store.close();
+    await competitor.close();
   });
 
   it("persists a strict private schema with store-owned monotonic revisions", async () => {
