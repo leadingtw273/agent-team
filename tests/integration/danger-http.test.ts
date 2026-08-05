@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import { parseInstant } from "../../src/domain/foundation/index.js";
+import {
+  createQuotaUiFeature,
+  QuotaDashboardUseCase,
+  type QuotaDashboardPort,
+} from "../../src/ui/features/quota/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 import {
   createDangerApprovalUseCase,
   createDangerUiFeatureRegistration,
@@ -8,10 +15,27 @@ import {
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
-import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 
 const handles: LocalUiServerHandle[] = [];
 afterEach(async () => Promise.all(handles.splice(0).map((handle) => handle.close())));
+
+function quotaFeature() {
+  const now = parseInstant("2026-08-04T12:05:00.000Z");
+  if (!now.ok) throw new Error(now.error.code);
+  const port: QuotaDashboardPort = {
+    listProviders: () => Promise.resolve([]),
+    invalidateSnapshot: () => Promise.resolve(),
+    refreshSample: () => Promise.resolve({ state: "accepted", reason: "refresh_started" }),
+    resumeDispatch: () => Promise.resolve({ state: "accepted", reason: "manual_review_recorded" }),
+  };
+  return createQuotaUiFeature(
+    new QuotaDashboardUseCase(port, {
+      now: () => now.value,
+      maxSampleAgeMs: 15 * 60 * 1_000,
+      expectedCliVersions: { codex: "0.146.0", claude: "2.1.221", gemini: "0.52.0" },
+    }),
+  );
+}
 
 async function startDanger(useCase: ReturnType<typeof createDangerApprovalUseCase>) {
   const application = createUiApplication({
@@ -152,10 +176,14 @@ describe("U006 danger approval HTTP", () => {
     expect(useCase.read().audit).toEqual([]);
   });
 
-  it("unions Role and Danger pages, assets, and APIs exactly once", () => {
+  it("unions Role, Quota, and Danger pages, assets, and APIs exactly once", () => {
     const danger = createDangerApprovalUseCase(new InMemoryDangerApprovalStore([]));
     const application = createUiApplication({
-      features: [createRoleModelFeature(), createDangerUiFeatureRegistration(danger)],
+      features: [
+        createRoleModelFeature(),
+        quotaFeature(),
+        createDangerUiFeatureRegistration(danger),
+      ],
     });
     const paths = application.routeContracts.map((route) => route.path);
 
@@ -170,6 +198,11 @@ describe("U006 danger approval HTTP", () => {
       "/assets/role-model.css",
       "/assets/role-model.js",
       "/api/role-models",
+      "/quota",
+      "/assets/quota.css",
+      "/assets/quota.js",
+      "/api/quota/refresh",
+      "/api/quota/resume",
       "/security",
       "/assets/danger.css",
       "/assets/danger.js",

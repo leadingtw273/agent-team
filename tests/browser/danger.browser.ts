@@ -5,6 +5,12 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import { dangerousOperationCategories } from "../../src/application/safety/index.js";
+import { parseInstant } from "../../src/domain/foundation/index.js";
+import {
+  createQuotaUiFeature,
+  QuotaDashboardUseCase,
+  type QuotaDashboardPort,
+} from "../../src/ui/features/quota/index.js";
 import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 import {
   createDangerApprovalUseCase,
@@ -32,10 +38,28 @@ const waiting = Object.freeze(
   ),
 );
 
+function quotaFeature() {
+  const now = parseInstant("2026-08-04T12:05:00.000Z");
+  if (!now.ok) throw new Error(now.error.code);
+  const port: QuotaDashboardPort = {
+    listProviders: () => Promise.resolve([]),
+    invalidateSnapshot: () => Promise.resolve(),
+    refreshSample: () => Promise.resolve({ state: "accepted", reason: "refresh_started" }),
+    resumeDispatch: () => Promise.resolve({ state: "accepted", reason: "manual_review_recorded" }),
+  };
+  return createQuotaUiFeature(
+    new QuotaDashboardUseCase(port, {
+      now: () => now.value,
+      maxSampleAgeMs: 15 * 60 * 1_000,
+      expectedCliVersions: { codex: "0.146.0", claude: "2.1.221", gemini: "0.52.0" },
+    }),
+  );
+}
+
 test.beforeEach(async () => {
   const danger = createDangerApprovalUseCase(new InMemoryDangerApprovalStore(waiting));
   const application = createUiApplication({
-    features: [createRoleModelFeature(), createDangerUiFeatureRegistration(danger)],
+    features: [createRoleModelFeature(), quotaFeature(), createDangerUiFeatureRegistration(danger)],
   });
   shell = await startLocalUiServer({
     securityPolicy: application.securityPolicy,
@@ -183,7 +207,7 @@ test("renders explicit warnings and unknown rejection safely at 320 and 390 pixe
   expect(await axeViolations(page)).toEqual([]);
 });
 
-test("keeps Role and Danger in one responsive shell with collapsed active navigation", async ({
+test("keeps Role, Quota, and Danger in one responsive shell with collapsed active navigation", async ({
   page,
 }) => {
   await page.addInitScript({ content: axe.source });
@@ -196,6 +220,7 @@ test("keeps Role and Danger in one responsive shell with collapsed active naviga
     await page.setViewportSize(viewport);
     for (const route of [
       { path: "/roles-models", label: "角色與模型" },
+      { path: "/quota", label: "額度" },
       { path: "/security", label: "安全" },
     ]) {
       if (authenticated) {
