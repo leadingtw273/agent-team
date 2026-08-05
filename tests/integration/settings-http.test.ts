@@ -18,11 +18,39 @@ import {
   type SettingsStore,
   type UiServerClock,
 } from "../../src/ui/index.js";
-import { ok } from "../../src/domain/foundation/index.js";
+import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import {
+  createQuotaUiFeature,
+  QuotaDashboardUseCase,
+  type QuotaDashboardPort,
+} from "../../src/ui/features/quota/index.js";
 import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 
 const handles: LocalUiServerHandle[] = [];
 const directories: string[] = [];
+
+function instant(value: string): Instant {
+  const parsed = parseInstant(value);
+  if (!parsed.ok) throw new Error(parsed.error.code);
+  return parsed.value;
+}
+
+function quotaFeature() {
+  const port: QuotaDashboardPort = {
+    listProviders: () => Promise.resolve([]),
+    invalidateSnapshot: () => Promise.resolve(),
+    refreshSample: () => Promise.resolve({ state: "accepted" as const, reason: "refresh_started" }),
+    resumeDispatch: () =>
+      Promise.resolve({ state: "accepted" as const, reason: "manual_review_recorded" }),
+  };
+  return createQuotaUiFeature(
+    new QuotaDashboardUseCase(port, {
+      now: () => instant("2026-08-04T12:05:00.000Z"),
+      maxSampleAgeMs: 15 * 60 * 1_000,
+      expectedCliVersions: { codex: "0.146.0", claude: "2.1.221", gemini: "0.52.0" },
+    }),
+  );
+}
 
 class MutableClock implements UiServerClock {
   constructor(private value: number) {}
@@ -92,14 +120,16 @@ afterEach(async () => {
 });
 
 describe("U008 settings HTTP route", () => {
-  it("composes the Role and Settings route union while each feature owns its assets", () => {
+  it("composes the Role, Quota, and Settings route union while each feature owns its assets", () => {
     const useCase = createSettingsUseCase(
       new FileSettingsStore("/tmp/agent-team-u008-registry-settings.yaml"),
     );
     const registration = createSettingsUiFeatureRegistration(useCase);
+    const quota = quotaFeature();
+    const quotaRegistration = quota.uiFeatureRegistration();
     const core = createUiApplication();
     const application = createUiApplication({
-      features: [createRoleModelFeature(), registration],
+      features: [createRoleModelFeature(), quota, registration],
     });
 
     expect(registration).toMatchObject({
@@ -116,6 +146,17 @@ describe("U008 settings HTTP route", () => {
       "/assets/settings.js",
       "/api/settings",
     ]);
+    expect(quotaRegistration.page).toMatchObject({
+      path: "/quota",
+      styles: ["/assets/quota.css"],
+      scripts: ["/assets/quota.js"],
+    });
+    expect(quotaRegistration.routes.map((route) => route.contract.path)).toEqual([
+      "/assets/quota.css",
+      "/assets/quota.js",
+      "/api/quota/refresh",
+      "/api/quota/resume",
+    ]);
     expect(core.routeContracts.map((route) => route.path)).toEqual([
       "/",
       "/projects",
@@ -130,6 +171,11 @@ describe("U008 settings HTTP route", () => {
       "/assets/role-model.css",
       "/assets/role-model.js",
       "/api/role-models",
+      "/quota",
+      "/assets/quota.css",
+      "/assets/quota.js",
+      "/api/quota/refresh",
+      "/api/quota/resume",
       "/settings",
       "/assets/settings.css",
       "/assets/settings.js",
@@ -142,6 +188,22 @@ describe("U008 settings HTTP route", () => {
       response: "secret-safe",
       mutationBody: "bounded-json",
     });
+    expect(
+      application.routeContracts.filter((route) => route.path.startsWith("/api/quota/")),
+    ).toEqual([
+      expect.objectContaining({
+        path: "/api/quota/refresh",
+        allowedMethods: ["POST"],
+        response: "standard",
+        mutationBody: "bounded-json",
+      }),
+      expect.objectContaining({
+        path: "/api/quota/resume",
+        allowedMethods: ["POST"],
+        response: "standard",
+        mutationBody: "bounded-json",
+      }),
+    ]);
   });
 
   it("rejects disallowed settings methods before body, handler, or idle refresh", async () => {
@@ -261,7 +323,11 @@ describe("U008 settings HTTP route", () => {
       save: vi.fn(),
     };
     const application = createUiApplication({
-      features: [createSettingsUiFeatureRegistration(createSettingsUseCase(store))],
+      features: [
+        createRoleModelFeature(),
+        quotaFeature(),
+        createSettingsUiFeatureRegistration(createSettingsUseCase(store)),
+      ],
     });
     const handle = await startLocalUiServer({
       securityPolicy: application.securityPolicy,

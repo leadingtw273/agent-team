@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
+import { parseInstant, type Instant } from "../../src/domain/foundation/index.js";
 import {
   createSettingsUiFeatureRegistration,
   createSettingsUseCase,
@@ -13,6 +14,11 @@ import {
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
+import {
+  createQuotaUiFeature,
+  QuotaDashboardUseCase,
+  type QuotaDashboardPort,
+} from "../../src/ui/features/quota/index.js";
 import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 
 let shell: LocalUiServerHandle | undefined;
@@ -21,6 +27,29 @@ let sessionCookiePair: string | undefined;
 let sessionCsrf: string | undefined;
 const screenshotRoot = "/tmp/ui-review";
 const screenshotWorktree = join(process.cwd(), "tmp", "ui-review");
+
+function instant(value: string): Instant {
+  const parsed = parseInstant(value);
+  if (!parsed.ok) throw new Error(parsed.error.code);
+  return parsed.value;
+}
+
+function quotaFeature() {
+  const port: QuotaDashboardPort = {
+    listProviders: () => Promise.resolve([]),
+    invalidateSnapshot: () => Promise.resolve(),
+    refreshSample: () => Promise.resolve({ state: "accepted" as const, reason: "refresh_started" }),
+    resumeDispatch: () =>
+      Promise.resolve({ state: "accepted" as const, reason: "manual_review_recorded" }),
+  };
+  return createQuotaUiFeature(
+    new QuotaDashboardUseCase(port, {
+      now: () => instant("2026-08-04T12:05:00.000Z"),
+      maxSampleAgeMs: 15 * 60 * 1_000,
+      expectedCliVersions: { codex: "0.146.0", claude: "2.1.221", gemini: "0.52.0" },
+    }),
+  );
+}
 
 function luminance(color: string): number {
   const legacy = /^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/u.exec(color)?.slice(1).map(Number);
@@ -47,6 +76,7 @@ test.beforeAll(async () => {
   const application = createUiApplication({
     features: [
       createRoleModelFeature(),
+      quotaFeature(),
       createSettingsUiFeatureRegistration(
         createSettingsUseCase(new FileSettingsStore(join(directory, "config", "settings.yaml"))),
       ),
@@ -205,7 +235,9 @@ test("settings edit control has AA normal/focus contrast and no axe violations",
   await expectNoAxeViolations(page);
 });
 
-test("Role and Settings share one collapsed mobile shell at 390px and 320px", async ({ page }) => {
+test("Role, Quota, and Settings share one collapsed mobile shell at 390px and 320px", async ({
+  page,
+}) => {
   await visitSettings(page);
   if (shell === undefined) throw new Error("settings browser session missing");
 
@@ -213,6 +245,7 @@ test("Role and Settings share one collapsed mobile shell at 390px and 320px", as
     await page.setViewportSize({ width, height: width === 390 ? 844 : 720 });
     for (const destination of [
       { path: "/roles-models", title: "角色與模型" },
+      { path: "/quota", title: "額度" },
       { path: "/settings", title: "設定" },
     ] as const) {
       await page.goto(`${shell.baseUrl}${destination.path}`, { waitUntil: "networkidle" });
