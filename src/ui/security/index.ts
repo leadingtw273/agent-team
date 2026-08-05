@@ -8,7 +8,7 @@ import type {
   UiSecurityPolicy,
   UiSecurityRequest,
 } from "../server/index.js";
-import { canonicalResponseIsUnsafe, canonicalValueIsUnsafe } from "./canonical.js";
+import { responseLeaksCredentials, untrustedInputIsUnsafe } from "./canonical.js";
 import { isSecretSafeJsonResponse } from "./secret.js";
 
 export { createSecretSafeJsonResponse, projectSecretSafeMetadata } from "./secret.js";
@@ -291,8 +291,8 @@ export function createUiSecurityPolicy(
   const authorize = (request: UiSecurityRequest): UiSecurityDecision => {
     if (
       activeSession !== undefined &&
-      (canonicalValueIsUnsafe(request.url, [activeSession.sessionToken]) ||
-        canonicalValueIsUnsafe(request.url, [activeSession.csrfToken]))
+      (untrustedInputIsUnsafe(request.url, [activeSession.sessionToken]) ||
+        untrustedInputIsUnsafe(request.url, [activeSession.csrfToken]))
     ) {
       return respond(response(400, "Bad Request\n"));
     }
@@ -428,7 +428,7 @@ export function createUiSecurityPolicy(
       headers: filteredHeaders,
       ...(source.body === undefined ? {} : { body: source.body }),
     });
-    return canonicalResponseIsUnsafe(filtered, [
+    return responseLeaksCredentials(filtered, [
       activeSession.sessionToken,
       activeSession.csrfToken,
     ]);
