@@ -46,7 +46,8 @@ function fixture(
       ? {}
       : {
           draftSource: {
-            load: () => Promise.resolve(ok({ project, config })),
+            load: () =>
+              Promise.resolve(ok({ project, config, linearAuditIssueId: "LINEAR-AUDIT-1" })),
           },
         }),
     git: {
@@ -168,6 +169,21 @@ function readySession(
       autoMergeEnabled: false,
       updatedAt: instant("2026-08-06T12:00:00.000Z"),
     },
+    linearAuditIssueId: "LINEAR-AUDIT-1",
+    gateEvidenceReceipt: {
+      schemaVersion: 1,
+      source: "source_control",
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      changeRequestId: "PR_node_1",
+      headSha: "e".repeat(40),
+      requirementsDigest,
+      diffDigest,
+      ciChecksDigest: digest("checks"),
+      reviewContext: "agent-team/review",
+      reviewEvidenceUrl: "https://review.test/evidence",
+      evidenceDigest: digest("gate"),
+    },
     evidence: Object.freeze([
       {
         code: "setup_ci_passed",
@@ -207,9 +223,7 @@ describe("W3A Registration Setup production controller", () => {
     expect(result.preview?.setupSessionId).toMatch(/^setup-[0-9a-f]{64}$/u);
     expect(result.evidence.map((item) => item.code)).toEqual([
       "merge_w3b_unwired",
-      "audit_w3b_unwired",
       "activation_w3b_unwired",
-      "conversation_approval_w3b_unwired",
     ]);
     expect(controller).not.toHaveProperty("ports");
     expect(controller).not.toHaveProperty("approveAndMerge");
@@ -224,6 +238,37 @@ describe("W3A Registration Setup production controller", () => {
     );
     expect(calls).toEqual([]);
   });
+
+  it.each([undefined, "bad issue id with spaces"])(
+    "fails closed with zero mutation for server-owned linearAuditIssueId=%s",
+    async (linearAuditIssueId) => {
+      const test = fixture();
+      let repositoryReads = 0;
+      const controller = new RegistrationSetupController({
+        ...test.ports,
+        draftSource: {
+          load: () => Promise.resolve(ok({ project, config, linearAuditIssueId } as never)),
+        },
+        git: {
+          inspectRepository: () => {
+            repositoryReads += 1;
+            return test.ports.git.inspectRepository({ rootPath: project.localRepositoryPath });
+          },
+        },
+      });
+      const read = await controller.read({ authorityDigest });
+      expect(read.state).toBe("configuration_incomplete");
+      expect(read.evidence.some((item) => item.code === "linear_audit_issue_invalid")).toBe(true);
+      await expect(
+        controller.refresh(
+          { setupSessionId: "setup-invalid", idempotencyKeyPrefix: "invalid:refresh" },
+          { authorityDigest },
+        ),
+      ).resolves.toMatchObject({ state: "configuration_incomplete" });
+      expect(repositoryReads).toBe(0);
+      expect(test.calls).toEqual([]);
+    },
+  );
 
   it("binds preview confirmation and start to trusted session + current digest", async () => {
     const { controller, calls } = fixture();
@@ -274,7 +319,7 @@ describe("W3A Registration Setup production controller", () => {
       },
       { authorityDigest },
     );
-    const approval = await test.controller.issueApprovalIntent(
+    const approval = await test.controller.issueLocalUiApprovalIntent(
       {
         setupSessionId: model.preview.setupSessionId,
         expectedSetupRevision: 3,
@@ -302,10 +347,9 @@ describe("W3A Registration Setup production controller", () => {
       refreshed: Object.freeze({
         state: "awaiting_user_approval",
         session,
-        auditIntents: Object.freeze([]),
       }),
     });
-    const result = await test.controller.issueApprovalIntent(
+    const result = await test.controller.issueLocalUiApprovalIntent(
       {
         setupSessionId: session.setupSessionId,
         expectedSetupRevision: session.revision,

@@ -31,6 +31,7 @@ const previewModel: RegistrationSetupControllerReadModel = Object.freeze({
     baseRevision: "d".repeat(40),
     previewDigest,
     requirementsDigest: "e".repeat(64),
+    linearAuditIssueId: "LINEAR-AUDIT-1",
   }),
 });
 
@@ -78,7 +79,7 @@ function fixture() {
         Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
       );
     },
-    issueApprovalIntent: (command, context) => {
+    issueLocalUiApprovalIntent: (command, context) => {
       calls.push(["approval", command, context]);
       return Promise.resolve(
         Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
@@ -126,6 +127,17 @@ describe("O005 Registration Setup Wizard contribution", () => {
         session: { authorityDigest },
       }),
     ).resolves.toMatchObject({ statusCode: 422 });
+    for (const injected of [
+      { source: "current_user_conversation" },
+      { authorityDigest: "f".repeat(64) },
+      { webhookComment: "APPROVE SETUP MERGE" },
+    ]) {
+      await expect(
+        handler(request("PUT", "session", { ...body, ...injected }), {
+          session: { authorityDigest },
+        }),
+      ).resolves.toMatchObject({ statusCode: 422 });
+    }
     expect(calls).toEqual([]);
 
     await expect(

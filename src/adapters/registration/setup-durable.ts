@@ -10,11 +10,15 @@ import {
   createRegistrationSetupPreview,
   registrationSetupBranch,
   type RegistrationSetupActivationMarker,
+  type RegistrationSetupAuditIntent,
+  type RegistrationSetupAuditReceipt,
   type RegistrationSetupApprovalBinding,
   type RegistrationSetupFilePort,
   type RegistrationSetupFinalApprovalAuthorityPort,
   type RegistrationSetupFinalApprovalReceipt,
   type RegistrationSetupFinalApprovalRequest,
+  type RegistrationSetupFinalApprovalAuthority,
+  type RegistrationSetupGateEvidenceReceipt,
   type RegistrationSetupExecutionFence,
   type RegistrationSetupExecutionLease,
   type RegistrationSetupFencedMutationOptions,
@@ -124,6 +128,7 @@ const previewSchema = z
     worktreePath: z.string().refine(isAbsolute),
     branch: z.literal(registrationSetupBranch),
     remote: z.literal("origin"),
+    linearAuditIssueId: identifierSchema,
     previewDigest: digestSchema,
     requirementsDigest: digestSchema,
   })
@@ -138,6 +143,7 @@ const previewSchema = z
       worktreePath: preview.worktreePath,
       branch: preview.branch,
       remote: preview.remote,
+      linearAuditIssueId: preview.linearAuditIssueId,
     });
     return (
       recreated.ok &&
@@ -230,12 +236,62 @@ const journalSchema = z
     );
   }) as unknown as z.ZodType<RegistrationSetupJournal>;
 
+const gateEvidenceSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    source: z.literal("source_control"),
+    projectId: identifierSchema,
+    repository: z.string().min(1),
+    changeRequestId: identifierSchema,
+    headSha: shaSchema,
+    requirementsDigest: digestSchema,
+    diffDigest: digestSchema,
+    ciChecksDigest: digestSchema,
+    reviewContext: z.literal("agent-team/review"),
+    reviewEvidenceUrl: z.url(),
+    evidenceDigest: digestSchema,
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupGateEvidenceReceipt>;
+
+const auditIntentObjectSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    destination: z.enum(["linear", "pull_request"]),
+    kind: z.literal("registration_setup_user_approval_required"),
+    setupSessionId: identifierSchema,
+    projectId: identifierSchema,
+    repository: z.string().min(1),
+    linearAuditIssueId: identifierSchema,
+    changeRequestId: identifierSchema,
+    headSha: shaSchema,
+    requirementsDigest: digestSchema,
+    diffDigest: digestSchema,
+    evidenceDigest: digestSchema,
+    body: z.string().min(1).max(65_536),
+    bodyDigest: digestSchema,
+    idempotencyKey: mutationKeySchema,
+  })
+  .strict();
+const auditIntentSchema =
+  auditIntentObjectSchema as unknown as z.ZodType<RegistrationSetupAuditIntent>;
+
+const auditReceiptSchema = auditIntentObjectSchema
+  .omit({ kind: true, body: true, idempotencyKey: true })
+  .extend({
+    externalCommentId: identifierSchema,
+    idempotencyKeyDigest: digestSchema,
+    createdAt: instantSchema,
+    reused: z.boolean(),
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupAuditReceipt>;
+
 const sessionSchema = z
   .object({
     schemaVersion: z.literal(1),
     revision: z.number().int().positive(),
     phase: z.enum([
       "ci_waiting",
+      "audit_pending",
       "awaiting_user_approval",
       "merge_authorized",
       "activated",
@@ -253,22 +309,58 @@ const sessionSchema = z
     configDigest: digestSchema,
     headSha: shaSchema,
     changeRequest: changeRequestSchema,
+    linearAuditIssueId: identifierSchema,
+    gateEvidenceReceipt: gateEvidenceSchema.optional(),
+    audit: z
+      .object({
+        pending: auditIntentSchema.optional(),
+        linearReceipt: auditReceiptSchema.optional(),
+        pullRequestReceipt: auditReceiptSchema.optional(),
+      })
+      .strict()
+      .optional(),
     evidence: z.array(evidenceSchema),
     approvalReferenceDigest: digestSchema.optional(),
     approvalNonceDigest: digestSchema.optional(),
-    approvalSessionDigest: digestSchema.optional(),
+    approvalAuthorityDigest: digestSchema.optional(),
+    approvalSource: z.enum(["local_ui", "current_user_conversation"]).optional(),
     activatedRevisionSha: shaSchema.optional(),
   })
   .strict()
   .refine((session) => {
     const approvalRequired = session.phase === "merge_authorized" || session.phase === "activated";
     const evidenceCodes = new Set(session.evidence.map((item) => item.code));
+    const gate = session.gateEvidenceReceipt;
+    const gateBound =
+      gate?.projectId === session.project.id &&
+      gate.repository === session.project.sourceControl.repository &&
+      gate.changeRequestId === session.changeRequest.id &&
+      gate.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+      gate.requirementsDigest === session.requirementsDigest &&
+      gate.diffDigest === session.diffDigest;
+    const receiptBound = (receipt: RegistrationSetupAuditReceipt | undefined) =>
+      receipt?.setupSessionId === session.setupSessionId &&
+      receipt.projectId === session.project.id &&
+      receipt.repository === session.project.sourceControl.repository &&
+      receipt.linearAuditIssueId === session.linearAuditIssueId &&
+      receipt.changeRequestId === session.changeRequest.id &&
+      receipt.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+      receipt.requirementsDigest === session.requirementsDigest &&
+      receipt.diffDigest === session.diffDigest &&
+      receipt.evidenceDigest === gate?.evidenceDigest;
     return (
       session.project.id === session.config.projectId &&
       session.config.defaultBranch === session.project.defaultBranch &&
       session.setupSessionId.length > 0 &&
       session.worktree.repositoryRoot === session.project.localRepositoryPath &&
       session.changeRequest.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+      (session.phase === "ci_waiting" || session.phase === "cancelled" || gateBound) &&
+      (session.phase === "ci_waiting" ||
+        session.phase === "cancelled" ||
+        session.phase === "audit_pending" ||
+        (session.audit?.pending === undefined &&
+          receiptBound(session.audit?.linearReceipt) &&
+          receiptBound(session.audit?.pullRequestReceipt))) &&
       session.evidence.every(
         (item) =>
           item.projectId === session.project.id &&
@@ -279,7 +371,8 @@ const sessionSchema = z
       (!approvalRequired ||
         (session.approvalReferenceDigest !== undefined &&
           session.approvalNonceDigest !== undefined &&
-          session.approvalSessionDigest !== undefined &&
+          session.approvalAuthorityDigest !== undefined &&
+          session.approvalSource !== undefined &&
           evidenceCodes.has("setup_user_approval_consumed"))) &&
       (session.phase !== "activated" ||
         (session.activatedRevisionSha !== undefined &&
@@ -343,6 +436,8 @@ const approvalBindingObjectSchema = z
     headSha: shaSchema,
     requirementsDigest: digestSchema,
     diffDigest: digestSchema,
+    linearAuditIssueId: identifierSchema,
+    gateEvidenceDigest: digestSchema,
   })
   .strict();
 const approvalBindingSchema =
@@ -351,8 +446,8 @@ const approvalBindingSchema =
 const approvalReceiptSchema = approvalBindingObjectSchema
   .extend({
     approvalId: identifierSchema,
-    issuer: z.literal("local_ui"),
-    uiSessionDigest: digestSchema,
+    issuer: z.enum(["local_ui", "current_user_conversation"]),
+    authorityDigest: digestSchema,
     approvalNonceDigest: digestSchema,
     consumedAt: instantSchema,
   })
@@ -362,6 +457,7 @@ const ledgerGrantSchema = z
   .object({
     approvalId: identifierSchema,
     issueOperationDigest: digestSchema,
+    issuer: z.enum(["local_ui", "current_user_conversation"]),
     authorityDigest: digestSchema,
     approvalNonceDigest: digestSchema,
     binding: approvalBindingObjectSchema,
@@ -1416,12 +1512,15 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
 
   async issue(
     binding: RegistrationSetupApprovalBinding,
-    trustedAuthorityDigest: string,
+    authority: RegistrationSetupFinalApprovalAuthority,
     options: MutationOptions,
   ) {
+    const rawAuthority = authority as unknown as Readonly<Record<string, unknown>>;
     if (
       !validMutation(options) ||
-      !digestPattern.test(trustedAuthorityDigest) ||
+      !digestPattern.test(authority.authorityDigest) ||
+      (rawAuthority["issuer"] !== "local_ui" &&
+        rawAuthority["issuer"] !== "current_user_conversation") ||
       !approvalBindingSchema.safeParse(binding).success
     ) {
       return err(domainError("invariant_violation"));
@@ -1443,7 +1542,8 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
         );
         if (existing !== undefined) {
           return existing.state === "pending" &&
-            existing.authorityDigest === trustedAuthorityDigest &&
+            existing.issuer === authority.issuer &&
+            existing.authorityDigest === authority.authorityDigest &&
             sameValue(existing.binding, binding)
             ? ok({
                 state: "issued" as const,
@@ -1454,7 +1554,8 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
         const issuedAt = this.#clock.now();
         const duplicateBinding = ledger.value.grants.find(
           (grant) =>
-            grant.authorityDigest === trustedAuthorityDigest &&
+            grant.issuer === authority.issuer &&
+            grant.authorityDigest === authority.authorityDigest &&
             sameValue(grant.binding, binding) &&
             (grant.state === "consumed" || Date.parse(issuedAt) <= Date.parse(grant.expiresAt)),
         );
@@ -1463,7 +1564,8 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
         const grant = ledgerGrantSchema.parse({
           approvalId: `approval-${randomUUID()}`,
           issueOperationDigest: operationDigest,
-          authorityDigest: trustedAuthorityDigest,
+          issuer: authority.issuer,
+          authorityDigest: authority.authorityDigest,
           approvalNonceDigest: hash(randomBytes(32).toString("hex")),
           binding,
           issuedAt,
@@ -1492,14 +1594,17 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
   async verifyAndConsume(
     request: RegistrationSetupFinalApprovalRequest,
     expectedBinding: RegistrationSetupApprovalBinding,
-    trustedAuthorityDigest: string,
+    authority: RegistrationSetupFinalApprovalAuthority,
     options: MutationOptions,
   ) {
+    const rawAuthority = authority as unknown as Readonly<Record<string, unknown>>;
     const requestKeys = Object.keys(request).sort();
     const rawRequest = request as unknown as Readonly<Record<string, unknown>>;
     if (
       !validMutation(options) ||
-      !digestPattern.test(trustedAuthorityDigest) ||
+      !digestPattern.test(authority.authorityDigest) ||
+      (rawAuthority["issuer"] !== "local_ui" &&
+        rawAuthority["issuer"] !== "current_user_conversation") ||
       !approvalBindingSchema.safeParse(expectedBinding).success ||
       requestKeys.join("\0") !== "approvalId\0expectedSetupRevision\0userConfirmed" ||
       !identifierPattern.test(request.approvalId) ||
@@ -1528,7 +1633,8 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
         );
         const grant = ledger.value.grants[index];
         if (
-          grant?.authorityDigest !== trustedAuthorityDigest ||
+          grant?.issuer !== authority.issuer ||
+          grant.authorityDigest !== authority.authorityDigest ||
           request.expectedSetupRevision !== expectedBinding.setupSessionRevision ||
           !sameValue(grant.binding, expectedBinding)
         ) {
@@ -1546,8 +1652,8 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
         const receipt = approvalReceiptSchema.parse({
           ...grant.binding,
           approvalId: grant.approvalId,
-          issuer: "local_ui",
-          uiSessionDigest: grant.authorityDigest,
+          issuer: grant.issuer,
+          authorityDigest: grant.authorityDigest,
           approvalNonceDigest: grant.approvalNonceDigest,
           consumedAt: this.#clock.now(),
         });

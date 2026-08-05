@@ -47,6 +47,7 @@ const setupPreviewModel: RegistrationSetupControllerReadModel = Object.freeze({
     baseRevision: "d".repeat(40),
     previewDigest: setupPreviewDigest,
     requirementsDigest: "e".repeat(64),
+    linearAuditIssueId: "LINEAR-AUDIT-1",
   }),
 });
 
@@ -66,7 +67,7 @@ function setupController(): RegistrationSetupControllerUseCase {
     start: () =>
       Promise.resolve(Object.freeze({ ...setupPreviewModel, state: "ci_waiting" as const })),
     refresh: () => Promise.resolve(setupPreviewModel),
-    issueApprovalIntent: () =>
+    issueLocalUiApprovalIntent: () =>
       Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
   });
 }

@@ -9,6 +9,8 @@ import { createRegistrationSetupPreview, type RegistrationSetupCoordinator } fro
 import {
   registrationSetupBranch,
   type RegistrationSetupApprovalBinding,
+  type RegistrationSetupConversationApprovalBridgePort,
+  type RegistrationSetupConversationHostCapability,
   type RegistrationSetupFinalApprovalAuthorityPort,
   type RegistrationSetupOutcome,
   type RegistrationSetupPreview,
@@ -26,6 +28,7 @@ export const registrationSetupFinalApprovalPhrase = "APPROVE SETUP MERGE" as con
 export interface RegistrationSetupDraft {
   readonly project: Project;
   readonly config: TrustedProjectConfig;
+  readonly linearAuditIssueId: string;
 }
 
 /** The host owns this source; request payloads never populate it. */
@@ -41,6 +44,7 @@ export interface RegistrationSetupControllerEvidence {
     | "production_dependencies_unwired"
     | "draft_source_unavailable"
     | "draft_invalid"
+    | "linear_audit_issue_invalid"
     | "local_repository_unavailable"
     | "default_branch_mismatch"
     | "working_tree_not_clean"
@@ -60,6 +64,7 @@ export interface RegistrationSetupPreviewSummary {
   readonly baseRevision: string;
   readonly previewDigest: string;
   readonly requirementsDigest: string;
+  readonly linearAuditIssueId: string;
 }
 
 export type RegistrationSetupControllerReadModel = Readonly<{
@@ -67,6 +72,7 @@ export type RegistrationSetupControllerReadModel = Readonly<{
     | "configuration_incomplete"
     | "preview_ready"
     | "ci_waiting"
+    | "audit_pending"
     | "checks_pending"
     | "awaiting_user_approval";
   evidence: readonly RegistrationSetupControllerEvidence[];
@@ -146,7 +152,7 @@ export interface RegistrationSetupControllerUseCase {
     command: RegistrationSetupRefreshCommand,
     context: RegistrationSetupControllerContext,
   ): Promise<RegistrationSetupControllerActionResult>;
-  issueApprovalIntent(
+  issueLocalUiApprovalIntent(
     command: RegistrationSetupApprovalIntentCommand,
     context: RegistrationSetupControllerContext,
   ): Promise<RegistrationSetupControllerActionResult>;
@@ -162,22 +168,26 @@ export interface RegistrationSetupControllerPorts {
   readonly finalApproval: RegistrationSetupFinalApprovalAuthorityPort;
 }
 
+export interface RegistrationSetupConversationApprovalFacade {
+  issueConversationApprovalIntent(
+    command: RegistrationSetupApprovalIntentCommand,
+    hostCapability: RegistrationSetupConversationHostCapability,
+  ): Promise<RegistrationSetupControllerActionResult>;
+}
+
+export interface RegistrationSetupConversationApprovalFacadePorts {
+  readonly coordinator: Pick<RegistrationSetupCoordinator, "refresh">;
+  readonly bridge: RegistrationSetupConversationApprovalBridgePort;
+}
+
 const w3bEvidence = Object.freeze([
   Object.freeze({
     code: "merge_w3b_unwired" as const,
     message: "合併能力留待 W3B；本頁不會執行 merge。",
   }),
   Object.freeze({
-    code: "audit_w3b_unwired" as const,
-    message: "Linear／PR 稽核 receipt 留待 W3B；留言不能核可。",
-  }),
-  Object.freeze({
     code: "activation_w3b_unwired" as const,
     message: "可信設定啟用與 loader gate 留待 W3B。",
-  }),
-  Object.freeze({
-    code: "conversation_approval_w3b_unwired" as const,
-    message: "對話核可 bridge 留待 W3B；目前只接受本機 UI。",
   }),
 ]);
 
@@ -205,6 +215,8 @@ function sessionSummary(session: RegistrationSetupSession) {
     changeRequestId: session.changeRequest.id,
     headSha: session.headSha,
     diffDigest: session.diffDigest,
+    linearAuditIssueId: session.linearAuditIssueId,
+    gateEvidenceDigest: session.gateEvidenceReceipt?.evidenceDigest,
     ciPassed: evidence.has("setup_ci_passed"),
     freshReviewPassed: evidence.has("setup_fresh_review_passed"),
   });
@@ -220,6 +232,7 @@ function previewSummary(preview: RegistrationSetupPreview): RegistrationSetupPre
     baseRevision: preview.baseRevision,
     previewDigest: preview.previewDigest,
     requirementsDigest: preview.requirementsDigest,
+    linearAuditIssueId: preview.linearAuditIssueId,
   });
 }
 
@@ -240,7 +253,9 @@ function readModel(
       ? "awaiting_user_approval"
       : session.phase === "ci_waiting"
         ? "ci_waiting"
-        : "checks_pending";
+        : session.phase === "audit_pending"
+          ? "audit_pending"
+          : "checks_pending";
   return Object.freeze({
     state,
     evidence: w3bEvidence,
@@ -257,7 +272,11 @@ function operationIsValid(value: string): boolean {
   return value.trim().length > 0 && value.length <= 500 && !/[\u0000\r\n]/u.test(value);
 }
 
-function approvalBinding(session: RegistrationSetupSession): RegistrationSetupApprovalBinding {
+function approvalBinding(
+  session: RegistrationSetupSession,
+): RegistrationSetupApprovalBinding | undefined {
+  const gateEvidenceDigest = session.gateEvidenceReceipt?.evidenceDigest;
+  if (gateEvidenceDigest === undefined) return undefined;
   return Object.freeze({
     schemaVersion: 1,
     setupSessionId: session.setupSessionId,
@@ -268,6 +287,8 @@ function approvalBinding(session: RegistrationSetupSession): RegistrationSetupAp
     headSha: session.headSha,
     requirementsDigest: session.requirementsDigest,
     diffDigest: session.diffDigest,
+    linearAuditIssueId: session.linearAuditIssueId,
+    gateEvidenceDigest,
   });
 }
 
@@ -304,10 +325,20 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
     const project = projectSchema.safeParse(draft.value.project);
     const config = trustedProjectConfigSchema.safeParse(draft.value.config);
     const serialized = serializeTrustedProjectConfig(draft.value.config);
-    if (!project.success || !config.success || !serialized.ok) {
+    if (
+      !project.success ||
+      !config.success ||
+      !serialized.ok ||
+      typeof draft.value.linearAuditIssueId !== "string" ||
+      !identifierPattern.test(draft.value.linearAuditIssueId)
+    ) {
       return incomplete({
-        code: "draft_invalid",
-        message: "Server-side Setup draft 未通過 schema。",
+        code:
+          typeof draft.value.linearAuditIssueId !== "string" ||
+          !identifierPattern.test(draft.value.linearAuditIssueId)
+            ? "linear_audit_issue_invalid"
+            : "draft_invalid",
+        message: "Server-side Setup draft 或 Linear audit issue 未通過 schema。",
       });
     }
     const repository = await this.#ports.git.inspectRepository(
@@ -336,6 +367,7 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
       project.data.id,
       repository.value.headSha.toLowerCase(),
       serialized.value.contentDigest,
+      draft.value.linearAuditIssueId,
     ].join("\0");
     const setupSessionId = `setup-${createHash("sha256").update(seed, "utf8").digest("hex")}`;
     const preview = createRegistrationSetupPreview({
@@ -347,6 +379,7 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
       worktreePath: join(this.#stateRoot, "registration-setup", "worktrees", setupSessionId),
       branch: registrationSetupBranch,
       remote: "origin",
+      linearAuditIssueId: draft.value.linearAuditIssueId,
     });
     return preview.ok
       ? preview.value
@@ -454,10 +487,17 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
     ) {
       return incomplete({ code: "draft_invalid", message: "Refresh request 無效。" });
     }
+    const preview = await this.#preview(context);
+    if (!("previewDigest" in preview) || preview.setupSessionId !== command.setupSessionId) {
+      return incomplete({
+        code: "draft_invalid",
+        message: "Server-side Setup draft 已缺失或漂移，禁止 refresh side effect。",
+      });
+    }
     return this.#ports.coordinator.refresh(command);
   }
 
-  async issueApprovalIntent(
+  async issueLocalUiApprovalIntent(
     command: RegistrationSetupApprovalIntentCommand,
     context: RegistrationSetupControllerContext,
   ): Promise<RegistrationSetupControllerActionResult> {
@@ -471,25 +511,34 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
       return incomplete({ code: "draft_invalid", message: "本機 UI approval intent 無效。" });
     }
     const refreshed = await this.refresh(command, context);
-    if (refreshed.state !== "awaiting_user_approval" || !("auditIntents" in refreshed)) {
+    if (
+      refreshed.state !== "awaiting_user_approval" ||
+      refreshed.session === undefined ||
+      !("gateEvidenceReceipt" in refreshed.session)
+    ) {
       return refreshed;
     }
-    if (refreshed.session.revision !== command.expectedSetupRevision) {
+    const session = refreshed.session;
+    if (session.revision !== command.expectedSetupRevision) {
       return incomplete({
         code: "draft_invalid",
         message: "Setup revision 已漂移，核可 intent 失效。",
       });
     }
+    const binding = approvalBinding(session);
+    if (binding === undefined) {
+      return incomplete({ code: "draft_invalid", message: "Gate evidence receipt 缺失。" });
+    }
     const issued = await this.#ports.finalApproval.issue(
-      approvalBinding(refreshed.session),
-      context.authorityDigest,
+      binding,
+      { issuer: "local_ui", authorityDigest: context.authorityDigest },
       { idempotencyKey: command.idempotencyKey },
     );
     return issued.ok && issued.value.state === "issued"
       ? Object.freeze({
           state: "approval_intent_issued",
-          setupSessionId: refreshed.session.setupSessionId,
-          expectedSetupRevision: refreshed.session.revision,
+          setupSessionId: session.setupSessionId,
+          expectedSetupRevision: session.revision,
           approvalId: issued.value.grant.approvalId,
           expiresAt: issued.value.grant.expiresAt,
           mergeState: "configuration_incomplete",
@@ -510,6 +559,56 @@ export function createUnwiredRegistrationSetupController(
     confirmPreview: () => Promise.resolve(model),
     start: () => Promise.resolve(model),
     refresh: () => Promise.resolve(model),
-    issueApprovalIntent: () => Promise.resolve(model),
+    issueLocalUiApprovalIntent: () => Promise.resolve(model),
   });
+}
+
+/** Host-only façade. HTTP, CLI, PR, and Linear payload parsers never receive its capability. */
+export class HostRegistrationSetupConversationApprovalFacade implements RegistrationSetupConversationApprovalFacade {
+  readonly #ports: RegistrationSetupConversationApprovalFacadePorts;
+
+  constructor(ports: RegistrationSetupConversationApprovalFacadePorts) {
+    this.#ports = ports;
+  }
+
+  async issueConversationApprovalIntent(
+    command: RegistrationSetupApprovalIntentCommand,
+    hostCapability: RegistrationSetupConversationHostCapability,
+  ): Promise<RegistrationSetupControllerActionResult> {
+    if (
+      command.confirmation !== registrationSetupFinalApprovalPhrase ||
+      !identifierPattern.test(command.setupSessionId) ||
+      !Number.isSafeInteger(command.expectedSetupRevision) ||
+      command.expectedSetupRevision <= 0 ||
+      !operationIsValid(command.idempotencyKey) ||
+      !operationIsValid(command.idempotencyKeyPrefix)
+    ) {
+      return incomplete({ code: "draft_invalid", message: "Conversation approval intent 無效。" });
+    }
+    const refreshed = await this.#ports.coordinator.refresh(command);
+    if (refreshed.state !== "awaiting_user_approval") return refreshed;
+    if (refreshed.session.revision !== command.expectedSetupRevision) {
+      return incomplete({ code: "draft_invalid", message: "Setup revision 已漂移。" });
+    }
+    const binding = approvalBinding(refreshed.session);
+    if (binding === undefined) {
+      return incomplete({ code: "draft_invalid", message: "Gate evidence receipt 缺失。" });
+    }
+    const issued = await this.#ports.bridge.issue(binding, hostCapability, {
+      idempotencyKey: command.idempotencyKey,
+    });
+    return issued.ok && issued.value.state === "issued"
+      ? Object.freeze({
+          state: "approval_intent_issued",
+          setupSessionId: refreshed.session.setupSessionId,
+          expectedSetupRevision: refreshed.session.revision,
+          approvalId: issued.value.grant.approvalId,
+          expiresAt: issued.value.grant.expiresAt,
+          mergeState: "configuration_incomplete",
+        })
+      : incomplete({
+          code: "draft_invalid",
+          message: "Host conversation capability 無法簽發 durable approval intent。",
+        });
+  }
 }

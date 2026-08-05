@@ -130,6 +130,7 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
     worktreePath,
     branch: "agent-team/setup",
     remote: "origin",
+    linearAuditIssueId: "LINEAR-AUDIT-RECOVERY",
   });
   if (!preview.ok) throw new Error(preview.error.code);
   const serialized = serializeTrustedProjectConfig(config);
@@ -186,13 +187,13 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
       getCommitChecks: () => Promise.resolve(err(domainError("unavailable"))),
       getCommitStatuses: () => Promise.resolve(err(domainError("unavailable"))),
       markChangeRequestReady: () => Promise.resolve(err(domainError("unavailable"))),
-      enableAutoMerge: () => Promise.resolve(err(domainError("unavailable"))),
     },
+    gateEvidence: { read: () => Promise.resolve(err(domainError("unavailable"))) },
+    audit: { publish: () => Promise.resolve(err(domainError("unavailable"))) },
     finalApproval: {
       issue: () => Promise.resolve(ok({ state: "rejected" as const })),
       verifyAndConsume: () => Promise.resolve(ok({ state: "rejected" as const })),
     },
-    mergedConfig: { read: () => Promise.resolve(err(domainError("unavailable"))) },
   };
   const request: RegistrationSetupBeginRequest = {
     preview: preview.value,

@@ -24,10 +24,10 @@ import type {
   CommitChecksSnapshot,
   CommitStatusesSnapshot,
 } from "../../src/application/ports/index.js";
+import { sha256Digest } from "../../src/domain/review/index.js";
 
 const baseSha = "a".repeat(40);
 const headSha = "b".repeat(40);
-const mergedSha = "c".repeat(40);
 const now = "2026-08-05T12:00:00.000Z";
 const project = projectSchema.parse({
   schemaVersion: 1,
@@ -62,6 +62,7 @@ const previewResult = createRegistrationSetupPreview({
   worktreePath: "/tmp/setup-worktree",
   branch: "agent-team/setup",
   remote: "origin",
+  linearAuditIssueId: "LINEAR-AUDIT-1",
 });
 if (!previewResult.ok) throw new Error(previewResult.error.code);
 const preview = previewResult.value;
@@ -87,14 +88,27 @@ function checks(
   aggregate: CommitChecksSnapshot["aggregate"] = "success",
   sha = headSha,
 ): CommitChecksSnapshot {
-  return { headSha: sha, aggregate, checks: [] };
+  return {
+    headSha: sha,
+    aggregate,
+    checks: [
+      {
+        name: "quality",
+        status: "completed",
+        conclusion: aggregate === "success" ? "success" : "failure",
+      },
+    ],
+  };
 }
 
 function statuses(
   state: "pending" | "success" | "failure" = "success",
   sha = headSha,
 ): CommitStatusesSnapshot {
-  return { headSha: sha, statuses: [{ context: "agent-team/review", state }] };
+  return {
+    headSha: sha,
+    statuses: [{ context: "agent-team/review", state, targetUrl: "https://review.test/evidence" }],
+  };
 }
 
 interface HarnessOptions {
@@ -125,6 +139,8 @@ interface HarnessOptions {
   readonly ownershipLossAfterEffect?: RegistrationSetupJournalStep;
   readonly mergedConfigReadBack?:
     "unavailable" | "config_drift" | "wrong_branch" | "wrong_revision" | "wrong_source";
+  readonly auditFailure?: "linear" | "pull_request";
+  readonly auditReceiptSaveCrash?: "linear" | "pull_request";
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -132,14 +148,18 @@ function harness(options: HarnessOptions = {}) {
   const sessions = new Map<string, RegistrationSetupSession>();
   const journals = new Map<string, RegistrationSetupJournal>();
   let diffReads = 0;
-  let mergeAttempts = 0;
   let localHeadSha = baseSha;
   let stagedConfig = false;
   let lastCommitMessage = "";
   let injectedCrash = false;
   let injectedConsumeSaveCrash = false;
+  let injectedAuditReceiptSaveCrash = false;
   let consumedApprovalOperation: string | undefined;
   let consumedApprovalReceipt: RegistrationSetupFinalApprovalReceipt | undefined;
+  const publishedAudit = new Map<
+    string,
+    Awaited<ReturnType<RegistrationSetupPorts["audit"]["publish"]>>
+  >();
   let executing = false;
   let executionEpoch = 0;
   let ownershipAssertions = 0;
@@ -409,14 +429,89 @@ function harness(options: HarnessOptions = {}) {
         current = changeRequest({ draft: false });
         return Promise.resolve(ok(current));
       },
-      enableAutoMerge: () => {
-        calls.push("merge");
-        mergeAttempts += 1;
-        if (options.fail === "merge" || (options.mergeFailOnce === true && mergeAttempts === 1)) {
-          return Promise.resolve(err(domainError("external_failure")));
+    },
+    gateEvidence: {
+      read: (command) => {
+        calls.push("ci-read", "review-read");
+        const ci = options.ci ?? checks();
+        const review = options.review ?? statuses();
+        if (ci.headSha !== command.expectedHeadSha || review.headSha !== command.expectedHeadSha) {
+          return Promise.resolve(err(domainError("conflict")));
         }
-        current = changeRequest({ draft: false, autoMergeEnabled: true });
-        return Promise.resolve(ok(current));
+        if (ci.aggregate !== "success") {
+          return Promise.resolve(
+            ok({
+              state: "not_ready" as const,
+              reason: ci.aggregate === "pending" ? ("ci_pending" as const) : ("ci_failed" as const),
+            }),
+          );
+        }
+        const matches = review.statuses.filter((item) => item.context === "agent-team/review");
+        const currentReview = matches[0];
+        if (
+          matches.length !== 1 ||
+          currentReview?.state !== "success" ||
+          currentReview.targetUrl === undefined
+        ) {
+          return Promise.resolve(
+            ok({
+              state: "not_ready" as const,
+              reason:
+                currentReview?.state === "pending" || currentReview === undefined
+                  ? ("review_pending" as const)
+                  : ("review_failed" as const),
+            }),
+          );
+        }
+        const receiptBinding = {
+          schemaVersion: 1 as const,
+          source: "source_control" as const,
+          projectId: command.project.id,
+          repository: command.project.sourceControl.repository,
+          changeRequestId: command.changeRequestId,
+          headSha: command.expectedHeadSha,
+          requirementsDigest: command.requirementsDigest,
+          diffDigest: command.diffDigest,
+          ciChecksDigest: "3".repeat(64) as typeof preview.requirementsDigest,
+          reviewContext: "agent-team/review" as const,
+          reviewEvidenceUrl: currentReview.targetUrl,
+        };
+        const evidenceDigest = sha256Digest({
+          kind: "registration_setup_gate_evidence",
+          ...receiptBinding,
+        });
+        if (!evidenceDigest.ok) return Promise.resolve(evidenceDigest);
+        return Promise.resolve(
+          ok({
+            state: "ready" as const,
+            receipt: { ...receiptBinding, evidenceDigest: evidenceDigest.value },
+          }),
+        );
+      },
+    },
+    audit: {
+      publish: (intent) => {
+        const existing = publishedAudit.get(intent.idempotencyKey);
+        if (existing !== undefined) return Promise.resolve(existing);
+        if (options.auditFailure === intent.destination) {
+          return Promise.resolve(err(domainError("unavailable")));
+        }
+        calls.push(`audit-${intent.destination}`);
+        const operationDigest = sha256Digest(intent.idempotencyKey);
+        if (!operationDigest.ok) return Promise.resolve(operationDigest);
+        const { kind: _kind, body: _body, idempotencyKey: _key, ...binding } = intent;
+        void _kind;
+        void _body;
+        void _key;
+        const result = ok({
+          ...binding,
+          externalCommentId: `${intent.destination}-comment-1`,
+          idempotencyKeyDigest: operationDigest.value,
+          createdAt: now,
+          reused: false,
+        });
+        publishedAudit.set(intent.idempotencyKey, result);
+        return Promise.resolve(result);
       },
     },
     journal: {
@@ -468,6 +563,16 @@ function harness(options: HarnessOptions = {}) {
     sessions: {
       load: (sessionId) => Promise.resolve(ok(sessions.get(sessionId))),
       save: (_expectedRevision, draft) => {
+        const currentSession = sessions.get(draft.setupSessionId);
+        if (
+          options.auditReceiptSaveCrash !== undefined &&
+          !injectedAuditReceiptSaveCrash &&
+          currentSession?.audit?.pending?.destination === options.auditReceiptSaveCrash &&
+          draft.audit?.pending === undefined
+        ) {
+          injectedAuditReceiptSaveCrash = true;
+          return Promise.resolve(err(domainError("external_failure")));
+        }
         if (
           options.consumeSessionSaveCrash === true &&
           draft.phase === "merge_authorized" &&
@@ -488,49 +593,6 @@ function harness(options: HarnessOptions = {}) {
               ? ("unknown" as const)
               : ("confirmed" as const),
             session,
-          }),
-        );
-      },
-      activate: (expectedRevision, draft, revisionSha) => {
-        calls.push("activate");
-        if (options.fail === "activation")
-          return Promise.resolve(err(domainError("external_failure")));
-        const session = { ...draft, revision: expectedRevision + 1 };
-        sessions.set(session.setupSessionId, session);
-        const returnedSession =
-          options.activationReceipt === "wrong_session"
-            ? { ...session, revision: session.revision + 1 }
-            : session;
-        const marker = {
-          schemaVersion: 1 as const,
-          source:
-            options.activationReceipt === "wrong_source"
-              ? ("local_default_branch" as "source_control_default_branch")
-              : ("source_control_default_branch" as const),
-          setupSessionId:
-            options.activationReceipt === "wrong_setup_session"
-              ? "other-session"
-              : session.setupSessionId,
-          projectId:
-            options.activationReceipt === "wrong_project"
-              ? ("project_018f47d2-77a4-7cc1-8ef2-999999999999" as typeof session.project.id)
-              : session.project.id,
-          authoritativeRevision:
-            options.activationReceipt === "wrong_revision" ? "9".repeat(40) : revisionSha,
-          defaultBranch:
-            options.activationReceipt === "wrong_branch"
-              ? "develop"
-              : session.project.defaultBranch,
-          configDigest:
-            options.activationReceipt === "wrong_digest" ? "9".repeat(64) : session.configDigest,
-        };
-        return Promise.resolve(
-          ok({
-            durability: options.unknownSessionDurability
-              ? ("unknown" as const)
-              : ("confirmed" as const),
-            session: returnedSession,
-            marker,
           }),
         );
       },
@@ -576,44 +638,14 @@ function harness(options: HarnessOptions = {}) {
             options.approvalAuthority === "mismatch" ? "f".repeat(40) : expectedBinding.headSha,
           requirementsDigest: expectedBinding.requirementsDigest,
           diffDigest: expectedBinding.diffDigest,
-          uiSessionDigest,
+          authorityDigest: uiSessionDigest,
+          linearAuditIssueId: expectedBinding.linearAuditIssueId,
+          gateEvidenceDigest: expectedBinding.gateEvidenceDigest,
           approvalNonceDigest,
           consumedAt: now,
         };
         return Promise.resolve(
           ok({ state: "verified_and_consumed" as const, receipt: consumedApprovalReceipt }),
-        );
-      },
-    },
-    mergedConfig: {
-      read: (command) => {
-        calls.push("merged-config-read");
-        if (options.mergedConfigReadBack === "unavailable") {
-          return Promise.resolve(err(domainError("unavailable")));
-        }
-        return Promise.resolve(
-          ok({
-            schemaVersion: 1 as const,
-            source:
-              options.mergedConfigReadBack === "wrong_source"
-                ? ("local_default_branch" as "source_control_default_branch")
-                : ("source_control_default_branch" as const),
-            projectId: project.id,
-            repository: project.sourceControl.repository,
-            changeRequestId: command.changeRequestId,
-            setupHeadSha: command.expectedHeadSha,
-            mergeCommitSha: mergedSha,
-            defaultBranch:
-              options.mergedConfigReadBack === "wrong_branch" ? "develop" : project.defaultBranch,
-            authoritativeRevision: mergedSha,
-            path: trustedProjectConfigPath,
-            configDigest:
-              options.mergedConfigReadBack === "config_drift" ? "9".repeat(64) : configDigest,
-            config,
-            ...(options.mergedConfigReadBack === "wrong_revision"
-              ? { authoritativeRevision: "8".repeat(40) }
-              : {}),
-          }),
         );
       },
     },
@@ -661,7 +693,7 @@ function approval(session: RegistrationSetupSession, overrides: Record<string, u
   };
 }
 
-const trustedAuthority = { authorityDigest: uiSessionDigest };
+const trustedAuthority = { issuer: "local_ui" as const, authorityDigest: uiSessionDigest };
 
 describe("O005 registration Setup PR flow", () => {
   it("serializes trusted config deterministically and rejects recognizable secrets", () => {
@@ -878,7 +910,7 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls.filter((call) => providerEffects.has(call))).toEqual([]);
   });
 
-  it("resolves unknown session and activation durability only through authoritative read-back", async () => {
+  it("resolves unknown merge-authorization durability only through authoritative read-back", async () => {
     const test = await prepared(harness({ unknownSessionDurability: true, mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -894,7 +926,9 @@ describe("O005 registration Setup PR flow", () => {
         },
         trustedAuthority,
       ),
-    ).resolves.toMatchObject({ state: "activated", revisionSha: mergedSha });
+    ).resolves.toMatchObject({ state: "merge_pending" });
+    expect(test.calls).not.toContain("merge");
+    expect(test.calls).not.toContain("activate");
   });
 
   it.each([
@@ -910,6 +944,8 @@ describe("O005 registration Setup PR flow", () => {
     });
     expect(result).toMatchObject({ state: "not_ready", reason });
     expect(test.calls).not.toContain("consume-approval");
+    expect(test.calls).not.toContain("audit-linear");
+    expect(test.calls).not.toContain("audit-pull_request");
   });
 
   it("requires review status for the exact Head and blocks Head or diff drift", async () => {
@@ -928,7 +964,7 @@ describe("O005 registration Setup PR flow", () => {
     }
   });
 
-  it("produces fixed audit intents only after CI and fresh review succeed", async () => {
+  it("persists typed audit receipts only after CI and fresh review succeed", async () => {
     const test = await prepared();
     const result = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -936,14 +972,58 @@ describe("O005 registration Setup PR flow", () => {
     });
     expect(result).toMatchObject({ state: "awaiting_user_approval" });
     if (result.state !== "awaiting_user_approval") return;
-    expect(result.auditIntents.map((intent) => intent.destination)).toEqual([
-      "linear",
-      "pull_request",
-    ]);
-    expect(result.auditIntents.every((intent) => !intent.body.includes("Authorization:"))).toBe(
-      true,
+    expect(result.session.audit?.pending).toBeUndefined();
+    expect(result.session.audit?.linearReceipt).toMatchObject({ destination: "linear" });
+    expect(result.session.audit?.pullRequestReceipt).toMatchObject({
+      destination: "pull_request",
+    });
+    expect(test.calls.indexOf("save:audit_pending")).toBeLessThan(
+      test.calls.indexOf("audit-linear"),
     );
   });
+
+  it.each(["linear", "pull_request"] as const)(
+    "fails closed in audit_pending when %s receipt is unknown",
+    async (auditFailure) => {
+      const test = await prepared(harness({ auditFailure }));
+      const result = await test.coordinator.refresh({
+        setupSessionId: preview.setupSessionId,
+        idempotencyKeyPrefix: `refresh:audit-failure:${auditFailure}`,
+      });
+      expect(result).toMatchObject({
+        state: "failed",
+        stage: "audit",
+        session: { phase: "audit_pending" },
+      });
+      expect(test.calls).not.toContain("verify-consume-approval");
+      expect(test.calls).not.toContain("merge");
+      expect(test.calls).not.toContain("activate");
+    },
+  );
+
+  it.each(["linear", "pull_request"] as const)(
+    "recovers the same %s comment after publish-before-receipt crash",
+    async (auditReceiptSaveCrash) => {
+      const test = await prepared(harness({ auditReceiptSaveCrash }));
+      const request = {
+        setupSessionId: preview.setupSessionId,
+        idempotencyKeyPrefix: `refresh:audit-crash:${auditReceiptSaveCrash}`,
+      };
+      await expect(test.coordinator.refresh(request)).resolves.toMatchObject({
+        state: "failed",
+        stage: "session",
+        session: { phase: "audit_pending" },
+      });
+      await expect(test.coordinator.refresh(request)).resolves.toMatchObject({
+        state: "awaiting_user_approval",
+      });
+      expect(test.calls.filter((call) => call === `audit-${auditReceiptSaveCrash}`)).toHaveLength(
+        1,
+      );
+      expect(test.calls).not.toContain("merge");
+      expect(test.calls).not.toContain("activate");
+    },
+  );
 
   it("rejects missing, wrong-session, replayed, and external-text approvals", async () => {
     const test = await prepared();
@@ -1014,7 +1094,7 @@ describe("O005 registration Setup PR flow", () => {
     }
   });
 
-  it("activates trusted config only after merged and default-branch read-back", async () => {
+  it("durably authorizes merge without invoking B2 merge or activation", async () => {
     const test = await prepared(harness({ mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -1029,9 +1109,14 @@ describe("O005 registration Setup PR flow", () => {
       },
       trustedAuthority,
     );
-    expect(result).toMatchObject({ state: "activated", revisionSha: mergedSha });
+    expect(result).toMatchObject({
+      state: "merge_pending",
+      session: { phase: "merge_authorized" },
+    });
     expect(JSON.stringify(result)).not.toContain("approval-grant-1");
-    expect(test.calls.indexOf("activate")).toBeGreaterThan(test.calls.lastIndexOf("pr-read"));
+    expect(test.calls).not.toContain("merge");
+    expect(test.calls).not.toContain("merged-config-read");
+    expect(test.calls).not.toContain("activate");
   });
 
   it.each([
@@ -1040,28 +1125,25 @@ describe("O005 registration Setup PR flow", () => {
     "wrong_branch",
     "wrong_revision",
     "wrong_source",
-  ] as const)(
-    "blocks activation when authoritative merged-config read-back is %s",
-    async (mergedConfigReadBack) => {
-      const test = await prepared(harness({ mergedReadBack: true, mergedConfigReadBack }));
-      const ready = await test.coordinator.refresh({
+  ] as const)("leaves B2 merged-config read-back %s unreachable", async (mergedConfigReadBack) => {
+    const test = await prepared(harness({ mergedReadBack: true, mergedConfigReadBack }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:readback",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const result = await test.coordinator.approveAndMerge(
+      {
         setupSessionId: preview.setupSessionId,
-        idempotencyKeyPrefix: "refresh:readback",
-      });
-      if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-      const result = await test.coordinator.approveAndMerge(
-        {
-          setupSessionId: preview.setupSessionId,
-          approval: approval(ready.session),
-          idempotencyKeyPrefix: "merge:readback",
-        },
-        trustedAuthority,
-      );
-      expect(result).toMatchObject({ state: "failed", stage: "trusted_config_readback" });
-      expect(test.calls).toContain("merged-config-read");
-      expect(test.calls).not.toContain("activate");
-    },
-  );
+        approval: approval(ready.session),
+        idempotencyKeyPrefix: "merge:readback",
+      },
+      trustedAuthority,
+    );
+    expect(result).toMatchObject({ state: "merge_pending" });
+    expect(test.calls).not.toContain("merged-config-read");
+    expect(test.calls).not.toContain("activate");
+  });
 
   it.each([
     "wrong_source",
@@ -1071,29 +1153,27 @@ describe("O005 registration Setup PR flow", () => {
     "wrong_branch",
     "wrong_digest",
     "wrong_session",
-  ] as const)(
-    "fails closed for a confirmed activation receipt with %s",
-    async (activationReceipt) => {
-      const test = await prepared(harness({ mergedReadBack: true, activationReceipt }));
-      const ready = await test.coordinator.refresh({
-        setupSessionId: preview.setupSessionId,
-        idempotencyKeyPrefix: `refresh:activation:${activationReceipt}`,
-      });
-      if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-      await expect(
-        test.coordinator.approveAndMerge(
-          {
-            setupSessionId: preview.setupSessionId,
-            approval: approval(ready.session),
-            idempotencyKeyPrefix: `merge:activation:${activationReceipt}`,
-          },
-          trustedAuthority,
-        ),
-      ).resolves.toMatchObject({ state: "failed", stage: "activation" });
-    },
-  );
+  ] as const)("leaves B2 activation receipt path %s unreachable", async (activationReceipt) => {
+    const test = await prepared(harness({ mergedReadBack: true, activationReceipt }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: `refresh:activation:${activationReceipt}`,
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    await expect(
+      test.coordinator.approveAndMerge(
+        {
+          setupSessionId: preview.setupSessionId,
+          approval: approval(ready.session),
+          idempotencyKeyPrefix: `merge:activation:${activationReceipt}`,
+        },
+        trustedAuthority,
+      ),
+    ).resolves.toMatchObject({ state: "merge_pending" });
+    expect(test.calls).not.toContain("activate");
+  });
 
-  it("recovers with the same bound approval after a transient merge failure", async () => {
+  it("reuses the same durable merge authorization without invoking merge", async () => {
     const test = await prepared(harness({ mergeFailOnce: true, mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -1110,7 +1190,7 @@ describe("O005 registration Setup PR flow", () => {
         },
         trustedAuthority,
       ),
-    ).resolves.toMatchObject({ state: "failed", stage: "merge" });
+    ).resolves.toMatchObject({ state: "merge_pending" });
     await expect(
       test.coordinator.approveAndMerge(
         {
@@ -1120,8 +1200,9 @@ describe("O005 registration Setup PR flow", () => {
         },
         trustedAuthority,
       ),
-    ).resolves.toMatchObject({ state: "activated" });
+    ).resolves.toMatchObject({ state: "merge_pending" });
     expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(1);
+    expect(test.calls).not.toContain("merge");
   });
 
   it("recovers the durable approval receipt after consume succeeds but session save crashes", async () => {
@@ -1142,7 +1223,7 @@ describe("O005 registration Setup PR flow", () => {
     ).resolves.toMatchObject({ state: "failed", stage: "session" });
     await expect(
       test.coordinator.approveAndMerge(request, trustedAuthority),
-    ).resolves.toMatchObject({ state: "activated" });
+    ).resolves.toMatchObject({ state: "merge_pending" });
     expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(2);
   });
 
@@ -1175,7 +1256,7 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls).not.toContain("merge");
   });
 
-  it("recovers idempotently after merge failure but rejects replay after activation", async () => {
+  it("recovers an already durable authorization without replaying authority consumption", async () => {
     const test = await prepared(harness({ mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -1199,8 +1280,9 @@ describe("O005 registration Setup PR flow", () => {
       },
       trustedAuthority,
     );
-    expect(replay).toMatchObject({ state: "blocked", reason: "approval_replay" });
-    expect(test.calls.filter((call) => call === "activate")).toHaveLength(1);
+    expect(replay).toMatchObject({ state: "merge_pending" });
+    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(1);
+    expect(test.calls).not.toContain("activate");
   });
 
   it("cancels fail-closed and never resumes mutations", async () => {

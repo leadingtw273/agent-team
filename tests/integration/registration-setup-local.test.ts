@@ -141,6 +141,7 @@ const previewResult = createRegistrationSetupPreview({
   worktreePath: "/tmp/setup-worktree",
   branch: "agent-team/setup",
   remote: "origin",
+  linearAuditIssueId: "LINEAR-AUDIT-1",
 });
 if (!previewResult.ok) throw new Error(previewResult.error.code);
 const preview = previewResult.value;
@@ -163,6 +164,10 @@ const serializedConfig = serialized.value;
 const testDigestResult = sha256Digest({ test: "registration-setup" });
 if (!testDigestResult.ok) throw new Error(testDigestResult.error.code);
 const testDigest = testDigestResult.value;
+const localApprovalAuthority = Object.freeze({
+  issuer: "local_ui" as const,
+  authorityDigest,
+});
 const updatedAtResult = parseInstant("2026-08-05T12:00:00.000Z");
 if (!updatedAtResult.ok) throw new Error(updatedAtResult.error.code);
 const updatedAt = updatedAtResult.value;
@@ -212,6 +217,63 @@ function sessionDraft(
       autoMergeEnabled: phase === "activated",
       updatedAt,
     },
+    linearAuditIssueId: preview.linearAuditIssueId,
+    ...(phase === "activated"
+      ? {
+          gateEvidenceReceipt: {
+            schemaVersion: 1 as const,
+            source: "source_control" as const,
+            projectId: project.id,
+            repository: project.sourceControl.repository,
+            changeRequestId: "PR_node_1",
+            headSha,
+            requirementsDigest: preview.requirementsDigest,
+            diffDigest: testDigest,
+            ciChecksDigest: testDigest,
+            reviewContext: "agent-team/review" as const,
+            reviewEvidenceUrl: "https://review.test/evidence",
+            evidenceDigest: testDigest,
+          },
+          audit: {
+            linearReceipt: {
+              schemaVersion: 1 as const,
+              destination: "linear" as const,
+              setupSessionId: preview.setupSessionId,
+              projectId: project.id,
+              repository: project.sourceControl.repository,
+              linearAuditIssueId: preview.linearAuditIssueId,
+              changeRequestId: "PR_node_1",
+              headSha,
+              requirementsDigest: preview.requirementsDigest,
+              diffDigest: testDigest,
+              evidenceDigest: testDigest,
+              bodyDigest: testDigest,
+              externalCommentId: "linear-comment-1",
+              idempotencyKeyDigest: testDigest,
+              createdAt: updatedAt,
+              reused: false,
+            },
+            pullRequestReceipt: {
+              schemaVersion: 1 as const,
+              destination: "pull_request" as const,
+              setupSessionId: preview.setupSessionId,
+              projectId: project.id,
+              repository: project.sourceControl.repository,
+              linearAuditIssueId: preview.linearAuditIssueId,
+              changeRequestId: "PR_node_1",
+              headSha,
+              requirementsDigest: preview.requirementsDigest,
+              diffDigest: testDigest,
+              evidenceDigest: testDigest,
+              bodyDigest: testDigest,
+              externalCommentId: "pr-comment-1",
+              idempotencyKeyDigest: testDigest,
+              createdAt: updatedAt,
+              reused: false,
+            },
+          },
+        }
+      : {}),
     evidence:
       phase === "activated"
         ? ([
@@ -251,7 +313,8 @@ function sessionDraft(
       ? {
           approvalReferenceDigest: testDigest,
           approvalNonceDigest: testDigest,
-          approvalSessionDigest: testDigest,
+          approvalAuthorityDigest: testDigest,
+          approvalSource: "local_ui" as const,
           activatedRevisionSha: mergedSha,
         }
       : {}),
@@ -269,6 +332,8 @@ function binding(revision = 2): RegistrationSetupApprovalBinding {
     headSha,
     requirementsDigest: preview.requirementsDigest,
     diffDigest: testDigest,
+    linearAuditIssueId: preview.linearAuditIssueId,
+    gateEvidenceDigest: testDigest,
   };
 }
 
@@ -770,6 +835,7 @@ describe("file-backed registration setup state", () => {
       worktreePath: "/tmp/setup-worktree-2",
       branch: "agent-team/setup",
       remote: "origin",
+      linearAuditIssueId: "LINEAR-AUDIT-2",
     });
     if (!secondPreviewResult.ok) throw new Error(secondPreviewResult.error.code);
     const secondPreview = secondPreviewResult.value;
@@ -882,7 +948,9 @@ describe("registration setup local adapters", () => {
       root,
       createFixedClock(instant.value),
     );
-    const issued = await authority.issue(binding(), authorityDigest, { idempotencyKey: "issue:1" });
+    const issued = await authority.issue(binding(), localApprovalAuthority, {
+      idempotencyKey: "issue:1",
+    });
     if (!issued.ok || issued.value.state !== "issued") throw new Error("grant not issued");
     expect(typeof issued.value.grant.approvalId).toBe("string");
     expect(Object.keys(issued.value.grant).sort()).toEqual(["approvalId", "expiresAt"]);
@@ -891,12 +959,12 @@ describe("registration setup local adapters", () => {
         0o777,
     ).toBe(0o600);
     await expect(
-      authority.issue({ ...binding(), headSha: "d".repeat(40) }, authorityDigest, {
+      authority.issue({ ...binding(), headSha: "d".repeat(40) }, localApprovalAuthority, {
         idempotencyKey: "issue:1",
       }),
     ).resolves.toEqual({ ok: true, value: { state: "rejected" } });
     await expect(
-      authority.issue(binding(), authorityDigest, { idempotencyKey: "issue:different" }),
+      authority.issue(binding(), localApprovalAuthority, { idempotencyKey: "issue:different" }),
     ).resolves.toEqual({ ok: true, value: { state: "rejected" } });
 
     const request = {
@@ -904,10 +972,10 @@ describe("registration setup local adapters", () => {
       userConfirmed: true as const,
       expectedSetupRevision: 2,
     };
-    const consumed = await authority.verifyAndConsume(request, binding(), authorityDigest, {
+    const consumed = await authority.verifyAndConsume(request, binding(), localApprovalAuthority, {
       idempotencyKey: "consume:1",
     });
-    const retried = await authority.verifyAndConsume(request, binding(), authorityDigest, {
+    const retried = await authority.verifyAndConsume(request, binding(), localApprovalAuthority, {
       idempotencyKey: "consume:1",
     });
     expect(consumed).toMatchObject({ ok: true, value: { state: "verified_and_consumed" } });
@@ -916,12 +984,12 @@ describe("registration setup local adapters", () => {
       authority.verifyAndConsume(
         request,
         { ...binding(), diffDigest: "9".repeat(64) as typeof testDigest },
-        authorityDigest,
+        localApprovalAuthority,
         { idempotencyKey: "consume:1" },
       ),
     ).resolves.toEqual({ ok: true, value: { state: "rejected" } });
     await expect(
-      authority.verifyAndConsume(request, binding(), authorityDigest, {
+      authority.verifyAndConsume(request, binding(), localApprovalAuthority, {
         idempotencyKey: "consume:different",
       }),
     ).resolves.toEqual({ ok: true, value: { state: "replay" } });
@@ -930,7 +998,9 @@ describe("registration setup local adapters", () => {
   it("rejects wrong authority, binding, session revision, and non-explicit confirmation", async () => {
     const root = await temporaryRoot();
     const authority = new FileRegistrationSetupFinalApprovalAuthority(root);
-    const issued = await authority.issue(binding(), authorityDigest, { idempotencyKey: "issue:2" });
+    const issued = await authority.issue(binding(), localApprovalAuthority, {
+      idempotencyKey: "issue:2",
+    });
     if (!issued.ok || issued.value.state !== "issued") throw new Error("grant not issued");
     const baseRequest = {
       approvalId: issued.value.grant.approvalId,
@@ -939,35 +1009,40 @@ describe("registration setup local adapters", () => {
     };
     for (const attempt of [
       () =>
-        authority.verifyAndConsume(baseRequest, binding(), "9".repeat(64), {
-          idempotencyKey: "wrong:authority",
-        }),
+        authority.verifyAndConsume(
+          baseRequest,
+          binding(),
+          { ...localApprovalAuthority, authorityDigest: "9".repeat(64) },
+          {
+            idempotencyKey: "wrong:authority",
+          },
+        ),
       () =>
         authority.verifyAndConsume(
           baseRequest,
           { ...binding(), headSha: "d".repeat(40) },
-          authorityDigest,
+          localApprovalAuthority,
           { idempotencyKey: "wrong:binding" },
         ),
       () =>
         authority.verifyAndConsume(
           baseRequest,
           { ...binding(), setupSessionId: "other-session" },
-          authorityDigest,
+          localApprovalAuthority,
           { idempotencyKey: "wrong:session" },
         ),
       () =>
         authority.verifyAndConsume(
           { ...baseRequest, expectedSetupRevision: 3 },
           binding(),
-          authorityDigest,
+          localApprovalAuthority,
           { idempotencyKey: "wrong:revision" },
         ),
       () =>
         authority.verifyAndConsume(
           { ...baseRequest, userConfirmed: false as true },
           binding(),
-          authorityDigest,
+          localApprovalAuthority,
           { idempotencyKey: "wrong:confirmation" },
         ),
     ]) {

@@ -8,4 +8,6 @@ export * from "./merged-config.js";
 export * from "./setup-durable.js";
 export * from "./setup-composition.js";
 export * from "./setup-draft-source.js";
+export * from "./setup-evidence.js";
+export * from "./setup-audit.js";
 export * from "./webhook.js";

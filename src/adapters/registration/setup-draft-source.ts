@@ -7,6 +7,8 @@ import type {
 import { domainError, err, ok } from "../../domain/foundation/index.js";
 import { projectSchema } from "../../domain/project/index.js";
 
+const identifierPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:@+-]{0,220}$/u;
+
 /**
  * Production host boundary for a complete in-process Project/config draft.
  * It snapshots constructor input and reparses each read, so later host mutation
@@ -31,9 +33,13 @@ export class HostRegistrationSetupDraftSource implements RegistrationSetupDraftS
     const source = this.#snapshot as Readonly<Record<string, unknown>>;
     const project = projectSchema.safeParse(source["project"]);
     const config = trustedProjectConfigSchema.safeParse(source["config"]);
+    const linearAuditIssueId = source["linearAuditIssueId"];
     return Promise.resolve(
-      project.success && config.success
-        ? ok(Object.freeze({ project: project.data, config: config.data }))
+      project.success &&
+        config.success &&
+        typeof linearAuditIssueId === "string" &&
+        identifierPattern.test(linearAuditIssueId)
+        ? ok(Object.freeze({ project: project.data, config: config.data, linearAuditIssueId }))
         : err(domainError("invariant_violation")),
     );
   }

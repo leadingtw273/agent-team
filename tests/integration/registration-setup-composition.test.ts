@@ -68,7 +68,7 @@ async function fixture() {
   };
   return {
     root,
-    draft: Object.freeze({ project, config }),
+    draft: Object.freeze({ project, config, linearAuditIssueId: "LINEAR-AUDIT-1" }),
     transport,
     transportCalls,
   };
@@ -107,20 +107,44 @@ describe("W3A production Registration Setup composition", () => {
     expect(html).toContain("production_dependencies_unwired");
   });
 
-  it("constructs W1 durable state and W2 authoritative read-back behind a non-merge controller", async () => {
+  it("constructs B1 durable trust gates without merge or merged-config capabilities", async () => {
     const setup = await fixture();
+    const missingAuditTransport = createProductionRegistrationSetupComposition({
+      stateRoot: join(setup.root, "missing-audit-state"),
+      draft: setup.draft,
+      githubTransport: setup.transport,
+    });
+    expect(missingAuditTransport.wiring).toMatchObject({
+      state: "configuration_incomplete",
+      audit: "unwired",
+      conversationApproval: "unwired",
+    });
+    expect(await missingAuditTransport.controller.read({ authorityDigest })).toMatchObject({
+      state: "configuration_incomplete",
+    });
+    expect(setup.transportCalls).toEqual([]);
     const options = {
       stateRoot: join(setup.root, "state"),
       draft: setup.draft,
       githubTransport: setup.transport,
+      linearAuditWriter: {
+        appendComment: () => Promise.resolve(err(domainError("unavailable"))),
+      },
+      pullRequestAuditWriter: {
+        appendChangeRequestComment: () => Promise.resolve(err(domainError("unavailable"))),
+      },
+      conversationApprovalBridge: {
+        issue: () => Promise.resolve(err(domainError("unavailable"))),
+      },
     };
     const composition = createProductionRegistrationSetupComposition(options);
     expect(composition.wiring).toEqual({
       state: "ready",
       durableState: "w1_file_stores",
-      mergedConfigReadBack: "w2_github_authoritative",
+      mergedConfigReadBack: "unwired",
       merge: "w3b_unwired",
-      audit: "w3b_unwired",
+      audit: "w3b1_receipts",
+      conversationApproval: "w3b1_host_capability",
       activation: "w3b_unwired",
     });
     expect(composition.controller).not.toHaveProperty("approveAndMerge");

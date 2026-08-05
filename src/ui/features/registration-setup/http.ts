@@ -111,7 +111,7 @@ export async function handleRegistrationSetupRequest(
     body["expectedSetupRevision"] > 0 &&
     body["confirmation"] === registrationSetupFinalApprovalPhrase
   ) {
-    result = await controller.issueApprovalIntent(
+    result = await controller.issueLocalUiApprovalIntent(
       {
         setupSessionId,
         expectedSetupRevision: body["expectedSetupRevision"],

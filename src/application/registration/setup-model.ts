@@ -25,6 +25,7 @@ export interface RegistrationSetupPreviewInput {
   readonly worktreePath: string;
   readonly branch: typeof registrationSetupBranch;
   readonly remote: string;
+  readonly linearAuditIssueId: string;
 }
 
 export interface RegistrationSetupPreview extends RegistrationSetupPreviewInput {
@@ -63,6 +64,8 @@ export interface RegistrationSetupApprovalBinding {
   readonly headSha: string;
   readonly requirementsDigest: Sha256Digest;
   readonly diffDigest: Sha256Digest;
+  readonly linearAuditIssueId: string;
+  readonly gateEvidenceDigest: Sha256Digest;
 }
 
 export interface RegistrationSetupFinalApprovalRequest {
@@ -79,13 +82,18 @@ export interface RegistrationSetupFinalApprovalGrant {
 export interface RegistrationSetupFinalApprovalReceipt extends RegistrationSetupApprovalBinding {
   readonly schemaVersion: 1;
   readonly approvalId: string;
-  readonly issuer: "local_ui";
-  readonly uiSessionDigest: string;
+  readonly issuer: RegistrationSetupApprovalSource;
+  readonly authorityDigest: string;
   readonly approvalNonceDigest: string;
   readonly consumedAt: string;
 }
 
 export interface RegistrationSetupTrustedAuthority {
+  readonly authorityDigest: string;
+}
+
+export interface RegistrationSetupFinalApprovalAuthority {
+  readonly issuer: RegistrationSetupApprovalSource;
   readonly authorityDigest: string;
 }
 
@@ -116,7 +124,12 @@ export interface RegistrationSetupEvidence {
 }
 
 export type RegistrationSetupPhase =
-  "ci_waiting" | "awaiting_user_approval" | "merge_authorized" | "activated" | "cancelled";
+  | "ci_waiting"
+  | "audit_pending"
+  | "awaiting_user_approval"
+  | "merge_authorized"
+  | "activated"
+  | "cancelled";
 
 export interface RegistrationSetupSession {
   readonly schemaVersion: 1;
@@ -134,10 +147,14 @@ export interface RegistrationSetupSession {
   readonly configDigest: string;
   readonly headSha: string;
   readonly changeRequest: ChangeRequestSnapshot;
+  readonly linearAuditIssueId: string;
+  readonly gateEvidenceReceipt?: RegistrationSetupGateEvidenceReceipt;
+  readonly audit?: RegistrationSetupAuditState;
   readonly evidence: readonly RegistrationSetupEvidence[];
   readonly approvalReferenceDigest?: Sha256Digest;
   readonly approvalNonceDigest?: string;
-  readonly approvalSessionDigest?: string;
+  readonly approvalAuthorityDigest?: string;
+  readonly approvalSource?: RegistrationSetupApprovalSource;
   readonly activatedRevisionSha?: string;
 }
 
@@ -207,10 +224,97 @@ export interface RegistrationSetupFencedMutationOptions extends MutationOptions 
   readonly executionFence: RegistrationSetupExecutionFence;
 }
 
+export interface RegistrationSetupGateEvidenceCommand {
+  readonly project: Project;
+  readonly changeRequestId: string;
+  readonly expectedHeadSha: string;
+  readonly requirementsDigest: Sha256Digest;
+  readonly diffDigest: Sha256Digest;
+}
+
+export interface RegistrationSetupGateEvidenceReceipt {
+  readonly schemaVersion: 1;
+  readonly source: "source_control";
+  readonly projectId: Project["id"];
+  readonly repository: string;
+  readonly changeRequestId: string;
+  readonly headSha: string;
+  readonly requirementsDigest: Sha256Digest;
+  readonly diffDigest: Sha256Digest;
+  readonly ciChecksDigest: Sha256Digest;
+  readonly reviewContext: typeof registrationSetupReviewStatus;
+  readonly reviewEvidenceUrl: string;
+  readonly evidenceDigest: Sha256Digest;
+}
+
+export interface RegistrationSetupGateEvidencePort {
+  read(
+    command: RegistrationSetupGateEvidenceCommand,
+    options?: ReadOptions,
+  ): AsyncPortResult<
+    | Readonly<{ state: "ready"; receipt: RegistrationSetupGateEvidenceReceipt }>
+    | Readonly<{
+        state: "not_ready";
+        reason: "ci_pending" | "ci_failed" | "review_pending" | "review_failed";
+      }>
+  >;
+}
+
 export interface RegistrationSetupAuditIntent {
+  readonly schemaVersion: 1;
   readonly destination: "linear" | "pull_request";
   readonly kind: "registration_setup_user_approval_required";
+  readonly setupSessionId: string;
+  readonly projectId: Project["id"];
+  readonly repository: string;
+  readonly linearAuditIssueId: string;
+  readonly changeRequestId: string;
+  readonly headSha: string;
+  readonly requirementsDigest: Sha256Digest;
+  readonly diffDigest: Sha256Digest;
+  readonly evidenceDigest: Sha256Digest;
   readonly body: string;
+  readonly bodyDigest: Sha256Digest;
+  readonly idempotencyKey: string;
+}
+
+export interface RegistrationSetupAuditReceipt extends Omit<
+  RegistrationSetupAuditIntent,
+  "kind" | "body" | "idempotencyKey"
+> {
+  readonly externalCommentId: string;
+  readonly idempotencyKeyDigest: Sha256Digest;
+  readonly createdAt: string;
+  readonly reused: boolean;
+}
+
+export interface RegistrationSetupAuditState {
+  readonly pending?: RegistrationSetupAuditIntent;
+  readonly linearReceipt?: RegistrationSetupAuditReceipt;
+  readonly pullRequestReceipt?: RegistrationSetupAuditReceipt;
+}
+
+export interface RegistrationSetupAuditPort {
+  publish(
+    intent: RegistrationSetupAuditIntent,
+    options: MutationOptions,
+  ): AsyncPortResult<RegistrationSetupAuditReceipt>;
+}
+
+declare const conversationCapabilityBrand: unique symbol;
+export interface RegistrationSetupConversationHostCapability {
+  readonly [conversationCapabilityBrand]: true;
+}
+
+export interface RegistrationSetupConversationApprovalBridgePort {
+  issue(
+    binding: RegistrationSetupApprovalBinding,
+    hostCapability: RegistrationSetupConversationHostCapability,
+    options: MutationOptions,
+  ): AsyncPortResult<
+    | Readonly<{ state: "issued"; grant: RegistrationSetupFinalApprovalGrant }>
+    | Readonly<{ state: "rejected" | "unknown" }>
+  >;
 }
 
 export interface RegistrationSetupFilePort {
@@ -308,7 +412,7 @@ export interface RegistrationSetupFinalApprovalAuthorityPort {
   /** Server-side only: creates a durable grant bound to trusted UI authority and setup state. */
   issue(
     binding: RegistrationSetupApprovalBinding,
-    trustedAuthorityDigest: string,
+    authority: RegistrationSetupFinalApprovalAuthority,
     options: MutationOptions,
   ): AsyncPortResult<
     | Readonly<{ state: "issued"; grant: RegistrationSetupFinalApprovalGrant }>
@@ -318,7 +422,7 @@ export interface RegistrationSetupFinalApprovalAuthorityPort {
   verifyAndConsume(
     request: RegistrationSetupFinalApprovalRequest,
     expectedBinding: RegistrationSetupApprovalBinding,
-    trustedAuthorityDigest: string,
+    authority: RegistrationSetupFinalApprovalAuthority,
     options: MutationOptions,
   ): AsyncPortResult<
     | Readonly<{ state: "verified_and_consumed"; receipt: RegistrationSetupFinalApprovalReceipt }>
@@ -377,13 +481,13 @@ export interface RegistrationSetupPorts {
     | "getCommitChecks"
     | "getCommitStatuses"
     | "markChangeRequestReady"
-    | "enableAutoMerge"
   >;
+  readonly gateEvidence: RegistrationSetupGateEvidencePort;
+  readonly audit: RegistrationSetupAuditPort;
   readonly journal: RegistrationSetupJournalPort;
   readonly execution: RegistrationSetupExecutionPort;
-  readonly sessions: RegistrationSetupSessionPort;
+  readonly sessions: Pick<RegistrationSetupSessionPort, "load" | "save">;
   readonly finalApproval: RegistrationSetupFinalApprovalAuthorityPort;
-  readonly mergedConfig: RegistrationSetupMergedConfigReadBackPort;
 }
 
 export interface RegistrationSetupBeginRequest {
@@ -418,6 +522,7 @@ export type RegistrationSetupFailureStage =
   | "change_request"
   | "checks"
   | "review"
+  | "audit"
   | "approval"
   | "merge"
   | "merge_readback"
@@ -427,6 +532,7 @@ export type RegistrationSetupFailureStage =
 export type RegistrationSetupOutcome =
   | Readonly<{ state: "in_progress"; setupSessionId: string }>
   | Readonly<{ state: "ci_waiting"; session: RegistrationSetupSession }>
+  | Readonly<{ state: "audit_pending"; session: RegistrationSetupSession }>
   | Readonly<{
       state: "not_ready";
       reason: "pending" | "ci_failed" | "review_pending" | "review_failed";
@@ -435,7 +541,6 @@ export type RegistrationSetupOutcome =
   | Readonly<{
       state: "awaiting_user_approval";
       session: RegistrationSetupSession;
-      auditIntents: readonly RegistrationSetupAuditIntent[];
     }>
   | Readonly<{ state: "merge_pending"; session: RegistrationSetupSession }>
   | Readonly<{ state: "activated"; session: RegistrationSetupSession; revisionSha: string }>
