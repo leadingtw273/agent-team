@@ -10,6 +10,9 @@ import {
 } from "node:http";
 
 import { responseLeaksCredentials, untrustedInputIsUnsafe } from "../security/canonical.js";
+import { readBoundedJsonMutation, type UiJsonObject } from "./json.js";
+
+export type { UiJsonArray, UiJsonObject, UiJsonPrimitive, UiJsonValue } from "./json.js";
 
 export const localhostUiHost = "127.0.0.1";
 export const defaultUiIdleTimeoutMs = 15 * 60 * 1_000;
@@ -28,6 +31,7 @@ export interface UiRequest {
   readonly url: string;
   readonly headers: Readonly<IncomingHttpHeaders>;
   readonly auth: Readonly<{ kind: UiAuthKind }>;
+  readonly body?: UiJsonObject;
 }
 
 export interface UiResponse {
@@ -56,6 +60,7 @@ export type UiSecurityDecision =
       authKind: UiAuthKind;
       handlerUrl: string;
       responseContract: UiHandlerResponseContract;
+      mutationBody: "none" | "bounded-json";
       refreshIdle: boolean;
     }>
   | Readonly<{ kind: "respond"; response: UiResponse; refreshIdle: boolean }>;
@@ -86,6 +91,7 @@ export interface StartLocalUiServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly idleTimeoutMs?: number;
+  readonly maxJsonMutationBodyBytes?: number;
   readonly clock?: UiServerClock;
   readonly tokenSource?: () => Uint8Array;
   readonly handler?: UiRequestHandler;
@@ -213,6 +219,7 @@ function sendFixed(
   body: string,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
+  closeConnection = false,
 ): void {
   if (response.destroyed || response.writableEnded) return;
   if (response.headersSent) {
@@ -228,6 +235,7 @@ function sendFixed(
       ...(Object.keys(secured.headers ?? {}).some((name) => name.toLowerCase() === "content-type")
         ? {}
         : { "content-type": "text/plain; charset=utf-8" }),
+      ...(closeConnection ? { connection: "close" } : {}),
     }),
     ...(secured.body === undefined ? {} : { body: secured.body }),
   });
@@ -303,7 +311,11 @@ export async function startLocalUiServer(
   const host = options.host ?? localhostUiHost;
   const port = options.port ?? 0;
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultUiIdleTimeoutMs;
+  const maxJsonMutationBodyBytes = options.maxJsonMutationBodyBytes ?? 16_384;
   validateOptions(host, port, idleTimeoutMs);
+  if (!Number.isSafeInteger(maxJsonMutationBodyBytes) || maxJsonMutationBodyBytes <= 0) {
+    throw new LocalUiServerError("Local UI JSON mutation body limit is invalid.");
+  }
 
   const clock = options.clock ?? systemClock;
   const tokenSource = options.tokenSource ?? (() => randomBytes(minimumTokenBytes));
@@ -324,6 +336,7 @@ export async function startLocalUiServer(
   let idleTimer: NodeJS.Timeout | undefined;
   let closePromise: Promise<void> | undefined;
   let serverOrigin = "";
+  const currentLifecycle = (): "active" | "locked" | "closed" => lifecycle;
 
   const outboundResponseIsAllowed: OutboundResponseGuard = (result) =>
     Number.isInteger(result.statusCode) &&
@@ -406,6 +419,7 @@ export async function startLocalUiServer(
                 authKind: "bearer",
                 handlerUrl: rawUrl,
                 responseContract: "standard",
+                mutationBody: "none",
                 refreshIdle: true,
               })
             : Object.freeze({
@@ -434,6 +448,52 @@ export async function startLocalUiServer(
       };
 
       try {
+        let mutationBody: UiJsonObject | undefined;
+        if (
+          decision.kind === "allow" &&
+          decision.mutationBody === "bounded-json" &&
+          request.method !== "GET" &&
+          request.method !== "HEAD"
+        ) {
+          const parsed = await readBoundedJsonMutation(request, maxJsonMutationBodyBytes);
+          lockIfExpired();
+          const postReadLifecycle = currentLifecycle();
+          if (postReadLifecycle === "closed") {
+            sendFixed(
+              response,
+              503,
+              "Service Unavailable\n",
+              outboundResponseIsAllowed,
+              securityPolicy,
+              true,
+            );
+            return;
+          }
+          if (postReadLifecycle === "locked") {
+            sendFixed(response, 423, "Locked\n", outboundResponseIsAllowed, securityPolicy, true);
+            return;
+          }
+          if (!parsed.ok) {
+            const rejected = securityPolicy?.secureResponse({
+              statusCode: parsed.statusCode,
+              headers: Object.freeze({
+                connection: "close",
+                "content-type": "text/plain; charset=utf-8",
+              }),
+              body: parsed.responseBody,
+            }) ?? {
+              statusCode: parsed.statusCode,
+              headers: Object.freeze({
+                connection: "close",
+                "content-type": "text/plain; charset=utf-8",
+              }),
+              body: parsed.responseBody,
+            };
+            send(response, rejected, outboundResponseIsAllowed);
+            return;
+          }
+          mutationBody = parsed.body;
+        }
         const handlerResult =
           decision.kind === "respond"
             ? decision.response
@@ -443,6 +503,7 @@ export async function startLocalUiServer(
                   url: decision.handlerUrl,
                   headers: handlerHeaders,
                   auth: Object.freeze({ kind: decision.authKind }),
+                  ...(mutationBody === undefined ? {} : { body: mutationBody }),
                 }),
               );
         if (

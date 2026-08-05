@@ -26,6 +26,7 @@ export interface UiSecurityRouteContract {
   readonly path: string;
   readonly allowedQueryParameters: readonly string[];
   readonly response: UiHandlerResponseContract;
+  readonly mutationBody?: "bounded-json";
 }
 
 export interface CreateUiSecurityPolicyOptions {
@@ -132,12 +133,14 @@ function respond(result: UiResponse, refreshIdle = false): UiSecurityDecision {
 function allowSession(
   handlerUrl: string,
   responseContract: UiHandlerResponseContract,
+  mutationBody: "bounded-json" | undefined,
 ): UiSecurityDecision {
   return Object.freeze({
     kind: "allow",
     authKind: "session",
     handlerUrl,
     responseContract,
+    mutationBody: mutationBody ?? "none",
     refreshIdle: true,
   });
 }
@@ -173,6 +176,7 @@ function validatedRoutes(
 ): ReadonlyMap<string, UiSecurityRouteContract> {
   const result = new Map<string, UiSecurityRouteContract>();
   for (const route of configured ?? defaultRoutes) {
+    const configuredMutationBody: unknown = route.mutationBody;
     if (
       !route.path.startsWith("/") ||
       route.path.startsWith("//") ||
@@ -180,7 +184,8 @@ function validatedRoutes(
       route.path.includes("#") ||
       route.path.includes("\\") ||
       decodeURI(route.path) !== route.path ||
-      result.has(route.path)
+      result.has(route.path) ||
+      (configuredMutationBody !== undefined && configuredMutationBody !== "bounded-json")
     ) {
       throw new TypeError("Invalid UI security route contract.");
     }
@@ -201,6 +206,7 @@ function validatedRoutes(
         path: route.path,
         allowedQueryParameters: Object.freeze([...route.allowedQueryParameters]),
         response: route.response,
+        ...(route.mutationBody === undefined ? {} : { mutationBody: route.mutationBody }),
       }),
     );
   }
@@ -367,7 +373,7 @@ export function createUiSecurityPolicy(
       const denied = authenticateSession(request);
       if (denied !== undefined) return denied;
       if (target.route === undefined) return respond(response(404, "Not Found\n"));
-      return allowSession(target.handlerUrl, target.route.response);
+      return allowSession(target.handlerUrl, target.route.response, undefined);
     }
     const denied = authenticateSession(request);
     if (denied !== undefined) return denied;
@@ -387,7 +393,7 @@ export function createUiSecurityPolicy(
     ) {
       return respond(response(403, "Forbidden\n"));
     }
-    return allowSession(target.handlerUrl, target.route.response);
+    return allowSession(target.handlerUrl, target.route.response, target.route.mutationBody);
   };
 
   const secureResponse = (source: UiResponse): UiResponse => {
