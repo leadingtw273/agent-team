@@ -36,15 +36,15 @@ afterEach(async () => {
 
 describe("Linux held secure directory", () => {
   it.each([
-    ["unavailable", "/definitely-missing/o004-flock"],
-    ["unexpected nonbusy exit", "/usr/bin/false"],
-  ] as const)("fails closed when the flock binary is %s", async (_kind, binary) => {
+    ["unavailable", "/definitely-missing/o004-flock", "unavailable"],
+    ["unexpected nonbusy exit", "/usr/bin/false", "external_failure"],
+  ] as const)("fails closed when the flock binary is %s", async (_kind, binary, code) => {
     const parent = await container();
     const handle = await open(join(parent, "probe.lock"), "a+", 0o600);
     try {
       expect(await acquireKernelFileLock(handle.fd, binary)).toMatchObject({
         ok: false,
-        error: { code: "external_failure" },
+        error: { code },
       });
     } finally {
       await handle.close();

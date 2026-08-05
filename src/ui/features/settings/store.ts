@@ -114,7 +114,12 @@ export class FileSettingsStore implements SettingsStore {
     const parsed = userSettingsSchema.safeParse(settings);
     if (!parsed.success) return Object.freeze({ state: "rejected" });
 
-    const lock = await acquireFileLock(this.#lockPath, `ui-settings:${String(process.pid)}`);
+    const lock = await acquireFileLock(
+      this.#lockPath,
+      `ui-settings:${String(process.pid)}`,
+      undefined,
+      { repairPermissions: true },
+    );
     if (!lock.ok) {
       return Object.freeze({ state: lock.error.code === "conflict" ? "conflict" : "failed" });
     }
