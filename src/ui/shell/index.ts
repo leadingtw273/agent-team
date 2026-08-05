@@ -1,5 +1,11 @@
 import { readFileSync } from "node:fs";
 
+import {
+  roleModelPageDescription,
+  roleModelPagePath,
+  roleModelPageTitle,
+  type RoleModelFeature,
+} from "../features/role-model/index.js";
 import type { UiRequest, UiRequestHandler, UiResponse } from "../server/index.js";
 
 const tablerCoreVersion = "1.4.0";
@@ -48,16 +54,16 @@ export interface UiShellReadModel {
 
 interface NavigationItem {
   readonly label: string;
-  readonly href?: "/" | "/projects" | "/events";
+  readonly href?: "/" | "/projects" | "/events" | "/roles-models";
   readonly icon:
     "overview" | "projects" | "running" | "roles" | "quota" | "security" | "events" | "settings";
 }
 
 interface PageDefinition {
-  readonly path: "/" | "/projects" | "/events";
-  readonly title: "總覽" | "專案" | "事件";
+  readonly path: "/" | "/projects" | "/events" | "/roles-models";
+  readonly title: "總覽" | "專案" | "事件" | "角色與模型";
   readonly description: string;
-  readonly render: (readModel: UiShellReadModel) => string;
+  readonly render: (readModel: UiShellReadModel) => string | Promise<string>;
 }
 
 interface StaticAsset {
@@ -337,15 +343,23 @@ function renderEvents(readModel: UiShellReadModel): string {
     </section>`;
 }
 
-function renderNavigationItems(activePath: PageDefinition["path"]): string {
+function navigationHref(item: NavigationItem, roleModelEnabled: boolean): NavigationItem["href"] {
+  return item.label === "角色與模型" && roleModelEnabled ? roleModelPagePath : item.href;
+}
+
+function renderNavigationItems(
+  activePath: PageDefinition["path"],
+  roleModelEnabled: boolean,
+): string {
   return navigation
     .map((item) => {
+      const href = navigationHref(item, roleModelEnabled);
       const itemIcon = icon(item.icon, "ui-nav-icon");
-      if (item.href === undefined) {
+      if (href === undefined) {
         return `<li class="nav-item"><span class="ui-nav-link ui-nav-link--future">${itemIcon}<span>${item.label}</span><span class="badge bg-secondary-lt text-secondary ms-auto">後續</span></span></li>`;
       }
-      const current = item.href === activePath ? ' aria-current="page"' : "";
-      return `<li class="nav-item"><a class="ui-nav-link" href="${item.href}"${current}>${itemIcon}<span>${item.label}</span></a></li>`;
+      const current = href === activePath ? ' aria-current="page"' : "";
+      return `<li class="nav-item"><a class="ui-nav-link" href="${href}"${current}>${itemIcon}<span>${item.label}</span></a></li>`;
     })
     .join("");
 }
@@ -353,23 +367,33 @@ function renderNavigationItems(activePath: PageDefinition["path"]): string {
 function renderNavigation(
   activePath: PageDefinition["path"],
   variant: "desktop" | "mobile",
+  roleModelEnabled: boolean,
 ): string {
-  return `<nav class="ui-nav ui-nav--${variant}" aria-label="主要導覽"><p class="ui-nav-caption">管理介面</p><ul class="navbar-nav">${renderNavigationItems(activePath)}</ul></nav>`;
+  return `<nav class="ui-nav ui-nav--${variant}" aria-label="主要導覽"><p class="ui-nav-caption">管理介面</p><ul class="navbar-nav">${renderNavigationItems(activePath, roleModelEnabled)}</ul></nav>`;
 }
 
-function renderMobileNavigation(activePath: PageDefinition["path"]): string {
-  const activeItem = navigation.find((item) => item.href === activePath);
-  if (activeItem?.href === undefined) throw new Error("Active navigation item is missing.");
+function renderMobileNavigation(
+  activePath: PageDefinition["path"],
+  roleModelEnabled: boolean,
+): string {
+  const activeItem = navigation.find(
+    (item) => navigationHref(item, roleModelEnabled) === activePath,
+  );
+  if (activeItem === undefined) throw new Error("Active navigation item is missing.");
   return `<details class="ui-mobile-nav">
           <summary class="ui-mobile-nav-toggle">
             <span class="ui-mobile-current">${icon(activeItem.icon, "ui-nav-icon")}<span class="ui-mobile-current-label">目前頁面：<strong>${activeItem.label}</strong></span></span>
             <span class="ui-mobile-nav-action"><span class="ui-mobile-nav-open">開啟選單</span><span class="ui-mobile-nav-close">關閉選單</span><span class="ui-mobile-nav-chevron" aria-hidden="true"></span></span>
           </summary>
-          ${renderNavigation(activePath, "mobile")}
+          ${renderNavigation(activePath, "mobile", roleModelEnabled)}
         </details>`;
 }
 
-function renderPage(page: PageDefinition, readModel: UiShellReadModel): string {
+async function renderPage(
+  page: PageDefinition,
+  readModel: UiShellReadModel,
+  roleModelEnabled: boolean,
+): Promise<string> {
   return `<!doctype html>
 <html lang="zh-Hant">
   <head>
@@ -386,15 +410,15 @@ function renderPage(page: PageDefinition, readModel: UiShellReadModel): string {
     <div class="ui-app">
       <aside class="ui-sidebar" aria-label="Agent Team 導覽">
         <a class="ui-brand" href="/" aria-label="Agent Team 總覽">${icon("agent", "ui-inline-icon ui-brand-mark")}<span class="ui-brand-copy"><span class="ui-brand-title">Agent Team</span><span class="ui-brand-subtitle">Local control room</span></span></a>
-        ${renderNavigation(page.path, "desktop")}
-        ${renderMobileNavigation(page.path)}
+        ${renderNavigation(page.path, "desktop", roleModelEnabled)}
+        ${renderMobileNavigation(page.path, roleModelEnabled)}
         <div class="ui-sidebar-spacer"></div>
         <p class="ui-sidebar-note">唯讀 UI Shell · 無遠端 JavaScript<br>後續功能會依階段逐步啟用。</p>
       </aside>
       <main id="main-content" class="ui-content" tabindex="-1">
         <div class="ui-content-inner">
           <header class="ui-page-header"><div><p class="ui-page-eyebrow">LOCALHOST 管理介面</p><h1>${page.title}</h1><p class="ui-page-description">${page.description}</p></div></header>
-          ${page.render(readModel)}
+          ${await page.render(readModel)}
         </div>
       </main>
     </div>
@@ -445,15 +469,32 @@ function htmlResponse(method: string, html: string): UiResponse {
   return Object.freeze({ statusCode: 200, headers, body: html });
 }
 
-function findPage(path: string): PageDefinition | undefined {
-  return pageDefinitions.find((page) => page.path === path);
+function findPage(
+  path: string,
+  definitions: readonly PageDefinition[],
+): PageDefinition | undefined {
+  return definitions.find((page) => page.path === path);
 }
 
-/** Creates the U003 allowlisted, read-only route handler for U001's authenticated server. */
+/** Creates the U003 shell and any deliberately supplied completed feature pages. */
 export function createUiShellHandler(
   readModel: UiShellReadModel = fixtureUiShellReadModel,
+  roleModelFeature?: RoleModelFeature,
 ): UiRequestHandler {
-  return (request: UiRequest): UiResponse => {
+  const definitions: readonly PageDefinition[] =
+    roleModelFeature === undefined
+      ? pageDefinitions
+      : Object.freeze([
+          ...pageDefinitions,
+          Object.freeze({
+            path: roleModelPagePath,
+            title: roleModelPageTitle,
+            description: roleModelPageDescription,
+            render: () => roleModelFeature.render(),
+          }),
+        ]);
+
+  return async (request: UiRequest): Promise<UiResponse> => {
     if (request.method !== "GET" && request.method !== "HEAD") {
       return textResponse(request.method, 405, "Method Not Allowed\n", "GET, HEAD");
     }
@@ -464,11 +505,14 @@ export function createUiShellHandler(
     const asset = (assets as Readonly<Record<string, StaticAsset | undefined>>)[path];
     if (asset !== undefined) return assetResponse(request.method, asset);
 
-    const page = findPage(path);
+    const page = findPage(path, definitions);
     if (page === undefined) return textResponse(request.method, 404, "Not Found\n");
 
     try {
-      return htmlResponse(request.method, renderPage(page, readModel));
+      return htmlResponse(
+        request.method,
+        await renderPage(page, readModel, roleModelFeature !== undefined),
+      );
     } catch {
       return textResponse(request.method, 500, "Internal Server Error\n");
     }
