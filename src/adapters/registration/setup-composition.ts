@@ -104,13 +104,29 @@ export function createProductionRegistrationSetupComposition(
   );
   const journal = new FileRegistrationSetupJournalStore(options.stateRoot);
   const execution = new FileRegistrationSetupExecutionStore(options.stateRoot);
-  const sessions = new FileRegistrationSetupSessionStore(options.stateRoot);
+  const sessionStore = new FileRegistrationSetupSessionStore(options.stateRoot);
+  const sessions = Object.freeze({
+    load: sessionStore.load.bind(sessionStore),
+    save: sessionStore.save.bind(sessionStore),
+  });
   const finalApproval = new FileRegistrationSetupFinalApprovalAuthority(
     options.stateRoot,
     options.clock,
   );
-  const sourceControl = new GitHubAdapter(options.githubTransport);
-  const gateEvidence = new SourceControlRegistrationSetupGateEvidence(sourceControl);
+  const github = new GitHubAdapter(options.githubTransport);
+  const sourceControl = Object.freeze({
+    createDraftChangeRequest: github.createDraftChangeRequest.bind(github),
+    getChangeRequest: github.getChangeRequest.bind(github),
+    getCommitChecks: github.getCommitChecks.bind(github),
+    getCommitStatuses: github.getCommitStatuses.bind(github),
+    markChangeRequestReady: github.markChangeRequestReady.bind(github),
+  });
+  const gateEvidence = new SourceControlRegistrationSetupGateEvidence(
+    Object.freeze({
+      getCommitChecks: github.getCommitChecks.bind(github),
+      getCommitStatuses: github.getCommitStatuses.bind(github),
+    }),
+  );
   const audit = new RegistrationSetupAuditAdapter(
     options.linearAuditWriter,
     options.pullRequestAuditWriter,

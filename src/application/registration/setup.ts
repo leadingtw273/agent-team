@@ -476,13 +476,14 @@ function approvalReceiptMatches(
 
 function approvalBinding(
   session: RegistrationSetupSession,
+  setupSessionRevision = session.revision,
 ): RegistrationSetupApprovalBinding | undefined {
   const gateEvidenceDigest = session.gateEvidenceReceipt?.evidenceDigest;
   if (gateEvidenceDigest === undefined) return undefined;
   return Object.freeze({
     schemaVersion: 1,
     setupSessionId: session.setupSessionId,
-    setupSessionRevision: session.revision,
+    setupSessionRevision,
     projectId: session.project.id,
     previewDigest: session.previewDigest,
     changeRequestId: session.changeRequest.id,
@@ -502,14 +503,18 @@ function bumped(
 }
 
 export class RegistrationSetupCoordinator {
-  constructor(readonly ports: RegistrationSetupPorts) {}
+  readonly #ports: RegistrationSetupPorts;
+
+  constructor(ports: RegistrationSetupPorts) {
+    this.#ports = Object.freeze(ports);
+  }
 
   async #runExclusive(
     setupSessionId: string,
     signal: AbortSignal | undefined,
     action: (lease: RegistrationSetupExecutionLease) => Promise<RegistrationSetupOutcome>,
   ): Promise<RegistrationSetupOutcome> {
-    const exclusive = await this.ports.execution.runExclusive(
+    const exclusive = await this.#ports.execution.runExclusive(
       setupSessionId,
       action,
       signal === undefined ? {} : { signal },
@@ -539,7 +544,7 @@ export class RegistrationSetupCoordinator {
     lease: RegistrationSetupExecutionLease,
   ): Promise<Result<RegistrationSetupSession, DomainError>> {
     const saved = await this.#owned(lease, () =>
-      this.ports.sessions.save(
+      this.#ports.sessions.save(
         current.revision,
         withoutSessionRevision(next),
         fencedMutation(request, step, lease),
@@ -550,7 +555,7 @@ export class RegistrationSetupCoordinator {
       return Object.freeze({ ok: true, value: saved.value.session });
     }
     const readBack = await this.#owned(lease, () =>
-      this.ports.sessions.load(current.setupSessionId),
+      this.#ports.sessions.load(current.setupSessionId),
     );
     return readBack.ok &&
       readBack.value !== undefined &&
@@ -578,7 +583,7 @@ export class RegistrationSetupCoordinator {
   ): Promise<RegistrationSetupOutcome> {
     if (!validPreviewConfirmation(request)) return failed("request");
     const existing = await this.#owned(lease, () =>
-      this.ports.sessions.load(request.preview.setupSessionId),
+      this.#ports.sessions.load(request.preview.setupSessionId),
     );
     if (!existing.ok) return portFailure("session", existing.error);
     if (existing.value !== undefined) {
@@ -600,13 +605,13 @@ export class RegistrationSetupCoordinator {
     const serialized = serializeTrustedProjectConfig(request.preview.config);
     if (!serialized.ok) return failed("request");
     const loadedJournal = await this.#owned(lease, () =>
-      this.ports.journal.load(request.preview.setupSessionId),
+      this.#ports.journal.load(request.preview.setupSessionId),
     );
     if (!loadedJournal.ok) return portFailure("session", loadedJournal.error);
     let journal = loadedJournal.value;
     if (journal === undefined) {
       const confirmation = await this.#owned(lease, () =>
-        this.ports.previewConfirmation.verify(
+        this.#ports.previewConfirmation.verify(
           request.confirmation,
           request.trustedAuthority.authorityDigest,
           mutation(request, "consume-preview-confirmation"),
@@ -615,7 +620,7 @@ export class RegistrationSetupCoordinator {
       if (!confirmation.ok) return portFailure("request", confirmation.error);
       if (confirmation.value.state !== "verified") return failed("request");
       const planned = await this.#owned(lease, () =>
-        this.ports.journal.save(
+        this.#ports.journal.save(
           undefined,
           {
             schemaVersion: 1,
@@ -648,7 +653,7 @@ export class RegistrationSetupCoordinator {
       const current = journal;
       if (current === undefined) return undefined;
       const saved = await this.#owned(lease, () =>
-        this.ports.journal.save(current.revision, draft, fencedMutation(request, saveStep, lease)),
+        this.#ports.journal.save(current.revision, draft, fencedMutation(request, saveStep, lease)),
       );
       if (!saved.ok) return undefined;
       if (saved.value.durability === "confirmed") return saved.value.journal;
@@ -686,7 +691,7 @@ export class RegistrationSetupCoordinator {
       const operationKey = journal.pending?.idempotencyKey;
       if (operationKey === undefined) return failed("session");
       const created = await this.#owned(lease, () =>
-        this.ports.git.createWorktree(
+        this.#ports.git.createWorktree(
           {
             rootPath: request.preview.project.localRepositoryPath,
             path: request.preview.worktreePath,
@@ -716,7 +721,7 @@ export class RegistrationSetupCoordinator {
       const operationKey = journal.pending?.idempotencyKey;
       if (operationKey === undefined) return failed("session");
       const written = await this.#owned(lease, () =>
-        this.ports.setupFiles.writeTrustedProjectConfig(
+        this.#ports.setupFiles.writeTrustedProjectConfig(
           {
             worktree,
             path: trustedProjectConfigPath,
@@ -741,12 +746,12 @@ export class RegistrationSetupCoordinator {
       let stagedReceipt: RegistrationSetupJournal["completed"]["stage"];
       if (journal.pending?.step === "stage") {
         const [observed, stagedDiff, file] = await Promise.all([
-          this.#owned(lease, () => this.ports.git.inspectWorkingTree(worktree)),
+          this.#owned(lease, () => this.#ports.git.inspectWorkingTree(worktree)),
           this.#owned(lease, () =>
-            this.ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
+            this.#ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
           ),
           this.#owned(lease, () =>
-            this.ports.setupFiles.readTrustedProjectConfig({
+            this.#ports.setupFiles.readTrustedProjectConfig({
               worktree,
               path: trustedProjectConfigPath,
             }),
@@ -780,7 +785,7 @@ export class RegistrationSetupCoordinator {
 
       if (stagedReceipt === undefined) {
         const preflight = await this.#owned(lease, () =>
-          this.ports.preflight.inspect(
+          this.#ports.preflight.inspect(
             {
               worktree,
               declaredRegions: [{ path: ".agent-team", coverage: "subtree" }],
@@ -806,7 +811,7 @@ export class RegistrationSetupCoordinator {
       if (operationKey === undefined) return failed("session");
       if (stagedReceipt === undefined) {
         const staged = await this.#owned(lease, () =>
-          this.ports.git.stagePaths(
+          this.#ports.git.stagePaths(
             worktree,
             [trustedProjectConfigPath],
             exactMutation(operationKey, request.signal),
@@ -822,7 +827,7 @@ export class RegistrationSetupCoordinator {
         )
           return failed("stage");
         const stagedDiff = await this.#owned(lease, () =>
-          this.ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
+          this.#ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
         );
         if (!stagedDiff.ok) return portFailure("stage", stagedDiff.error);
         if (!isExactTrustedConfigDiff(stagedDiff.value, serialized.value.content)) {
@@ -846,25 +851,25 @@ export class RegistrationSetupCoordinator {
       if (operationKey === undefined) return failed("session");
       const expectedMessage = setupCommitMessage(operationKey);
       let commitReceipt: Readonly<{ sha: string; branch: string }> | undefined;
-      const observed = await this.#owned(lease, () => this.ports.git.inspectWorkingTree(worktree));
+      const observed = await this.#owned(lease, () => this.#ports.git.inspectWorkingTree(worktree));
       if (!observed.ok) return portFailure("commit", observed.error);
       if (!sameSha(observed.value.headSha, request.preview.baseRevision)) {
         const [file, changes, commit] = await Promise.all([
           this.#owned(lease, () =>
-            this.ports.setupFiles.readTrustedProjectConfig({
+            this.#ports.setupFiles.readTrustedProjectConfig({
               worktree,
               path: trustedProjectConfigPath,
             }),
           ),
           this.#owned(lease, () =>
-            this.ports.git.getEffectiveTreeDiff(
+            this.#ports.git.getEffectiveTreeDiff(
               { rootPath: request.preview.project.localRepositoryPath },
               request.preview.baseRevision,
               observed.value.headSha,
             ),
           ),
           this.#owned(lease, () =>
-            this.ports.git.inspectCommit({ rootPath: worktree.path }, observed.value.headSha),
+            this.#ports.git.inspectCommit({ rootPath: worktree.path }, observed.value.headSha),
           ),
         ]);
         if (
@@ -888,10 +893,10 @@ export class RegistrationSetupCoordinator {
       if (commitReceipt === undefined) {
         const [stagedDiff, file] = await Promise.all([
           this.#owned(lease, () =>
-            this.ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
+            this.#ports.git.getStagedTreeDiff(worktree, request.preview.baseRevision),
           ),
           this.#owned(lease, () =>
-            this.ports.setupFiles.readTrustedProjectConfig({
+            this.#ports.setupFiles.readTrustedProjectConfig({
               worktree,
               path: trustedProjectConfigPath,
             }),
@@ -911,7 +916,7 @@ export class RegistrationSetupCoordinator {
           return failed("commit");
         }
         const committed = await this.#owned(lease, () =>
-          this.ports.git.commit(
+          this.#ports.git.commit(
             {
               worktree,
               message: expectedMessage,
@@ -926,7 +931,7 @@ export class RegistrationSetupCoordinator {
       if (commitReceipt.branch !== registrationSetupBranch || !shaPattern.test(commitReceipt.sha)) {
         return failed("commit");
       }
-      const clean = await this.#owned(lease, () => this.ports.git.inspectWorkingTree(worktree));
+      const clean = await this.#owned(lease, () => this.#ports.git.inspectWorkingTree(worktree));
       if (!clean.ok) return portFailure("commit", clean.error);
       if (!sameSha(clean.value.headSha, commitReceipt.sha) || clean.value.changes.length !== 0) {
         return failed("commit");
@@ -943,7 +948,7 @@ export class RegistrationSetupCoordinator {
       const operationKey = journal.pending?.idempotencyKey;
       if (operationKey === undefined) return failed("session");
       const pushed = await this.#owned(lease, () =>
-        this.ports.git.push(
+        this.#ports.git.push(
           worktree,
           request.preview.remote,
           exactMutation(operationKey, request.signal),
@@ -983,7 +988,7 @@ export class RegistrationSetupCoordinator {
       const operationKey = journal.pending?.idempotencyKey;
       if (operationKey === undefined) return failed("session");
       draft = await this.#owned(lease, () =>
-        this.ports.sourceControl.createDraftChangeRequest(
+        this.#ports.sourceControl.createDraftChangeRequest(
           draftCommand,
           exactMutation(operationKey, request.signal),
         ),
@@ -1007,7 +1012,7 @@ export class RegistrationSetupCoordinator {
     } else {
       const draftReceipt = journal.completed.draftPullRequest;
       draft = await this.#owned(lease, () =>
-        this.ports.sourceControl.getChangeRequest({
+        this.#ports.sourceControl.getChangeRequest({
           project: request.preview.project,
           changeRequestId: draftReceipt.changeRequestId,
         }),
@@ -1022,7 +1027,7 @@ export class RegistrationSetupCoordinator {
       return failed("draft_pull_request");
 
     const diff = await this.#owned(lease, () =>
-      this.ports.git.getEffectiveTreeDiff(
+      this.#ports.git.getEffectiveTreeDiff(
         { rootPath: request.preview.project.localRepositoryPath },
         request.preview.baseRevision,
         pushed.sha,
@@ -1075,7 +1080,7 @@ export class RegistrationSetupCoordinator {
       ]),
     });
     const saved = await this.#owned(lease, () =>
-      this.ports.sessions.save(
+      this.#ports.sessions.save(
         undefined,
         sessionDraft,
         fencedMutation(request, "save-created", lease),
@@ -1085,7 +1090,7 @@ export class RegistrationSetupCoordinator {
     let session = saved.value.session;
     if (saved.value.durability !== "confirmed") {
       const readBack = await this.#owned(lease, () =>
-        this.ports.sessions.load(request.preview.setupSessionId),
+        this.#ports.sessions.load(request.preview.setupSessionId),
       );
       if (
         !readBack.ok ||
@@ -1115,7 +1120,9 @@ export class RegistrationSetupCoordinator {
     request: RegistrationSetupSessionRequest,
     lease: RegistrationSetupExecutionLease,
   ): Promise<RegistrationSetupOutcome> {
-    const loaded = await this.#owned(lease, () => this.ports.sessions.load(request.setupSessionId));
+    const loaded = await this.#owned(lease, () =>
+      this.#ports.sessions.load(request.setupSessionId),
+    );
     if (!loaded.ok) return portFailure("session", loaded.error);
     if (loaded.value === undefined) return Object.freeze({ state: "blocked", reason: "not_found" });
     const session = loaded.value;
@@ -1141,7 +1148,7 @@ export class RegistrationSetupCoordinator {
   ): Promise<RegistrationSetupOutcome> {
     const reference = { project: session.project, changeRequestId: session.changeRequest.id };
     const current = await this.#owned(lease, () =>
-      this.ports.sourceControl.getChangeRequest(reference),
+      this.#ports.sourceControl.getChangeRequest(reference),
     );
     if (!current.ok) return portFailure("change_request", current.error, session);
     if (
@@ -1155,7 +1162,7 @@ export class RegistrationSetupCoordinator {
     let ready = current.value;
     if (ready.draft) {
       const marked = await this.#owned(lease, () =>
-        this.ports.sourceControl.markChangeRequestReady(
+        this.#ports.sourceControl.markChangeRequestReady(
           reference,
           session.headSha,
           mutation(request, "ready-for-review"),
@@ -1172,7 +1179,7 @@ export class RegistrationSetupCoordinator {
       ready = marked.value;
     }
     const diff = await this.#owned(lease, () =>
-      this.ports.git.getEffectiveTreeDiff(
+      this.#ports.git.getEffectiveTreeDiff(
         { rootPath: session.project.localRepositoryPath },
         session.baseRevision,
         session.headSha,
@@ -1192,7 +1199,7 @@ export class RegistrationSetupCoordinator {
     let working = session;
     if (working.gateEvidenceReceipt === undefined) {
       const gate = await this.#owned(lease, () =>
-        this.ports.gateEvidence.read({
+        this.#ports.gateEvidence.read({
           project: working.project,
           changeRequestId: working.changeRequest.id,
           expectedHeadSha: working.headSha,
@@ -1283,7 +1290,7 @@ export class RegistrationSetupCoordinator {
       }
       if (pending === undefined || !sameValue(pending, expected)) return failed("audit", working);
       const published = await this.#owned(lease, () =>
-        this.ports.audit.publish(pending, exactMutation(pending.idempotencyKey, request.signal)),
+        this.#ports.audit.publish(pending, exactMutation(pending.idempotencyKey, request.signal)),
       );
       if (!published.ok) return portFailure("audit", published.error, working);
       if (!auditReceiptMatches(working, published.value, destination)) {
@@ -1346,20 +1353,14 @@ export class RegistrationSetupCoordinator {
     );
   }
 
-  /** B1 compatibility shim; authorizes only and never merges or activates. */
-  approveAndMerge(
-    request: RegistrationSetupMergeRequest,
-    authority: RegistrationSetupFinalApprovalAuthority,
-  ): Promise<RegistrationSetupOutcome> {
-    return this.authorizeMerge(request, authority);
-  }
-
   async #authorizeMergeExclusive(
     request: RegistrationSetupMergeRequest,
     authority: RegistrationSetupFinalApprovalAuthority,
     lease: RegistrationSetupExecutionLease,
   ): Promise<RegistrationSetupOutcome> {
-    const loaded = await this.#owned(lease, () => this.ports.sessions.load(request.setupSessionId));
+    const loaded = await this.#owned(lease, () =>
+      this.#ports.sessions.load(request.setupSessionId),
+    );
     if (!loaded.ok) return portFailure("session", loaded.error);
     if (loaded.value === undefined) return Object.freeze({ state: "blocked", reason: "not_found" });
     let session = loaded.value;
@@ -1378,14 +1379,45 @@ export class RegistrationSetupCoordinator {
     const approval = request.approval;
     if (session.phase === "merge_authorized") {
       const referenceDigest = approvalReferenceDigest(approval.approvalId);
-      if (!referenceDigest.ok || session.approvalReferenceDigest !== referenceDigest.value) {
+      const expectedBinding = approvalBinding(session, session.revision - 1);
+      if (
+        !referenceDigest.ok ||
+        expectedBinding === undefined ||
+        session.approvalReferenceDigest !== referenceDigest.value
+      ) {
         return Object.freeze({ state: "blocked", reason: "approval_replay" });
+      }
+      const recovered = await this.#owned(lease, () =>
+        this.#ports.finalApproval.verifyAndConsume(
+          approval,
+          expectedBinding,
+          authority,
+          mutation(request, "verify-consume-user-approval"),
+        ),
+      );
+      if (!recovered.ok) return portFailure("approval", recovered.error, session);
+      if (recovered.value.state !== "verified_and_consumed") {
+        return Object.freeze({
+          state: "blocked",
+          reason: recovered.value.state === "replay" ? "approval_replay" : "user_approval_invalid",
+        });
+      }
+      const receipt = recovered.value.receipt;
+      if (
+        !approvalReceiptMatches(receipt, approval, expectedBinding) ||
+        receipt.issuer !== authority.issuer ||
+        receipt.authorityDigest !== authority.authorityDigest ||
+        receipt.issuer !== session.approvalSource ||
+        receipt.authorityDigest !== session.approvalAuthorityDigest ||
+        receipt.approvalNonceDigest !== session.approvalNonceDigest
+      ) {
+        return Object.freeze({ state: "blocked", reason: "user_approval_invalid" });
       }
     } else {
       const expectedBinding = approvalBinding(session);
       if (expectedBinding === undefined) return failed("approval", session);
       const consumed = await this.#owned(lease, () =>
-        this.ports.finalApproval.verifyAndConsume(
+        this.#ports.finalApproval.verifyAndConsume(
           approval,
           expectedBinding,
           authority,
@@ -1429,7 +1461,7 @@ export class RegistrationSetupCoordinator {
         ]),
       });
       const saved = await this.#owned(lease, () =>
-        this.ports.sessions.save(
+        this.#ports.sessions.save(
           session.revision,
           withoutSessionRevision(authorized),
           fencedMutation(request, "save-merge-authorized", lease),
@@ -1440,7 +1472,7 @@ export class RegistrationSetupCoordinator {
         session = saved.value.session;
       } else {
         const readBack = await this.#owned(lease, () =>
-          this.ports.sessions.load(session.setupSessionId),
+          this.#ports.sessions.load(session.setupSessionId),
         );
         if (
           !readBack.ok ||
@@ -1470,7 +1502,9 @@ export class RegistrationSetupCoordinator {
     request: RegistrationSetupSessionRequest,
     lease: RegistrationSetupExecutionLease,
   ): Promise<RegistrationSetupOutcome> {
-    const loaded = await this.#owned(lease, () => this.ports.sessions.load(request.setupSessionId));
+    const loaded = await this.#owned(lease, () =>
+      this.#ports.sessions.load(request.setupSessionId),
+    );
     if (!loaded.ok) return portFailure("session", loaded.error);
     if (loaded.value === undefined) return Object.freeze({ state: "blocked", reason: "not_found" });
     const session = loaded.value;
@@ -1483,7 +1517,7 @@ export class RegistrationSetupCoordinator {
     }
     const cancelled = bumped(session, { phase: "cancelled" });
     const saved = await this.#owned(lease, () =>
-      this.ports.sessions.save(
+      this.#ports.sessions.save(
         session.revision,
         withoutSessionRevision(cancelled),
         fencedMutation(request, "save-cancelled", lease),
@@ -1493,7 +1527,7 @@ export class RegistrationSetupCoordinator {
     let cancelledSession = saved.value.session;
     if (saved.value.durability !== "confirmed") {
       const readBack = await this.#owned(lease, () =>
-        this.ports.sessions.load(session.setupSessionId),
+        this.#ports.sessions.load(session.setupSessionId),
       );
       if (
         !readBack.ok ||

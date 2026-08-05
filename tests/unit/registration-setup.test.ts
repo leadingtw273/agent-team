@@ -696,6 +696,15 @@ function approval(session: RegistrationSetupSession, overrides: Record<string, u
 const trustedAuthority = { issuer: "local_ui" as const, authorityDigest: uiSessionDigest };
 
 describe("O005 registration Setup PR flow", () => {
+  it("keeps coordinator capabilities private and exposes no B1 merge alias", () => {
+    const test = harness();
+    expect(Object.keys(test.coordinator)).toEqual([]);
+    expect(test.coordinator).not.toHaveProperty("ports");
+    expect(test.coordinator).not.toHaveProperty("approveAndMerge");
+    expect(test.coordinator).not.toHaveProperty("enableAutoMerge");
+    expect(test.coordinator).not.toHaveProperty("activate");
+  });
+
   it("serializes trusted config deterministically and rejects recognizable secrets", () => {
     const first = serializeTrustedProjectConfig(config);
     const second = serializeTrustedProjectConfig({ ...config });
@@ -918,7 +927,7 @@ describe("O005 registration Setup PR flow", () => {
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
     await expect(
-      test.coordinator.approveAndMerge(
+      test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: approval(ready.session),
@@ -1037,7 +1046,7 @@ describe("O005 registration Setup PR flow", () => {
       approval(ready.session, { setupSessionId: "other" }),
       approval(ready.session, { issuer: "local_ui" }),
     ]) {
-      const result = await test.coordinator.approveAndMerge(
+      const result = await test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           ...(token === undefined ? {} : { approval: token }),
@@ -1059,7 +1068,7 @@ describe("O005 registration Setup PR flow", () => {
         idempotencyKeyPrefix: "refresh:authority",
       });
       if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-      const result = await test.coordinator.approveAndMerge(
+      const result = await test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: approval(ready.session),
@@ -1081,7 +1090,7 @@ describe("O005 registration Setup PR flow", () => {
         idempotencyKeyPrefix: "refresh:merge",
       });
       if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-      const result = await test.coordinator.approveAndMerge(
+      const result = await test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: approval(ready.session),
@@ -1101,7 +1110,7 @@ describe("O005 registration Setup PR flow", () => {
       idempotencyKeyPrefix: "refresh:success",
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-    const result = await test.coordinator.approveAndMerge(
+    const result = await test.coordinator.authorizeMerge(
       {
         setupSessionId: preview.setupSessionId,
         approval: approval(ready.session),
@@ -1132,7 +1141,7 @@ describe("O005 registration Setup PR flow", () => {
       idempotencyKeyPrefix: "refresh:readback",
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
-    const result = await test.coordinator.approveAndMerge(
+    const result = await test.coordinator.authorizeMerge(
       {
         setupSessionId: preview.setupSessionId,
         approval: approval(ready.session),
@@ -1161,7 +1170,7 @@ describe("O005 registration Setup PR flow", () => {
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
     await expect(
-      test.coordinator.approveAndMerge(
+      test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: approval(ready.session),
@@ -1173,7 +1182,7 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls).not.toContain("activate");
   });
 
-  it("reuses the same durable merge authorization without invoking merge", async () => {
+  it("revalidates the same durable merge authorization operation without invoking merge", async () => {
     const test = await prepared(harness({ mergeFailOnce: true, mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -1182,7 +1191,7 @@ describe("O005 registration Setup PR flow", () => {
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
     const token = approval(ready.session);
     await expect(
-      test.coordinator.approveAndMerge(
+      test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: token,
@@ -1192,16 +1201,16 @@ describe("O005 registration Setup PR flow", () => {
       ),
     ).resolves.toMatchObject({ state: "merge_pending" });
     await expect(
-      test.coordinator.approveAndMerge(
+      test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: token,
-          idempotencyKeyPrefix: "merge:recover",
+          idempotencyKeyPrefix: "merge:fail",
         },
         trustedAuthority,
       ),
     ).resolves.toMatchObject({ state: "merge_pending" });
-    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(2);
     expect(test.calls).not.toContain("merge");
   });
 
@@ -1218,12 +1227,12 @@ describe("O005 registration Setup PR flow", () => {
       approval: token,
       idempotencyKeyPrefix: "merge:consume-window",
     };
-    await expect(
-      test.coordinator.approveAndMerge(request, trustedAuthority),
-    ).resolves.toMatchObject({ state: "failed", stage: "session" });
-    await expect(
-      test.coordinator.approveAndMerge(request, trustedAuthority),
-    ).resolves.toMatchObject({ state: "merge_pending" });
+    await expect(test.coordinator.authorizeMerge(request, trustedAuthority)).resolves.toMatchObject(
+      { state: "failed", stage: "session" },
+    );
+    await expect(test.coordinator.authorizeMerge(request, trustedAuthority)).resolves.toMatchObject(
+      { state: "merge_pending" },
+    );
     expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(2);
   });
 
@@ -1235,7 +1244,7 @@ describe("O005 registration Setup PR flow", () => {
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
     const token = approval(ready.session);
-    await test.coordinator.approveAndMerge(
+    await test.coordinator.authorizeMerge(
       {
         setupSessionId: preview.setupSessionId,
         approval: token,
@@ -1244,7 +1253,7 @@ describe("O005 registration Setup PR flow", () => {
       trustedAuthority,
     );
     await expect(
-      test.coordinator.approveAndMerge(
+      test.coordinator.authorizeMerge(
         {
           setupSessionId: preview.setupSessionId,
           approval: token,
@@ -1256,7 +1265,7 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls).not.toContain("merge");
   });
 
-  it("recovers an already durable authorization without replaying authority consumption", async () => {
+  it("rejects a different operation after authorization is durable", async () => {
     const test = await prepared(harness({ mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
       setupSessionId: preview.setupSessionId,
@@ -1264,7 +1273,7 @@ describe("O005 registration Setup PR flow", () => {
     });
     if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
     const token = approval(ready.session);
-    await test.coordinator.approveAndMerge(
+    await test.coordinator.authorizeMerge(
       {
         setupSessionId: preview.setupSessionId,
         approval: token,
@@ -1272,7 +1281,7 @@ describe("O005 registration Setup PR flow", () => {
       },
       trustedAuthority,
     );
-    const replay = await test.coordinator.approveAndMerge(
+    const replay = await test.coordinator.authorizeMerge(
       {
         setupSessionId: preview.setupSessionId,
         approval: token,
@@ -1280,8 +1289,37 @@ describe("O005 registration Setup PR flow", () => {
       },
       trustedAuthority,
     );
-    expect(replay).toMatchObject({ state: "merge_pending" });
-    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(1);
+    expect(replay).toMatchObject({ state: "blocked", reason: "approval_replay" });
+    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(2);
+    expect(test.calls).not.toContain("activate");
+  });
+
+  it("rejects another authority when recovering a durable authorization", async () => {
+    const test = await prepared();
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:wrong-recovery-authority",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const token = approval(ready.session);
+    const request = {
+      setupSessionId: preview.setupSessionId,
+      approval: token,
+      idempotencyKeyPrefix: "merge:wrong-recovery-authority",
+    };
+    await expect(test.coordinator.authorizeMerge(request, trustedAuthority)).resolves.toMatchObject(
+      {
+        state: "merge_pending",
+      },
+    );
+    await expect(
+      test.coordinator.authorizeMerge(request, {
+        issuer: "current_user_conversation",
+        authorityDigest: "9".repeat(64),
+      }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "user_approval_invalid" });
+    expect(test.calls.filter((call) => call === "save:merge_authorized")).toHaveLength(1);
+    expect(test.calls).not.toContain("merge");
     expect(test.calls).not.toContain("activate");
   });
 
