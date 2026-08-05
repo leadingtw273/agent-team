@@ -100,6 +100,7 @@ describe("quota UI read model", () => {
     expect(fiveHour.remainingPercent).toBeUndefined();
     const rendered = renderQuotaDashboard(dashboard);
     expect(rendered).toContain("五小時額度");
+    expect(rendered).toContain('<span class="visually-hidden">Claude </span>五小時額度');
     expect(rendered).toContain("無法確認");
     expect(rendered).toContain("使用者設定週使用上限：<strong>75%</strong>");
     expect(rendered).toContain("93% 已使用 · 7% 剩餘");

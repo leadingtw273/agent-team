@@ -91,11 +91,15 @@ function observedUsage(bucket: QuotaBucketReadModel): string {
   return `${String(bucket.usedPercent)}% 已使用 · ${String(bucket.remainingPercent)}% 剩餘${reset}`;
 }
 
-function renderBucket(provider: QuotaProviderId, bucket: QuotaBucketReadModel): string {
+function renderBucket(
+  provider: QuotaProviderId,
+  providerLabel: string,
+  bucket: QuotaBucketReadModel,
+): string {
   const label = quotaBucketLabel(provider, bucket.bucket);
   const state = stateLabel(bucket.state);
   return `<section class="ui-quota-bucket" aria-labelledby="quota-${provider}-${bucket.bucket}">
-    <div class="ui-section-heading"><div><h3 id="quota-${provider}-${bucket.bucket}">${label}</h3><p>Provider 觀測結果</p></div><span class="badge ui-status-badge ui-status--${statusClass(bucket.state)} ui-quota-state-badge ui-quota-state--${bucket.state}" data-quota-state="${bucket.state}"><span class="ui-quota-state-symbol" aria-hidden="true">${stateSymbol(bucket.state)}</span><span>${state}</span></span></div>
+    <div class="ui-section-heading"><div><h3 id="quota-${provider}-${bucket.bucket}"><span class="visually-hidden">${escapeHtml(providerLabel)} </span>${label}</h3><p>Provider 觀測結果</p></div><span class="badge ui-status-badge ui-status--${statusClass(bucket.state)} ui-quota-state-badge ui-quota-state--${bucket.state}" data-quota-state="${bucket.state}"><span class="ui-quota-state-symbol" aria-hidden="true">${stateSymbol(bucket.state)}</span><span>${state}</span></span></div>
     <dl class="ui-quota-details">
       <div><dt>觀測結果</dt><dd>${observedUsage(bucket)}</dd></div>
       <div><dt>樣本來源</dt><dd>${escapeHtml(bucket.source)}</dd></div>
@@ -130,7 +134,7 @@ function renderProvider(provider: QuotaDashboardReadModel["providers"][number]):
       <p class="ui-quota-configuration">${renderWeeklyConfiguration(provider.weeklyConfiguration)}</p>
       <p class="ui-quota-no-five-hour-config">五小時額度沒有使用者設定；只顯示 Provider 已知訊號。</p>
       <div class="ui-quota-buckets">${provider.buckets
-        .map((bucket) => renderBucket(provider.provider, bucket))
+        .map((bucket) => renderBucket(provider.provider, provider.label, bucket))
         .join("")}</div>
       <div class="ui-quota-actions" aria-label="${provider.label} 額度動作">
         <button class="btn btn-outline-primary" type="button" data-quota-action="refresh" data-quota-provider="${provider.provider}">刷新樣本</button>
