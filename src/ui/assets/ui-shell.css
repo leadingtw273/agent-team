@@ -422,6 +422,25 @@ button:focus-visible,
   outline-offset: var(--ui-focus-offset);
 }
 
+.danger-page [data-decision="approve_once"] {
+  color: #fff;
+  background: #176b2c;
+  border-color: #176b2c;
+}
+
+.danger-page [data-decision="reject"],
+.danger-page .badge.bg-danger {
+  color: #fff;
+  background: #a52828;
+  border-color: #a52828;
+}
+
+.danger-page [data-decision="allow_project_category"] {
+  color: #704d00;
+  background: #fff;
+  border-color: #704d00;
+}
+
 @media (max-width: 900px) {
   .ui-app {
     grid-template-columns: 13.5rem minmax(0, 1fr);
