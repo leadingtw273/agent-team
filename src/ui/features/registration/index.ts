@@ -1,4 +1,6 @@
 export * from "./fixture.js";
+export * from "./github-policy.js";
+export * from "./github-policy-fixture.js";
 export * from "./linear-fixture.js";
 export * from "./linear-http.js";
 export * from "./metadata.js";

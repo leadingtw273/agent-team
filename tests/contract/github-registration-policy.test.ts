@@ -40,7 +40,6 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
     _schema: z.ZodType<Output>,
     _options?: ReadOptions,
   ): Promise<Result<Output, DomainError>> {
-    void _schema;
     void _options;
     this.calls.push([...arguments_]);
     const endpoint = arguments_[1] ?? "";
@@ -76,7 +75,8 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
         admin: this.admin,
       };
     }
-    return Promise.resolve(ok(value as Output));
+    const parsed = _schema.safeParse(value);
+    return Promise.resolve(parsed.success ? ok(parsed.data) : err(domainError("external_failure")));
   }
 }
 

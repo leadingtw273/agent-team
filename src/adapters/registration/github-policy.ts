@@ -51,7 +51,9 @@ const rulesetDetailSchema = z
     requiredChecks: z.array(z.string().min(1).max(100)).max(1_000),
   })
   .strict();
-const createdRulesetSchema = z.object({ id: z.union([z.number(), z.string()]) }).strict();
+const createdRulesetSchema = z
+  .object({ id: z.union([z.number().int().positive(), z.string().regex(ruleIdPattern)]) })
+  .strict();
 const autoMergeSchema = z.object({ allowAutoMerge: z.literal(true) }).strict();
 
 const repositoryProjection =

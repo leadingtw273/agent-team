@@ -106,7 +106,7 @@ describe("O004 GitHub registration policy", () => {
       await useCase.apply({
         ...target,
         expectedRevision: preview.expectedRevision,
-        confirmationToken: `${preview.confirmationToken.slice(0, -1)}x`,
+        confirmationToken: `${preview.confirmationToken.slice(0, -1)}${preview.confirmationToken.endsWith("x") ? "y" : "x"}`,
       }),
     ).toMatchObject({ state: "blocked", reason: "confirmation_invalid" });
     port.setInventory(inventory({ revision: "c".repeat(64) }));
