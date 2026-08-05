@@ -5,6 +5,7 @@ import {
   RegistrationSetupCoordinator,
   createUnwiredRegistrationSetupController,
   type RegistrationSetupControllerUseCase,
+  type RegistrationSetupDraft,
   type RegistrationSetupDraftSourcePort,
 } from "../../application/registration/index.js";
 import type { Clock } from "../../domain/foundation/index.js";
@@ -19,9 +20,13 @@ import {
   FileRegistrationSetupSessionStore,
   LocalRegistrationSetupFileAdapter,
 } from "./setup-durable.js";
+import { HostRegistrationSetupDraftSource } from "./setup-draft-source.js";
 
 export interface CreateProductionRegistrationSetupCompositionOptions {
   readonly stateRoot: string;
+  /** Direct production-host draft; snapshotted behind HostRegistrationSetupDraftSource. */
+  readonly draft?: RegistrationSetupDraft;
+  /** Dynamic production-host source. Mutually exclusive with `draft`. */
   readonly draftSource?: RegistrationSetupDraftSourcePort;
   /** Explicit so tests and hosts cannot silently fall through to live `gh`. */
   readonly githubTransport?: GhJsonTransport;
@@ -57,9 +62,14 @@ const incompleteWiring = Object.freeze({
 export function createProductionRegistrationSetupComposition(
   options: CreateProductionRegistrationSetupCompositionOptions,
 ): ProductionRegistrationSetupComposition {
+  let draftSource = options.draftSource;
+  if (draftSource === undefined && options.draft !== undefined) {
+    draftSource = new HostRegistrationSetupDraftSource(options.draft);
+  }
   if (
     !isAbsolute(options.stateRoot) ||
-    options.draftSource === undefined ||
+    draftSource === undefined ||
+    (options.draft !== undefined && options.draftSource !== undefined) ||
     options.githubTransport === undefined
   ) {
     return Object.freeze({
@@ -98,7 +108,7 @@ export function createProductionRegistrationSetupComposition(
   return Object.freeze({
     controller: new RegistrationSetupController({
       stateRoot: options.stateRoot,
-      draftSource: options.draftSource,
+      draftSource,
       git,
       coordinator,
       sessions,

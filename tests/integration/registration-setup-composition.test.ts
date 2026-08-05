@@ -10,14 +10,16 @@ import type { z } from "zod";
 import { createProductionRegistrationSetupComposition } from "../../src/adapters/registration/index.js";
 import type { GhJsonTransport } from "../../src/adapters/github/adapter.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
-import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import { domainError, err } from "../../src/domain/foundation/index.js";
 import { projectSchema } from "../../src/domain/project/index.js";
 import {
+  createUiApplication,
   createFixtureGitHubRegistrationPolicyUseCaseFactory,
   createFixtureLinearProvisionUseCaseFactory,
   createProductionRegistrationWizardUiComposition,
   fixtureRegistrationReadOnlyScanUseCase,
-} from "../../src/ui/features/registration/index.js";
+  startLocalUiServer,
+} from "../../src/ui/index.js";
 
 const run = promisify(execFile);
 const authorityDigest = "a".repeat(64);
@@ -66,7 +68,7 @@ async function fixture() {
   };
   return {
     root,
-    draftSource: { load: () => Promise.resolve(ok({ project, config })) },
+    draft: Object.freeze({ project, config }),
     transport,
     transportCalls,
   };
@@ -109,7 +111,7 @@ describe("W3A production Registration Setup composition", () => {
     const setup = await fixture();
     const options = {
       stateRoot: join(setup.root, "state"),
-      draftSource: setup.draftSource,
+      draft: setup.draft,
       githubTransport: setup.transport,
     };
     const composition = createProductionRegistrationSetupComposition(options);
@@ -156,5 +158,42 @@ describe("W3A production Registration Setup composition", () => {
     expect(html).toContain("preview_ready");
     expect(html).not.toContain("production_dependencies_unwired");
     expect(setup.transportCalls).toEqual([]);
+
+    const application = createUiApplication({
+      productionRegistrationWizard: {
+        readOnlyScan: fixtureRegistrationReadOnlyScanUseCase,
+        linearUseCaseFactory: createFixtureLinearProvisionUseCaseFactory(),
+        githubUseCaseFactory: createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+        githubTarget: Object.freeze({
+          projectId: "sandbox-project",
+          repository: "owner/sandbox",
+          defaultBranch: "main",
+        }),
+        setup: options,
+      },
+    });
+    expect(application.routeContracts.map((route) => route.path)).toContain(
+      "/api/registration/setup",
+    );
+    const handle = await startLocalUiServer({
+      securityPolicy: application.securityPolicy,
+      handler: application.handler,
+    });
+    try {
+      const exchange = await fetch(`${handle.baseUrl}/__session/exchange`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${handle.sessionToken}` },
+      });
+      const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0];
+      if (cookie === undefined) throw new Error("production UI session exchange failed");
+      const page = await fetch(`${handle.baseUrl}/registration`, { headers: { cookie } });
+      expect(page.status).toBe(200);
+      const pageBody = await page.text();
+      expect(pageBody).toContain("可信設定 Setup");
+      expect(pageBody).toContain("preview_ready");
+      expect(pageBody).not.toContain("production_dependencies_unwired");
+    } finally {
+      await handle.close();
+    }
   });
 });
