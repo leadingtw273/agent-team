@@ -5,17 +5,44 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createUiShellHandler,
+  createUiApplication,
   fixtureUiShellReadModel,
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
-import type { RuntimeStatusReadModel } from "../../src/ui/features/runtime-status/index.js";
+import {
+  createRuntimeStatusUiFeatureRegistration,
+  fixtureRuntimeStatusReadModel,
+  type RuntimeStatusReadModel,
+} from "../../src/ui/features/runtime-status/index.js";
+import {
+  createDangerApprovalUseCase,
+  createDangerUiFeatureRegistration,
+  InMemoryDangerApprovalStore,
+} from "../../src/ui/features/danger/index.js";
+import { createQuotaUiFeature, QuotaDashboardUseCase } from "../../src/ui/features/quota/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
+import {
+  createSettingsUiFeatureRegistration,
+  createSettingsUseCase,
+  type SettingsStore,
+} from "../../src/ui/features/settings/index.js";
+import { domainError, err, parseInstant } from "../../src/domain/foundation/index.js";
 
 const reviewDirectory = "/tmp/ui-review";
 const worktreeReviewDirectory = join(process.cwd(), "tmp", "ui-review");
 let shell: LocalUiServerHandle | undefined;
 let longIdentifierShell: LocalUiServerHandle | undefined;
+const authenticatedTargets = new WeakMap<Page, LocalUiServerHandle>();
+const featurePages = [
+  { path: "/roles-models", label: "角色與模型" },
+  { path: "/quota", label: "額度" },
+  { path: "/runtime-status", label: "執行中" },
+  { path: "/security", label: "安全" },
+  { path: "/settings", label: "設定" },
+] as const;
+
+type FeaturePagePath = (typeof featurePages)[number]["path"];
 
 interface AxeViolation {
   readonly help: string;
@@ -59,21 +86,63 @@ function shellBaseUrl(target = shell): string {
 
 async function authenticate(page: Page, target = shell): Promise<void> {
   const activeShell = requiredShell(target);
-  const sessionToken = activeShell.sessionToken;
-  await page.context().route(`${shellBaseUrl(activeShell)}/**`, async (route) => {
-    await route.continue({
-      headers: { ...route.request().headers(), authorization: `Bearer ${sessionToken}` },
-    });
+  if (authenticatedTargets.get(page) === activeShell) return;
+  await page.goto(`${shellBaseUrl(activeShell)}/#${activeShell.sessionToken}`, {
+    waitUntil: "domcontentloaded",
   });
+  await page.waitForFunction(() => sessionStorage.getItem("agent-team-csrf") !== null);
+  authenticatedTargets.set(page, activeShell);
 }
 
 async function visit(
   page: Page,
-  path: "/" | "/runtime-status" = "/runtime-status",
+  path: FeaturePagePath = "/runtime-status",
   target = shell,
 ): Promise<void> {
+  await page.context().addInitScript({ content: axe.source });
   await authenticate(page, target);
-  await page.goto(`${shellBaseUrl(target)}${path}`, { waitUntil: "networkidle" });
+  await page.goto(`${shellBaseUrl(target)}${path}`, { waitUntil: "domcontentloaded" });
+  await page.locator("#main-content").waitFor();
+}
+
+function quotaFeature() {
+  const parsed = parseInstant("2026-08-05T12:00:00.000Z");
+  if (!parsed.ok) throw new Error(parsed.error.code);
+  return createQuotaUiFeature(
+    new QuotaDashboardUseCase(
+      {
+        listProviders: () => Promise.resolve(Object.freeze([])),
+        invalidateSnapshot: () => Promise.resolve(undefined),
+        refreshSample: () =>
+          Promise.resolve(Object.freeze({ state: "rejected" as const, reason: "unused" })),
+        resumeDispatch: () =>
+          Promise.resolve(Object.freeze({ state: "rejected" as const, reason: "unused" })),
+      },
+      {
+        now: () => parsed.value,
+        maxSampleAgeMs: 15 * 60 * 1_000,
+        expectedCliVersions: Object.freeze({
+          codex: "fixture",
+          claude: "fixture",
+          gemini: "fixture",
+        }),
+      },
+    ),
+  );
+}
+
+function dangerFeature() {
+  return createDangerUiFeatureRegistration(
+    createDangerApprovalUseCase(new InMemoryDangerApprovalStore()),
+  );
+}
+
+function settingsFeature() {
+  const store: SettingsStore = {
+    read: () => Promise.resolve(err(domainError("not_found"))),
+    save: () => Promise.resolve(Object.freeze({ state: "rejected" as const })),
+  };
+  return createSettingsUiFeatureRegistration(createSettingsUseCase(store));
 }
 
 async function copyReviewScreenshot(page: Page, name: string): Promise<void> {
@@ -87,7 +156,6 @@ async function copyReviewScreenshot(page: Page, name: string): Promise<void> {
 }
 
 async function expectNoAxeViolations(page: Page): Promise<void> {
-  await page.addScriptTag({ content: axe.source });
   const violations = await page.evaluate(async () => {
     const browser = globalThis as typeof globalThis & {
       readonly axe?: AxeRunner;
@@ -134,12 +202,25 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
   expect(layout.overflowingSelectors).toEqual([]);
 }
 
+async function expectShellFitsViewport(page: Page): Promise<void> {
+  const fitsViewport = await page.evaluate(() => {
+    const browser = globalThis as typeof globalThis & {
+      readonly document?: RuntimeLayoutDocument;
+    };
+    if (browser.document === undefined) throw new Error("UI document is unavailable.");
+    const root = browser.document.documentElement;
+    return root.scrollWidth <= root.clientWidth;
+  });
+
+  expect(fitsViewport).toBe(true);
+}
+
 function longIdentifier(value: string): string {
   return `${value}_${"long-runtime-identifier".repeat(20)}`;
 }
 
 function longIdentifierReadModel(): RuntimeStatusReadModel {
-  const [source] = fixtureUiShellReadModel.listRuntimeStatuses();
+  const [source] = fixtureRuntimeStatusReadModel.listRuntimeStatuses();
   if (source === undefined)
     throw new Error("Runtime status fixture is required for visual coverage.");
   const checkpoint = source.checkpoint;
@@ -173,20 +254,39 @@ function longIdentifierReadModel(): RuntimeStatusReadModel {
   });
 }
 
+async function startRuntimeStatusShell(
+  readModel: RuntimeStatusReadModel,
+): Promise<LocalUiServerHandle> {
+  const application = createUiApplication({
+    readModel: fixtureUiShellReadModel,
+    features: [
+      createRoleModelFeature(),
+      quotaFeature(),
+      dangerFeature(),
+      settingsFeature(),
+      createRuntimeStatusUiFeatureRegistration(readModel),
+    ],
+  });
+  return startLocalUiServer({
+    securityPolicy: application.securityPolicy,
+    handler: application.handler,
+  });
+}
+
 test.describe("U007 runtime status UI", () => {
-  test.beforeAll(async () => {
-    shell = await startLocalUiServer({ handler: createUiShellHandler(fixtureUiShellReadModel) });
-    longIdentifierShell = await startLocalUiServer({
-      handler: createUiShellHandler({ ...fixtureUiShellReadModel, ...longIdentifierReadModel() }),
-    });
+  test.beforeEach(async () => {
+    shell = await startRuntimeStatusShell(fixtureRuntimeStatusReadModel);
+    longIdentifierShell = await startRuntimeStatusShell(longIdentifierReadModel());
   });
 
-  test.afterAll(async () => {
+  test.afterEach(async () => {
     await Promise.all([shell?.close(), longIdentifierShell?.close()]);
+    shell = undefined;
+    longIdentifierShell = undefined;
   });
 
   test("navigates to 執行中 with the keyboard", async ({ page }) => {
-    await visit(page, "/");
+    await visit(page, "/roles-models");
     const runtimeStatusLink = page
       .getByRole("navigation", { name: "主要導覽" })
       .getByRole("link", { name: "執行中", exact: true });
@@ -198,6 +298,27 @@ test.describe("U007 runtime status UI", () => {
     await expect(page).toHaveURL(`${shellBaseUrl()}/runtime-status`);
     await expect(page.getByRole("heading", { level: 1, name: "執行中" })).toBeVisible();
     await expect(runtimeStatusLink).toHaveAttribute("aria-current", "page");
+  });
+
+  test("uses one session and Shell for every feature at 390px and 320px", async ({ page }) => {
+    for (const width of [390, 320] as const) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const feature of featurePages) {
+        await visit(page, feature.path);
+
+        const disclosure = page.locator("details.ui-mobile-nav");
+        const activeLink = disclosure.locator(`a[href="${feature.path}"]`);
+        await expect(page.locator(".ui-app")).toHaveCount(1);
+        await expect(page.locator(".ui-content")).toHaveCount(1);
+        await expect(disclosure).not.toHaveAttribute("open", "");
+        await expect(activeLink).toHaveAttribute("aria-current", "page");
+        await expect(activeLink).toHaveText(feature.label);
+        await disclosure.locator("summary").click();
+        await expect(disclosure).toHaveAttribute("open", "");
+        await expect(activeLink).toBeVisible();
+        await expectShellFitsViewport(page);
+      }
+    }
   });
 
   test("keeps Runtime Status cards read-only after a touch tap at 390px", async ({ browser }) => {
@@ -258,7 +379,7 @@ test.describe("U007 runtime status UI", () => {
       page
         .getByRole("navigation", { name: "主要導覽" })
         .getByRole("link", { name: "安全", exact: true }),
-    ).toHaveCount(0);
+    ).toHaveCount(1);
     await expect(cards.filter({ hasText: "未知錯誤" })).toContainText("已到 60 分鐘硬邊界並停止");
     await expect(page.getByText("不顯示完整命令、Secret 或模型隱藏推理")).toBeVisible();
     await expect(page.getByText("45 分鐘檢查").first()).toBeVisible();
@@ -301,6 +422,7 @@ test.describe("U007 runtime status UI", () => {
     await visit(page);
 
     await expect(page.getByRole("article")).toHaveCount(4);
+    await expect(page.locator("details.ui-mobile-nav")).toHaveCount(1);
     await expect(page.getByText("週額度不足")).toBeVisible();
     await expect(page.getByText("等待危險操作核可")).toBeVisible();
     await expectNoHorizontalOverflow(page);
@@ -328,8 +450,15 @@ test.describe("U007 runtime status UI", () => {
     }
   });
 
-  test("has no definite axe violations", async ({ page }) => {
-    await visit(page);
-    await expectNoAxeViolations(page);
+  test("has no definite axe violations for every feature at desktop, 390px, and 320px", async ({
+    page,
+  }) => {
+    for (const width of [1280, 390, 320]) {
+      await page.setViewportSize({ width, height: 844 });
+      for (const feature of featurePages) {
+        await visit(page, feature.path);
+        await expectNoAxeViolations(page);
+      }
+    }
   });
 });

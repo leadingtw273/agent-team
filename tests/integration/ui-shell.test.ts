@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createUiShellHandler,
-  fixtureRuntimeStatusReadModel,
   startLocalUiServer,
   type LocalUiServerHandle,
   type UiShellReadModel,
@@ -11,7 +10,6 @@ import {
 const handles: LocalUiServerHandle[] = [];
 
 const fixtureReadModel: UiShellReadModel = Object.freeze({
-  ...fixtureRuntimeStatusReadModel,
   readOverview: () =>
     Object.freeze({
       source: "fixture" as const,
@@ -152,7 +150,6 @@ describe("localhost UI shell", () => {
   it("labels empty state data without implying a connected production runtime", async () => {
     const handle = await start(
       Object.freeze({
-        ...fixtureRuntimeStatusReadModel,
         readOverview: () =>
           Object.freeze({
             source: "fixture" as const,

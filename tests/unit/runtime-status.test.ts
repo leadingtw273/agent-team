@@ -1,12 +1,31 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  createRuntimeStatusUiFeatureRegistration,
   fixtureRuntimeStatusReadModel,
   renderRuntimeStatusPage,
+  runtimeStatusCssPath,
+  runtimeStatusPagePath,
   type RuntimeStatusReadModel,
 } from "../../src/ui/features/runtime-status/index.js";
 
 describe("runtime status read model", () => {
+  it("declares content-only registration in the running slot with a feature-owned stylesheet", () => {
+    const registration = createRuntimeStatusUiFeatureRegistration(fixtureRuntimeStatusReadModel);
+    const content = registration.page.render();
+
+    expect(registration.id).toBe("runtime-status");
+    expect(registration.slot).toBe("running");
+    expect(registration.page.path).toBe(runtimeStatusPagePath);
+    expect(registration.page.styles).toEqual([runtimeStatusCssPath]);
+    expect(registration.page.scripts).toBeUndefined();
+    expect(registration.routes.map((route) => route.contract.path)).toEqual([runtimeStatusCssPath]);
+    expect(registration.routes[0]?.contract.allowedMethods).toEqual(["GET"]);
+    expect(content).toContain("Runtime 工作狀態");
+    expect(content).not.toContain("<html");
+    expect(content).not.toContain("ui-sidebar");
+  });
+
   it("covers Crash, quota, danger approval, and unknown blockers with safe summaries", () => {
     const statuses = fixtureRuntimeStatusReadModel.listRuntimeStatuses();
 
@@ -56,8 +75,8 @@ describe("runtime status read model", () => {
 
     const html = renderRuntimeStatusPage(unsafeReadModel);
 
-    expect(html).toContain("工作 ID");
-    expect(html).toContain("租約");
+    expect(html).toContain("Job ID");
+    expect(html).toContain("Lease");
     expect(html).toContain("嘗試次數");
     expect(html).toContain("最後有效進度");
     expect(html).toContain("45 分鐘檢查");
