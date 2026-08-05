@@ -48,6 +48,7 @@ const rulesetDetailSchema = z
     enforcement: z.string().max(50),
     includesDefaultBranch: z.boolean(),
     excludesDefaultBranch: z.boolean(),
+    bypassActorCount: z.number().int().nonnegative(),
     requiredChecks: z.array(z.string().min(1).max(100)).max(1_000),
   })
   .strict();
@@ -60,7 +61,7 @@ const repositoryProjection =
   "{defaultBranch:.default_branch,allowAutoMerge:.allow_auto_merge,admin:.permissions.admin}";
 const rulesetListProjection = "[add[]|{id}]";
 const rulesetDetailProjection =
-  '{id,name,target,enforcement,includesDefaultBranch:((.conditions.ref_name.include // [])|index("~DEFAULT_BRANCH")!=null),excludesDefaultBranch:((.conditions.ref_name.exclude // [])|index("~DEFAULT_BRANCH")!=null),requiredChecks:[.rules[]?|select(.type=="required_status_checks")|.parameters.required_status_checks[]?.context]}';
+  '{id,name,target,enforcement,includesDefaultBranch:((.conditions.ref_name.include // [])|index("~DEFAULT_BRANCH")!=null),excludesDefaultBranch:((.conditions.ref_name.exclude // [])|index("~DEFAULT_BRANCH")!=null),bypassActorCount:([.bypass_actors[]?]|length),requiredChecks:[.rules[]?|select(.type=="required_status_checks")|.parameters.required_status_checks[]?.context]}';
 
 export interface GitHubRegistrationJsonTransport {
   requestJson<Output>(
@@ -123,6 +124,7 @@ function normalizedRule(rule: z.infer<typeof rulesetDetailSchema>) {
     enforcement: rule.enforcement,
     includesDefaultBranch: rule.includesDefaultBranch,
     excludesDefaultBranch: rule.excludesDefaultBranch,
+    bypassActorCount: rule.bypassActorCount,
     requiredChecks: Object.freeze([...new Set(rule.requiredChecks)].sort()),
   });
 }
@@ -153,17 +155,19 @@ function createRulesetArguments(target: GitHubRegistrationTarget): readonly stri
     "-f",
     "enforcement=active",
     "-f",
-    "conditions[ref_name][include][0]=~DEFAULT_BRANCH",
+    "conditions[ref_name][include][]=~DEFAULT_BRANCH",
     "-f",
-    "conditions[ref_name][exclude][0]=refs/heads/__agent_team_never__",
+    "conditions[ref_name][exclude][]=refs/heads/__agent_team_never__",
     "-f",
-    "rules[0][type]=required_status_checks",
+    "rules[][type]=required_status_checks",
     "-f",
-    `rules[0][parameters][required_status_checks][0][context]=${githubRegistrationRequiredChecks[0]}`,
+    `rules[][parameters][required_status_checks][][context]=${githubRegistrationRequiredChecks[0]}`,
     "-f",
-    `rules[0][parameters][required_status_checks][1][context]=${githubRegistrationRequiredChecks[1]}`,
+    `rules[][parameters][required_status_checks][][context]=${githubRegistrationRequiredChecks[1]}`,
     "-F",
-    "rules[0][parameters][strict_required_status_checks_policy]=true",
+    "rules[][parameters][strict_required_status_checks_policy]=true",
+    "-F",
+    "rules[][parameters][do_not_enforce_on_create]=false",
     "--jq",
     "{id}",
   ]);
@@ -237,7 +241,8 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
         rule.target === "branch" &&
         rule.enforcement === "active" &&
         rule.includesDefaultBranch &&
-        !rule.excludesDefaultBranch,
+        !rule.excludesDefaultBranch &&
+        rule.bypassActorCount === 0,
     );
     const activeRequiredChecks = Object.freeze(
       [...new Set(applicable.flatMap((rule) => rule.requiredChecks))].sort(),
@@ -254,6 +259,7 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
           rule.enforcement === "active" &&
           rule.includesDefaultBranch &&
           !rule.excludesDefaultBranch &&
+          rule.bypassActorCount === 0 &&
           githubRegistrationRequiredChecks.every((context) => rule.requiredChecks.includes(context))
         ),
     );

@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { MutationOptions, ReadOptions } from "../ports/index.js";
@@ -221,6 +221,10 @@ function signedToken(
     .digest("base64url");
 }
 
+function confirmationIdempotencyKey(token: string): string {
+  return `github-registration:${createHash("sha256").update(token, "ascii").digest("hex")}`;
+}
+
 function secureTokenEqual(candidate: string, expected: string): boolean {
   if (!tokenPattern.test(candidate) || !tokenPattern.test(expected)) return false;
   return timingSafeEqual(Buffer.from(candidate, "ascii"), Buffer.from(expected, "ascii"));
@@ -303,7 +307,7 @@ export function createGitHubRegistrationPolicy(
         enableAutoMerge: true,
       }),
       {
-        idempotencyKey: `github-registration:${command.confirmationToken}`,
+        idempotencyKey: confirmationIdempotencyKey(command.confirmationToken),
         ...(command.signal === undefined ? {} : { signal: command.signal }),
       },
     );

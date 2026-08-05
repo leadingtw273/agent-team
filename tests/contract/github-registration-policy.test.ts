@@ -25,6 +25,7 @@ interface Rule {
   readonly enforcement: string;
   readonly includesDefaultBranch: boolean;
   readonly excludesDefaultBranch: boolean;
+  readonly bypassActorCount: number;
   readonly requiredChecks: readonly string[];
 }
 
@@ -61,6 +62,7 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
         enforcement: "active",
         includesDefaultBranch: true,
         excludesDefaultBranch: false,
+        bypassActorCount: 0,
         requiredChecks: [...githubRegistrationRequiredChecks],
       };
       this.rules.push(rule);
@@ -94,6 +96,7 @@ describe("O004 GitHub registration adapter", () => {
         enforcement: "active",
         includesDefaultBranch: true,
         excludesDefaultBranch: false,
+        bypassActorCount: 0,
         requiredChecks: ["CI", "agent-team/review", "security-scan"],
       },
       {
@@ -103,6 +106,7 @@ describe("O004 GitHub registration adapter", () => {
         enforcement: "evaluate",
         includesDefaultBranch: true,
         excludesDefaultBranch: false,
+        bypassActorCount: 0,
         requiredChecks: ["untrusted-evaluate-check"],
       },
     ];
@@ -146,7 +150,7 @@ describe("O004 GitHub registration adapter", () => {
     );
     expect(mutationCalls).toHaveLength(2);
     expect(mutationCalls[0]?.join(" ")).toContain(
-      "rules[0][parameters][required_status_checks][0][context]=CI",
+      "rules[][parameters][required_status_checks][][context]=CI",
     );
     expect(mutationCalls[0]?.join(" ")).toContain("agent-team/review");
     expect(mutationCalls[1]?.join(" ")).toContain("allow_auto_merge=true");
@@ -224,10 +228,11 @@ describe("O004 GitHub registration adapter", () => {
         id: 4,
         name: githubRegistrationManagedRulesetName,
         target: "branch",
-        enforcement: "disabled",
+        enforcement: "active",
         includesDefaultBranch: true,
         excludesDefaultBranch: false,
-        requiredChecks: [],
+        bypassActorCount: 1,
+        requiredChecks: [...githubRegistrationRequiredChecks],
       },
     ];
     const collisionRead = await new GitHubRegistrationPolicyAdapter(collision).inspect(target);
@@ -235,5 +240,7 @@ describe("O004 GitHub registration adapter", () => {
       ok: true,
       value: { managedRulesetCollision: true },
     });
+    if (!collisionRead.ok) throw new Error(collisionRead.error.code);
+    expect(collisionRead.value.activeRequiredChecks).toEqual([]);
   });
 });

@@ -94,6 +94,7 @@ describe("O004 GitHub registration policy", () => {
         enableAutoMerge: true,
       },
     });
+    expect(JSON.stringify(port.calls[0])).not.toContain(preview.confirmationToken);
   });
 
   it("rejects forged confirmation and CAS drift without mutation", async () => {
