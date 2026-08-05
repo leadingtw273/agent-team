@@ -32,6 +32,10 @@ function text(value: string): string {
   return escapeHtml(safeRuntimeSummary(value));
 }
 
+function runtimeIdentifier(value: string): string {
+  return `<code class="ui-runtime-id">${escapeHtml(value)}</code>`;
+}
+
 function label(value: string): string {
   return escapeHtml(safeRuntimeLabel(value));
 }
@@ -47,14 +51,25 @@ function statusLabel(state: RuntimeStatusItem["state"]): string {
   }
 }
 
-function statusVariant(state: RuntimeStatusItem["state"]): "active" | "warning" | "error" {
+function statusVariant(state: RuntimeStatusItem["state"]): "active" | "warning" | "blocked" {
   switch (state) {
     case "running":
       return "active";
     case "checkpointed":
       return "warning";
     case "blocked":
-      return "error";
+      return "blocked";
+  }
+}
+
+function leaseStateLabel(state: RuntimeStatusItem["lease"]["state"]): string {
+  switch (state) {
+    case "active":
+      return "有效";
+    case "expired":
+      return "已過期";
+    case "released":
+      return "已釋放";
   }
 }
 
@@ -167,8 +182,8 @@ function renderCheckpoint(checkpoint: RuntimeCheckpointSummary | undefined): str
 
   return `<section class="ui-runtime-section" aria-label="Checkpoint">
     <h3>Checkpoint</h3>
-    <dl class="ui-runtime-facts ui-runtime-facts--compact">
-      <div><dt>ID</dt><dd><code>${escapeHtml(checkpoint.id)}</code></dd></div>
+    <dl class="ui-runtime-facts ui-runtime-facts--compact ui-runtime-facts--mobile-rows">
+      <div><dt>ID</dt><dd>${runtimeIdentifier(checkpoint.id)}</dd></div>
       <div><dt>原因</dt><dd>${checkpointReasonLabel(checkpoint.reason)}</dd></div>
       <div><dt>建立時間</dt><dd>${escapeHtml(checkpoint.createdAt)}</dd></div>
       <div><dt>完成／剩餘</dt><dd>${String(checkpoint.completedItemCount)} ／ ${String(checkpoint.remainingItemCount)} 項</dd></div>
@@ -201,7 +216,7 @@ function renderWatchdog(watchdog: RuntimeWatchdogSummary): string {
 
   return `<section class="ui-runtime-section" aria-label="Watchdog 時間界線">
     <h3>Watchdog</h3>
-    <dl class="ui-runtime-facts ui-runtime-facts--compact">
+    <dl class="ui-runtime-facts ui-runtime-facts--compact ui-runtime-facts--mobile-rows">
       <div><dt>已執行</dt><dd>${String(elapsed)} 分鐘</dd></div>
       <div><dt>45 分鐘檢查</dt><dd>${inspectionStatus}</dd></div>
       <div><dt>60 分鐘硬邊界</dt><dd>${hardStopStatus}</dd></div>
@@ -227,7 +242,7 @@ function renderBlock(block: RuntimeBlock | undefined): string {
 
 function renderRuntimeStatus(item: RuntimeStatusItem, index: number): string {
   const headingId = `runtime-status-${String(index + 1)}`;
-  return `<article class="card ui-runtime-card" aria-labelledby="${headingId}">
+  return `<article class="card ui-runtime-card ui-runtime-card--${item.state}" aria-labelledby="${headingId}">
     <div class="card-body">
       <div class="ui-runtime-card-header">
         <div>
@@ -236,20 +251,20 @@ function renderRuntimeStatus(item: RuntimeStatusItem, index: number): string {
         </div>
         <span class="badge ui-status-badge ui-status--${statusVariant(item.state)}"><span class="ui-status-dot" aria-hidden="true"></span>${statusLabel(item.state)}</span>
       </div>
-      <dl class="ui-runtime-facts">
-        <div><dt>工作 ID</dt><dd><code>${escapeHtml(item.job.id)}</code></dd></div>
-        <div><dt>專案</dt><dd><code>${escapeHtml(item.job.projectId)}</code></dd></div>
+      <dl class="ui-runtime-facts ui-runtime-facts--context" aria-label="Job 與 Lease">
+        <div><dt>Job ID</dt><dd>${runtimeIdentifier(item.job.id)}</dd></div>
+        <div><dt>專案</dt><dd>${runtimeIdentifier(item.job.projectId)}</dd></div>
         <div><dt>開始時間</dt><dd>${escapeHtml(item.job.startedAt)}</dd></div>
-        <div><dt>租約</dt><dd><code>${escapeHtml(item.lease.id)}</code> · ${item.lease.state === "active" ? "有效" : item.lease.state === "expired" ? "已過期" : "已釋放"}</dd></div>
-        <div><dt>租約到期</dt><dd>${escapeHtml(item.lease.expiresAt)}</dd></div>
+        <div><dt>Lease</dt><dd>${runtimeIdentifier(item.lease.id)} <span class="ui-runtime-inline-status">${leaseStateLabel(item.lease.state)}</span></dd></div>
+        <div><dt>Lease 到期</dt><dd>${escapeHtml(item.lease.expiresAt)}</dd></div>
       </dl>
       <section class="ui-runtime-section" aria-label="嘗試次數">
         <h3>嘗試次數</h3>
         <ul class="ui-runtime-attempts">
-          <li>Crash 復航 ${String(item.attempts.processRecoveries)} / 1</li>
-          <li>CI 修正 ${String(item.attempts.ciFixRounds)} / 2</li>
-          <li>Reviewer 修正 ${String(item.attempts.reviewerFixRounds)} / 2</li>
-          <li>完整審查 ${String(item.attempts.reviewRuns)} / 3</li>
+          <li><span>Crash 復航</span><strong>${String(item.attempts.processRecoveries)} / 1</strong></li>
+          <li><span>CI 修正</span><strong>${String(item.attempts.ciFixRounds)} / 2</strong></li>
+          <li><span>Reviewer 修正</span><strong>${String(item.attempts.reviewerFixRounds)} / 2</strong></li>
+          <li><span>完整審查</span><strong>${String(item.attempts.reviewRuns)} / 3</strong></li>
         </ul>
       </section>
       ${renderProgress(item.lastEffectiveProgress)}
@@ -275,13 +290,13 @@ export function renderRuntimeStatusPage(readModel: RuntimeStatusReadModel): stri
     <aside class="ui-runtime-safety-notice" aria-label="顯示範圍說明">本頁僅顯示經摘要化的 Job、Lease、Checkpoint 與阻塞資訊；不顯示完整命令、Secret 或模型隱藏推理。</aside>
     <section class="ui-runtime-overview" aria-labelledby="runtime-status-summary-title">
       <div><h2 id="runtime-status-summary-title">執行中、Checkpoint 與阻塞</h2><p>依 C012 Watchdog 與 C013 Reconcile 的唯讀安全摘要，供恢復與診斷時判讀。</p></div>
-      <p class="ui-runtime-count" aria-label="工作數量">${String(statuses.length)} 項工作</p>
+      <p class="ui-runtime-count">${String(statuses.length)} 項工作</p>
     </section>
-    <div class="ui-runtime-grid" aria-label="Runtime 工作狀態">
+    <section class="ui-runtime-grid" aria-label="Runtime 工作狀態">
       ${
         statuses.length === 0
           ? `<section class="card ui-panel"><div class="card-body"><p class="ui-runtime-empty">目前沒有可顯示的執行中、Checkpoint 或阻塞工作。</p></div></section>`
           : statuses.map(renderRuntimeStatus).join("")
       }
-    </div>`;
+    </section>`;
 }
