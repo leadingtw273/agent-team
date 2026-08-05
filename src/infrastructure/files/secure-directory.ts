@@ -11,7 +11,12 @@ import {
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import { AtomicFileStore, privateFileMode, syncDirectory } from "./atomic.js";
+import {
+  AtomicFileStore,
+  privateFileMode,
+  syncDirectory,
+  type AtomicWriteOptions,
+} from "./atomic.js";
 import { privateDirectoryMode } from "./layout.js";
 
 const entryNamePattern = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/u;
@@ -368,10 +373,12 @@ export class HeldSecureDirectory {
     name: string,
     content: Uint8Array,
     store: AtomicFileStore = new AtomicFileStore(),
+    options: AtomicWriteOptions = {},
   ): Promise<Result<Readonly<{ durability: "confirmed" | "unknown" }>, DomainError>> {
     const path = this.#path(name);
     if (!path.ok) return path;
     return store.write(path.value, Uint8Array.from(content), {
+      ...options,
       visibility: "private",
     });
   }

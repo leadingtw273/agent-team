@@ -18,7 +18,12 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
-import { createFixedClock, parseInstant } from "../../src/domain/foundation/index.js";
+import {
+  createFixedClock,
+  domainError,
+  err,
+  parseInstant,
+} from "../../src/domain/foundation/index.js";
 import {
   acquireFileLock,
   AtomicFileStore,
@@ -90,6 +95,43 @@ describe("file layout", () => {
 });
 
 describe("atomic schema files", () => {
+  it.each([
+    ["synchronous", () => err(domainError("conflict"))],
+    ["asynchronous", () => Promise.resolve(err(domainError("conflict")))],
+  ] as const)(
+    "runs a %s commit guard after temp fsync and never publishes when ownership is lost",
+    async (_kind, commitGuard) => {
+      const root = await temporaryDirectory();
+      const target = join(root, "state.json");
+      await writeFile(target, "old", "utf8");
+      let renameCount = 0;
+      const operations: AtomicFileOperations = {
+        chmod,
+        mkdir,
+        open,
+        rename: async (from, to) => {
+          renameCount += 1;
+          await rename(from, to);
+        },
+        unlink,
+      };
+
+      const result = await new AtomicFileStore(operations).write(
+        target,
+        Buffer.from("new", "utf8"),
+        {
+          commitGuard,
+        },
+      );
+
+      expect(result).toMatchObject({ ok: false, error: { code: "conflict" } });
+      expect(renameCount).toBe(0);
+      await expect(readFile(target, "utf8")).resolves.toBe("old");
+      const temporaryPrefix = `.${basename(target)}.`;
+      expect((await readdir(root)).filter((name) => name.startsWith(temporaryPrefix))).toEqual([]);
+    },
+  );
+
   it("keeps the previous authoritative file when failure occurs before rename", async () => {
     const root = await temporaryDirectory();
     const target = join(root, "state.json");

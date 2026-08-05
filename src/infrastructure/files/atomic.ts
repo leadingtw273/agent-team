@@ -27,6 +27,8 @@ const nodeFileOperations: AtomicFileOperations = { chmod, mkdir, open, rename, u
 
 export interface AtomicWriteOptions {
   readonly visibility?: "private" | "project";
+  /** Runs after the temporary file is complete and fsynced, immediately before publication. */
+  readonly commitGuard?: () => Result<void, DomainError> | Promise<Result<void, DomainError>>;
 }
 
 export interface AtomicWriteReceipt {
@@ -94,6 +96,13 @@ export class AtomicFileStore {
       await handle.sync();
       await handle.close();
       handle = undefined;
+      if (options.commitGuard !== undefined) {
+        const guarded = await options.commitGuard();
+        if (!guarded.ok) {
+          await unlinkQuietly(this.#operations, temporaryPath);
+          return guarded;
+        }
+      }
       await this.#operations.rename(temporaryPath, targetPath);
       renamed = true;
       await syncDirectory(directory, this.#operations);
