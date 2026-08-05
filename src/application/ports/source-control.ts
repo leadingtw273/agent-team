@@ -84,6 +84,11 @@ export interface SourceControlPort {
     command: ChangeRequestCommentCommand,
     options: MutationOptions,
   ): AsyncPortResult<ChangeRequestCommentReceipt>;
+  markChangeRequestReady(
+    reference: ChangeRequestRef,
+    expectedHeadSha: string,
+    options: MutationOptions,
+  ): AsyncPortResult<ChangeRequestSnapshot>;
   enableAutoMerge(
     reference: ChangeRequestRef,
     expectedHeadSha: string,

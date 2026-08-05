@@ -106,6 +106,19 @@ const autoMergeMutationSchema = z
       .strict(),
   })
   .strict();
+const readyForReviewMutationSchema = z
+  .object({
+    data: z
+      .object({
+        markPullRequestReadyForReview: z
+          .object({
+            pullRequest: z.object({ id: z.string().min(1), isDraft: z.literal(false) }).strict(),
+          })
+          .strict(),
+      })
+      .strict(),
+  })
+  .strict();
 
 const changeRequestProjection =
   '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
@@ -117,6 +130,8 @@ const statusesProjection =
 const commentProjection = "{id:(.id|tostring),url:.html_url,createdAt:.created_at,body}";
 const enableAutoMergeMutation =
   "mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!,$mergeMethod:PullRequestMergeMethod!){enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod}){pullRequest{id}}}";
+const markReadyForReviewMutation =
+  "mutation($pullRequestId:ID!){markPullRequestReadyForReview(input:{pullRequestId:$pullRequestId}){pullRequest{id,isDraft}}}";
 
 export interface GhJsonTransport {
   requestJson<Output>(
@@ -492,6 +507,50 @@ export class GitHubAdapter implements SourceControlPort {
       return failure("conflict");
     }
     return commentFromProjection(readBack.value[0]);
+  }
+
+  async markChangeRequestReady(
+    reference: ChangeRequestRef,
+    expectedHeadSha: string,
+    options: MutationOptions,
+  ): Promise<Result<ChangeRequestSnapshot, DomainError>> {
+    if (
+      !validRepository(reference) ||
+      !mutationAllowed(options) ||
+      !shaPattern.test(expectedHeadSha)
+    ) {
+      return failure();
+    }
+    const current = await this.getChangeRequest(reference, options);
+    if (!current.ok) return current;
+    if (current.value.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      return failure("conflict");
+    }
+    if (current.value.state !== "open") return failure("conflict");
+    if (!current.value.draft) return current;
+
+    const result = await this.transport.requestJson(
+      [
+        "api",
+        "graphql",
+        ...rawField("query", markReadyForReviewMutation),
+        ...rawField("pullRequestId", current.value.id),
+      ],
+      readyForReviewMutationSchema,
+      options,
+    );
+    if (!result.ok) return result;
+    if (result.value.data.markPullRequestReadyForReview.pullRequest.id !== current.value.id) {
+      return failure();
+    }
+    const readBack = await this.getChangeRequest(reference, options);
+    if (!readBack.ok) return readBack;
+    if (readBack.value.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      return failure("conflict");
+    }
+    return readBack.value.state === "open" && !readBack.value.draft
+      ? readBack
+      : failure("external_failure");
   }
 
   async enableAutoMerge(

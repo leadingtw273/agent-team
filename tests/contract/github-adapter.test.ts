@@ -188,6 +188,73 @@ describe("GitHub source-control adapter", () => {
     transport.expectDone();
   });
 
+  it("marks a Draft ready only for the exact Head SHA and confirms read-back", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull({ draft: true }) },
+      {
+        assert: (arguments_) => {
+          expect(arguments_).toContain("graphql");
+          expect(arguments_.join(" ")).toContain("markPullRequestReadyForReview");
+        },
+        value: {
+          data: {
+            markPullRequestReadyForReview: {
+              pullRequest: { id: "PR_node_fixture", isDraft: false },
+            },
+          },
+        },
+      },
+      { value: pull({ draft: false }) },
+    ]);
+    const result = await new GitHubAdapter(transport).markChangeRequestReady(
+      reference,
+      sha,
+      mutation,
+    );
+
+    expect(result.ok && result.value.draft).toBe(false);
+    expect(result.ok && result.value.headSha).toBe(sha);
+    transport.expectDone();
+  });
+
+  it("does not mark a Draft ready when the Head SHA changed", async () => {
+    const transport = new ScriptedTransport([{ value: pull({ draft: true }) }]);
+    const result = await new GitHubAdapter(transport).markChangeRequestReady(
+      reference,
+      "b".repeat(40),
+      mutation,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("conflict");
+    transport.expectDone();
+  });
+
+  it("detects a Head race after marking the Draft ready", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull({ draft: true }) },
+      {
+        value: {
+          data: {
+            markPullRequestReadyForReview: {
+              pullRequest: { id: "PR_node_fixture", isDraft: false },
+            },
+          },
+        },
+      },
+      { value: pull({ draft: false, headSha: nextSha }) },
+    ]);
+    const result = await new GitHubAdapter(transport).markChangeRequestReady(
+      reference,
+      sha,
+      mutation,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("conflict");
+    transport.expectDone();
+  });
+
   it("binds review comments to Head SHA and deduplicates retries with a hashed marker", async () => {
     let storedComment = "";
     const receipt = {
