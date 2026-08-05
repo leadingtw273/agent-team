@@ -184,6 +184,9 @@ export class RawWebhookAdapter {
     const stored = await this.#inbox.store({
       provider: this.#contract.provider,
       deliveryId,
+      eventType,
+      streamKey: metadata.streamKey,
+      sourceTimestampMs: metadata.sourceTimestampMs,
       receivedAt: request.receivedAt,
       mediaType: mediaType(headers),
       rawBody: request.rawBody,

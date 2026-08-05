@@ -118,7 +118,11 @@ describe("GitHub webhook adapter", () => {
       classification: "duplicate",
       statusCode: 200,
     });
-    expect(readBack.ok && Buffer.from(readBack.value.bodyBase64, "base64")).toEqual(body);
+    if (!readBack.ok || readBack.value.schemaVersion !== 2) {
+      throw new Error("expected processable Inbox v2 record");
+    }
+    expect(Buffer.from(readBack.value.bodyBase64, "base64")).toEqual(body);
+    expect(readBack.value).toMatchObject({ eventType: "ping", streamKey: "unknown" });
   });
 
   it.each([

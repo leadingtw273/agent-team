@@ -76,7 +76,14 @@ describe("Linear CLI ingest", () => {
       eventType: "UnknownFutureEvent",
       sourceTimestampMs: nowMs - 60_000,
     });
-    expect(readBack.ok).toBe(true);
+    if (!readBack.ok || readBack.value.schemaVersion !== 2) {
+      throw new Error("expected processable Inbox v2 record");
+    }
+    expect(readBack.value).toMatchObject({
+      eventType: "UnknownFutureEvent",
+      streamKey: "linear-issue-1",
+      sourceTimestampMs: nowMs - 60_000,
+    });
   });
 
   it("deduplicates an identical Linear delivery", async () => {
