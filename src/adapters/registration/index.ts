@@ -4,4 +4,6 @@ export * from "./github-policy.js";
 export * from "./github-policy-operation-store.js";
 export * from "./linear.js";
 export * from "./local.js";
+export * from "./merged-config.js";
+export * from "./setup-durable.js";
 export * from "./webhook.js";

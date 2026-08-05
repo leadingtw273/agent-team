@@ -10,5 +10,6 @@ export type {
 } from "./shell/index.js";
 export * from "./features/danger/index.js";
 export * from "./features/registration/index.js";
+export * from "./features/registration-setup/index.js";
 export * from "./features/settings/index.js";
 export * from "./features/runtime-status/index.js";

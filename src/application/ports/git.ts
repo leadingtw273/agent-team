@@ -55,6 +55,13 @@ export interface GitCommitReceipt {
   readonly branch: string;
 }
 
+export interface GitCommitSnapshot {
+  readonly sha: string;
+  readonly treeSha: string;
+  readonly parentShas: readonly string[];
+  readonly message: string;
+}
+
 export interface GitCommitCommand {
   readonly worktree: GitWorktree;
   readonly message: string;
@@ -99,6 +106,16 @@ export interface GitPort {
     headRevision: string,
     options?: ReadOptions,
   ): AsyncPortResult<readonly EffectiveTreeChange[]>;
+  getStagedTreeDiff(
+    worktree: GitWorktree,
+    baseRevision: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<readonly EffectiveTreeChange[]>;
+  inspectCommit(
+    repository: GitRepositoryRef,
+    revision: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<GitCommitSnapshot>;
   commit(command: GitCommitCommand, options: MutationOptions): AsyncPortResult<GitCommitReceipt>;
   push(
     worktree: GitWorktree,
