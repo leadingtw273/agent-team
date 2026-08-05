@@ -13,6 +13,10 @@ export default tseslint.config(
       globals: globals.node,
     },
   },
+  {
+    files: ["src/ui/assets/role-model.js"],
+    languageOptions: { globals: globals.browser },
+  },
   ...tseslint.configs.strictTypeChecked.map((config) => ({
     ...config,
     files: ["src/**/*.ts", "tests/**/*.ts"],

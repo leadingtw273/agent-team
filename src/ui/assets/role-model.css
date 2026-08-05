@@ -1,0 +1,160 @@
+.ui-role-model-intro {
+  margin-bottom: 1rem;
+}
+
+.ui-role-model-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.ui-role-model-card:last-child {
+  grid-column: 1 / -1;
+}
+
+.ui-role-model-caption,
+.ui-role-model-active > p,
+.ui-role-model-save p {
+  color: #52657a;
+}
+
+.ui-role-model-card .bg-azure-lt.text-azure {
+  color: #164d7d !important;
+}
+
+.ui-role-model-card .bg-secondary-lt.text-secondary {
+  color: #4b5563 !important;
+}
+
+.ui-role-model-candidates {
+  display: grid;
+  gap: 0.625rem;
+  margin: 1rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ui-role-model-candidate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-width: 0;
+  padding: 0.875rem;
+  border: 1px solid #d6e0eb;
+  border-radius: 0.625rem;
+  background: #f8fafc;
+  cursor: grab;
+}
+
+.ui-role-model-candidate:focus-visible {
+  outline: 3px solid #206bc4;
+  outline-offset: 2px;
+}
+
+.ui-role-model-candidate.is-dragging {
+  opacity: 0.55;
+}
+
+.ui-role-model-candidate-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.ui-role-model-candidate-main strong,
+.ui-role-model-candidate-main code {
+  display: block;
+}
+
+.ui-role-model-candidate-main code {
+  overflow-wrap: anywhere;
+  color: #3c4a5b;
+}
+
+.ui-role-model-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.375rem;
+}
+
+.ui-role-model-active {
+  padding-top: 1rem;
+  border-top: 1px solid #e4eaf0;
+}
+
+.ui-role-model-active h3 {
+  margin-bottom: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.ui-role-model-save {
+  margin-top: 1rem;
+  box-shadow: 0 0.5rem 1.5rem rgb(24 36 51 / 12%);
+}
+
+.ui-role-model-save .card-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.75rem 1rem;
+}
+
+.ui-role-model-save h2,
+.ui-role-model-save p {
+  margin-bottom: 0.25rem;
+}
+
+.ui-role-model-save .btn-primary {
+  border-color: #0b5797;
+  background: #0b5797;
+  color: #fff;
+}
+
+.ui-role-model-status {
+  grid-column: 1 / -1;
+  min-height: 1.25rem;
+  margin: 0;
+  font-size: 0.8125rem;
+}
+
+.ui-role-model-status[data-state="success"] {
+  color: #157347;
+}
+
+.ui-role-model-status[data-state="error"] {
+  color: #b42318;
+}
+
+@media (max-width: 900px) {
+  .ui-role-model-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ui-role-model-card:last-child {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 575.98px) {
+  .ui-role-model-candidate,
+  .ui-role-model-save .card-body {
+    align-items: stretch;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ui-role-model-candidate {
+    flex-direction: column;
+  }
+
+  .ui-role-model-actions {
+    width: 100%;
+  }
+
+  .ui-role-model-actions .btn,
+  .ui-role-model-save .btn {
+    flex: 1;
+    min-height: 2.75rem;
+  }
+}

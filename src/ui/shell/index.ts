@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 
 import {
+  handleRoleModelTypedApiRequest,
+  roleModelApiPath,
   roleModelPageDescription,
   roleModelPagePath,
   roleModelPageTitle,
@@ -68,7 +70,8 @@ interface PageDefinition {
 
 interface StaticAsset {
   readonly content: string;
-  readonly contentType: "image/svg+xml; charset=utf-8" | "text/css; charset=utf-8";
+  readonly contentType:
+    "image/svg+xml; charset=utf-8" | "text/css; charset=utf-8" | "text/javascript; charset=utf-8";
 }
 
 const navigation: readonly NavigationItem[] = Object.freeze([
@@ -83,7 +86,14 @@ const navigation: readonly NavigationItem[] = Object.freeze([
 ]);
 
 const assets: Readonly<
-  Record<"/assets/icons.svg" | "/assets/tabler-1.4.0.min.css" | "/assets/ui-shell.css", StaticAsset>
+  Record<
+    | "/assets/icons.svg"
+    | "/assets/tabler-1.4.0.min.css"
+    | "/assets/ui-shell.css"
+    | "/assets/role-model.css"
+    | "/assets/role-model.js",
+    StaticAsset
+  >
 > = Object.freeze({
   "/assets/icons.svg": Object.freeze({
     content: readFileSync(new URL("../assets/icons.svg", import.meta.url), "utf8"),
@@ -96,6 +106,14 @@ const assets: Readonly<
   "/assets/ui-shell.css": Object.freeze({
     content: readFileSync(new URL("../assets/ui-shell.css", import.meta.url), "utf8"),
     contentType: "text/css; charset=utf-8",
+  }),
+  "/assets/role-model.css": Object.freeze({
+    content: readFileSync(new URL("../assets/role-model.css", import.meta.url), "utf8"),
+    contentType: "text/css; charset=utf-8",
+  }),
+  "/assets/role-model.js": Object.freeze({
+    content: readFileSync(new URL("../assets/role-model.js", import.meta.url), "utf8"),
+    contentType: "text/javascript; charset=utf-8",
   }),
 });
 
@@ -394,6 +412,10 @@ async function renderPage(
   readModel: UiShellReadModel,
   roleModelEnabled: boolean,
 ): Promise<string> {
+  const roleModelAssets =
+    page.path === roleModelPagePath
+      ? '    <link rel="stylesheet" href="/assets/role-model.css">\n    <script src="/assets/role-model.js" defer></script>\n'
+      : "";
   return `<!doctype html>
 <html lang="zh-Hant">
   <head>
@@ -404,6 +426,7 @@ async function renderPage(
     <link rel="stylesheet" href="${tablerCoreCdnUrl}" integrity="${tablerCoreSri}" crossorigin="anonymous">
     <link rel="stylesheet" href="/assets/tabler-${tablerCoreVersion}.min.css">
     <link rel="stylesheet" href="/assets/ui-shell.css">
+${roleModelAssets}
   </head>
   <body class="ui-shell">
     <a class="skip-link" href="#main-content">跳至主要內容</a>
@@ -413,7 +436,7 @@ async function renderPage(
         ${renderNavigation(page.path, "desktop", roleModelEnabled)}
         ${renderMobileNavigation(page.path, roleModelEnabled)}
         <div class="ui-sidebar-spacer"></div>
-        <p class="ui-sidebar-note">唯讀 UI Shell · 無遠端 JavaScript<br>後續功能會依階段逐步啟用。</p>
+        <p class="ui-sidebar-note">${roleModelEnabled ? "本機安全 UI · 無遠端 JavaScript" : "唯讀 UI Shell · 無遠端 JavaScript"}<br>後續功能會依階段逐步啟用。</p>
       </aside>
       <main id="main-content" class="ui-content" tabindex="-1">
         <div class="ui-content-inner">
@@ -469,6 +492,25 @@ function htmlResponse(method: string, html: string): UiResponse {
   return Object.freeze({ statusCode: 200, headers, body: html });
 }
 
+function jsonResponse(
+  method: string,
+  statusCode: number,
+  value: unknown,
+  allow?: string,
+): UiResponse {
+  const headers: Record<string, string> = {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+  };
+  if (allow !== undefined) headers["allow"] = allow;
+  if (method === "HEAD") return Object.freeze({ statusCode, headers: Object.freeze(headers) });
+  return Object.freeze({
+    statusCode,
+    headers: Object.freeze(headers),
+    body: JSON.stringify(value),
+  });
+}
+
 function findPage(
   path: string,
   definitions: readonly PageDefinition[],
@@ -495,12 +537,25 @@ export function createUiShellHandler(
         ]);
 
   return async (request: UiRequest): Promise<UiResponse> => {
+    const path = routePath(request.url);
+    if (path === undefined) return textResponse(request.method, 404, "Not Found\n");
+
+    if (path === roleModelApiPath && roleModelFeature !== undefined) {
+      const result = await handleRoleModelTypedApiRequest(roleModelFeature, {
+        method: request.method,
+        ...(request.body === undefined ? {} : { input: request.body }),
+      });
+      return jsonResponse(
+        request.method,
+        result.statusCode,
+        result.body,
+        result.statusCode === 405 ? "GET, PUT" : undefined,
+      );
+    }
+
     if (request.method !== "GET" && request.method !== "HEAD") {
       return textResponse(request.method, 405, "Method Not Allowed\n", "GET, HEAD");
     }
-
-    const path = routePath(request.url);
-    if (path === undefined) return textResponse(request.method, 404, "Not Found\n");
 
     const asset = (assets as Readonly<Record<string, StaticAsset | undefined>>)[path];
     if (asset !== undefined) return assetResponse(request.method, asset);

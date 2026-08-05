@@ -38,7 +38,7 @@ function renderActiveAssignments(assignments: readonly ActiveModelAssignment[]):
   return `<ul class="ui-list ui-role-model-active-list">${assignments
     .map(
       (assignment) =>
-        `<li class="ui-list-item"><div><span class="ui-item-title">${escapeHtml(assignment.jobId)}</span><span class="ui-item-meta">${escapeHtml(assignment.candidate.provider)} / ${escapeHtml(assignment.candidate.model)} · 啟動時順位 ${String(assignment.candidateIndex + 1)}</span></div><span class="badge bg-secondary-lt text-secondary">維持原指派</span></li>`,
+        `<li class="ui-list-item" data-active-job-id="${escapeHtml(assignment.jobId)}" data-active-candidate="${escapeHtml(`${assignment.candidate.provider}:${assignment.candidate.model}`)}"><div><div class="ui-item-title">${escapeHtml(assignment.jobId)}</div><div class="ui-item-meta">${escapeHtml(assignment.candidate.provider)} / ${escapeHtml(assignment.candidate.model)} · 啟動時順位 ${String(assignment.candidateIndex + 1)}</div></div><span class="badge bg-secondary-lt text-secondary">維持原指派</span></li>`,
     )
     .join("")}</ul>`;
 }
@@ -79,5 +79,5 @@ export function renderRoleModelPage(snapshot: RoleModelSettingsSnapshot): string
     <div class="ui-role-model-grid">${snapshot.routes
       .map((route) => renderRoute(route, snapshot.activeAssignments))
       .join("")}</div>
-    <section class="ui-role-model-save card ui-panel" aria-label="儲存模型順位"><div class="card-body"><div><h2>儲存設定</h2><p>排序完成後會以安全 Session、CSRF 與同源 Mutation 合約寫入，並立刻讀回確認。</p></div><button class="btn btn-primary" type="button" data-role-model-save disabled>安全傳輸接入後啟用</button><p class="visually-hidden" aria-live="polite" data-role-model-status></p></div></section>`;
+    <section class="ui-role-model-save card ui-panel" aria-label="儲存模型順位"><div class="card-body"><div><h2>儲存設定</h2><p>排序完成後會以安全 Session、CSRF 與同源 Mutation 合約寫入，並立刻讀回確認。</p></div><button class="btn btn-primary" type="button" data-role-model-save disabled>儲存模型順序</button><p class="ui-role-model-status" aria-live="polite" data-role-model-status>正在確認安全工作階段…</p></div></section>`;
 }
