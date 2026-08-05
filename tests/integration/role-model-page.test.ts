@@ -5,13 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createRoleModelFeature,
   defaultRoleModelRoutingConfig,
-  roleModelUiSecurityRoutes,
   type RoleModelFeature,
   type RoleModelSettingsStore,
 } from "../../src/ui/features/role-model/index.js";
 import {
-  createUiSecurityPolicy,
-  createUiShellHandler,
+  createUiApplication,
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
@@ -49,10 +47,11 @@ class MismatchingReadBackStore implements RoleModelSettingsStore {
 }
 
 async function start(feature: RoleModelFeature = createRoleModelFeature()) {
-  const handler = vi.fn(createUiShellHandler(undefined, feature));
+  const application = createUiApplication({ features: [feature.uiFeatureRegistration()] });
+  const handler = vi.fn(application.handler);
   const handle = await startLocalUiServer({
     handler,
-    securityPolicy: createUiSecurityPolicy({ routes: roleModelUiSecurityRoutes }),
+    securityPolicy: application.securityPolicy,
   });
   handles.push(handle);
   return Object.freeze({ feature, handle, handler });
@@ -131,8 +130,9 @@ afterEach(async () => {
 
 describe("role model page integration", () => {
   it("declares exact read and API method contracts for every feature route", () => {
-    const api = roleModelUiSecurityRoutes.find((route) => route.path === "/api/role-models");
-    const reads = roleModelUiSecurityRoutes.filter((route) => route !== api);
+    const routes = createUiApplication({ features: [createRoleModelFeature()] }).routeContracts;
+    const api = routes.find((route) => route.path === "/api/role-models");
+    const reads = routes.filter((route) => route !== api);
 
     expect(api?.allowedMethods).toEqual(["GET", "PUT"]);
     expect(reads).not.toHaveLength(0);
@@ -156,6 +156,11 @@ describe("role model page integration", () => {
     expect(page).not.toMatch(/(?:--model|--provider|inline cli|行內 CLI)/iu);
     expect(page).toContain("輸入驗證失敗時保留舊設定；寫入後讀回確認");
     expect(page).not.toContain("失敗時保留舊設定。");
+    expect(page.match(/<html\b/gu)).toHaveLength(1);
+    expect(page.match(/class="ui-brand"/gu)).toHaveLength(1);
+    expect(page.match(/href="#main-content"/gu)).toHaveLength(1);
+    expect(page.match(/href="\/assets\/role-model\.css"/gu)).toHaveLength(1);
+    expect(page.match(/src="\/assets\/role-model\.js"/gu)).toHaveLength(1);
 
     const script = await fetch(`${handle.baseUrl}/assets/role-model.js`, {
       headers: { cookie: session.cookie },

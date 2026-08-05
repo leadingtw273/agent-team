@@ -1,4 +1,6 @@
 import type { ModelRoutingConfig } from "../../../application/routing/index.js";
+import type { UiFeatureRegistration } from "../../registry/index.js";
+import { createRoleModelUiFeatureRegistration } from "./registration.js";
 import {
   InMemoryActiveModelAssignmentReader,
   InMemoryRoleModelSettingsStore,
@@ -7,11 +9,6 @@ import {
 } from "./store.js";
 import { RoleModelSettingsUseCase, type RoleModelSettingsSnapshot } from "./use-case.js";
 import { renderRoleModelPage } from "./view.js";
-
-export const roleModelPagePath = "/roles-models" as const;
-export const roleModelPageTitle = "角色與模型" as const;
-export const roleModelPageDescription =
-  "調整各標準角色的模型候選順位；新設定只會套用到後續建立的工作。";
 
 export interface CreateRoleModelFeatureOptions {
   readonly settingsStore?: RoleModelSettingsStore;
@@ -44,6 +41,10 @@ export class RoleModelFeature {
   async readSnapshot(): Promise<RoleModelSettingsSnapshot | undefined> {
     const result = await this.read();
     return result.ok ? result.value : undefined;
+  }
+
+  uiFeatureRegistration(): UiFeatureRegistration {
+    return createRoleModelUiFeatureRegistration(this);
   }
 }
 
