@@ -63,6 +63,15 @@ function spawnError(): CommandRunResult {
   };
 }
 
+function isRuntimePreflight(request: CommandRunRequest): boolean {
+  return (
+    request.executable === "/usr/bin/env" &&
+    request.arguments.includes("/tmp/fake-node") &&
+    request.arguments.at(-2) === "reconcile" &&
+    request.arguments.at(-1) === "--all"
+  );
+}
+
 function payload(message: string | undefined): Readonly<Record<string, unknown>> {
   expect(message).toBeDefined();
   return JSON.parse(message ?? "") as Readonly<Record<string, unknown>>;
@@ -147,10 +156,14 @@ describe("systemd installer security boundary", () => {
     });
     expect(preview.timer).toContain("OnBootSec=5min");
     expect(preview.timer).toContain("OnUnitInactiveSec=5min");
-    expect(preview.service).toContain('Environment="PATH=/test/$$path"');
-    expect(preview.service).toContain('Environment="AGENT_TEAM_HOME=');
+    expect(preview.service).not.toContain("\nEnvironment=");
+    expect(preview.service).toContain('ExecStart="/usr/bin/env" "-i" "PATH=/test/$$path"');
     expect(preview.service).toContain("agent-$$home");
     expect(preview.service).not.toContain("never-render-or-run-with-this");
+    expect(preview.runtimeCommand).toContain("PATH=/test/$path");
+    expect(preview.runtimeCommand).toContain(
+      `AGENT_TEAM_HOME=${join(fixture.root, "agent-$home")}`,
+    );
     expect(Object.keys(preview.runtimeEnvironment).sort()).toEqual(
       [...runtimeEnvironmentNames].sort(),
     );
@@ -166,20 +179,26 @@ describe("systemd installer security boundary", () => {
     expect(payload(result.message)).toMatchObject({ operation: "install", state: "installed" });
     await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
     await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
-    expect(fixture.calls[0]).toMatchObject({
-      executable: "/tmp/fake-node",
-      arguments: ["/tmp/fake-agent-team", "reconcile", "--all"],
-    });
-    expect(Object.keys(fixture.calls[0]?.environment ?? {}).sort()).toEqual(
-      [...runtimeEnvironmentNames].sort(),
+    expect(fixture.calls[0]).toMatchObject({ executable: "/usr/bin/env" });
+    expect([fixture.calls[0]?.executable, ...(fixture.calls[0]?.arguments ?? [])]).toEqual(
+      preview.runtimeCommand,
     );
-    expect(fixture.calls[0]?.environment).not.toHaveProperty("SECRET_ACCESS_TOKEN");
+    expect(fixture.calls[0]?.arguments).toContain("PATH=/test/bin");
+    expect(fixture.calls[0]?.arguments).not.toContain(
+      "SECRET_ACCESS_TOKEN=never-render-or-run-with-this",
+    );
+    expect(fixture.calls[0]?.environment).toHaveProperty(
+      "SECRET_ACCESS_TOKEN",
+      "never-render-or-run-with-this",
+    );
     expect(
-      fixture.calls.every((call) =>
-        Object.keys(call.environment).every((name) =>
-          runtimeEnvironmentNames.includes(name as never),
+      fixture.calls
+        .slice(1)
+        .every((call) =>
+          Object.keys(call.environment).every((name) =>
+            runtimeEnvironmentNames.includes(name as never),
+          ),
         ),
-      ),
     ).toBe(true);
     expect(fixture.calls.slice(1)).toMatchObject([
       {
@@ -195,7 +214,12 @@ describe("systemd installer security boundary", () => {
   });
 
   it("is idempotent only for byte-identical canonical units", async () => {
-    const fixture = await setup();
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+      if (request.arguments[1] === "is-active") return exited(0, "active\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "active\n");
+      return exited();
+    });
     const preview = await fixture.manager.preview();
     await fixture.manager.handle({ action: "install", dryRun: false });
     const initialService = await stat(preview.servicePath);
@@ -209,17 +233,195 @@ describe("systemd installer security boundary", () => {
     expect((await stat(preview.servicePath)).ino).toBe(initialService.ino);
     expect((await stat(preview.timerPath)).ino).toBe(initialTimer.ino);
     expect(fixture.calls.map((call) => call.executable)).toEqual([
-      "/tmp/fake-node",
-      "systemd-analyze",
+      "/usr/bin/env",
+      "systemctl",
       "systemctl",
       "systemctl",
     ]);
+    expect(fixture.calls.map((call) => call.arguments[1])).toEqual([
+      "PATH=/test/bin",
+      "is-enabled",
+      "is-active",
+      "is-failed",
+    ]);
+  });
+
+  it("enables an existing canonical timer only from explicit disabled and inactive state", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(1, "disabled\n");
+      if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    await writeCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("success");
+    expect(payload(result.message)).toMatchObject({ state: "enabled_existing_installation" });
+    expect(
+      fixture.calls.map((call) =>
+        call.executable === "systemctl"
+          ? `systemctl:${call.arguments[1] ?? "missing"}`
+          : call.executable,
+      ),
+    ).toEqual([
+      "/usr/bin/env",
+      "systemctl:is-enabled",
+      "systemctl:is-active",
+      "systemctl:is-failed",
+      "systemd-analyze",
+      "systemctl:daemon-reload",
+      "systemctl:enable",
+    ]);
+    expect(fixture.calls.some((call) => call.arguments[1] === "disable")).toBe(false);
+  });
+
+  it("disables an existing canonical timer back to its original state when enable fails", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(1, "disabled\n");
+      if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      if (request.arguments[1] === "enable") return exited(1);
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    await writeCanonical(fixture, preview);
+    const originalService = await stat(preview.servicePath, { bigint: true });
+    const originalTimer = await stat(preview.timerPath, { bigint: true });
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("failed");
+    expect(payload(result.message)).toMatchObject({ state: "timer_enable_failed" });
+    expect(
+      fixture.calls.map((call) =>
+        call.executable === "systemctl"
+          ? `systemctl:${call.arguments[1] ?? "missing"}`
+          : call.executable,
+      ),
+    ).toEqual([
+      "/usr/bin/env",
+      "systemctl:is-enabled",
+      "systemctl:is-active",
+      "systemctl:is-failed",
+      "systemd-analyze",
+      "systemctl:daemon-reload",
+      "systemctl:enable",
+      "systemctl:disable",
+    ]);
+    expect((await stat(preview.servicePath, { bigint: true })).ino).toBe(originalService.ino);
+    expect((await stat(preview.timerPath, { bigint: true })).ino).toBe(originalTimer.ino);
+  });
+
+  it("blocks an existing canonical timer when its state query is unknown", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(5, "Failed to connect\n");
+      if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    await writeCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toMatchObject({ state: "timer_state_unknown" });
+    expect(fixture.calls).toHaveLength(4);
+    expect(fixture.calls.some((call) => call.executable === "systemd-analyze")).toBe(false);
+    expect(fixture.calls.some((call) => call.arguments[1] === "enable")).toBe(false);
+    expect(fixture.calls.some((call) => call.arguments[1] === "disable")).toBe(false);
+  });
+
+  it("blocks an inconsistent enabled but inactive canonical timer", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+      if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    await writeCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toMatchObject({ state: "timer_state_inconsistent" });
+    expect(fixture.calls).toHaveLength(4);
+    expect(fixture.calls.some((call) => call.arguments[1] === "enable")).toBe(false);
+    expect(fixture.calls.some((call) => call.arguments[1] === "disable")).toBe(false);
+  });
+
+  it("blocks before enable when daemon-reload replaces a newly written canonical unit", async () => {
+    let timerPath = "";
+    let timerContent = "";
+    const fixture = await setup(async (request) => {
+      if (request.executable === "systemctl" && request.arguments[1] === "daemon-reload") {
+        await delay(10);
+        await unlink(timerPath);
+        await writeFile(timerPath, timerContent, "utf8");
+      }
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    timerPath = preview.timerPath;
+    timerContent = preview.timer;
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toMatchObject({
+      state: "unit_changed_after_reload",
+      enableAttempted: false,
+      rollback: { action: "preserve_conflicting_units", successful: true },
+    });
+    expect(fixture.calls.some((call) => call.arguments[1] === "enable")).toBe(false);
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
+  });
+
+  it("disables but never deletes a replacement created during enable", async () => {
+    let timerPath = "";
+    let timerContent = "";
+    const fixture = await setup(async (request) => {
+      if (request.executable === "systemctl" && request.arguments[1] === "enable") {
+        await delay(10);
+        await unlink(timerPath);
+        await writeFile(timerPath, timerContent, "utf8");
+      }
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    timerPath = preview.timerPath;
+    timerContent = preview.timer;
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("failed");
+    expect(payload(result.message)).toMatchObject({
+      state: "unit_changed_after_enable",
+      conflict: "unit_changed_after_enable",
+      rollback: {
+        action: "disable_known_timer",
+        successful: true,
+        foreignUnitsPreserved: true,
+      },
+    });
+    expect(fixture.calls.map((call) => call.arguments[1])).toContain("enable");
+    expect(fixture.calls.at(-1)?.arguments).toEqual([
+      "--user",
+      "disable",
+      "--now",
+      systemdUnitNames.timer,
+    ]);
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
   });
 
   it("fails closed before directory writes or systemctl when Runtime preflight is unavailable", async () => {
-    const fixture = await setup((request) =>
-      request.executable === "/tmp/fake-node" ? exited(3) : exited(),
-    );
+    const fixture = await setup((request) => (isRuntimePreflight(request) ? exited(3) : exited()));
     const preview = await fixture.manager.preview();
     const result = await fixture.manager.handle({ action: "install", dryRun: false });
 
@@ -252,7 +454,7 @@ describe("systemd installer security boundary", () => {
       units: { service: "untrusted", timer: "untrusted" },
     });
     await expect(readFile(preview.servicePath, "utf8")).resolves.toContain("/usr/bin/foreign");
-    expect(fixture.calls.map((call) => call.executable)).toEqual(["/tmp/fake-node"]);
+    expect(fixture.calls.map((call) => call.executable)).toEqual(["/usr/bin/env"]);
   });
 
   it("rejects hardlinked canonical-looking units during install and uninstall", async () => {
@@ -272,7 +474,7 @@ describe("systemd installer security boundary", () => {
     expect(payload(uninstall.message)).toMatchObject({ state: "untrusted_units" });
     expect((await stat(preview.servicePath)).nlink).toBe(2);
     await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
-    expect(fixture.calls.map((call) => call.executable)).toEqual(["/tmp/fake-node"]);
+    expect(fixture.calls.map((call) => call.executable)).toEqual(["/usr/bin/env"]);
   });
 
   it("never disables or deletes a mixed canonical and drifted pair during uninstall", async () => {
@@ -520,6 +722,32 @@ describe("systemd installer security boundary", () => {
     await expect(readFile(preview.timerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("preserves a foreign unit recreated during uninstall daemon-reload and reports conflict", async () => {
+    let servicePath = "";
+    const fixture = await setup(async (request) => {
+      if (request.executable === "systemctl" && request.arguments[1] === "daemon-reload") {
+        await writeFile(servicePath, "[Service]\nExecStart=/usr/bin/foreign\n", "utf8");
+      }
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    servicePath = preview.servicePath;
+    await writeCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "uninstall", dryRun: false });
+
+    expect(result.state).toBe("failed");
+    expect(payload(result.message)).toMatchObject({
+      state: "unit_reappeared_after_reload",
+      conflict: "unit_paths_not_absent",
+      units: { service: "untrusted", timer: "missing" },
+      foreignUnitsPreserved: true,
+    });
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toContain("/usr/bin/foreign");
+    await expect(readFile(preview.timerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(fixture.calls).toHaveLength(2);
+  });
+
   it("retains canonical units and reports recovery when quarantine cannot begin", async () => {
     let unitDirectory = "";
     const fixture = await setup(async (request) => {
@@ -580,7 +808,7 @@ describe("systemd installer security boundary", () => {
 
   it("reports disabled, inactive, and failed states separately from systemd query errors", async () => {
     const fixture = await setup((request) => {
-      if (request.executable === "/tmp/fake-node") return exited();
+      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(1, "disabled\n");
       if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
       if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
@@ -599,9 +827,7 @@ describe("systemd installer security boundary", () => {
   });
 
   it("reports unavailable Runtime status without treating it as a systemd state", async () => {
-    const fixture = await setup((request) =>
-      request.executable === "/tmp/fake-node" ? exited(3) : exited(),
-    );
+    const fixture = await setup((request) => (isRuntimePreflight(request) ? exited(3) : exited()));
 
     const result = await fixture.manager.handle({ action: "status" });
 
@@ -612,12 +838,18 @@ describe("systemd installer security boundary", () => {
       preflight: { classification: "exited", exitCode: 3 },
     });
     expect(fixture.calls).toHaveLength(1);
-    expect(fixture.calls[0]?.environment).not.toHaveProperty("SECRET_ACCESS_TOKEN");
+    expect(fixture.calls[0]?.environment).toHaveProperty(
+      "SECRET_ACCESS_TOKEN",
+      "never-render-or-run-with-this",
+    );
+    expect(fixture.calls[0]?.arguments).not.toContain(
+      "SECRET_ACCESS_TOKEN=never-render-or-run-with-this",
+    );
   });
 
   it("does not collapse a DBus/spawn error into disabled", async () => {
     const fixture = await setup((request) => {
-      if (request.executable === "/tmp/fake-node") return exited();
+      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return spawnError();
       return exited();
     });
@@ -633,7 +865,7 @@ describe("systemd installer security boundary", () => {
 
   it("reports an unexpected nonzero is-enabled result as unknown rather than disabled", async () => {
     const fixture = await setup((request) => {
-      if (request.executable === "/tmp/fake-node") return exited();
+      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(5);
       if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
       if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
@@ -651,7 +883,7 @@ describe("systemd installer security boundary", () => {
 
   it("does not treat a nonzero D-Bus diagnostic as disabled without an explicit state", async () => {
     const fixture = await setup((request) => {
-      if (request.executable === "/tmp/fake-node") return exited();
+      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(1, "Failed to connect to bus\n");
       return exited();
     });

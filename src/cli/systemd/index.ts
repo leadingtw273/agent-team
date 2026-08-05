@@ -149,6 +149,15 @@ interface RollbackResult {
   readonly reason?: "disable_failed" | "remove_failed" | "reload_failed";
 }
 
+interface TimerQueryResult {
+  readonly enabledResult: CommandRunResult;
+  readonly activeResult: CommandRunResult;
+  readonly failedResult: CommandRunResult;
+  readonly queryError: boolean;
+  readonly enabled: "enabled" | "disabled" | "unknown";
+  readonly activity: "active" | "failed" | "inactive" | "unknown";
+}
+
 interface BoundedOutput {
   readonly content: Buffer;
   readonly bytes: number;
@@ -167,6 +176,7 @@ const maximumDeadlineMs = 60_000;
 const maximumOutputLimit = 1_048_576;
 const maximumTerminateGraceMs = 5_000;
 const supportsDetachedProcessGroups = process.platform !== "win32";
+const runtimeEnvironmentExecutable = "/usr/bin/env";
 
 function isErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
@@ -491,15 +501,28 @@ function renderExecStart(runtimeCommand: RuntimeCommand): string {
   return [runtimeCommand.executable, ...arguments_].map(quoteSystemdArgument).join(" ");
 }
 
-function renderRuntimeEnvironment(environment: NodeJS.ProcessEnv): string {
-  return runtimeEnvironmentNames
-    .flatMap((name) => {
-      const value = environment[name];
-      return value === undefined
-        ? []
-        : [`Environment=${quoteSystemdArgument(`${name}=${value}`)}\n`];
-    })
-    .join("");
+function buildRuntimeWrapperCommand(
+  runtimeCommand: RuntimeCommand,
+  runtimeEnvironment: NodeJS.ProcessEnv,
+  inheritedEnvironment: NodeJS.ProcessEnv,
+): RuntimeCommand {
+  if (!isAbsolute(runtimeCommand.executable)) {
+    throw new Error("Runtime executable must be absolute.");
+  }
+  const assignments = runtimeEnvironmentNames.flatMap((name) => {
+    const value = runtimeEnvironment[name];
+    return value === undefined ? [] : [`${name}=${value}`];
+  });
+  return Object.freeze({
+    executable: runtimeEnvironmentExecutable,
+    arguments: Object.freeze([
+      "-i",
+      ...assignments,
+      runtimeCommand.executable,
+      ...runtimeCommand.arguments,
+    ]),
+    environment: inheritedEnvironment,
+  });
 }
 
 function renderTemplate(template: string, replacements: Readonly<Record<string, string>>): string {
@@ -867,16 +890,18 @@ export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv):
 export class SystemdManager {
   readonly #runtimeCommand: RuntimeCommand;
   readonly #runtimeEnvironment: NodeJS.ProcessEnv;
+  readonly #inheritedEnvironment: NodeJS.ProcessEnv;
   readonly #commandRunner: CommandRunner;
   readonly #templateDirectory: string;
 
   constructor(options: SystemdManagerOptions) {
+    this.#inheritedEnvironment = Object.freeze({ ...options.runtimeCommand.environment });
     this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
-    this.#runtimeCommand = Object.freeze({
-      executable: options.runtimeCommand.executable,
-      arguments: Object.freeze([...options.runtimeCommand.arguments]),
-      environment: this.#runtimeEnvironment,
-    });
+    this.#runtimeCommand = buildRuntimeWrapperCommand(
+      options.runtimeCommand,
+      this.#runtimeEnvironment,
+      this.#inheritedEnvironment,
+    );
     this.#commandRunner = options.commandRunner ?? defaultCommandRunner;
     this.#templateDirectory = options.templateDirectory ?? defaultTemplateDirectory;
   }
@@ -888,7 +913,6 @@ export class SystemdManager {
     ]);
     const unitDirectory = resolveSystemdUserUnitDirectory(this.#runtimeEnvironment);
     const service = renderTemplate(serviceTemplate, {
-      "{{RUNTIME_ENVIRONMENT}}": renderRuntimeEnvironment(this.#runtimeEnvironment),
       "{{EXEC_START}}": renderExecStart(this.#runtimeCommand),
     });
     const timer = renderTemplate(timerTemplate, {});
@@ -959,14 +983,40 @@ export class SystemdManager {
     return { service: observed.service.kind, timer: observed.timer.kind };
   }
 
+  #canonicalPair(observed: UnitPair<UnitObservation>): UnitPair<CanonicalUnit> | undefined {
+    return observed.service.kind === "canonical" &&
+      observed.service.unit !== undefined &&
+      observed.timer.kind === "canonical" &&
+      observed.timer.unit !== undefined
+      ? { service: observed.service.unit, timer: observed.timer.unit }
+      : undefined;
+  }
+
+  #sameCanonicalPair(
+    observed: UnitPair<UnitObservation>,
+    expected: UnitPair<CanonicalUnit>,
+  ): boolean {
+    const current = this.#canonicalPair(observed);
+    return (
+      current !== undefined &&
+      sameFileIdentity(current.service.identity, expected.service.identity) &&
+      sameFileIdentity(current.timer.identity, expected.timer.identity)
+    );
+  }
+
+  #pathsAbsent(observed: UnitPair<UnitObservation>): boolean {
+    return observed.service.kind === "missing" && observed.timer.kind === "missing";
+  }
+
   async #run(request: Omit<CommandRunRequest, "environment">): Promise<CommandRunResult> {
     return this.#commandRunner.run({ ...request, environment: this.#runtimeEnvironment });
   }
 
   async #runPreflight(): Promise<CommandRunResult> {
-    return this.#run({
+    return this.#commandRunner.run({
       executable: this.#runtimeCommand.executable,
       arguments: this.#runtimeCommand.arguments,
+      environment: this.#inheritedEnvironment,
     });
   }
 
@@ -994,6 +1044,34 @@ export class SystemdManager {
 
   async #reloadUserManager(): Promise<CommandRunResult> {
     return this.#systemctl(["daemon-reload"]);
+  }
+
+  async #queryTimer(): Promise<TimerQueryResult> {
+    const [enabledResult, activeResult, failedResult] = await Promise.all([
+      this.#systemctl(["is-enabled", systemdUnitNames.timer]),
+      this.#systemctl(["is-active", systemdUnitNames.timer]),
+      this.#systemctl(["is-failed", systemdUnitNames.timer]),
+    ]);
+    return {
+      enabledResult,
+      activeResult,
+      failedResult,
+      queryError: [enabledResult, activeResult, failedResult].some(
+        (result) => result.classification !== "exited" || result.terminationErrorCode !== undefined,
+      ),
+      enabled: enabledState(enabledResult),
+      activity: activityState(activeResult, failedResult),
+    };
+  }
+
+  #timerQuerySummary(query: TimerQueryResult): Readonly<Record<string, unknown>> {
+    return {
+      enabled: query.enabled,
+      activity: query.activity,
+      enabledQuery: commandSummary(query.enabledResult),
+      activeQuery: commandSummary(query.activeResult),
+      failedQuery: commandSummary(query.failedResult),
+    };
   }
 
   async #rollbackInstall(
@@ -1054,6 +1132,40 @@ export class SystemdManager {
       });
     }
 
+    const existingPair = this.#canonicalPair(observed);
+    if (installationState === "installed") {
+      if (existingPair === undefined) {
+        return outcome("blocked", { operation: "install", state: "untrusted_units" });
+      }
+      const timerQuery = await this.#queryTimer();
+      if (
+        timerQuery.queryError ||
+        timerQuery.enabled === "unknown" ||
+        timerQuery.activity === "unknown"
+      ) {
+        return outcome("blocked", {
+          operation: "install",
+          state: "timer_state_unknown",
+          timer: this.#timerQuerySummary(timerQuery),
+        });
+      }
+      if (timerQuery.enabled === "enabled" && timerQuery.activity === "active") {
+        return outcome("success", {
+          operation: "install",
+          state: "already_installed",
+          unitDirectory: preview.unitDirectory,
+          timer: this.#timerQuerySummary(timerQuery),
+        });
+      }
+      if (timerQuery.enabled !== "disabled" || timerQuery.activity !== "inactive") {
+        return outcome("blocked", {
+          operation: "install",
+          state: "timer_state_inconsistent",
+          timer: this.#timerQuerySummary(timerQuery),
+        });
+      }
+    }
+
     const verification = await this.#verify(preview);
     if (!successful(verification)) {
       return outcome("blocked", {
@@ -1064,7 +1176,9 @@ export class SystemdManager {
     }
 
     const created: CanonicalUnit[] = [];
+    let enableAttempted = false;
     try {
+      let expectedPair = existingPair;
       if (installationState === "not_installed") {
         const service = await writeNewCanonicalUnit(
           preview.servicePath,
@@ -1094,11 +1208,28 @@ export class SystemdManager {
           });
         }
         created.push(timer);
+        expectedPair = { service, timer };
       }
+      if (expectedPair === undefined) throw new Error("Canonical unit pair is unavailable.");
 
       const reload = await this.#reloadUserManager();
+      const afterReload = await this.#observePair(preview, directory);
+      if (!this.#sameCanonicalPair(afterReload, expectedPair)) {
+        return outcome("blocked", {
+          operation: "install",
+          state: "unit_changed_after_reload",
+          conflict: "canonical_identity_or_content_changed",
+          units: this.#unitSummary(afterReload),
+          reload: commandSummary(reload),
+          enableAttempted: false,
+          rollback: { action: "preserve_conflicting_units", successful: true },
+        });
+      }
       if (!successful(reload)) {
-        const rollback = await this.#rollbackInstall(created, directory, false);
+        const rollback =
+          created.length === 0
+            ? { rolledBack: true as const }
+            : await this.#rollbackInstall(created, directory, false);
         return outcome("failed", {
           operation: "install",
           state: rollback.rolledBack ? "daemon_reload_failed" : "rollback_failed",
@@ -1106,7 +1237,26 @@ export class SystemdManager {
           ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
         });
       }
+      enableAttempted = true;
       const enable = await this.#systemctl(["enable", "--now", systemdUnitNames.timer]);
+      const afterEnable = await this.#observePair(preview, directory);
+      if (!this.#sameCanonicalPair(afterEnable, expectedPair)) {
+        const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+        const rollbackSucceeded = successful(disable);
+        return outcome("failed", {
+          operation: "install",
+          state: rollbackSucceeded ? "unit_changed_after_enable" : "rollback_failed",
+          conflict: "unit_changed_after_enable",
+          units: this.#unitSummary(afterEnable),
+          enable: commandSummary(enable),
+          rollback: {
+            action: "disable_known_timer",
+            successful: rollbackSucceeded,
+            result: commandSummary(disable),
+            foreignUnitsPreserved: true,
+          },
+        });
+      }
       if (!successful(enable)) {
         const rollback = await this.#rollbackInstall(created, directory, true);
         return outcome("failed", {
@@ -1118,12 +1268,13 @@ export class SystemdManager {
       }
       return outcome("success", {
         operation: "install",
-        state: installationState === "not_installed" ? "installed" : "already_installed",
+        state:
+          installationState === "not_installed" ? "installed" : "enabled_existing_installation",
         unitDirectory: preview.unitDirectory,
         timer: systemdUnitNames.timer,
       });
     } catch {
-      const rollback = await this.#rollbackInstall(created, directory, created.length === 2);
+      const rollback = await this.#rollbackInstall(created, directory, enableAttempted);
       return outcome("failed", {
         operation: "install",
         state: rollback.rolledBack ? "safe_write_failed" : "rollback_failed",
@@ -1196,10 +1347,32 @@ export class SystemdManager {
       });
     }
     const reload = await this.#reloadUserManager();
+    const afterReload = await this.#observePair(preview, directory);
+    if (!this.#pathsAbsent(afterReload)) {
+      return outcome("failed", {
+        operation: "uninstall",
+        state: "unit_reappeared_after_reload",
+        conflict: "unit_paths_not_absent",
+        units: this.#unitSummary(afterReload),
+        reload: commandSummary(reload),
+        foreignUnitsPreserved: true,
+      });
+    }
     if (!successful(reload)) {
       const restored = await restoreTransaction([original.service, original.timer], [], directory);
-      const recoveryReload = restored ? await this.#reloadUserManager() : undefined;
-      const recovered = restored && recoveryReload !== undefined && successful(recoveryReload);
+      const restoredPair = restored
+        ? this.#canonicalPair(await this.#observePair(preview, directory))
+        : undefined;
+      const recoveryReload =
+        restoredPair === undefined ? undefined : await this.#reloadUserManager();
+      const recoveredAfterReload =
+        recoveryReload === undefined ? undefined : await this.#observePair(preview, directory);
+      const recovered =
+        restoredPair !== undefined &&
+        recoveryReload !== undefined &&
+        successful(recoveryReload) &&
+        recoveredAfterReload !== undefined &&
+        this.#sameCanonicalPair(recoveredAfterReload, restoredPair);
       return outcome("failed", {
         operation: "uninstall",
         state: recovered ? "daemon_reload_failed_recovered" : "rollback_failed",
@@ -1234,28 +1407,17 @@ export class SystemdManager {
       });
     }
 
-    const [enabled, active, failed] = await Promise.all([
-      this.#systemctl(["is-enabled", systemdUnitNames.timer]),
-      this.#systemctl(["is-active", systemdUnitNames.timer]),
-      this.#systemctl(["is-failed", systemdUnitNames.timer]),
-    ]);
-    const queryError = [enabled, active, failed].some(
-      (result) => result.classification !== "exited" || result.terminationErrorCode !== undefined,
-    );
-    const timer = queryError
+    const query = await this.#queryTimer();
+    const timer = query.queryError
       ? {
           state: "query_error",
-          enabled: commandSummary(enabled),
-          active: commandSummary(active),
-          failed: commandSummary(failed),
+          enabled: commandSummary(query.enabledResult),
+          active: commandSummary(query.activeResult),
+          failed: commandSummary(query.failedResult),
         }
       : {
           state: "queried",
-          enabled: enabledState(enabled),
-          activity: activityState(active, failed),
-          enabledQuery: commandSummary(enabled),
-          activeQuery: commandSummary(active),
-          failedQuery: commandSummary(failed),
+          ...this.#timerQuerySummary(query),
         };
     return outcome("success", {
       operation: "status",

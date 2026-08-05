@@ -4,4 +4,4 @@ Description=Agent Team deterministic reconcile
 
 [Service]
 Type=oneshot
-{{RUNTIME_ENVIRONMENT}}ExecStart={{EXEC_START}}
+ExecStart={{EXEC_START}}

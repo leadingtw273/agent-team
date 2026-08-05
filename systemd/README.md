@@ -26,9 +26,19 @@ untrusted. Because a successful rename can legitimately update ctime, quarantine
 complete identity immediately after proving the remaining generation fields are unchanged; every
 later pre-delete check uses that new complete identity.
 
-The rendered service and every preflight command receive the same allowlisted runtime environment:
-`PATH`, `HOME`, `XDG_CONFIG_HOME`, and, when set, `XDG_RUNTIME_DIR` and `AGENT_TEAM_HOME`.
-Other inherited variables, including credentials and tokens, are intentionally excluded.
+The service does not use `Environment=` as an allowlist. Its `ExecStart` and the install preflight
+are the exact same absolute `/usr/bin/env -i` command: `-i` is followed by `PATH`, `HOME`,
+`XDG_CONFIG_HOME`, and, when set, `XDG_RUNTIME_DIR` and `AGENT_TEAM_HOME`, then the absolute Node
+and compiled CLI paths. Even if the preflight process inherits credentials or tokens, `env -i`
+clears them before Node starts. Every argument uses systemd `ExecStart` escaping.
+
+Install re-reads both canonical identities and contents after `daemon-reload` and again after
+`enable --now`. A replacement before enable blocks without enabling; a replacement during enable
+causes a best-effort stop of the known timer name but is never deleted. Existing canonical units
+must report either enabled/active (idempotent success) or disabled/inactive (eligible to enable);
+unknown or inconsistent states block. Uninstall reports success only after the post-removal reload
+and a read-back proving that both unit paths remain absent.
+
 `status` reports ownership plus `is-enabled`, `is-active`, and `is-failed` query results; command
 or D-Bus errors are reported as unknown rather than as a disabled timer. It never enables,
 disables, writes, or removes a unit.
