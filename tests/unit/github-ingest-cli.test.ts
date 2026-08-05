@@ -91,7 +91,15 @@ describe("GitHub CLI ingest", () => {
       accepted: true,
       classification: "duplicate",
     });
-    expect(readBack.ok && Buffer.from(readBack.value.bodyBase64, "base64")).toEqual(body);
+    if (!readBack.ok || readBack.value.schemaVersion !== 2) {
+      throw new Error("expected processable Inbox v2 record");
+    }
+    expect(Buffer.from(readBack.value.bodyBase64, "base64")).toEqual(body);
+    expect(readBack.value).toMatchObject({
+      eventType: "pull_request",
+      streamKey: "42",
+      sourceTimestampMs: Date.parse("2026-08-05T12:00:00.000Z"),
+    });
   });
 
   it("rejects a bad signature without creating Inbox data", async () => {

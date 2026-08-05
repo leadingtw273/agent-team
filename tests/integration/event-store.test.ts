@@ -17,6 +17,7 @@ import {
   JsonlEventStore,
   readEventLog,
   replayProjection,
+  type InboxMessage,
 } from "../../src/infrastructure/events/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -69,20 +70,25 @@ describe("durable inbox", () => {
     const message = {
       provider: "github",
       deliveryId: "delivery-123",
+      eventType: "pull_request",
+      streamKey: "17",
+      sourceTimestampMs: Date.parse("2026-08-04T12:00:00.000Z"),
       receivedAt: instant("2026-08-04T12:00:00.000Z"),
       mediaType: "application/json",
       rawBody: Buffer.from('{"action":"opened"}', "utf8"),
-    };
+    } satisfies InboxMessage;
 
     const stored = await inbox.store(message);
     const duplicate = await inbox.store({
       ...message,
       receivedAt: instant("2026-08-04T12:00:05.000Z"),
+      sourceTimestampMs: Date.parse("2026-08-04T12:00:05.000Z"),
     });
     const changed = await inbox.store({
       ...message,
       rawBody: Buffer.from('{"action":"closed"}', "utf8"),
     });
+    const changedMetadata = await inbox.store({ ...message, eventType: "issues" });
 
     if (!stored.ok || !duplicate.ok) throw new Error("expected durable inbox receipts");
     expect(stored.value.classification).toBe("stored");
@@ -92,10 +98,16 @@ describe("durable inbox", () => {
     expect(changed.ok).toBe(false);
     if (changed.ok) throw new Error("changed duplicate must fail closed");
     expect(changed.error.code).toBe("conflict");
+    expect(changedMetadata).toMatchObject({ ok: false, error: { code: "conflict" } });
 
     const readBack = await inbox.read(message.provider, message.deliveryId);
+    const listed = await inbox.list();
     if (!readBack.ok) throw new Error(readBack.error.code);
     expect(Buffer.from(readBack.value.bodyBase64, "base64")).toEqual(message.rawBody);
+    expect(listed).toMatchObject({
+      ok: true,
+      value: [{ schemaVersion: 2, eventType: "pull_request", streamKey: "17" }],
+    });
   });
 });
 
