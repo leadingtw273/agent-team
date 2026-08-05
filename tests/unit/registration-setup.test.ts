@@ -644,6 +644,7 @@ function confirmation(overrides: Record<string, unknown> = {}) {
 async function prepared(test = harness()) {
   const result = await test.coordinator.begin({
     preview,
+    trustedAuthority,
     confirmation: confirmation(),
     idempotencyKeyPrefix: "setup:1",
   });
@@ -681,6 +682,7 @@ describe("O005 registration Setup PR flow", () => {
     const test = harness();
     const result = await test.coordinator.begin({
       preview,
+      trustedAuthority,
       confirmation: confirmation({ previewDigest: "0".repeat(64) }),
       idempotencyKeyPrefix: "setup:drift",
     });
@@ -692,6 +694,7 @@ describe("O005 registration Setup PR flow", () => {
     const test = harness({ fail });
     const result = await test.coordinator.begin({
       preview,
+      trustedAuthority,
       confirmation: confirmation(),
       idempotencyKeyPrefix: `setup:${fail}`,
     });
@@ -719,6 +722,7 @@ describe("O005 registration Setup PR flow", () => {
     const mutationCount = test.calls.length;
     const replay = await test.coordinator.begin({
       preview,
+      trustedAuthority,
       confirmation: confirmation(),
       idempotencyKeyPrefix: "setup:replay",
     });
@@ -739,6 +743,7 @@ describe("O005 registration Setup PR flow", () => {
     await expect(
       test.coordinator.begin({
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: "setup:ownership-loss",
       }),
@@ -752,6 +757,7 @@ describe("O005 registration Setup PR flow", () => {
     await expect(
       test.coordinator.begin({
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: "setup:intent-save-failure",
       }),
@@ -765,6 +771,7 @@ describe("O005 registration Setup PR flow", () => {
     await expect(
       test.coordinator.begin({
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: "setup:post-mutation-owner-loss",
       }),
@@ -786,6 +793,7 @@ describe("O005 registration Setup PR flow", () => {
       const test = harness({ barrierStep });
       const request = {
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: `concurrent:${barrierStep}`,
       };
@@ -810,6 +818,7 @@ describe("O005 registration Setup PR flow", () => {
       const test = harness({ crashAfter });
       const request = {
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: `crash:${crashAfter}`,
       };
@@ -837,6 +846,7 @@ describe("O005 registration Setup PR flow", () => {
       const test = harness({ crashAfter: "commit", recoveryDiffAttack });
       const request = {
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: `recovery:${recoveryDiffAttack}`,
       };
@@ -858,6 +868,7 @@ describe("O005 registration Setup PR flow", () => {
     await expect(
       test.coordinator.begin({
         preview,
+        trustedAuthority,
         confirmation: confirmation(),
         idempotencyKeyPrefix: "unknown:journal",
       }),

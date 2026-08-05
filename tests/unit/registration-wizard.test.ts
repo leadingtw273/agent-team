@@ -13,6 +13,11 @@ import {
   safeRegistrationText,
   type RegistrationWizardReadModel,
 } from "../../src/ui/features/registration/index.js";
+import {
+  registrationSetupApiPath,
+  registrationSetupCssPath,
+  registrationSetupScriptPath,
+} from "../../src/ui/features/registration-setup/index.js";
 
 function joined(...parts: readonly string[]): string {
   return parts.join("");
@@ -33,23 +38,34 @@ describe("O002/O003/O004 registration wizard UI", () => {
       slot: "registration",
       page: {
         path: registrationWizardPagePath,
-        styles: [registrationWizardCssPath],
-        scripts: [registrationWizardScriptPath, githubRegistrationPolicyScriptPath],
+        styles: [registrationWizardCssPath, registrationSetupCssPath],
+        scripts: [
+          registrationWizardScriptPath,
+          githubRegistrationPolicyScriptPath,
+          registrationSetupScriptPath,
+        ],
       },
     });
     expect(registration.routes.map((route) => route.contract.path)).toEqual([
       registrationWizardCssPath,
       registrationWizardScriptPath,
       githubRegistrationPolicyScriptPath,
+      registrationSetupCssPath,
+      registrationSetupScriptPath,
+      registrationSetupApiPath,
       linearProvisionApiPath,
       githubRegistrationPolicyApiPath,
     ]);
     expect(registration.routes[0]?.contract.allowedMethods).toEqual(["GET"]);
-    expect(registration.routes[3]?.contract).toMatchObject({
+    expect(registration.routes[5]?.contract).toMatchObject({
       allowedMethods: ["GET", "PUT"],
       mutationBody: "bounded-json",
     });
-    expect(registration.routes[4]?.contract).toMatchObject({
+    expect(registration.routes[6]?.contract).toMatchObject({
+      allowedMethods: ["GET", "PUT"],
+      mutationBody: "bounded-json",
+    });
+    expect(registration.routes[7]?.contract).toMatchObject({
       allowedMethods: ["PUT"],
       mutationBody: "bounded-json",
     });
@@ -61,6 +77,8 @@ describe("O002/O003/O004 registration wizard UI", () => {
     expect(content).toContain("不刪除、不改名");
     expect(content).toContain("GitHub 合併保護");
     expect(content).toContain("現有保護規則不會被修改或刪除");
+    expect(content).toContain("可信設定 Setup");
+    expect(content).toContain("production_dependencies_unwired");
     expect(content).not.toContain("<html");
     expect(content).not.toContain("<form");
     expect(scan.gates).toHaveLength(11);

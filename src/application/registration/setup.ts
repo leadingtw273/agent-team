@@ -437,7 +437,8 @@ export class RegistrationSetupCoordinator {
   async begin(request: RegistrationSetupBeginRequest): Promise<RegistrationSetupOutcome> {
     if (
       !identifierPattern.test(request.preview.setupSessionId) ||
-      !validPrefix(request.idempotencyKeyPrefix)
+      !validPrefix(request.idempotencyKeyPrefix) ||
+      !digestPattern.test(request.trustedAuthority.authorityDigest)
     ) {
       return failed("request");
     }
@@ -482,7 +483,8 @@ export class RegistrationSetupCoordinator {
       const confirmation = await this.#owned(lease, () =>
         this.ports.previewConfirmation.verify(
           request.confirmation,
-          request.signal === undefined ? {} : { signal: request.signal },
+          request.trustedAuthority.authorityDigest,
+          mutation(request, "consume-preview-confirmation"),
         ),
       );
       if (!confirmation.ok) return portFailure("request", confirmation.error);

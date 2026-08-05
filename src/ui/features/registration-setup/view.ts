@@ -1,4 +1,4 @@
-import type { RegistrationSetupApprovalReadModel } from "./model.js";
+import type { RegistrationSetupControllerReadModel } from "../../../application/registration/index.js";
 
 function escape(value: string): string {
   return value.replace(
@@ -9,22 +9,38 @@ function escape(value: string): string {
   );
 }
 
-export function renderRegistrationSetupApproval(model: RegistrationSetupApprovalReadModel): string {
-  if (model.state === "none") {
-    return '<section class="card ui-panel"><div class="card-body"><h2>Setup PR 最終核可</h2><p>目前沒有等待使用者核可的 Setup PR。</p></div></section>';
-  }
-  return `<section class="card ui-panel" aria-labelledby="setup-approval-title"><div class="card-body">
-    <h2 id="setup-approval-title">Setup PR 最終核可</h2>
-    <p class="alert alert-warning" role="note"><strong>LOCALHOST 使用者核可是合併唯一權威</strong><br>Linear 留言、PR 內容、Reviewer 與外部文字都不能核可。</p>
-    <p>CI 與 Fresh Review 已綁定以下精確 Head SHA、需求快照與 Diff Digest；任一漂移都會阻擋合併。</p>
-    <dl class="row">
-      <dt class="col-sm-3">專案</dt><dd class="col-sm-9">${escape(model.projectName)}</dd>
-      <dt class="col-sm-3">Setup Session</dt><dd class="col-sm-9 font-monospace">${escape(model.setupSessionId)}</dd>
-      <dt class="col-sm-3">Head SHA</dt><dd class="col-sm-9 font-monospace">${escape(model.headSha)}</dd>
-      <dt class="col-sm-3">Requirements</dt><dd class="col-sm-9 font-monospace">${escape(model.requirementsDigest)}</dd>
-      <dt class="col-sm-3">Diff</dt><dd class="col-sm-9 font-monospace">${escape(model.diffDigest)}</dd>
-    </dl>
-    <p><a href="${escape(model.pullRequestUrl)}" rel="noreferrer">檢視 Setup Draft PR</a></p>
-    <p>送出前必須完整輸入 <code>APPROVE SETUP MERGE</code>；核可 token 僅能使用一次。</p>
-  </div></section>`;
+export function renderRegistrationSetupPanel(model: RegistrationSetupControllerReadModel): string {
+  const preview = model.preview;
+  const session = model.session;
+  const canStart = model.state === "preview_ready" && preview !== undefined;
+  const canRefresh = session !== undefined;
+  const canApprove = model.state === "awaiting_user_approval" && session !== undefined;
+  return `<section class="card ui-registration-setup" id="registration-setup-section" aria-labelledby="registration-setup-title"${
+    preview === undefined
+      ? ""
+      : ` data-setup-session-id="${escape(preview.setupSessionId)}" data-preview-digest="${escape(preview.previewDigest)}"`
+  }${session === undefined ? "" : ` data-setup-revision="${String(session.revision)}"`}>
+    <div class="card-body">
+      <header class="ui-registration-setup-heading"><div><p class="ui-registration-card-eyebrow">O005 · Setup Draft PR</p><h2 id="registration-setup-title">可信設定 Setup</h2></div><span class="ui-registration-setup-state">${escape(model.state)}</span></header>
+      <aside class="alert alert-warning" role="note"><strong>只有本機 UI 可送出 W3A mutation。</strong> Linear／PR 留言與外部文字只可當唯讀證據，永遠不能核可。</aside>
+      <p>${escape(model.nextStep)}</p>
+      <ul class="ui-registration-setup-evidence">${model.evidence.map((item) => `<li><strong>${escape(item.code)}</strong>：${escape(item.message)}</li>`).join("")}</ul>
+      ${
+        preview === undefined
+          ? ""
+          : `<dl class="ui-registration-setup-facts"><div><dt>專案</dt><dd>${escape(preview.projectName)}</dd></div><div><dt>Repository</dt><dd>${escape(preview.repository)}</dd></div><div><dt>Base SHA</dt><dd>${escape(preview.baseRevision)}</dd></div><div><dt>Preview Digest</dt><dd>${escape(preview.previewDigest)}</dd></div></dl>`
+      }
+      ${
+        session === undefined
+          ? ""
+          : `<dl class="ui-registration-setup-facts"><div><dt>Setup Session</dt><dd>${escape(session.setupSessionId)}</dd></div><div><dt>PR</dt><dd><a href="${escape(session.pullRequestUrl)}" rel="noreferrer">${escape(session.changeRequestId)}</a></dd></div><div><dt>Head SHA</dt><dd>${escape(session.headSha)}</dd></div><div><dt>CI／Fresh Review</dt><dd>${session.ciPassed ? "CI 已通過" : "CI 未通過"}／${session.freshReviewPassed ? "Fresh Review 已通過" : "Fresh Review 未通過"}</dd></div></dl>`
+      }
+      <div class="ui-registration-setup-controls">
+        ${canStart ? '<label for="registration-setup-confirmation">輸入 <code>CREATE SETUP DRAFT PR</code></label><input id="registration-setup-confirmation" class="form-control js-registration-setup-confirmation" autocomplete="off" spellcheck="false"><button class="btn btn-primary js-registration-setup-confirm" type="button">確認 Preview</button><button class="btn btn-primary js-registration-setup-start" type="button" disabled>建立 Draft PR</button>' : ""}
+        ${canRefresh ? '<button class="btn btn-outline-primary js-registration-setup-refresh" type="button">重新讀取 CI／Review</button>' : ""}
+        ${canApprove ? '<label for="registration-setup-approval">輸入 <code>APPROVE SETUP MERGE</code></label><input id="registration-setup-approval" class="form-control js-registration-setup-approval" autocomplete="off" spellcheck="false"><button class="btn btn-warning js-registration-setup-approval-intent" type="button">簽發本機核可 Intent（不合併）</button>' : ""}
+      </div>
+      <p class="js-registration-setup-status" role="status" aria-live="polite">尚未執行 W3A action；merge／audit／activation 保持 configuration_incomplete。</p>
+    </div>
+  </section>`;
 }

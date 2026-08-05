@@ -5,5 +5,6 @@ export * from "./policy.js";
 export * from "./probe.js";
 export * from "./schema.js";
 export * from "./setup-model.js";
+export * from "./setup-controller.js";
 export * from "./setup.js";
 export * from "./wakeup.js";

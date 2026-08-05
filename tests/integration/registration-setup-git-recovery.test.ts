@@ -196,6 +196,7 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
   };
   const request: RegistrationSetupBeginRequest = {
     preview: preview.value,
+    trustedAuthority: { authorityDigest: "e".repeat(64) },
     confirmation: {
       source: "local_ui",
       explicit: true,

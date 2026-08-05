@@ -43,6 +43,16 @@ export interface RegistrationSetupPreviewConfirmation {
   readonly previewDigest: Sha256Digest;
 }
 
+export type RegistrationSetupPreviewConfirmationBinding = Omit<
+  RegistrationSetupPreviewConfirmation,
+  "source" | "explicit" | "tokenId"
+>;
+
+export interface RegistrationSetupPreviewConfirmationGrant {
+  readonly confirmation: RegistrationSetupPreviewConfirmation;
+  readonly expiresAt: string;
+}
+
 export interface RegistrationSetupApprovalBinding {
   readonly schemaVersion: 1;
   readonly setupSessionId: string;
@@ -223,8 +233,20 @@ export interface RegistrationSetupPreviewConfirmationPort {
   /** Verifies that the version-bound confirmation was issued by the current local user surface. */
   verify(
     token: RegistrationSetupPreviewConfirmation,
-    options?: ReadOptions,
+    trustedAuthorityDigest: string,
+    options: MutationOptions,
   ): AsyncPortResult<Readonly<{ state: "verified" | "rejected" }>>;
+}
+
+export interface RegistrationSetupPreviewConfirmationAuthorityPort extends RegistrationSetupPreviewConfirmationPort {
+  issue(
+    binding: RegistrationSetupPreviewConfirmationBinding,
+    trustedAuthorityDigest: string,
+    options: MutationOptions,
+  ): AsyncPortResult<
+    | Readonly<{ state: "issued"; grant: RegistrationSetupPreviewConfirmationGrant }>
+    | Readonly<{ state: "rejected" | "unknown" }>
+  >;
 }
 
 export interface RegistrationSetupSessionPort {
@@ -367,6 +389,7 @@ export interface RegistrationSetupPorts {
 export interface RegistrationSetupBeginRequest {
   readonly preview: RegistrationSetupPreview;
   readonly confirmation: RegistrationSetupPreviewConfirmation;
+  readonly trustedAuthority: RegistrationSetupTrustedAuthority;
   readonly idempotencyKeyPrefix: string;
   readonly signal?: AbortSignal;
 }

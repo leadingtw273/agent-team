@@ -1,11 +1,13 @@
-import type { UiRequest, UiResponse } from "../../server/index.js";
-import type {
-  RegistrationSetupApprovalUiCommand,
-  RegistrationSetupApprovalUiUseCase,
-} from "./model.js";
+import {
+  registrationSetupFinalApprovalPhrase,
+  registrationSetupPreviewConfirmationPhrase,
+  type RegistrationSetupControllerContext,
+  type RegistrationSetupControllerUseCase,
+} from "../../../application/registration/index.js";
+import type { UiRequest, UiResponse, UiTrustedRequestContext } from "../../server/index.js";
 
-const confirmationPhrase = "APPROVE SETUP MERGE";
 const identifierPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:@+-]{0,220}$/u;
+const digestPattern = /^[0-9a-f]{64}$/u;
 
 function response(request: UiRequest, statusCode: number, body: unknown): UiResponse {
   const headers = Object.freeze({
@@ -17,46 +19,115 @@ function response(request: UiRequest, statusCode: number, body: unknown): UiResp
     : Object.freeze({ statusCode, headers, body: JSON.stringify(body) });
 }
 
-function approvalCommand(body: UiRequest["body"]): RegistrationSetupApprovalUiCommand | undefined {
-  if (body === undefined || Object.keys(body).length !== 3) return undefined;
-  const approvalId = body["approvalId"];
-  const expectedSetupRevision = body["expectedSetupRevision"];
-  if (
-    body["confirmation"] !== confirmationPhrase ||
-    typeof approvalId !== "string" ||
-    typeof expectedSetupRevision !== "number" ||
-    !Number.isSafeInteger(expectedSetupRevision) ||
-    expectedSetupRevision <= 0
-  ) {
-    return undefined;
-  }
-  return identifierPattern.test(approvalId)
-    ? Object.freeze({ approvalId, expectedSetupRevision, userConfirmed: true as const })
-    : undefined;
+function exactKeys(body: UiRequest["body"], keys: readonly string[]): boolean {
+  return body !== undefined && Object.keys(body).sort().join("\0") === [...keys].sort().join("\0");
 }
 
-export async function handleRegistrationSetupApprovalRequest(
-  useCase: RegistrationSetupApprovalUiUseCase,
+function context(
+  trustedContext: UiTrustedRequestContext,
+): RegistrationSetupControllerContext | undefined {
+  const authorityDigest = trustedContext.session?.authorityDigest;
+  return authorityDigest === undefined ? undefined : Object.freeze({ authorityDigest });
+}
+
+export async function handleRegistrationSetupRequest(
+  controller: RegistrationSetupControllerUseCase,
   request: UiRequest,
+  trustedContext: UiTrustedRequestContext,
 ): Promise<UiResponse> {
+  const trusted = context(trustedContext);
+  if (request.auth.kind !== "session" || trusted === undefined) {
+    return response(request, 403, { state: "error", code: "localhost_session_required" });
+  }
   if (request.method === "GET" || request.method === "HEAD") {
-    return response(request, 200, await useCase.read());
+    return response(request, 200, await controller.read(trusted));
   }
   if (request.method !== "PUT") {
     return response(request, 405, { state: "error", code: "method_not_allowed" });
   }
-  if (request.auth.kind !== "session") {
-    return response(request, 403, { state: "error", code: "localhost_session_required" });
+  const body = request.body;
+  const action = body?.["action"];
+  const setupSessionId = body?.["setupSessionId"];
+  const operationId = body?.["operationId"];
+  if (
+    typeof action !== "string" ||
+    typeof setupSessionId !== "string" ||
+    typeof operationId !== "string" ||
+    !identifierPattern.test(setupSessionId) ||
+    !identifierPattern.test(operationId)
+  ) {
+    return response(request, 422, { state: "error", code: "invalid_setup_action" });
   }
-  const parsed = approvalCommand(request.body);
-  if (parsed === undefined) {
-    return response(request, 422, { state: "error", code: "invalid_explicit_approval" });
+  let result;
+  if (
+    action === "confirm_preview" &&
+    exactKeys(body, ["action", "setupSessionId", "previewDigest", "confirmation", "operationId"]) &&
+    typeof body?.["previewDigest"] === "string" &&
+    digestPattern.test(body["previewDigest"]) &&
+    body["confirmation"] === registrationSetupPreviewConfirmationPhrase
+  ) {
+    result = await controller.confirmPreview(
+      {
+        setupSessionId,
+        previewDigest: body["previewDigest"],
+        confirmation: registrationSetupPreviewConfirmationPhrase,
+        idempotencyKey: `ui:${operationId}:confirm-preview`,
+      },
+      trusted,
+    );
+  } else if (
+    action === "start" &&
+    exactKeys(body, ["action", "setupSessionId", "previewDigest", "tokenId", "operationId"]) &&
+    typeof body?.["previewDigest"] === "string" &&
+    digestPattern.test(body["previewDigest"]) &&
+    typeof body["tokenId"] === "string" &&
+    identifierPattern.test(body["tokenId"])
+  ) {
+    result = await controller.start(
+      {
+        setupSessionId,
+        previewDigest: body["previewDigest"],
+        tokenId: body["tokenId"],
+        idempotencyKeyPrefix: `ui:${operationId}:start`,
+      },
+      trusted,
+    );
+  } else if (action === "refresh" && exactKeys(body, ["action", "setupSessionId", "operationId"])) {
+    result = await controller.refresh(
+      { setupSessionId, idempotencyKeyPrefix: `ui:${operationId}:refresh` },
+      trusted,
+    );
+  } else if (
+    action === "issue_approval_intent" &&
+    exactKeys(body, [
+      "action",
+      "setupSessionId",
+      "expectedSetupRevision",
+      "confirmation",
+      "operationId",
+    ]) &&
+    typeof body?.["expectedSetupRevision"] === "number" &&
+    Number.isSafeInteger(body["expectedSetupRevision"]) &&
+    body["expectedSetupRevision"] > 0 &&
+    body["confirmation"] === registrationSetupFinalApprovalPhrase
+  ) {
+    result = await controller.issueApprovalIntent(
+      {
+        setupSessionId,
+        expectedSetupRevision: body["expectedSetupRevision"],
+        confirmation: registrationSetupFinalApprovalPhrase,
+        idempotencyKey: `ui:${operationId}:approval-intent`,
+        idempotencyKeyPrefix: `ui:${operationId}:approval-refresh`,
+      },
+      trusted,
+    );
+  } else {
+    return response(request, 422, { state: "error", code: "invalid_setup_action" });
   }
-  const result = await useCase.approve(parsed);
-  return result.state === "accepted"
-    ? response(request, 202, { state: "accepted" })
-    : response(request, result.state === "conflict" ? 409 : 422, {
-        state: "error",
-        code: result.state,
-      });
+  const failure = result.state === "failed" || result.state === "blocked";
+  return response(
+    request,
+    failure ? 409 : result.state === "configuration_incomplete" ? 503 : 202,
+    result,
+  );
 }

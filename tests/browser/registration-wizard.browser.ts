@@ -15,6 +15,8 @@ import {
 import type {
   RegistrationReadOnlyScanReadModel,
   RegistrationReadOnlyScanUseCase,
+  RegistrationSetupControllerReadModel,
+  RegistrationSetupControllerUseCase,
 } from "../../src/application/registration/index.js";
 
 const reviewDirectory = "/tmp/ui-review";
@@ -22,6 +24,52 @@ const worktreeReviewDirectory = join(process.cwd(), "tmp", "ui-review");
 let shell: LocalUiServerHandle | undefined;
 let longTextShell: LocalUiServerHandle | undefined;
 const authenticatedTargets = new WeakMap<Page, LocalUiServerHandle>();
+const setupSessionId = `setup-${"c".repeat(64)}`;
+const setupPreviewDigest = "b".repeat(64);
+const setupPreviewModel: RegistrationSetupControllerReadModel = Object.freeze({
+  state: "preview_ready",
+  evidence: Object.freeze([
+    Object.freeze({ code: "merge_w3b_unwired", message: "merge remains unavailable" }),
+    Object.freeze({ code: "audit_w3b_unwired", message: "audit remains unavailable" }),
+    Object.freeze({ code: "activation_w3b_unwired", message: "activation remains unavailable" }),
+    Object.freeze({
+      code: "conversation_approval_w3b_unwired",
+      message: "conversation approval remains unavailable",
+    }),
+  ]),
+  nextStep: "確認 server-side preview。",
+  preview: Object.freeze({
+    setupSessionId,
+    projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    projectName: "Sandbox",
+    repository: "owner/sandbox",
+    defaultBranch: "main",
+    baseRevision: "d".repeat(40),
+    previewDigest: setupPreviewDigest,
+    requirementsDigest: "e".repeat(64),
+  }),
+});
+
+function setupController(): RegistrationSetupControllerUseCase {
+  return Object.freeze({
+    read: () => Promise.resolve(setupPreviewModel),
+    confirmPreview: () =>
+      Promise.resolve(
+        Object.freeze({
+          state: "preview_confirmation_issued" as const,
+          setupSessionId,
+          previewDigest: setupPreviewDigest,
+          tokenId: "preview-token-1",
+          expiresAt: "2026-08-06T12:05:00.000Z",
+        }),
+      ),
+    start: () =>
+      Promise.resolve(Object.freeze({ ...setupPreviewModel, state: "ci_waiting" as const })),
+    refresh: () => Promise.resolve(setupPreviewModel),
+    issueApprovalIntent: () =>
+      Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
+  });
+}
 
 interface AxeViolation {
   readonly id: string;
@@ -118,7 +166,7 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
     const root = browser.document.documentElement;
     const overflowingSelectors: string[] = [];
     for (const element of browser.document.querySelectorAll(
-      ".ui-registration-card, .ui-registration-detail, .ui-registration-facts dd, .ui-linear-provision, .ui-linear-action, .ui-linear-controls",
+      ".ui-registration-card, .ui-registration-detail, .ui-registration-facts dd, .ui-linear-provision, .ui-linear-action, .ui-linear-controls, .ui-registration-setup, .ui-registration-setup-facts dd, .ui-registration-setup-controls",
     )) {
       const rect = element.getBoundingClientRect();
       if (element.scrollWidth > element.clientWidth + 1 || rect.right > root.clientWidth + 1) {
@@ -161,7 +209,15 @@ async function startRegistrationShell(
 ): Promise<LocalUiServerHandle> {
   const application = createUiApplication({
     readModel: fixtureUiShellReadModel,
-    features: [createRegistrationWizardUiFeatureRegistration(useCase)],
+    features: [
+      createRegistrationWizardUiFeatureRegistration(
+        useCase,
+        undefined,
+        undefined,
+        undefined,
+        setupController(),
+      ),
+    ],
   });
   return startLocalUiServer({
     securityPolicy: application.securityPolicy,
@@ -214,8 +270,35 @@ test.describe("O002 registration wizard", () => {
       "主動 delivery 驗證留待 O006",
     );
     await expect(page.locator('script[src="/assets/registration.js"]')).toHaveCount(1);
+    await expect(page.locator('script[src="/assets/registration-setup.js"]')).toHaveCount(1);
+    await expect(page.locator("#registration-setup-section")).toHaveCount(1);
     await expectNoAxeViolations(page);
     await copyReviewScreenshot(page, "o002-registration-wizard-desktop.png");
+  });
+
+  test("requires the exact visible phrase and a second click before starting Setup", async ({
+    page,
+  }) => {
+    await visit(page);
+    const panel = page.locator("#registration-setup-section");
+    const confirmation = panel.getByLabel("輸入 CREATE SETUP DRAFT PR");
+    const confirm = panel.getByRole("button", { name: "確認 Preview" });
+    const start = panel.getByRole("button", { name: "建立 Draft PR" });
+    const status = panel.getByRole("status");
+
+    await expect(panel.getByText("CREATE SETUP DRAFT PR", { exact: true })).toBeVisible();
+    await expect(start).toBeDisabled();
+    await confirmation.fill("WRONG PHRASE");
+    await confirm.click();
+    await expect(status).toContainText("確認文字不符");
+    await expect(start).toBeDisabled();
+
+    await confirmation.fill("CREATE SETUP DRAFT PR");
+    await confirm.click();
+    await expect(status).toContainText("一次性 Preview 確認已簽發");
+    await expect(start).toBeEnabled();
+    await start.click();
+    await expect(status).toContainText("Setup Draft PR 已建立");
   });
 
   test("keeps synthetic Gates readable without horizontal overflow at 390px and 320px", async ({

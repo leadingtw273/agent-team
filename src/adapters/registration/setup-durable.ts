@@ -21,6 +21,9 @@ import {
   type RegistrationSetupJournal,
   type RegistrationSetupJournalDraft,
   type RegistrationSetupJournalPort,
+  type RegistrationSetupPreviewConfirmation,
+  type RegistrationSetupPreviewConfirmationAuthorityPort,
+  type RegistrationSetupPreviewConfirmationBinding,
   type RegistrationSetupSession,
   type RegistrationSetupSessionDraft,
   type RegistrationSetupSessionPort,
@@ -383,6 +386,51 @@ const ledgerSchema = z
   })
   .strict();
 type ApprovalLedger = z.infer<typeof ledgerSchema>;
+
+const previewConfirmationBindingSchema = z
+  .object({
+    setupSessionId: identifierSchema,
+    projectId: identifierSchema,
+    previewDigest: digestSchema,
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupPreviewConfirmationBinding>;
+const previewConfirmationSchema = z
+  .object({
+    source: z.literal("local_ui"),
+    explicit: z.literal(true),
+    tokenId: identifierSchema,
+    setupSessionId: identifierSchema,
+    projectId: identifierSchema,
+    previewDigest: digestSchema,
+  })
+  .strict() as unknown as z.ZodType<RegistrationSetupPreviewConfirmation>;
+const pendingPreviewConfirmationSchema = z
+  .object({
+    tokenId: identifierSchema,
+    issueOperationDigest: digestSchema,
+    authorityDigest: digestSchema,
+    binding: previewConfirmationBindingSchema,
+    issuedAt: instantSchema,
+    expiresAt: instantSchema,
+    state: z.literal("pending"),
+  })
+  .strict();
+const consumedPreviewConfirmationSchema = pendingPreviewConfirmationSchema
+  .omit({ state: true })
+  .extend({
+    state: z.literal("consumed"),
+    consumeOperationDigest: digestSchema,
+    consumedAt: instantSchema,
+  })
+  .strict();
+const previewConfirmationLedgerSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    revision: z.number().int().nonnegative(),
+    grants: z.array(z.union([pendingPreviewConfirmationSchema, consumedPreviewConfirmationSchema])),
+  })
+  .strict();
+type PreviewConfirmationLedger = z.infer<typeof previewConfirmationLedgerSchema>;
 
 function hash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -1102,6 +1150,228 @@ export class LocalRegistrationSetupFileAdapter implements RegistrationSetupFileP
         ),
       );
     }
+  }
+}
+
+/** Durable, local-UI-only authority for the explicit preview-to-Draft-PR transition. */
+export class FileLocalUiPreviewConfirmationAuthority implements RegistrationSetupPreviewConfirmationAuthorityPort {
+  readonly #stateRoot: string;
+  readonly #clock: Clock;
+  readonly #atomicStore: AtomicFileStore;
+
+  constructor(
+    stateRoot: string,
+    clock: Clock = createClock(),
+    atomicStore: AtomicFileStore = new AtomicFileStore(),
+  ) {
+    if (!isAbsolute(stateRoot)) throw new Error("state_root_must_be_absolute");
+    this.#stateRoot = resolve(stateRoot);
+    this.#clock = clock;
+    this.#atomicStore = atomicStore;
+  }
+
+  async #load(
+    directory: HeldSecureDirectory,
+  ): Promise<Result<PreviewConfirmationLedger, DomainError>> {
+    const loaded = await readPrivate(
+      directory,
+      "preview-confirmations.json",
+      previewConfirmationLedgerSchema,
+    );
+    return !loaded.ok && loaded.error.code === "not_found"
+      ? ok({ schemaVersion: 1, revision: 0, grants: [] })
+      : loaded;
+  }
+
+  #persist(
+    ledger: PreviewConfirmationLedger,
+    directory: HeldSecureDirectory,
+    lockCommitGuard: CommitGuard,
+    lockPublicationGuard: PublicationGuard,
+  ) {
+    return persistPrivate(
+      directory,
+      "preview-confirmations.json",
+      previewConfirmationLedgerSchema,
+      ledger,
+      {
+        store: this.#atomicStore,
+        commitGuard: lockCommitGuard,
+        publicationGuard: lockPublicationGuard,
+      },
+    );
+  }
+
+  async issue(
+    binding: RegistrationSetupPreviewConfirmationBinding,
+    trustedAuthorityDigest: string,
+    options: MutationOptions,
+  ) {
+    if (
+      !validMutation(options) ||
+      !digestPattern.test(trustedAuthorityDigest) ||
+      !previewConfirmationBindingSchema.safeParse(binding).success
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    return withLock<
+      | Readonly<{
+          state: "issued";
+          grant: Readonly<{
+            confirmation: RegistrationSetupPreviewConfirmation;
+            expiresAt: string;
+          }>;
+        }>
+      | Readonly<{ state: "rejected" | "unknown" }>
+    >(
+      this.#stateRoot,
+      ["registration-setup", "preview-confirmation-authority"],
+      "ledger.lock",
+      "registration-setup-preview-confirmation-issue",
+      async (directory, lockCommitGuard, lockPublicationGuard) => {
+        const ledger = await this.#load(directory);
+        if (!ledger.ok) return ledger;
+        const operationDigest = hash(options.idempotencyKey);
+        const existing = ledger.value.grants.find(
+          (grant) => grant.issueOperationDigest === operationDigest,
+        );
+        if (existing !== undefined) {
+          if (
+            existing.state !== "pending" ||
+            existing.authorityDigest !== trustedAuthorityDigest ||
+            !sameValue(existing.binding, binding)
+          ) {
+            return ok({ state: "rejected" as const });
+          }
+          return ok({
+            state: "issued" as const,
+            grant: {
+              confirmation: previewConfirmationSchema.parse({
+                source: "local_ui",
+                explicit: true,
+                tokenId: existing.tokenId,
+                ...existing.binding,
+              }),
+              expiresAt: existing.expiresAt,
+            },
+          });
+        }
+        const issuedAt = this.#clock.now();
+        const duplicate = ledger.value.grants.some(
+          (grant) =>
+            grant.authorityDigest === trustedAuthorityDigest &&
+            sameValue(grant.binding, binding) &&
+            (grant.state === "consumed" || Date.parse(issuedAt) <= Date.parse(grant.expiresAt)),
+        );
+        if (duplicate) return ok({ state: "rejected" as const });
+        const expiresAt = new Date(Date.parse(issuedAt) + 5 * 60_000).toISOString();
+        const pending = pendingPreviewConfirmationSchema.parse({
+          tokenId: `preview-${randomUUID()}`,
+          issueOperationDigest: operationDigest,
+          authorityDigest: trustedAuthorityDigest,
+          binding,
+          issuedAt,
+          expiresAt,
+          state: "pending",
+        });
+        const next = previewConfirmationLedgerSchema.parse({
+          schemaVersion: 1,
+          revision: ledger.value.revision + 1,
+          grants: [...ledger.value.grants, pending],
+        });
+        const persisted = await this.#persist(
+          next,
+          directory,
+          lockCommitGuard,
+          lockPublicationGuard,
+        );
+        if (!persisted.ok) return persisted;
+        return persisted.value.durability === "confirmed"
+          ? ok({
+              state: "issued" as const,
+              grant: {
+                confirmation: previewConfirmationSchema.parse({
+                  source: "local_ui",
+                  explicit: true,
+                  tokenId: pending.tokenId,
+                  ...pending.binding,
+                }),
+                expiresAt,
+              },
+            })
+          : ok({ state: "unknown" as const });
+      },
+    );
+  }
+
+  async verify(
+    token: RegistrationSetupPreviewConfirmation,
+    trustedAuthorityDigest: string,
+    options: MutationOptions,
+  ) {
+    if (
+      !validMutation(options) ||
+      !digestPattern.test(trustedAuthorityDigest) ||
+      !previewConfirmationSchema.safeParse(token).success
+    ) {
+      return ok({ state: "rejected" as const });
+    }
+    return withLock<Readonly<{ state: "verified" | "rejected" }>>(
+      this.#stateRoot,
+      ["registration-setup", "preview-confirmation-authority"],
+      "ledger.lock",
+      "registration-setup-preview-confirmation-consume",
+      async (directory, lockCommitGuard, lockPublicationGuard) => {
+        const ledger = await this.#load(directory);
+        if (!ledger.ok) return ledger;
+        const index = ledger.value.grants.findIndex((grant) => grant.tokenId === token.tokenId);
+        const grant = ledger.value.grants[index];
+        const binding = {
+          setupSessionId: token.setupSessionId,
+          projectId: token.projectId,
+          previewDigest: token.previewDigest,
+        };
+        if (
+          grant?.authorityDigest !== trustedAuthorityDigest ||
+          !sameValue(grant.binding, binding)
+        ) {
+          return ok({ state: "rejected" as const });
+        }
+        const operationDigest = hash(options.idempotencyKey);
+        if (grant.state === "consumed") {
+          return ok({
+            state: grant.consumeOperationDigest === operationDigest ? "verified" : "rejected",
+          } as const);
+        }
+        const consumedAt = this.#clock.now();
+        if (Date.parse(consumedAt) > Date.parse(grant.expiresAt)) {
+          return ok({ state: "rejected" as const });
+        }
+        const consumed = consumedPreviewConfirmationSchema.parse({
+          ...grant,
+          state: "consumed",
+          consumeOperationDigest: operationDigest,
+          consumedAt,
+        });
+        const grants = [...ledger.value.grants];
+        grants[index] = consumed;
+        const next = previewConfirmationLedgerSchema.parse({
+          schemaVersion: 1,
+          revision: ledger.value.revision + 1,
+          grants,
+        });
+        const persisted = await this.#persist(
+          next,
+          directory,
+          lockCommitGuard,
+          lockPublicationGuard,
+        );
+        if (!persisted.ok) return persisted;
+        return ok({
+          state: persisted.value.durability === "confirmed" ? "verified" : "rejected",
+        } as const);
+      },
+    );
   }
 }
 
