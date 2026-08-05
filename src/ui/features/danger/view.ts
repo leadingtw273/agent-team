@@ -24,12 +24,38 @@ function escape(value: string): string {
   );
 }
 
+function confirmationPanel(request: DangerApprovalRequest): string {
+  const id = `danger-confirm-${escape(request.requestId)}`;
+  return `<section class="danger-confirmation" data-confirmation hidden aria-labelledby="${id}">
+      <h3 id="${id}" data-confirm-title>確認安全決策</h3>
+      <p class="danger-confirmation-message" data-confirm-message></p>
+      <dl class="danger-confirmation-summary">
+        <div><dt>專案</dt><dd>${escape(request.projectName)}</dd></div>
+        <div><dt>類別</dt><dd>${categoryLabels[request.category]}</dd></div>
+        <div><dt>版本</dt><dd class="font-monospace text-break">${escape(request.revision)}</dd></div>
+      </dl>
+      <div class="danger-confirmation-actions"><button class="btn btn-primary danger-action-button" type="button" data-confirm-submit>確認</button><button class="btn btn-outline-secondary danger-action-button" type="button" data-confirm-cancel>取消</button></div>
+    </section>`;
+}
+
+function decisionControls(request: DangerApprovalRequest): string {
+  if (request.category === "unknown") {
+    return `<p class="danger-unknown-note" role="note"><strong>未知類別只能拒絕</strong><span>系統不會顯示任何核可或長期允許入口。</span></p>
+    <div class="danger-action-layout danger-action-layout--unknown"><div class="danger-reject-zone"><button class="btn btn-danger danger-action-button" type="button" data-decision="reject">拒絕</button></div></div>`;
+  }
+  return `<div class="danger-action-layout">
+      <div class="danger-approval-zone" role="group" aria-label="核可選項"><button class="btn btn-success danger-action-button" type="button" data-decision="approve_once">核可一次</button><button class="btn btn-outline-warning danger-action-button danger-long-term-trigger" type="button" data-decision="allow_project_category"><span aria-hidden="true">⚠</span><span>此專案長期允許此類別</span></button></div>
+      <div class="danger-reject-zone"><button class="btn btn-danger danger-action-button" type="button" data-decision="reject">拒絕</button></div>
+    </div>
+    ${confirmationPanel(request)}`;
+}
+
 function requestCard(request: DangerApprovalRequest): string {
   const identity = `data-request-id="${escape(request.requestId)}" data-project-id="${escape(request.projectId)}" data-category="${escape(request.category)}" data-revision="${request.revision}"`;
   return `<article class="card ui-panel mb-3" ${identity} aria-labelledby="danger-${escape(request.requestId)}"><div class="card-body">
     <div class="ui-section-heading"><div><h2 id="danger-${escape(request.requestId)}">${escape(request.projectName)}</h2><p>${escape(request.requestId)}</p></div><span class="badge ${request.category === "unknown" ? "bg-danger text-white" : "bg-warning text-dark"}">${categoryLabels[request.category]}</span></div>
     <dl class="row mb-3"><dt class="col-sm-2">目的</dt><dd class="col-sm-10">${escape(request.purpose)}</dd><dt class="col-sm-2">範圍</dt><dd class="col-sm-10">${escape(request.scope)}</dd><dt class="col-sm-2">版本</dt><dd class="col-sm-10 font-monospace text-break">${request.revision}</dd></dl>
-    <div class="d-flex flex-wrap gap-2"><button class="btn btn-success" type="button" data-decision="approve_once" ${request.category === "unknown" ? "disabled" : ""}>核可一次</button><button class="btn btn-danger" type="button" data-decision="reject">拒絕</button>${request.category === "unknown" ? "" : '<button class="btn btn-outline-warning" type="button" data-decision="allow_project_category">此專案長期允許此類別</button>'}</div>
+    ${decisionControls(request)}
   </div></article>`;
 }
 

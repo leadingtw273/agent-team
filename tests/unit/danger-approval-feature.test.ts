@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   createDangerApprovalUseCase,
   InMemoryDangerApprovalStore,
+  renderDangerPage,
   type DangerApprovalRequest,
 } from "../../src/ui/features/danger/index.js";
 
@@ -17,6 +18,18 @@ const request: DangerApprovalRequest = Object.freeze({
 });
 
 describe("U006 dangerous operation approval", () => {
+  it("renders unknown requests with reject as their only decision", () => {
+    const unknown = { ...request, requestId: "danger-unknown", category: "unknown" as const };
+    const html = renderDangerPage(
+      createDangerApprovalUseCase(new InMemoryDangerApprovalStore([unknown])).read(),
+    );
+
+    expect(html).toContain("未知類別只能拒絕");
+    expect(html).toContain('data-decision="reject"');
+    expect(html).not.toContain('data-decision="approve_once"');
+    expect(html).not.toContain('data-decision="allow_project_category"');
+  });
+
   it("binds a localhost decision to exact request, project, category, and revision CAS", () => {
     const store = new InMemoryDangerApprovalStore([request]);
     const useCase = createDangerApprovalUseCase(store);

@@ -78,4 +78,73 @@ describe("U006 danger approval HTTP", () => {
     expect(useCase.read().waiting).toEqual([]);
     expect(useCase.read().audit).toHaveLength(1);
   });
+
+  it("returns stale CAS conflicts and never accepts unknown approval decisions", async () => {
+    const known = {
+      requestId: "danger-stale",
+      projectId: "project-alpha",
+      projectName: "Alpha",
+      category: "deployment" as const,
+      purpose: "部署測試版本",
+      scope: "namespace agent-team-test",
+      revision: "a".repeat(64),
+    };
+    const unknown = {
+      ...known,
+      requestId: "danger-unknown",
+      category: "unknown" as const,
+      revision: "b".repeat(64),
+    };
+    const useCase = createDangerApprovalUseCase(new InMemoryDangerApprovalStore([known, unknown]));
+    const handle = await startLocalUiServer({
+      securityPolicy: createUiSecurityPolicy({ routes: [dangerUiRouteContract] }),
+      handler: createDangerUiHandler(useCase),
+    });
+    handles.push(handle);
+    const exchange = await fetch(`${handle.baseUrl}/__session/exchange`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${handle.sessionToken}` },
+    });
+    const cookie = exchange.headers.get("set-cookie")?.split(";", 1)[0];
+    const csrf = exchange.headers.get("x-csrf-token");
+    if (cookie === undefined || csrf === null) throw new Error("session exchange failed");
+    const decide = async (body: Readonly<Record<string, string>>): Promise<Response> =>
+      await fetch(`${handle.baseUrl}/api/danger`, {
+        method: "PUT",
+        headers: {
+          cookie,
+          origin: handle.baseUrl,
+          "content-type": "application/json",
+          "x-csrf-token": csrf,
+        },
+        body: JSON.stringify(body),
+      });
+
+    expect(
+      (
+        await decide({
+          requestId: known.requestId,
+          projectId: known.projectId,
+          category: known.category,
+          expectedRevision: "c".repeat(64),
+          decision: "approve_once",
+        })
+      ).status,
+    ).toBe(409);
+    for (const decision of ["approve_once", "allow_project_category"]) {
+      expect(
+        (
+          await decide({
+            requestId: unknown.requestId,
+            projectId: unknown.projectId,
+            category: unknown.category,
+            expectedRevision: unknown.revision,
+            decision,
+          })
+        ).status,
+      ).toBe(422);
+    }
+    expect(useCase.read().waiting).toEqual([known, unknown]);
+    expect(useCase.read().audit).toEqual([]);
+  });
 });
