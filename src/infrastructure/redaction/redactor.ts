@@ -46,15 +46,21 @@ const sensitiveKeySuffixes = [
   "signature",
 ] as const;
 
-const tokenPatterns = [
-  /\bsk-ant-[a-zA-Z0-9_-]{12,}\b/gu,
-  /\bsk-[a-zA-Z0-9_-]{12,}\b/gu,
-  /\blin_api_[a-zA-Z0-9_-]{12,}\b/gu,
-  /\bgh[pousr]_[a-zA-Z0-9_]{20,}\b/gu,
-  /\bgithub_pat_[a-zA-Z0-9_]{20,}\b/gu,
-  /\bAIza[a-zA-Z0-9_-]{30,}\b/gu,
-  /\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b/gu,
+const tokenPatternSources = [
+  String.raw`\bsk-ant-[a-zA-Z0-9_-]{12,}\b`,
+  String.raw`\bsk-[a-zA-Z0-9_-]{12,}\b`,
+  String.raw`\blin_api_[a-zA-Z0-9_-]{12,}\b`,
+  String.raw`\bgh[pousr]_[a-zA-Z0-9_]{20,}\b`,
+  String.raw`\bgithub_pat_[a-zA-Z0-9_]{20,}\b`,
+  String.raw`\bAIza[a-zA-Z0-9_-]{30,}\b`,
+  String.raw`\beyJ[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\.[a-zA-Z0-9_-]{8,}\b`,
 ] as const;
+const tokenPatterns = tokenPatternSources.map((source) => new RegExp(source, "gu"));
+
+/** Pure, allocation-bounded recognition for provider credentials and JWT-shaped values. */
+export function containsSensitiveValue(input: string): boolean {
+  return tokenPatternSources.some((source) => new RegExp(source, "u").test(input));
+}
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/gu, "");
@@ -127,7 +133,9 @@ export class Redactor {
       (match, boundary: string, quote: string, key: string, separator: string) =>
         this.isSensitiveKey(key) ? `${boundary}${quote}${key}${separator}${redactedValue}` : match,
     );
-    for (const pattern of tokenPatterns) output = output.replace(pattern, redactedValue);
+    if (containsSensitiveValue(output)) {
+      for (const pattern of tokenPatterns) output = output.replace(pattern, redactedValue);
+    }
     return output;
   }
 

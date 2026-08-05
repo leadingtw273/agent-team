@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  containsSensitiveValue,
   redactCommand,
   Redactor,
   redactedValue,
@@ -12,6 +13,18 @@ function joined(...parts: readonly string[]): string {
 }
 
 describe("text redaction", () => {
+  it("shares a pure predicate for known provider and JWT credential markers", () => {
+    const markers = [
+      joined("github", "_pat_", "abcdefghijklmnopqrstuvwxyz"),
+      joined("lin", "_api_", "abcdefghijklmnopqrstuv"),
+      joined("AI", "za", "abcdefghijklmnopqrstuvwxyz123456789"),
+      joined("eyJ", "abcdefghijk", ".", "abcdefghijkl", ".", "abcdefghijkl"),
+    ];
+
+    for (const marker of markers) expect(containsSensitiveValue(marker)).toBe(true);
+    expect(containsSensitiveValue("https://hooks.example.test/agent-team")).toBe(false);
+  });
+
   it("redacts registered secrets and common encoded variants", () => {
     const secret = "value with/slash+symbols";
     const redactor = new Redactor({ secrets: [secret] });
