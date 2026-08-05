@@ -120,6 +120,7 @@ function statuses(
 interface HarnessOptions {
   readonly fail?: "worktree" | "write" | "merge" | "activation";
   readonly mergeFailOnce?: boolean;
+  readonly mergeReceiptSaveCrash?: boolean;
   readonly ci?: CommitChecksSnapshot;
   readonly review?: CommitStatusesSnapshot;
   readonly driftDiff?: boolean;
@@ -139,7 +140,9 @@ interface HarnessOptions {
     | "wrong_revision"
     | "wrong_branch"
     | "wrong_digest"
-    | "wrong_session";
+    | "wrong_session"
+    | "wrong_authority"
+    | "wrong_nonce";
   readonly activationIndexFailOnce?: boolean;
   readonly ownershipLossAt?: number;
   readonly journalIntentSaveFail?: RegistrationSetupJournalStep;
@@ -162,6 +165,7 @@ function harness(options: HarnessOptions = {}) {
   let injectedConsumeSaveCrash = false;
   let injectedAuditReceiptSaveCrash = false;
   let injectedMergeFailure = false;
+  let injectedMergeReceiptSaveCrash = false;
   let activationMarker:
     | import("../../src/application/registration/index.js").RegistrationSetupActivationMarker
     | undefined;
@@ -580,6 +584,16 @@ function harness(options: HarnessOptions = {}) {
       save: (_expectedRevision, draft) => {
         const currentSession = sessions.get(draft.setupSessionId);
         if (
+          options.mergeReceiptSaveCrash === true &&
+          !injectedMergeReceiptSaveCrash &&
+          currentSession?.phase === "merge_pending" &&
+          currentSession.mergeReceipt === undefined &&
+          draft.mergeReceipt !== undefined
+        ) {
+          injectedMergeReceiptSaveCrash = true;
+          return Promise.resolve(err(domainError("external_failure")));
+        }
+        if (
           options.auditReceiptSaveCrash !== undefined &&
           !injectedAuditReceiptSaveCrash &&
           currentSession?.audit?.pending?.destination === options.auditReceiptSaveCrash &&
@@ -645,10 +659,19 @@ function harness(options: HarnessOptions = {}) {
           auditReceiptsDigest: auditReceiptsDigest.value,
           approvalSource: session.approvalSource ?? ("local_ui" as const),
           approvalReferenceDigest: session.approvalReferenceDigest ?? digest("missing-approval"),
+          authorityDigest: session.approvalAuthorityDigest ?? digest("missing-authority"),
+          approvalNonceDigest: session.approvalNonceDigest ?? digest("missing-nonce"),
         };
-        activationMarker = marker;
+        activationMarker =
+          options.activationReceipt === "wrong_authority"
+            ? { ...marker, authorityDigest: digest("other-authority") }
+            : options.activationReceipt === "wrong_nonce"
+              ? { ...marker, approvalNonceDigest: digest("other-nonce") }
+              : marker;
         sessions.set(session.setupSessionId, session);
-        return Promise.resolve(ok({ durability: "confirmed" as const, session, marker }));
+        return Promise.resolve(
+          ok({ durability: "confirmed" as const, session, marker: activationMarker }),
+        );
       },
       readActivation: () => Promise.resolve(ok(activationMarker)),
     },
@@ -706,6 +729,15 @@ function harness(options: HarnessOptions = {}) {
     },
     squashMerge: {
       enable: (_command, mutationOptions) => {
+        if (current.state === "merged" || current.autoMergeEnabled) {
+          return Promise.resolve(
+            ok({
+              state:
+                current.state === "merged" ? ("merged" as const) : ("auto_merge_enabled" as const),
+              snapshot: current,
+            }),
+          );
+        }
         calls.push("merge");
         mutationKeys.push({ step: "merge", key: mutationOptions.idempotencyKey });
         if (options.fail === "merge" || (options.mergeFailOnce === true && !injectedMergeFailure)) {
@@ -1482,6 +1514,29 @@ describe("O005 registration Setup PR flow", () => {
     expect(mergeMutations[0]?.key).toMatch(/^setup-merge:/u);
   });
 
+  it.each(["wrong_authority", "wrong_nonce"] as const)(
+    "fails closed when the activation marker has a valid-format %s substitution",
+    async (activationReceipt) => {
+      const test = await prepared(harness({ mergedReadBack: true, activationReceipt }));
+      const ready = await test.coordinator.refresh({
+        setupSessionId: preview.setupSessionId,
+        idempotencyKeyPrefix: `refresh:b2:${activationReceipt}`,
+      });
+      if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+      await expect(
+        test.approveAndMerge(
+          {
+            setupSessionId: preview.setupSessionId,
+            approval: approval(ready.session),
+            idempotencyKeyPrefix: `merge:b2:${activationReceipt}`,
+          },
+          trustedAuthority,
+        ),
+      ).resolves.toMatchObject({ state: "failed", stage: "activation" });
+      expect(test.calls).not.toContain("publish-activation-index");
+    },
+  );
+
   it("returns merge_pending without W2 or activation while GitHub is not merged", async () => {
     const test = await prepared(harness());
     const ready = await test.coordinator.refresh({
@@ -1529,6 +1584,29 @@ describe("O005 registration Setup PR flow", () => {
     expect(mergeKeys).toHaveLength(2);
     expect(new Set(mergeKeys).size).toBe(1);
     expect(test.calls.filter((call) => call === "save:merge_pending")).toHaveLength(2);
+  });
+
+  it("reads authoritative merge state before retrying a response-lost mutation", async () => {
+    const test = await prepared(harness({ mergeReceiptSaveCrash: true, mergedReadBack: true }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:b2-response-lost",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const request = {
+      setupSessionId: preview.setupSessionId,
+      approval: approval(ready.session),
+      idempotencyKeyPrefix: "merge:b2-response-lost",
+    };
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "failed",
+      stage: "session",
+    });
+    await expect(test.approveAndMerge(request, trustedAuthority)).resolves.toMatchObject({
+      state: "activated",
+    });
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
+    expect(test.mutationKeys.filter((item) => item.step === "merge")).toHaveLength(1);
   });
 
   it("repairs only the project index after a W1-marker-to-index crash", async () => {

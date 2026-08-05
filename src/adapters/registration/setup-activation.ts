@@ -2,9 +2,11 @@ import { isAbsolute, resolve } from "node:path";
 
 import { z } from "zod";
 
-import type {
-  RegistrationSetupActivationMarker,
-  RegistrationSetupActivationRegistryPort,
+import {
+  verifyRegistrationSetupActivationBinding,
+  type RegistrationSetupActivationMarker,
+  type RegistrationSetupActivationRegistryPort,
+  type RegistrationSetupSession,
 } from "../../application/registration/index.js";
 import type {
   AsyncPortResult,
@@ -45,6 +47,8 @@ const markerSchema = z
     auditReceiptsDigest: digestSchema,
     approvalSource: z.enum(["local_ui", "current_user_conversation"]),
     approvalReferenceDigest: digestSchema,
+    authorityDigest: digestSchema,
+    approvalNonceDigest: digestSchema,
   })
   .strict() as unknown as z.ZodType<RegistrationSetupActivationMarker>;
 const indexSchema = z
@@ -100,20 +104,36 @@ async function readIndex(
 export class FileRegistrationSetupActivationRegistry implements RegistrationSetupActivationRegistryPort {
   readonly #stateRoot: string;
   readonly #atomicStore: AtomicFileStore;
-  readonly #sessions: Pick<FileRegistrationSetupSessionStore, "readActivation">;
+  readonly #sessions: Pick<FileRegistrationSetupSessionStore, "load" | "readActivation">;
 
   constructor(
     stateRoot: string,
     atomicStore: AtomicFileStore = new AtomicFileStore(),
     sessions: Pick<
       FileRegistrationSetupSessionStore,
-      "readActivation"
+      "load" | "readActivation"
     > = new FileRegistrationSetupSessionStore(stateRoot),
   ) {
     if (!isAbsolute(stateRoot)) throw new TypeError("state_root_must_be_absolute");
     this.#stateRoot = resolve(stateRoot);
     this.#atomicStore = atomicStore;
     this.#sessions = sessions;
+  }
+
+  async #verifyMarker(
+    marker: RegistrationSetupActivationMarker,
+    options: ReadOptions,
+  ): Promise<Result<RegistrationSetupSession, DomainError>> {
+    const session = await this.#sessions.load(marker.setupSessionId, options);
+    if (!session.ok) return session;
+    const sessionMarker = await this.#sessions.readActivation(marker.setupSessionId, options);
+    if (!sessionMarker.ok) return sessionMarker;
+    return session.value !== undefined &&
+      sessionMarker.value !== undefined &&
+      verifyRegistrationSetupActivationBinding(session.value, marker) &&
+      JSON.stringify(sessionMarker.value) === JSON.stringify(marker)
+      ? ok(session.value)
+      : err(domainError("conflict"));
   }
 
   async read(projectId: string, options: ReadOptions = {}) {
@@ -125,15 +145,8 @@ export class FileRegistrationSetupActivationRegistry implements RegistrationSetu
     if (!read.ok && read.error.code === "not_found") return ok(undefined);
     if (!read.ok) return read;
     if (read.value.marker.projectId !== projectId) return err(domainError("conflict"));
-    const sessionMarker = await this.#sessions.readActivation(
-      read.value.marker.setupSessionId,
-      options,
-    );
-    return sessionMarker.ok &&
-      sessionMarker.value !== undefined &&
-      JSON.stringify(sessionMarker.value) === JSON.stringify(read.value.marker)
-      ? ok(read.value.marker)
-      : err(domainError(sessionMarker.ok ? "conflict" : sessionMarker.error.code));
+    const verified = await this.#verifyMarker(read.value.marker, options);
+    return verified.ok ? ok(read.value.marker) : verified;
   }
 
   async publish(
@@ -152,14 +165,8 @@ export class FileRegistrationSetupActivationRegistry implements RegistrationSetu
     ) {
       return err(domainError("invariant_violation"));
     }
-    const sessionMarker = await this.#sessions.readActivation(parsed.data.setupSessionId, options);
-    if (
-      !sessionMarker.ok ||
-      sessionMarker.value === undefined ||
-      JSON.stringify(sessionMarker.value) !== JSON.stringify(parsed.data)
-    ) {
-      return err(domainError(sessionMarker.ok ? "conflict" : sessionMarker.error.code));
-    }
+    const verified = await this.#verifyMarker(parsed.data, options);
+    if (!verified.ok) return verified;
     return withSecureDirectory<ActivationPublishResult>(
       this.#stateRoot,
       ["registration-setup-activation", key],

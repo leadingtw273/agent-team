@@ -212,6 +212,8 @@ export interface RegistrationSetupActivationMarker {
   readonly auditReceiptsDigest: Sha256Digest;
   readonly approvalSource: RegistrationSetupApprovalSource;
   readonly approvalReferenceDigest: Sha256Digest;
+  readonly authorityDigest: string;
+  readonly approvalNonceDigest: string;
 }
 
 export interface RegistrationSetupMergeIntent {

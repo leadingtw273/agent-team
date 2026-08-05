@@ -92,8 +92,7 @@ export function createProductionRegistrationSetupComposition(
     (options.draft !== undefined && options.draftSource !== undefined) ||
     options.githubTransport === undefined ||
     options.linearAuditWriter === undefined ||
-    options.pullRequestAuditWriter === undefined ||
-    options.conversationApprovalBridge === undefined
+    options.pullRequestAuditWriter === undefined
   ) {
     return Object.freeze({
       controller: createUnwiredRegistrationSetupController(),
@@ -187,6 +186,16 @@ export function createProductionRegistrationSetupComposition(
     activationRegistry,
   });
   const approveAndMerge = createRegistrationSetupControllerMergeOperation(coordinator);
+  const conversationApproval =
+    options.conversationApprovalBridge === undefined
+      ? Object.freeze({})
+      : Object.freeze({
+          conversationApproval: new HostRegistrationSetupConversationApprovalFacade({
+            coordinator,
+            bridge: options.conversationApprovalBridge,
+            approveAndMerge,
+          }),
+        });
 
   return Object.freeze({
     controller: new RegistrationSetupController({
@@ -199,18 +208,17 @@ export function createProductionRegistrationSetupComposition(
       finalApproval,
       approveAndMerge,
     }),
-    conversationApproval: new HostRegistrationSetupConversationApprovalFacade({
-      coordinator,
-      bridge: options.conversationApprovalBridge,
-      approveAndMerge,
-    }),
+    ...conversationApproval,
     wiring: Object.freeze({
       state: "ready" as const,
       durableState: "w1_file_stores" as const,
       mergedConfigReadBack: "w2_github_authoritative" as const,
       merge: "w3b2_controller_squash" as const,
       audit: "w3b1_receipts" as const,
-      conversationApproval: "w3b1_host_capability" as const,
+      conversationApproval:
+        options.conversationApprovalBridge === undefined
+          ? ("unwired" as const)
+          : ("w3b1_host_capability" as const),
       activation: "w3b2_project_index" as const,
     }),
   });

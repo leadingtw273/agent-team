@@ -33,9 +33,10 @@ import {
 } from "../../src/application/registration/index.js";
 import {
   serializeTrustedProjectConfig,
+  TrustedProjectConfigLoader,
   trustedProjectConfigSchema,
 } from "../../src/application/projects/index.js";
-import { createFixedClock, parseInstant } from "../../src/domain/foundation/index.js";
+import { createFixedClock, ok, parseInstant } from "../../src/domain/foundation/index.js";
 import { projectSchema } from "../../src/domain/project/index.js";
 import { sha256Digest } from "../../src/domain/review/index.js";
 import { AtomicFileStore, type AtomicWriteOptions } from "../../src/infrastructure/files/index.js";
@@ -166,6 +167,28 @@ const serializedConfig = serialized.value;
 const testDigestResult = sha256Digest({ test: "registration-setup" });
 if (!testDigestResult.ok) throw new Error(testDigestResult.error.code);
 const testDigest = testDigestResult.value;
+function mustDigest(value: unknown) {
+  const result = sha256Digest(value);
+  if (!result.ok) throw new Error(result.error.code);
+  return result.value;
+}
+const gateEvidenceBinding = Object.freeze({
+  schemaVersion: 1 as const,
+  source: "source_control" as const,
+  projectId: project.id,
+  repository: project.sourceControl.repository,
+  changeRequestId: "PR_node_1",
+  headSha,
+  requirementsDigest: preview.requirementsDigest,
+  diffDigest: testDigest,
+  ciChecksDigest: testDigest,
+  reviewContext: "agent-team/review" as const,
+  reviewEvidenceUrl: "https://review.test/evidence",
+});
+const gateEvidenceReceipt = Object.freeze({
+  ...gateEvidenceBinding,
+  evidenceDigest: mustDigest({ kind: "registration_setup_gate_evidence", ...gateEvidenceBinding }),
+});
 const localApprovalAuthority = Object.freeze({
   issuer: "local_ui" as const,
   authorityDigest,
@@ -173,6 +196,68 @@ const localApprovalAuthority = Object.freeze({
 const updatedAtResult = parseInstant("2026-08-05T12:00:00.000Z");
 if (!updatedAtResult.ok) throw new Error(updatedAtResult.error.code);
 const updatedAt = updatedAtResult.value;
+
+function testAuditReceipt(destination: "linear" | "pull_request") {
+  const body = [
+    "Agent Team registration Setup PR is waiting for explicit user approval.",
+    `project=${project.id}`,
+    `setup_session=${preview.setupSessionId}`,
+    `preview_digest=${preview.previewDigest}`,
+    "change_request=PR_node_1",
+    `head_sha=${headSha}`,
+    `requirements_digest=${preview.requirementsDigest}`,
+    `diff_digest=${testDigest}`,
+    `linear_audit_issue=${preview.linearAuditIssueId}`,
+    `gate_evidence_digest=${gateEvidenceReceipt.evidenceDigest}`,
+    `review_evidence=${gateEvidenceReceipt.reviewEvidenceUrl}`,
+    "merge=squash",
+    "authority=local UI or trusted current-user conversation only",
+  ].join("\n");
+  const idempotencyKey = `setup-audit:${preview.setupSessionId}:${gateEvidenceReceipt.evidenceDigest.slice(0, 16)}:${destination}`;
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    destination,
+    setupSessionId: preview.setupSessionId,
+    projectId: project.id,
+    repository: project.sourceControl.repository,
+    linearAuditIssueId: preview.linearAuditIssueId,
+    changeRequestId: "PR_node_1",
+    headSha,
+    requirementsDigest: preview.requirementsDigest,
+    diffDigest: testDigest,
+    evidenceDigest: gateEvidenceReceipt.evidenceDigest,
+    bodyDigest: mustDigest(body),
+    externalCommentId: `${destination}-comment-1`,
+    idempotencyKeyDigest: mustDigest(idempotencyKey),
+    createdAt: updatedAt,
+    reused: false,
+  });
+}
+
+const mergeIdempotencyKey = `setup-merge:${preview.setupSessionId}:${testDigest.slice(0, 16)}`;
+const mergeIntentBinding = Object.freeze({
+  schemaVersion: 1 as const,
+  projectId: project.id,
+  repository: project.sourceControl.repository,
+  changeRequestId: "PR_node_1",
+  expectedHeadSha: headSha,
+  mergeMethod: "SQUASH" as const,
+  idempotencyKey: mergeIdempotencyKey,
+});
+const mergeIntent = Object.freeze({
+  ...mergeIntentBinding,
+  mergeIntentDigest: mustDigest({
+    kind: "registration_setup_merge_intent",
+    ...mergeIntentBinding,
+  }),
+});
+const { idempotencyKey: _mergeIdempotencyKey, ...mergeReceiptBinding } = mergeIntent;
+void _mergeIdempotencyKey;
+const mergeReceipt = Object.freeze({
+  ...mergeReceiptBinding,
+  state: "merged" as const,
+  idempotencyKeyDigest: mustDigest(mergeIdempotencyKey),
+});
 
 function plannedJournal(): RegistrationSetupJournalDraft {
   return {
@@ -222,57 +307,10 @@ function sessionDraft(
     linearAuditIssueId: preview.linearAuditIssueId,
     ...(phase === "activated"
       ? {
-          gateEvidenceReceipt: {
-            schemaVersion: 1 as const,
-            source: "source_control" as const,
-            projectId: project.id,
-            repository: project.sourceControl.repository,
-            changeRequestId: "PR_node_1",
-            headSha,
-            requirementsDigest: preview.requirementsDigest,
-            diffDigest: testDigest,
-            ciChecksDigest: testDigest,
-            reviewContext: "agent-team/review" as const,
-            reviewEvidenceUrl: "https://review.test/evidence",
-            evidenceDigest: testDigest,
-          },
+          gateEvidenceReceipt,
           audit: {
-            linearReceipt: {
-              schemaVersion: 1 as const,
-              destination: "linear" as const,
-              setupSessionId: preview.setupSessionId,
-              projectId: project.id,
-              repository: project.sourceControl.repository,
-              linearAuditIssueId: preview.linearAuditIssueId,
-              changeRequestId: "PR_node_1",
-              headSha,
-              requirementsDigest: preview.requirementsDigest,
-              diffDigest: testDigest,
-              evidenceDigest: testDigest,
-              bodyDigest: testDigest,
-              externalCommentId: "linear-comment-1",
-              idempotencyKeyDigest: testDigest,
-              createdAt: updatedAt,
-              reused: false,
-            },
-            pullRequestReceipt: {
-              schemaVersion: 1 as const,
-              destination: "pull_request" as const,
-              setupSessionId: preview.setupSessionId,
-              projectId: project.id,
-              repository: project.sourceControl.repository,
-              linearAuditIssueId: preview.linearAuditIssueId,
-              changeRequestId: "PR_node_1",
-              headSha,
-              requirementsDigest: preview.requirementsDigest,
-              diffDigest: testDigest,
-              evidenceDigest: testDigest,
-              bodyDigest: testDigest,
-              externalCommentId: "pr-comment-1",
-              idempotencyKeyDigest: testDigest,
-              createdAt: updatedAt,
-              reused: false,
-            },
+            linearReceipt: testAuditReceipt("linear"),
+            pullRequestReceipt: testAuditReceipt("pull_request"),
           },
         }
       : {}),
@@ -318,27 +356,8 @@ function sessionDraft(
           approvalAuthorityDigest: testDigest,
           approvalSource: "local_ui" as const,
           approvalSetupRevision: 1,
-          mergeIntent: {
-            schemaVersion: 1 as const,
-            projectId: project.id,
-            repository: project.sourceControl.repository,
-            changeRequestId: "PR_node_1",
-            expectedHeadSha: headSha,
-            mergeMethod: "SQUASH" as const,
-            idempotencyKey: "setup-merge:activation-test",
-            mergeIntentDigest: testDigest,
-          },
-          mergeReceipt: {
-            schemaVersion: 1 as const,
-            projectId: project.id,
-            repository: project.sourceControl.repository,
-            changeRequestId: "PR_node_1",
-            expectedHeadSha: headSha,
-            mergeMethod: "SQUASH" as const,
-            mergeIntentDigest: testDigest,
-            state: "merged" as const,
-            idempotencyKeyDigest: testDigest,
-          },
+          mergeIntent,
+          mergeReceipt,
           mergedConfigReceipt: {
             schemaVersion: 1 as const,
             source: "source_control_default_branch" as const,
@@ -357,6 +376,75 @@ function sessionDraft(
         }
       : {}),
   };
+}
+
+async function createActivatedFixture(root: string) {
+  const sessions = new FileRegistrationSetupSessionStore(root);
+  const initial = await withExecution(root, (lease) =>
+    sessions.save(undefined, sessionDraft(), {
+      idempotencyKey: "tamper:create",
+      executionFence: lease.fence,
+    }),
+  );
+  if (!initial.ok) throw new Error(initial.error.code);
+  const activated = await withExecution(root, (lease) =>
+    sessions.activate(initial.value.session.revision, sessionDraft("activated"), mergedSha, {
+      idempotencyKey: "tamper:activate",
+      executionFence: lease.fence,
+    }),
+  );
+  if (!activated.ok) throw new Error(activated.error.code);
+  const registry = new FileRegistrationSetupActivationRegistry(root);
+  const published = await registry.publish(activated.value.marker, {
+    idempotencyKey: "tamper:publish",
+  });
+  if (!published.ok) throw new Error(published.error.code);
+  return { sessions, activated, registry };
+}
+
+interface MutableActivationRecord {
+  marker: Record<string, unknown>;
+  session: {
+    mergedConfigReceipt: {
+      projectId: string;
+      repository: string;
+      path: string;
+      config: { projectRules: string[] };
+    };
+  };
+}
+
+async function tamperActivationRecord(
+  sessions: FileRegistrationSetupSessionStore,
+  mutate: (record: MutableActivationRecord) => void,
+) {
+  const path = sessions.paths(preview.setupSessionId).activation;
+  const record = JSON.parse(await readFile(path, "utf8")) as MutableActivationRecord;
+  mutate(record);
+  await writeFile(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+}
+
+async function expectLoaderActivationUnavailable(
+  registry: FileRegistrationSetupActivationRegistry,
+) {
+  const loader = new TrustedProjectConfigLoader(
+    {
+      readTextFileAtRevision: (command) =>
+        Promise.resolve(
+          ok({
+            revisionSha: mergedSha,
+            path: command.path,
+            content: serializedConfig.content,
+            byteLength: Buffer.byteLength(serializedConfig.content, "utf8"),
+          }),
+        ),
+    },
+    registry,
+  );
+  await expect(loader.load(project)).resolves.toMatchObject({
+    state: "rejected",
+    reason: "activation_unavailable",
+  });
 }
 
 function binding(revision = 2): RegistrationSetupApprovalBinding {
@@ -547,6 +635,40 @@ describe("file-backed registration setup state", () => {
       error: { code: "conflict" },
     });
   });
+
+  it.each(["authorityDigest", "approvalNonceDigest"] as const)(
+    "rejects a valid-format activation marker %s substitution across registry and loader",
+    async (field) => {
+      const root = await temporaryRoot();
+      const { sessions, registry } = await createActivatedFixture(root);
+      await tamperActivationRecord(sessions, (record) => {
+        record.marker[field] = mustDigest(`tampered-${field}`);
+      });
+      await expect(sessions.load(preview.setupSessionId)).resolves.toMatchObject({ ok: false });
+      await expect(registry.read(project.id)).resolves.toMatchObject({ ok: false });
+      await expectLoaderActivationUnavailable(registry);
+    },
+  );
+
+  it.each(["project", "repository", "path", "config"] as const)(
+    "rejects an activated W2 receipt with exact-binding %s tampering",
+    async (field) => {
+      const root = await temporaryRoot();
+      const { sessions, registry } = await createActivatedFixture(root);
+      await tamperActivationRecord(sessions, (record) => {
+        const receipt = record.session.mergedConfigReceipt;
+        if (field === "project") receipt.projectId = "project_other";
+        if (field === "repository") receipt.repository = "other/repository";
+        if (field === "path") receipt.path = ".agent-team/other.json";
+        if (field === "config") receipt.config.projectRules = ["Tampered rule."];
+      });
+      await expect(sessions.readActivation(preview.setupSessionId)).resolves.toMatchObject({
+        ok: false,
+      });
+      await expect(registry.read(project.id)).resolves.toMatchObject({ ok: false });
+      await expectLoaderActivationUnavailable(registry);
+    },
+  );
 
   it.each(["state-root", "registration-parent", "session-child"] as const)(
     "rejects a %s symlink without following it",

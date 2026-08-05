@@ -233,6 +233,32 @@ describe("W3A Registration Setup production controller", () => {
     expect(controller).not.toHaveProperty("approveAndMerge");
   });
 
+  it.each(["authority", "nonce"] as const)(
+    "fails closed on GET when an activated session has a mismatched %s binding",
+    async () => {
+      const initial = fixture();
+      const model = await initial.controller.read({ authorityDigest });
+      if (model.preview === undefined) throw new Error("missing preview");
+      const session = {
+        ...readySession(model.preview.setupSessionId, model.preview.previewDigest as Sha256Digest),
+        phase: "activated" as const,
+      };
+      const test = fixture({
+        refreshed: Object.freeze({
+          state: "failed" as const,
+          stage: "activation" as const,
+          error: domainError("external_failure"),
+          session,
+        }),
+      });
+      test.sessions.set(session.setupSessionId, session);
+      const read = await test.controller.read({ authorityDigest });
+      expect(read.state).toBe("configuration_incomplete");
+      expect(read.evidence.map((item) => item.code)).toContain("activation_index_required");
+      expect(test.calls.map(callName)).toEqual(["refresh"]);
+    },
+  );
+
   it("fails closed when the server-side source is missing", async () => {
     const { controller, calls } = fixture({ source: "missing" });
     const result = await controller.read({ authorityDigest });

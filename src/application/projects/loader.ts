@@ -196,8 +196,10 @@ export class TrustedProjectConfigLoader {
     const expectedMarkerKeys = [
       "approvalReferenceDigest",
       "approvalSource",
+      "approvalNonceDigest",
       "auditReceiptsDigest",
       "authoritativeRevision",
+      "authorityDigest",
       "changeRequestId",
       "configDigest",
       "defaultBranch",
@@ -229,6 +231,8 @@ export class TrustedProjectConfigLoader {
       !digest.test(marker.gateEvidenceDigest) ||
       !digest.test(marker.auditReceiptsDigest) ||
       !digest.test(marker.approvalReferenceDigest) ||
+      !digest.test(marker.authorityDigest) ||
+      !digest.test(marker.approvalNonceDigest) ||
       (rawMarker["approvalSource"] !== "local_ui" &&
         rawMarker["approvalSource"] !== "current_user_conversation")
     ) {

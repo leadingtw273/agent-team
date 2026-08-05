@@ -168,6 +168,25 @@ describe("W3A production Registration Setup composition", () => {
     expect(first).toMatchObject({ state: "preview_confirmation_issued" });
     expect(setup.transportCalls).toEqual([]);
 
+    const { conversationApprovalBridge: _bridge, ...localUiOnlyOptions } = options;
+    void _bridge;
+    const localUiOnly = createProductionRegistrationSetupComposition({
+      ...localUiOnlyOptions,
+      stateRoot: join(setup.root, "local-ui-only-state"),
+    });
+    expect(localUiOnly.wiring).toMatchObject({
+      state: "ready",
+      merge: "w3b2_controller_squash",
+      activation: "w3b2_project_index",
+      conversationApproval: "unwired",
+    });
+    expect(localUiOnly.conversationApproval).toBeUndefined();
+    expect(await localUiOnly.controller.read({ authorityDigest })).toMatchObject({
+      state: "preview_ready",
+    });
+    expect(localUiOnly.controller).toHaveProperty("approveAndMergeLocalUi");
+    expect(setup.transportCalls).toEqual([]);
+
     const wizard = createProductionRegistrationWizardUiComposition({
       readOnlyScan: fixtureRegistrationReadOnlyScanUseCase,
       linearUseCaseFactory: createFixtureLinearProvisionUseCaseFactory(),

@@ -454,7 +454,36 @@ function mergedConfigMatches(
   );
 }
 
-function activationMarkerMatches(
+export function verifyRegistrationSetupActivatedSession(
+  session: RegistrationSetupSession,
+): boolean {
+  const evidenceCodes = new Set(session.evidence.map((item) => item.code));
+  return (
+    session.phase === "activated" &&
+    session.changeRequest.state === "merged" &&
+    gateEvidenceMatches(session) &&
+    auditReceiptsDigest(session) !== undefined &&
+    session.approvalReferenceDigest !== undefined &&
+    digestPattern.test(session.approvalReferenceDigest) &&
+    session.approvalAuthorityDigest !== undefined &&
+    digestPattern.test(session.approvalAuthorityDigest) &&
+    session.approvalNonceDigest !== undefined &&
+    digestPattern.test(session.approvalNonceDigest) &&
+    (session.approvalSource === "local_ui" ||
+      session.approvalSource === "current_user_conversation") &&
+    mergeIntentMatches(session, session.mergeIntent) &&
+    mergeReceiptMatches(session.mergeIntent, session.mergeReceipt) &&
+    session.mergedConfigReceipt !== undefined &&
+    mergedConfigMatches(session, session.mergedConfigReceipt) &&
+    session.activatedRevisionSha !== undefined &&
+    sameSha(session.activatedRevisionSha, session.mergedConfigReceipt.authoritativeRevision) &&
+    evidenceCodes.has("setup_user_approval_consumed") &&
+    evidenceCodes.has("setup_merge_verified") &&
+    evidenceCodes.has("trusted_config_activated")
+  );
+}
+
+export function verifyRegistrationSetupActivationBinding(
   session: RegistrationSetupSession,
   marker: RegistrationSetupActivationMarker | undefined,
 ): marker is RegistrationSetupActivationMarker {
@@ -463,6 +492,7 @@ function activationMarkerMatches(
   const rawMarker = marker as unknown as Readonly<Record<string, unknown>> | undefined;
   return (
     marker !== undefined &&
+    verifyRegistrationSetupActivatedSession(session) &&
     merged !== undefined &&
     auditDigest !== undefined &&
     rawMarker?.["schemaVersion"] === 1 &&
@@ -480,7 +510,9 @@ function activationMarkerMatches(
     marker.gateEvidenceDigest === session.gateEvidenceReceipt?.evidenceDigest &&
     marker.auditReceiptsDigest === auditDigest &&
     marker.approvalSource === session.approvalSource &&
-    marker.approvalReferenceDigest === session.approvalReferenceDigest
+    marker.approvalReferenceDigest === session.approvalReferenceDigest &&
+    marker.authorityDigest === session.approvalAuthorityDigest &&
+    marker.approvalNonceDigest === session.approvalNonceDigest
   );
 }
 
@@ -546,12 +578,7 @@ function validSession(session: RegistrationSetupSession): boolean {
       (mergeIntentMatches(session, session.mergeIntent) &&
         (session.mergeReceipt === undefined ||
           mergeReceiptMatches(session.mergeIntent, session.mergeReceipt)))) &&
-    (session.phase !== "activated" ||
-      (session.activatedRevisionSha !== undefined &&
-        shaPattern.test(session.activatedRevisionSha) &&
-        session.mergeReceipt !== undefined &&
-        session.mergedConfigReceipt !== undefined &&
-        mergedConfigMatches(session, session.mergedConfigReceipt)))
+    (session.phase !== "activated" || verifyRegistrationSetupActivatedSession(session))
   );
 }
 
@@ -1292,7 +1319,7 @@ export class RegistrationSetupCoordinator {
       const marker = await this.#owned(lease, () =>
         this.#ports.sessions.readActivation(session.setupSessionId),
       );
-      if (!marker.ok || !activationMarkerMatches(session, marker.value)) {
+      if (!marker.ok || !verifyRegistrationSetupActivationBinding(session, marker.value)) {
         return failed("activation", session);
       }
       const indexed = await this.#owned(lease, () =>
@@ -1965,7 +1992,7 @@ export class RegistrationSetupCoordinator {
       activatedSession = sessionRead.value;
       marker = markerRead.value;
     }
-    if (!activationMarkerMatches(activatedSession, marker)) {
+    if (!verifyRegistrationSetupActivationBinding(activatedSession, marker)) {
       return failed("activation", activatedSession);
     }
     return this.#publishActivationIndex(activatedSession, request, lease, marker);
@@ -1983,7 +2010,7 @@ export class RegistrationSetupCoordinator {
             this.#ports.sessions.readActivation(session.setupSessionId),
           )
         : Object.freeze({ ok: true as const, value: knownMarker });
-    if (!readMarker.ok || !activationMarkerMatches(session, readMarker.value)) {
+    if (!readMarker.ok || !verifyRegistrationSetupActivationBinding(session, readMarker.value)) {
       return failed("activation", session);
     }
     const marker = readMarker.value;

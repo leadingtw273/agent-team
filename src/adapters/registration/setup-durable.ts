@@ -9,6 +9,8 @@ import { z } from "zod";
 import {
   createRegistrationSetupPreview,
   registrationSetupBranch,
+  verifyRegistrationSetupActivatedSession,
+  verifyRegistrationSetupActivationBinding,
   type RegistrationSetupActivationMarker,
   type RegistrationSetupAuditIntent,
   type RegistrationSetupAuditReceipt,
@@ -428,12 +430,7 @@ const sessionSchema = z
       ((session.phase !== "merge_pending" && session.phase !== "activated") ||
         session.mergeIntent !== undefined) &&
       (session.phase !== "activated" ||
-        (session.activatedRevisionSha !== undefined &&
-          session.mergeReceipt !== undefined &&
-          session.mergedConfigReceipt !== undefined &&
-          session.changeRequest.state === "merged" &&
-          evidenceCodes.has("setup_merge_verified") &&
-          evidenceCodes.has("trusted_config_activated")))
+        verifyRegistrationSetupActivatedSession(session as unknown as RegistrationSetupSession))
     );
   }) as unknown as z.ZodType<RegistrationSetupSession>;
 
@@ -455,31 +452,15 @@ const markerSchema = z
     auditReceiptsDigest: digestSchema,
     approvalSource: z.enum(["local_ui", "current_user_conversation"]),
     approvalReferenceDigest: digestSchema,
+    authorityDigest: digestSchema,
+    approvalNonceDigest: digestSchema,
   })
   .strict() as unknown as z.ZodType<RegistrationSetupActivationMarker>;
 
 const activationRecordSchema = z
   .object({ schemaVersion: z.literal(1), session: sessionSchema, marker: markerSchema })
   .strict()
-  .refine(
-    ({ session, marker }) =>
-      session.phase === "activated" &&
-      session.setupSessionId === marker.setupSessionId &&
-      session.project.id === marker.projectId &&
-      session.project.sourceControl.repository === marker.repository &&
-      session.changeRequest.id === marker.changeRequestId &&
-      session.headSha.toLowerCase() === marker.setupHeadSha.toLowerCase() &&
-      session.mergedConfigReceipt?.mergeCommitSha.toLowerCase() ===
-        marker.mergeCommitSha.toLowerCase() &&
-      session.project.defaultBranch === marker.defaultBranch &&
-      session.configDigest === marker.configDigest &&
-      session.linearAuditIssueId === marker.linearAuditIssueId &&
-      session.gateEvidenceReceipt?.evidenceDigest === marker.gateEvidenceDigest &&
-      durableAuditReceiptsDigest(session) === marker.auditReceiptsDigest &&
-      session.approvalSource === marker.approvalSource &&
-      session.approvalReferenceDigest === marker.approvalReferenceDigest &&
-      session.activatedRevisionSha?.toLowerCase() === marker.authoritativeRevision.toLowerCase(),
-  );
+  .refine(({ session, marker }) => verifyRegistrationSetupActivationBinding(session, marker));
 
 function durableAuditReceiptsDigest(session: RegistrationSetupSession): string | undefined {
   if (
@@ -1232,6 +1213,8 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
           auditReceiptsDigest: durableAuditReceiptsDigest(session),
           approvalSource: session.approvalSource,
           approvalReferenceDigest: session.approvalReferenceDigest,
+          authorityDigest: session.approvalAuthorityDigest,
+          approvalNonceDigest: session.approvalNonceDigest,
         });
         const record = activationRecordSchema.parse({ schemaVersion: 1, session, marker });
         const persisted = await persistPrivate(
