@@ -39,6 +39,7 @@ const sourceControl = {
   getCommitChecks: unavailable,
   setCommitStatus: unavailable,
   appendChangeRequestComment: unavailable,
+  markChangeRequestReady: unavailable,
   enableAutoMerge: unavailable,
   closeChangeRequest: unavailable,
 } satisfies SourceControlPort;
@@ -91,6 +92,7 @@ const requiredMethods = {
     "getCommitChecks",
     "setCommitStatus",
     "appendChangeRequestComment",
+    "markChangeRequestReady",
     "enableAutoMerge",
     "closeChangeRequest",
   ],

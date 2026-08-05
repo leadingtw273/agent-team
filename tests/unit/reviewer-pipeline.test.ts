@@ -1,0 +1,715 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  ReviewerPipeline,
+  type ReviewerPipelinePorts,
+  type ReviewerPipelineRequest,
+  type ReviewQualityDimension,
+  type ReviewerReport,
+} from "../../src/application/pipelines/index.js";
+import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
+import type {
+  ProviderEvent,
+  ProviderRunHandle,
+  ProviderRunRequest,
+} from "../../src/application/ports/index.js";
+import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import { jobSchema, type JobAttemptCounters } from "../../src/domain/jobs/index.js";
+import {
+  issueSchema,
+  projectSchema,
+  type ReviewRequirement,
+} from "../../src/domain/project/index.js";
+import {
+  createRequirementSnapshot,
+  createReviewIdentity,
+  type EffectiveTreeChange,
+  type RequirementSnapshot,
+  type ReviewIdentity,
+} from "../../src/domain/review/index.js";
+import { visualManifestSchema } from "../../src/domain/checkpoint/index.js";
+
+const headSha = "a".repeat(40);
+const baseSha = "b".repeat(40);
+const objectSha = "c".repeat(40);
+const artifactSha = "d".repeat(64);
+const acceptanceCriterion = "The review binds to exact evidence.";
+const codeQualityDimensions = [
+  "test_effectiveness",
+  "correctness",
+  "error_handling",
+  "boundaries",
+  "security",
+  "secrets",
+  "readability",
+  "module_boundaries",
+  "maintainability",
+  "duplication_overdesign",
+  "compatibility",
+  "scope",
+  "documentation_migrations",
+] as const satisfies readonly ReviewQualityDimension[];
+const visualQualityDimensions = [
+  "layout",
+  "spacing",
+  "hierarchy",
+  "readability",
+  "style_consistency",
+  "sizes_states",
+  "accessibility",
+  "broken_assets_clipping_flicker",
+  "visual_regression",
+] as const satisfies readonly ReviewQualityDimension[];
+
+function instant(value: string): Instant {
+  const parsed = parseInstant(value);
+  if (!parsed.ok) throw new Error(parsed.error.code);
+  return parsed.value;
+}
+
+const now = instant("2026-08-05T00:00:00.000Z");
+const deadline = instant("2026-08-05T00:30:00.000Z");
+const project = projectSchema.parse({
+  schemaVersion: 1,
+  id: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  displayName: "Reviewer fixture",
+  localRepositoryPath: "/tmp/repository",
+  defaultBranch: "main",
+  workManagement: { provider: "linear", containerId: "workspace", projectId: "team" },
+  sourceControl: { provider: "github", repository: "owner/repository" },
+});
+const worktree = {
+  repositoryRoot: project.localRepositoryPath,
+  path: "/tmp/reviewer-worktree",
+  branch: "feature/ENG-123-review",
+  headSha,
+} as const;
+const diff: readonly EffectiveTreeChange[] = [
+  {
+    before: null,
+    after: {
+      path: "src/feature.ts",
+      mode: "100644",
+      objectId: { algorithm: "sha1", value: objectSha },
+    },
+  },
+];
+
+function context(reviewRequirement: ReviewRequirement) {
+  const issue = issueSchema.parse({
+    schemaVersion: 1,
+    id: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    projectId: project.id,
+    externalId: "ENG-123",
+    title: "Review pipeline",
+    goal: "Review an exact diff with fresh context.",
+    background: "CI is green.",
+    acceptanceCriteria: [acceptanceCriterion],
+    inScope: ["src"],
+    outOfScope: ["Implementer conversation"],
+    dependencies: { kind: "none" },
+    priority: "high",
+    agentRole: "implementer",
+    reviewRequirement,
+    estimatedMinutes: 30,
+    changeRegions: [{ path: "src", coverage: "subtree" }],
+  });
+  const snapshot = createRequirementSnapshot(issue, now);
+  if (!snapshot.ok) throw new Error(snapshot.error.code);
+  const identity = createReviewIdentity(snapshot.value, headSha, diff);
+  if (!identity.ok) throw new Error(identity.error.code);
+  return { issue, snapshot: snapshot.value, identity: identity.value };
+}
+
+function firstCriterion(snapshot: RequirementSnapshot): string {
+  const criterion = snapshot.issue.acceptanceCriteria?.[0];
+  if (criterion === undefined) throw new Error("Missing fixture acceptance criterion.");
+  return criterion;
+}
+
+const config = trustedProjectConfigSchema.parse({
+  schemaVersion: 1,
+  projectId: project.id,
+  defaultBranch: "main",
+  platforms: {
+    workManagement: project.workManagement,
+    sourceControl: project.sourceControl,
+  },
+  projectRules: ["Review exact Head only."],
+  roleInstructions: {
+    code_reviewer: ["Check code quality."],
+    visual_reviewer: ["Check observable visual evidence."],
+  },
+  commands: {
+    quality: [{ executable: "pnpm", arguments: ["test"] }],
+    visualReview: [{ executable: "pnpm", arguments: ["test:visual"] }],
+  },
+});
+
+function job(snapshot: RequirementSnapshot, attempts: Partial<JobAttemptCounters> = {}) {
+  return jobSchema.parse({
+    schemaVersion: 1,
+    id: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    projectId: project.id,
+    issueId: snapshot.issue.id,
+    createdAt: now,
+    watchdogExtensionGranted: false,
+    attempts: {
+      processRecoveries: 0,
+      ciFixRounds: 0,
+      reviewerFixRounds: 0,
+      reviewRuns: 0,
+      ...attempts,
+    },
+  });
+}
+
+function request(
+  reviewRequirement: ReviewRequirement,
+  attempts: Partial<JobAttemptCounters> = {},
+  overrides: Partial<ReviewerPipelineRequest> = {},
+) {
+  const review = context(reviewRequirement);
+  const needsCode = reviewRequirement !== "visual_review";
+  const needsVisual = reviewRequirement !== "code_review";
+  const visualManifest = needsVisual
+    ? visualManifestSchema.parse({
+        schemaVersion: 1 as const,
+        issueId: review.issue.id,
+        commitSha: headSha,
+        generatedAt: now,
+        environment: { runner: "fixture", operatingSystem: "linux" },
+        artifacts: [
+          {
+            path: "evidence/screen.png",
+            mediaType: "image/png",
+            sha256: artifactSha,
+            title: "Screen",
+            acceptanceCriteria: [firstCriterion(review.snapshot)],
+          },
+        ],
+      })
+    : undefined;
+  const evidence = needsVisual
+    ? [
+        {
+          kind: "file" as const,
+          category: "visual_artifact" as const,
+          source: "artifact:screen",
+          mediaType: "image/png",
+          path: "/tmp/reviewer-worktree/evidence/screen.png",
+          sha256: artifactSha,
+          repositoryPath: "evidence/screen.png",
+        },
+      ]
+    : [
+        {
+          kind: "text" as const,
+          category: "known_issue" as const,
+          source: "known:compatibility",
+          mediaType: "text/plain",
+          content: "Known compatibility boundary.",
+        },
+      ];
+  return {
+    review,
+    value: {
+      job: job(review.snapshot, attempts),
+      project,
+      trustedConfig: config,
+      requirementSnapshot: review.snapshot,
+      worktree,
+      changeRequestId: "42",
+      baseRevision: baseSha,
+      expectedHeadSha: headSha,
+      models: {
+        ...(needsCode ? { code: "gpt-review" } : {}),
+        ...(needsVisual ? { visual: "gemini-visual" } : {}),
+      },
+      evidence,
+      ...(visualManifest === undefined ? {} : { visualManifest }),
+      deadlineAt: deadline,
+      idempotencyKeyPrefix: "job:ENG-123:review",
+      ...overrides,
+    } satisfies ReviewerPipelineRequest,
+  };
+}
+
+function report(
+  role: "code_reviewer" | "visual_reviewer",
+  identity: ReviewIdentity,
+  verdict: ReviewerReport["verdict"] = "passed",
+  findings: ReviewerReport["findings"] = [],
+): ReviewerReport {
+  const evidenceSources = [role === "visual_reviewer" ? "artifact:screen" : "agent-team:diff"];
+  const qualityDimensions =
+    role === "code_reviewer" ? codeQualityDimensions : visualQualityDimensions;
+  return {
+    schemaVersion: 1,
+    role,
+    verdict,
+    requirementsDigest: identity.requirementsDigest,
+    headSha: identity.headSha,
+    diffDigest: identity.diffDigest,
+    summary:
+      verdict === "passed" ? "All acceptance and quality checks passed." : "Review found issues.",
+    acceptanceCriteria: [
+      {
+        criterion: acceptanceCriterion,
+        status:
+          verdict === "changes_requested"
+            ? "failed"
+            : verdict === "clarification_required"
+              ? "clarification_required"
+              : "passed",
+        summary: "The approved criterion was reviewed.",
+        evidenceSources,
+      },
+    ],
+    qualityChecks: qualityDimensions.map((dimension, index) => ({
+      dimension,
+      status: verdict === "changes_requested" && index === 0 ? "failed" : "passed",
+      summary: `Reviewed ${dimension}.`,
+      evidenceSources,
+    })),
+    findings,
+  };
+}
+
+function handle(output: unknown, events: readonly ProviderEvent[] = []): ProviderRunHandle {
+  return {
+    runId: `review-${Math.random().toString(16)}`,
+    events: {
+      async *[Symbol.asyncIterator]() {
+        await Promise.resolve();
+        for (const event of events) yield event;
+        yield {
+          kind: "output",
+          observedAt: now,
+          stream: "stdout",
+          text: typeof output === "string" ? output : JSON.stringify(output),
+        } as const;
+      },
+    },
+    completion: () => Promise.resolve(ok({ outcome: "completed", sessionId: "fresh-session" })),
+    respondToToolRequest: () => Promise.resolve(ok(undefined)),
+    interrupt: () => Promise.resolve(ok(undefined)),
+  };
+}
+
+interface FixtureOptions {
+  readonly checks?: "pending" | "success" | "failure";
+  readonly reports?: Partial<Record<"code_reviewer" | "visual_reviewer", unknown>>;
+  readonly postReviewDirty?: boolean;
+  readonly evidenceVerified?: boolean;
+  readonly persistence?: "confirmed" | "unknown";
+}
+
+function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}) {
+  const calls: string[] = [];
+  const providerRequests: ProviderRunRequest[] = [];
+  const persistedJobs: ReturnType<typeof job>[] = [];
+  let workingTreeReads = 0;
+  const draft = {
+    id: "PR_node_fixture",
+    number: 42,
+    url: "https://example.invalid/pull/42",
+    state: "open",
+    draft: true,
+    baseBranch: "main",
+    headBranch: worktree.branch,
+    headSha,
+    mergeability: "mergeable",
+    autoMergeEnabled: false,
+    updatedAt: now,
+  } as const;
+  const ready = { ...draft, draft: false } as const;
+  const provider = (role: "code_reviewer" | "visual_reviewer") => ({
+    inspectCapabilities: () =>
+      Promise.resolve(
+        ok({
+          provider: role,
+          cliVersion: "1",
+          models: [role === "code_reviewer" ? "gpt-review" : "gemini-visual"],
+          supportsResume: false,
+          supportsStructuredEvents: true,
+          supportsDynamicApproval: false,
+          supportsVisualInput: role === "visual_reviewer",
+        }),
+      ),
+    start: (providerRequest: ProviderRunRequest) => {
+      calls.push(`provider:${role}`);
+      providerRequests.push(providerRequest);
+      const output = options.reports?.[role] ?? report(role, input.review.identity);
+      return Promise.resolve(ok(handle(output)));
+    },
+  });
+  const ports: ReviewerPipelinePorts = {
+    git: {
+      inspectWorktree: () => {
+        calls.push("git:worktree");
+        return Promise.resolve(
+          ok({
+            rootPath: project.localRepositoryPath,
+            headSha,
+            branch: worktree.branch,
+            clean: !options.postReviewDirty || workingTreeReads === 0,
+          }),
+        );
+      },
+      inspectWorkingTree: () => {
+        workingTreeReads += 1;
+        calls.push("git:changes");
+        return Promise.resolve(
+          ok({
+            headSha,
+            changes:
+              options.postReviewDirty && workingTreeReads > 1
+                ? [
+                    {
+                      path: "src/changed.ts",
+                      kind: "modified" as const,
+                      mode: "file" as const,
+                      staged: false,
+                    },
+                  ]
+                : [],
+          }),
+        );
+      },
+      getEffectiveTreeDiff: () => {
+        calls.push("git:diff");
+        return Promise.resolve(ok(diff));
+      },
+    },
+    sourceControl: {
+      getChangeRequest: () => {
+        calls.push("pr:get");
+        return Promise.resolve(ok(draft));
+      },
+      getCommitChecks: () => {
+        calls.push("ci:get");
+        return Promise.resolve(
+          ok({
+            headSha,
+            aggregate: options.checks ?? "success",
+            checks: [
+              {
+                name: "quality",
+                status: options.checks === "pending" ? "in_progress" : "completed",
+                conclusion:
+                  options.checks === "pending"
+                    ? null
+                    : options.checks === "failure"
+                      ? "failure"
+                      : "success",
+              },
+            ],
+          }),
+        );
+      },
+      markChangeRequestReady: () => {
+        calls.push("pr:ready");
+        return Promise.resolve(ok(ready));
+      },
+    },
+    codeReviewer: provider("code_reviewer"),
+    visualReviewer: provider("visual_reviewer"),
+    toolDecisions: {
+      decide: () =>
+        Promise.resolve(ok({ response: "approve", pause: false, summary: "read-only" })),
+    },
+    evidenceIntegrity: {
+      verify: (evidence) => {
+        calls.push(`evidence:${evidence.source}`);
+        return Promise.resolve(
+          ok({ verified: options.evidenceVerified ?? true, byteLength: 1_024 }),
+        );
+      },
+    },
+    jobs: {
+      update: (updated) => {
+        calls.push("job:update");
+        persistedJobs.push(updated);
+        return Promise.resolve(ok({ durability: options.persistence ?? "confirmed" }));
+      },
+    },
+    checkpoint: {
+      preserve: () => {
+        calls.push("checkpoint");
+        return Promise.resolve(ok({ checkpointId: "checkpoint-review-limit" }));
+      },
+    },
+  };
+  return {
+    pipeline: new ReviewerPipeline(ports),
+    calls,
+    providerRequests,
+    persistedJobs,
+  };
+}
+
+describe("ReviewerPipeline", () => {
+  it("runs a fresh code review after exact-SHA CI success and increments only reviewRuns", async () => {
+    const input = request("code_review", { ciFixRounds: 1 });
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "approved",
+      job: { attempts: { ciFixRounds: 1, reviewerFixRounds: 0, reviewRuns: 1 } },
+      changeRequest: { draft: false, headSha },
+      reports: [{ role: "code_reviewer", verdict: "passed" }],
+    });
+    expect(setup.providerRequests).toHaveLength(1);
+    expect(setup.providerRequests[0]).toMatchObject({
+      role: "code_reviewer",
+      model: "gpt-review",
+      workingDirectory: worktree.path,
+    });
+    expect(setup.providerRequests[0]?.checkpoint).toBeUndefined();
+    expect(setup.providerRequests[0]?.externalData.map((block) => block.source)).toEqual([
+      "agent-team:review-identity",
+      "agent-team:diff",
+      "agent-team:ci",
+      "known:compatibility",
+    ]);
+    const diffEvidence = setup.providerRequests[0]?.externalData.find(
+      (block) => block.kind === "text" && block.source === "agent-team:diff",
+    );
+    expect(diffEvidence?.kind === "text" ? JSON.parse(diffEvidence.content) : undefined).toEqual(
+      diff,
+    );
+    expect(setup.calls).toEqual([
+      "pr:get",
+      "ci:get",
+      "git:worktree",
+      "git:changes",
+      "git:diff",
+      "pr:ready",
+      "provider:code_reviewer",
+      "git:worktree",
+      "git:changes",
+      "job:update",
+    ]);
+  });
+
+  it("requires both code and visual reviewers to pass in a dual review", async () => {
+    const input = request("dual_review");
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "approved",
+      reports: [
+        { role: "code_reviewer", verdict: "passed" },
+        { role: "visual_reviewer", verdict: "passed" },
+      ],
+    });
+    expect(setup.providerRequests).toHaveLength(2);
+    const visual = setup.providerRequests.find((run) => run.role === "visual_reviewer");
+    expect(visual?.externalData.map((block) => block.source)).toEqual([
+      "agent-team:review-identity",
+      "agent-team:diff",
+      "agent-team:ci",
+      "artifact:screen",
+      "agent-team:visual-manifest",
+    ]);
+    expect(setup.calls).toContain("evidence:artifact:screen");
+  });
+
+  it("returns blocking findings when either half of a dual review rejects", async () => {
+    const input = request("dual_review");
+    const blocking = {
+      severity: "blocking" as const,
+      title: "Clipped content",
+      description: "The evidence shows clipped content.",
+      acceptanceCriteria: [firstCriterion(input.review.snapshot)],
+      evidenceSources: ["artifact:screen"],
+    };
+    const setup = fixture(input, {
+      reports: {
+        visual_reviewer: report("visual_reviewer", input.review.identity, "changes_requested", [
+          blocking,
+        ]),
+      },
+    });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "changes_requested",
+      findings: [blocking],
+      job: { attempts: { reviewerFixRounds: 0, reviewRuns: 1 } },
+    });
+  });
+
+  it("returns clarification separately from implementation findings", async () => {
+    const input = request("code_review");
+    const clarification = {
+      severity: "clarification" as const,
+      title: "Ambiguous AC",
+      description: "The accepted boundary is unclear.",
+      acceptanceCriteria: [firstCriterion(input.review.snapshot)],
+      evidenceSources: [],
+    };
+    const setup = fixture(input, {
+      reports: {
+        code_reviewer: report("code_reviewer", input.review.identity, "clarification_required", [
+          clarification,
+        ]),
+      },
+    });
+
+    await expect(setup.pipeline.run(input.value)).resolves.toMatchObject({
+      state: "clarification_required",
+      findings: [clarification],
+    });
+  });
+
+  it.each([
+    ["CI", { ciFixRounds: 2 }],
+    ["Reviewer fix", { reviewerFixRounds: 2 }],
+    ["review run", { reviewRuns: 3 }],
+  ] as const)(
+    "checkpoints before Provider work when the %s limit is reached",
+    async (_name, attempts) => {
+      const input = request("code_review", attempts);
+      const setup = fixture(input);
+      const outcome = await setup.pipeline.run(input.value);
+
+      expect(outcome).toMatchObject({
+        state: "checkpointed",
+        checkpointId: "checkpoint-review-limit",
+        job: input.value.job,
+      });
+      expect(setup.calls).toEqual(["pr:get", "ci:get", "checkpoint"]);
+    },
+  );
+
+  it("allows the third full review and preserves independent fix counters", async () => {
+    const input = request("code_review", {
+      ciFixRounds: 1,
+      reviewerFixRounds: 1,
+      reviewRuns: 2,
+    });
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "approved",
+      job: { attempts: { ciFixRounds: 1, reviewerFixRounds: 1, reviewRuns: 3 } },
+    });
+    expect(setup.persistedJobs[0]?.attempts.reviewRuns).toBe(3);
+  });
+
+  it.each(["pending", "failure"] as const)(
+    "does not start Reviewer while CI is %s",
+    async (aggregate) => {
+      const input = request("code_review");
+      const setup = fixture(input, { checks: aggregate });
+      const outcome = await setup.pipeline.run(input.value);
+
+      expect(outcome).toMatchObject({
+        state: "not_ready",
+        reason: aggregate === "pending" ? "ci_pending" : "ci_failed",
+      });
+      expect(setup.calls).toEqual(["pr:get", "ci:get"]);
+    },
+  );
+
+  it("fails closed when visual Artifact bytes do not match trusted evidence", async () => {
+    const input = request("visual_review");
+    const setup = fixture(input, { evidenceVerified: false });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "evidence" });
+    expect(setup.calls).not.toContain("pr:ready");
+    expect(setup.providerRequests).toHaveLength(0);
+  });
+
+  it("rejects a visual Artifact path that escapes the review Worktree", async () => {
+    const input = request("visual_review");
+    const artifact = input.value.evidence[0];
+    if (artifact?.kind !== "file") throw new Error("Missing fixture artifact.");
+    const escaped = {
+      ...input.value,
+      evidence: [{ ...artifact, path: "/tmp/outside/screen.png" }],
+    } satisfies ReviewerPipelineRequest;
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(escaped);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "evidence" });
+    expect(setup.calls).not.toContain("evidence:artifact:screen");
+    expect(setup.calls).not.toContain("pr:ready");
+  });
+
+  it("rejects report references outside the evidence whitelist", async () => {
+    const input = request("code_review");
+    const blocking = {
+      severity: "blocking" as const,
+      title: "Untrusted handoff claim",
+      description: "This improperly cites implementer conversation.",
+      acceptanceCriteria: [],
+      evidenceSources: ["implementer-handoff"],
+    };
+    const setup = fixture(input, {
+      reports: {
+        code_reviewer: report("code_reviewer", input.review.identity, "changes_requested", [
+          blocking,
+        ]),
+      },
+    });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "report" });
+    expect(setup.calls).not.toContain("job:update");
+  });
+
+  it.each(["acceptanceCriteria", "qualityChecks"] as const)(
+    "rejects a passed report with incomplete %s coverage",
+    async (field) => {
+      const input = request("code_review");
+      const complete = report("code_reviewer", input.review.identity);
+      const incomplete = { ...complete, [field]: complete[field].slice(1) };
+      const setup = fixture(input, { reports: { code_reviewer: incomplete } });
+      const outcome = await setup.pipeline.run(input.value);
+
+      expect(outcome).toMatchObject({ state: "failed", stage: "report" });
+      expect(setup.calls).not.toContain("job:update");
+    },
+  );
+
+  it("detects any Reviewer write even when Provider reports success", async () => {
+    const input = request("code_review");
+    const setup = fixture(input, { postReviewDirty: true });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "post_review_worktree",
+      error: { code: "permission_denied" },
+    });
+    expect(setup.calls).not.toContain("job:update");
+  });
+
+  it("fails closed when the completed review counter is not durably persisted", async () => {
+    const input = request("code_review");
+    const setup = fixture(input, { persistence: "unknown" });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "attempt_persistence" });
+  });
+
+  it("rejects visual review without a Manifest before any external call", async () => {
+    const input = request("visual_review");
+    const invalid = {
+      ...input.value,
+      visualManifest: undefined,
+    } as unknown as ReviewerPipelineRequest;
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(invalid);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "request" });
+    expect(setup.calls).toEqual([]);
+  });
+});
