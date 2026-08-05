@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import type { Stats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import {
   link,
   lstat,
@@ -61,6 +61,7 @@ export interface CommandRunResult {
   readonly stderrTruncated: boolean;
   readonly signal?: NodeJS.Signals;
   readonly spawnErrorCode?: string;
+  readonly terminationErrorCode?: string;
 }
 
 export interface CommandRunner {
@@ -94,14 +95,21 @@ type InstallationState = "not_installed" | "installed" | "untrusted_units";
 
 interface DirectoryIdentity {
   readonly path: string;
-  readonly dev: number;
-  readonly ino: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
 }
 
 interface FileIdentity {
-  readonly dev: number;
-  readonly ino: number;
-  readonly nlink: number;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly nlink: bigint;
+  readonly ctimeNs: bigint;
+  readonly birthtimeNs: bigint;
+  readonly uid: bigint;
+  readonly gid: bigint;
+  readonly mode: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
 }
 
 interface CanonicalUnit {
@@ -123,6 +131,7 @@ interface UnitPair<T> {
 interface QuarantinedUnit {
   readonly unit: CanonicalUnit;
   readonly quarantinePath: string;
+  readonly identity?: FileIdentity;
 }
 
 interface QuarantineResult {
@@ -157,6 +166,7 @@ const defaultTerminateGraceMs = 500;
 const maximumDeadlineMs = 60_000;
 const maximumOutputLimit = 1_048_576;
 const maximumTerminateGraceMs = 5_000;
+const supportsDetachedProcessGroups = process.platform !== "win32";
 
 function isErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
@@ -204,7 +214,11 @@ function outcome(
 }
 
 function successful(result: CommandRunResult): boolean {
-  return result.classification === "exited" && result.exitCode === 0;
+  return (
+    result.classification === "exited" &&
+    result.exitCode === 0 &&
+    result.terminationErrorCode === undefined
+  );
 }
 
 function commandSummary(result: CommandRunResult): Readonly<Record<string, unknown>> {
@@ -213,6 +227,9 @@ function commandSummary(result: CommandRunResult): Readonly<Record<string, unkno
     exitCode: result.exitCode,
     ...(result.signal === undefined ? {} : { signal: result.signal }),
     ...(result.spawnErrorCode === undefined ? {} : { spawnErrorCode: result.spawnErrorCode }),
+    ...(result.terminationErrorCode === undefined
+      ? {}
+      : { terminationErrorCode: result.terminationErrorCode }),
     stdoutTruncated: result.stdoutTruncated,
     stderrTruncated: result.stderrTruncated,
   };
@@ -275,6 +292,28 @@ function boundedOutputText(output: BoundedOutput): string {
   return text;
 }
 
+function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): string | undefined {
+  if (pid === undefined) return "ESRCH";
+  try {
+    process.kill(-pid, signal);
+    return undefined;
+  } catch (error) {
+    return codeFromError(error) ?? "UNKNOWN";
+  }
+}
+
+function unsupportedProcessGroupResult(): CommandRunResult {
+  return {
+    classification: "spawn_error",
+    exitCode: null,
+    stdout: "",
+    stderr: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    spawnErrorCode: "UNSUPPORTED_PROCESS_GROUPS",
+  };
+}
+
 export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): CommandRunner {
   const deadlineMs = options.deadlineMs ?? defaultDeadlineMs;
   const maxOutputBytes = options.maxOutputBytes ?? defaultOutputLimit;
@@ -294,11 +333,13 @@ export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): 
   }
 
   return Object.freeze({
-    run: async (request: CommandRunRequest) =>
-      new Promise<CommandRunResult>((resolveResult) => {
+    run: async (request: CommandRunRequest) => {
+      if (!supportsDetachedProcessGroups) return unsupportedProcessGroupResult();
+      return new Promise<CommandRunResult>((resolveResult) => {
         let child;
         try {
           child = spawn(request.executable, request.arguments, {
+            detached: true,
             env: request.environment,
             stdio: ["ignore", "pipe", "pipe"],
           });
@@ -311,6 +352,9 @@ export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): 
         let stderr: BoundedOutput = { content: Buffer.alloc(0), bytes: 0, truncated: false };
         let settled = false;
         let timedOut = false;
+        let killSent = false;
+        let pendingTimeoutResult: CommandRunResult | undefined;
+        let terminationErrorCode: string | undefined;
         let terminateTimer: NodeJS.Timeout | undefined;
         const settle = (result: CommandRunResult): void => {
           if (settled) return;
@@ -321,26 +365,20 @@ export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): 
         };
         const deadlineTimer = setTimeout(() => {
           timedOut = true;
-          try {
-            child.kill("SIGTERM");
-          } catch {
-            // The close/error handler classifies the process result.
-          }
+          const termError = signalProcessGroup(child.pid, "SIGTERM");
+          if (termError !== undefined && termError !== "ESRCH") terminationErrorCode = termError;
           terminateTimer = setTimeout(() => {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // The forced timeout result below is authoritative.
+            const killError = signalProcessGroup(child.pid, "SIGKILL");
+            if (killError !== undefined && killError !== "ESRCH") {
+              terminationErrorCode = killError;
             }
-            settle({
-              classification: "timeout",
-              exitCode: child.exitCode,
-              stdout: boundedOutputText(stdout),
-              stderr: boundedOutputText(stderr),
-              stdoutTruncated: stdout.truncated,
-              stderrTruncated: stderr.truncated,
-              ...(child.signalCode === null ? {} : { signal: child.signalCode }),
-            });
+            killSent = true;
+            if (pendingTimeoutResult !== undefined) {
+              settle({
+                ...pendingTimeoutResult,
+                ...(terminationErrorCode === undefined ? {} : { terminationErrorCode }),
+              });
+            }
           }, terminateGraceMs);
         }, deadlineMs);
 
@@ -362,6 +400,12 @@ export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): 
           );
         });
         child.once("close", (exitCode: number | null, signal: NodeJS.Signals | null) => {
+          if (!timedOut) {
+            const cleanupError = signalProcessGroup(child.pid, "SIGKILL");
+            if (cleanupError !== undefined && cleanupError !== "ESRCH") {
+              terminationErrorCode = cleanupError;
+            }
+          }
           const base = {
             exitCode,
             stdout: boundedOutputText(stdout),
@@ -369,16 +413,20 @@ export function createBoundedCommandRunner(options: CommandRunnerOptions = {}): 
             stdoutTruncated: stdout.truncated,
             stderrTruncated: stderr.truncated,
             ...(signal === null ? {} : { signal }),
+            ...(terminationErrorCode === undefined ? {} : { terminationErrorCode }),
           };
           if (timedOut) {
-            settle({ classification: "timeout", ...base });
+            const timeoutResult: CommandRunResult = { classification: "timeout", ...base };
+            if (killSent) settle(timeoutResult);
+            else pendingTimeoutResult = timeoutResult;
           } else if (signal !== null) {
             settle({ classification: "signal", ...base });
           } else {
             settle({ classification: "exited", ...base });
           }
         });
-      }),
+      });
+    },
   });
 }
 
@@ -468,19 +516,56 @@ function renderTemplate(template: string, replacements: Readonly<Record<string, 
   return rendered;
 }
 
-function fileIdentity(entry: Stats): FileIdentity {
-  return { dev: entry.dev, ino: entry.ino, nlink: entry.nlink };
+function fileIdentity(entry: BigIntStats): FileIdentity {
+  return {
+    dev: entry.dev,
+    ino: entry.ino,
+    nlink: entry.nlink,
+    ctimeNs: entry.ctimeNs,
+    birthtimeNs: entry.birthtimeNs,
+    uid: entry.uid,
+    gid: entry.gid,
+    mode: entry.mode,
+    size: entry.size,
+    mtimeNs: entry.mtimeNs,
+  };
 }
 
 function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.nlink === right.nlink &&
+    left.ctimeNs === right.ctimeNs &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.mode === right.mode &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs
+  );
 }
 
-function isSafeRegularFile(entry: Stats): boolean {
-  return entry.isFile() && !entry.isSymbolicLink() && entry.nlink === 1;
+function sameFileGenerationAcrossRename(after: FileIdentity, before: FileIdentity): boolean {
+  return (
+    after.dev === before.dev &&
+    after.ino === before.ino &&
+    after.nlink === before.nlink &&
+    after.ctimeNs >= before.ctimeNs &&
+    after.birthtimeNs === before.birthtimeNs &&
+    after.uid === before.uid &&
+    after.gid === before.gid &&
+    after.mode === before.mode &&
+    after.size === before.size &&
+    after.mtimeNs === before.mtimeNs
+  );
 }
 
-function directoryIdentity(path: string, entry: Stats): DirectoryIdentity {
+function isSafeRegularFile(entry: BigIntStats): boolean {
+  return entry.isFile() && !entry.isSymbolicLink() && entry.nlink === 1n;
+}
+
+function directoryIdentity(path: string, entry: BigIntStats): DirectoryIdentity {
   return { path, dev: entry.dev, ino: entry.ino };
 }
 
@@ -494,9 +579,9 @@ function pathComponents(path: string): readonly string[] {
   return pathFromRoot.length === 0 ? [] : pathFromRoot.split(sep).filter((part) => part.length > 0);
 }
 
-async function lstatOrMissing(path: string): Promise<Stats | undefined> {
+async function lstatOrMissing(path: string): Promise<BigIntStats | undefined> {
   try {
-    return await lstat(path);
+    return await lstat(path, { bigint: true });
   } catch (error) {
     if (isErrorWithCode(error, "ENOENT")) return undefined;
     throw error;
@@ -526,7 +611,7 @@ async function ensureSafeDirectory(
       throw new Error("Systemd unit directory contains a symlink or non-directory.");
     }
   }
-  const finalEntry = await lstat(path);
+  const finalEntry = await lstat(path, { bigint: true });
   if (!finalEntry.isDirectory() || finalEntry.isSymbolicLink()) {
     throw new Error("Systemd unit directory is unsafe.");
   }
@@ -651,7 +736,9 @@ async function restoreQuarantinedUnit(
   if (
     source.kind !== "canonical" ||
     source.unit === undefined ||
-    !sameFileIdentity(source.unit.identity, quarantined.unit.identity)
+    (quarantined.identity === undefined
+      ? !sameFileGenerationAcrossRename(source.unit.identity, quarantined.unit.identity)
+      : !sameFileIdentity(source.unit.identity, quarantined.identity))
   ) {
     return false;
   }
@@ -666,7 +753,7 @@ async function restoreQuarantinedUnit(
   return (
     restored.kind === "canonical" &&
     restored.unit !== undefined &&
-    sameFileIdentity(restored.unit.identity, quarantined.unit.identity)
+    sameFileGenerationAcrossRename(restored.unit.identity, source.unit.identity)
   );
 }
 
@@ -712,17 +799,19 @@ async function quarantineUnits(
       quarantined.push({ unit, quarantinePath });
     }
     await syncDirectory(directory.path);
+    const validated: QuarantinedUnit[] = [];
     for (const entry of quarantined) {
       const moved = await observeUnit(entry.quarantinePath, entry.unit.expected, directory);
       if (
         moved.kind !== "canonical" ||
         moved.unit === undefined ||
-        !sameFileIdentity(moved.unit.identity, entry.unit.identity)
+        !sameFileGenerationAcrossRename(moved.unit.identity, entry.unit.identity)
       ) {
         throw new Error("Systemd quarantined unit did not retain canonical identity.");
       }
+      validated.push({ ...entry, identity: moved.unit.identity });
     }
-    return { entries: Object.freeze(quarantined), restored: false };
+    return { entries: Object.freeze(validated), restored: false };
   } catch {
     return { restored: await restoreTransaction([], quarantined, directory) };
   }
@@ -744,7 +833,8 @@ async function removeCanonicalUnits(
       if (
         current.kind !== "canonical" ||
         current.unit === undefined ||
-        !sameFileIdentity(current.unit.identity, entry.unit.identity)
+        entry.identity === undefined ||
+        !sameFileIdentity(current.unit.identity, entry.identity)
       ) {
         throw new Error("Systemd quarantine changed before removal.");
       }
@@ -1150,7 +1240,7 @@ export class SystemdManager {
       this.#systemctl(["is-failed", systemdUnitNames.timer]),
     ]);
     const queryError = [enabled, active, failed].some(
-      (result) => result.classification !== "exited",
+      (result) => result.classification !== "exited" || result.terminationErrorCode !== undefined,
     );
     const timer = queryError
       ? {

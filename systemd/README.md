@@ -20,12 +20,23 @@ then atomically renames both files into randomized names in the same directory. 
 quarantined file again before deletion. Any failure restores or preserves the pair and reports a
 rollback failure instead of claiming success.
 
+File identity includes device, inode, link count, nanosecond ctime and birth time, owner, group,
+mode, size, and nanosecond mtime in addition to canonical bytes. A same-byte replacement is still
+untrusted. Because a successful rename can legitimately update ctime, quarantine captures a new
+complete identity immediately after proving the remaining generation fields are unchanged; every
+later pre-delete check uses that new complete identity.
+
 The rendered service and every preflight command receive the same allowlisted runtime environment:
 `PATH`, `HOME`, `XDG_CONFIG_HOME`, and, when set, `XDG_RUNTIME_DIR` and `AGENT_TEAM_HOME`.
 Other inherited variables, including credentials and tokens, are intentionally excluded.
 `status` reports ownership plus `is-enabled`, `is-active`, and `is-failed` query results; command
 or D-Bus errors are reported as unknown rather than as a disabled timer. It never enables,
 disables, writes, or removes a unit.
+
+On Linux and WSL, each bounded management command runs as a detached POSIX process group. A
+deadline sends `SIGTERM` to the whole group, waits a bounded grace period, then sends `SIGKILL` to
+the whole group and waits for the direct child to settle. Output remains capped. Platforms without
+POSIX process-group termination fail closed before spawning a command.
 
 Current activation is deliberately fail-closed: until Runtime composition wires
 `agent-team reconcile --all`, install rejects the unavailable command and leaves no unit behind.

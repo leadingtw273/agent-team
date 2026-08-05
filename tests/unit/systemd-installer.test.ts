@@ -1,16 +1,19 @@
 import {
   chmod,
   link,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -456,6 +459,44 @@ describe("systemd installer security boundary", () => {
     });
     await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
     await expect(readFile(preview.timerPath, "utf8")).resolves.toContain("OnBootSec=1min");
+    expect(fixture.calls).toHaveLength(1);
+  });
+
+  it("preserves a canonical-byte replacement whose file generation changed after disable", async () => {
+    let servicePath = "";
+    let serviceContent = "";
+    let initialCtimeNs: bigint | undefined;
+    let replacementCtimeNs: bigint | undefined;
+    const fixture = await setup(async (request) => {
+      if (request.executable === "systemctl" && request.arguments[1] === "disable") {
+        const initial = await lstat(servicePath, { bigint: true });
+        initialCtimeNs = initial.ctimeNs;
+        await delay(10);
+        await unlink(servicePath);
+        await writeFile(servicePath, serviceContent, "utf8");
+        await chmod(servicePath, 0o600);
+        await chmod(servicePath, 0o644);
+        replacementCtimeNs = (await lstat(servicePath, { bigint: true })).ctimeNs;
+      }
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    servicePath = preview.servicePath;
+    serviceContent = preview.service;
+    await writeCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "uninstall", dryRun: false });
+
+    expect(initialCtimeNs).toBeDefined();
+    expect(replacementCtimeNs).toBeDefined();
+    expect(replacementCtimeNs).not.toBe(initialCtimeNs);
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toMatchObject({
+      state: "unit_changed_after_disable",
+      units: { service: "canonical", timer: "canonical" },
+    });
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
     expect(fixture.calls).toHaveLength(1);
   });
 
