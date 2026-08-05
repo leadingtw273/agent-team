@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { createConnection } from "node:net";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createRoleModelFeature,
@@ -16,12 +18,13 @@ const handles: LocalUiServerHandle[] = [];
 
 async function start() {
   const feature = createRoleModelFeature();
+  const handler = vi.fn(createUiShellHandler(undefined, feature));
   const handle = await startLocalUiServer({
-    handler: createUiShellHandler(undefined, feature),
+    handler,
     securityPolicy: createUiSecurityPolicy({ routes: roleModelUiSecurityRoutes }),
   });
   handles.push(handle);
-  return Object.freeze({ feature, handle });
+  return Object.freeze({ feature, handle, handler });
 }
 
 async function exchange(handle: LocalUiServerHandle): Promise<{
@@ -66,11 +69,45 @@ async function putApi(
   return Object.freeze({ response, body: await response.text() });
 }
 
+async function openRawRequest(
+  handle: LocalUiServerHandle,
+  payload: string,
+): Promise<Readonly<{ response: Promise<string> }>> {
+  const url = new URL(handle.baseUrl);
+  const socket = createConnection({ host: url.hostname, port: Number(url.port) });
+  const response = new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    socket.setTimeout(2_000, () => {
+      socket.destroy(new Error("raw HTTP request timed out"));
+    });
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.on("error", reject);
+    socket.on("close", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(payload);
+  return Object.freeze({ response });
+}
+
 afterEach(async () => {
   await Promise.all(handles.splice(0).map(async (handle) => handle.close()));
 });
 
 describe("role model page integration", () => {
+  it("declares exact read and API method contracts for every feature route", () => {
+    const api = roleModelUiSecurityRoutes.find((route) => route.path === "/api/role-models");
+    const reads = roleModelUiSecurityRoutes.filter((route) => route !== api);
+
+    expect(api?.allowedMethods).toEqual(["GET", "PUT"]);
+    expect(reads).not.toHaveLength(0);
+    expect(reads.every((route) => route.allowedMethods?.join(",") === "GET")).toBe(true);
+  });
+
   it("serves the completed page and only self-hosted behavior behind a real session", async () => {
     const { handle } = await start();
     const session = await exchange(handle);
@@ -198,24 +235,29 @@ describe("role model page integration", () => {
     expect(after.body).toEqual(initial.body);
   });
 
-  it.each(["POST", "PATCH", "DELETE"])("rejects the %s method without mutation", async (method) => {
-    const { handle } = await start();
-    const session = await exchange(handle);
-    const before = await readApi(handle, session.cookie);
-    const response = await fetch(`${handle.baseUrl}/api/role-models`, {
-      method,
-      headers: {
-        cookie: session.cookie,
-        origin: handle.baseUrl,
-        "x-csrf-token": session.csrf,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(defaultRoleModelRoutingConfig()),
-    });
-    const after = await readApi(handle, session.cookie);
+  it.each(["POST", "PATCH", "DELETE"])(
+    "rejects the %s method before reading its body or reaching the handler",
+    async (method) => {
+      const { handle, handler } = await start();
+      const session = await exchange(handle);
+      const headers = [
+        `Host: ${new URL(handle.baseUrl).host}`,
+        `Cookie: ${session.cookie}`,
+        `Origin: ${handle.baseUrl}`,
+        `X-CSRF-Token: ${session.csrf}`,
+        "Content-Type: application/json",
+        "Content-Length: 2",
+        "Connection: close",
+      ].join("\r\n");
+      const pending = await openRawRequest(
+        handle,
+        `${method} /api/role-models HTTP/1.1\r\n${headers}\r\n\r\n{`,
+      );
+      const response = await pending.response;
 
-    expect(response.status).toBe(405);
-    expect(response.headers.get("allow")).toBe("GET, PUT");
-    expect(after.body).toEqual(before.body);
-  });
+      expect(response).toContain("HTTP/1.1 405 Method Not Allowed");
+      expect(response).toMatch(/allow: GET, HEAD, PUT/iu);
+      expect(handler).not.toHaveBeenCalled();
+    },
+  );
 });
