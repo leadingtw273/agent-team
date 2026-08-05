@@ -688,6 +688,10 @@ button:focus-visible,
     flex-direction: column;
   }
 
+  .ui-fixture-notice {
+    flex-direction: column;
+  }
+
   .ui-page-header,
   .ui-list-item {
     gap: 0.75rem;

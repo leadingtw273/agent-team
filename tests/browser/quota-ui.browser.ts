@@ -369,6 +369,10 @@ test.describe("U005 quota management UI", () => {
     await page.reload({ waitUntil: "networkidle" });
     await expect(page.getByRole("heading", { level: 1, name: "額度" })).toBeVisible();
     await expect(page.getByRole("button", { name: "刷新樣本" }).first()).toBeVisible();
+    await expect(page.getByRole("complementary", { name: "帳號切換警示" })).toHaveCSS(
+      "flex-direction",
+      "column",
+    );
     expect(await hasNoHorizontalOverflow(page)).toBe(true);
     await expectNoAxeViolations(page);
     await copyReviewScreenshot(page, "u005-quota-mobile.png");
