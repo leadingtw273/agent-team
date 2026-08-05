@@ -262,10 +262,12 @@ describe("U008 settings view", () => {
     expect(html).toContain("Webhook Runtime URL");
     expect(html).toContain("全域模型工作");
     expect(html).toContain("進階 Raw YAML（唯讀）");
+    expect(html).toContain('wrap="off"');
     expect(html).toContain("readonly");
     expect(html).toContain("disabled");
-    expect(html).toContain("儲存功能將在安全 mutation transport 整合後啟用");
-    expect(html).not.toContain("<script");
+    expect(html).toContain("預設為唯讀；切換至受控編輯後才會送出");
+    expect(html).toContain('<script src="/assets/settings.js" defer>');
+    expect(html).not.toContain("<script>");
     expect(html).not.toMatch(/(?:--token|--secret|api[_-]?key|authorization:|bearer\s)/iu);
   });
 

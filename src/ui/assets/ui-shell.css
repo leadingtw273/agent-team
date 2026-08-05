@@ -41,6 +41,12 @@ body.ui-shell {
   transform: translateY(0);
 }
 
+.skip-link,
+.ui-brand,
+.ui-nav-link {
+  min-height: 2.75rem;
+}
+
 .ui-app {
   display: grid;
   grid-template-columns: minmax(14.5rem, 17.5rem) minmax(0, 1fr);
@@ -420,6 +426,16 @@ button:focus-visible,
 .ui-app .btn:focus-visible {
   outline: var(--ui-focus-offset) solid var(--ui-focus-ring);
   outline-offset: var(--ui-focus-offset);
+}
+
+#settings-edit {
+  color: #0756a3;
+  background: #ffffff;
+  border-color: #0756a3;
+}
+
+#settings-edit:focus-visible {
+  outline-color: #2f6fed;
 }
 
 @media (max-width: 900px) {

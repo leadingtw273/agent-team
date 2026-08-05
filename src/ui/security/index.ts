@@ -11,7 +11,11 @@ import type {
 import { responseLeaksCredentials, untrustedInputIsUnsafe } from "./canonical.js";
 import { isSecretSafeJsonResponse } from "./secret.js";
 
-export { createSecretSafeJsonResponse, projectSecretSafeMetadata } from "./secret.js";
+export {
+  createSettingsSecretSafeJsonResponse,
+  createSecretSafeJsonResponse,
+  projectSecretSafeMetadata,
+} from "./secret.js";
 export type { SecretSafeJsonResponse, SecretSafeMetadata } from "./secret.js";
 
 const sessionCookieName = "agent_team_session";
@@ -55,6 +59,23 @@ type ValidatedUiSecurityRouteContract = Readonly<
 >;
 
 const defaultRoutes: readonly UiSecurityRouteContract[] = Object.freeze([
+  ...["/assets/icons.svg", "/assets/tabler-1.4.0.min.css", "/assets/ui-shell.css"].map((path) =>
+    Object.freeze({
+      path,
+      allowedQueryParameters: Object.freeze([]),
+      response: "standard" as const,
+    }),
+  ),
+  Object.freeze({
+    path: "/settings",
+    allowedQueryParameters: Object.freeze([]),
+    response: "standard" as const,
+  }),
+  Object.freeze({
+    path: "/assets/settings.js",
+    allowedQueryParameters: Object.freeze([]),
+    response: "standard" as const,
+  }),
   Object.freeze({
     path: "/api/projects",
     allowedQueryParameters: Object.freeze([]),
@@ -64,6 +85,7 @@ const defaultRoutes: readonly UiSecurityRouteContract[] = Object.freeze([
     path: "/api/settings",
     allowedQueryParameters: Object.freeze([]),
     response: "secret-safe" as const,
+    mutationBody: "bounded-json" as const,
   }),
 ]);
 
