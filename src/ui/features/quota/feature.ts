@@ -8,6 +8,8 @@ import { renderQuotaDashboard } from "./view.js";
 const refreshPath = "/api/quota/refresh";
 const resumePath = "/api/quota/resume";
 const clientPath = "/assets/quota.js";
+const readMethods = Object.freeze(["GET"] as const);
+const mutationMethods = Object.freeze(["POST"] as const);
 
 export const quotaUiSecurityRoutes: readonly UiSecurityRouteContract[] = Object.freeze([
   ...[
@@ -21,28 +23,33 @@ export const quotaUiSecurityRoutes: readonly UiSecurityRouteContract[] = Object.
     Object.freeze({
       path,
       allowedQueryParameters: Object.freeze([]),
+      allowedMethods: readMethods,
       response: "standard" as const,
     }),
   ),
   Object.freeze({
     path: "/quota",
     allowedQueryParameters: Object.freeze([]),
+    allowedMethods: readMethods,
     response: "standard",
   }),
   Object.freeze({
     path: clientPath,
     allowedQueryParameters: Object.freeze([]),
+    allowedMethods: readMethods,
     response: "standard",
   }),
   Object.freeze({
     path: refreshPath,
     allowedQueryParameters: Object.freeze([]),
+    allowedMethods: mutationMethods,
     response: "standard",
     mutationBody: "bounded-json",
   }),
   Object.freeze({
     path: resumePath,
     allowedQueryParameters: Object.freeze([]),
+    allowedMethods: mutationMethods,
     response: "standard",
     mutationBody: "bounded-json",
   }),

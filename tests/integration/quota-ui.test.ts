@@ -14,6 +14,7 @@ import {
   fixtureUiShellReadModel,
   startLocalUiServer,
   type LocalUiServerHandle,
+  type UiServerClock,
 } from "../../src/ui/index.js";
 
 function instant(value: string): Instant {
@@ -44,6 +45,18 @@ class RecordingQuotaPort implements QuotaDashboardPort {
   });
 }
 
+class MutableClock implements UiServerClock {
+  constructor(private value: number) {}
+
+  now(): number {
+    return this.value;
+  }
+
+  advance(milliseconds: number): void {
+    this.value += milliseconds;
+  }
+}
+
 const handles: LocalUiServerHandle[] = [];
 
 function useCase(port: QuotaDashboardPort): QuotaDashboardUseCase {
@@ -54,9 +67,13 @@ function useCase(port: QuotaDashboardPort): QuotaDashboardUseCase {
   });
 }
 
-async function start(port: RecordingQuotaPort): Promise<LocalUiServerHandle> {
+async function start(
+  port: RecordingQuotaPort,
+  options: Readonly<{ clock?: UiServerClock; idleTimeoutMs?: number }> = {},
+): Promise<LocalUiServerHandle> {
   const feature = createQuotaUiFeature(useCase(port));
   const handle = await startLocalUiServer({
+    ...options,
     securityPolicy: createUiSecurityPolicy({ routes: quotaUiSecurityRoutes }),
     handler: async (request) =>
       (await feature.handle(request)) ?? { statusCode: 404, body: "Not Found\n" },
@@ -84,19 +101,26 @@ afterEach(async () => {
 });
 
 describe("quota UI secured mutations", () => {
-  it("declares separate bounded JSON refresh and resume routes", () => {
+  it("declares exact read and POST-only mutation methods for every feature route", () => {
     expect(quotaUiSecurityRoutes).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           path: "/api/quota/refresh",
+          allowedMethods: ["POST"],
           mutationBody: "bounded-json",
         }),
         expect.objectContaining({
           path: "/api/quota/resume",
+          allowedMethods: ["POST"],
           mutationBody: "bounded-json",
         }),
       ]),
     );
+    expect(
+      quotaUiSecurityRoutes
+        .filter((route) => !route.path.startsWith("/api/"))
+        .every((route) => route.allowedMethods?.join(",") === "GET"),
+    ).toBe(true);
   });
 
   it("rejects missing Session, Origin, or CSRF before either action reaches the port", async () => {
@@ -175,7 +199,37 @@ describe("quota UI secured mutations", () => {
     expect(port.resumed).toEqual(["claude"]);
   });
 
-  it("rejects a non-POST method and any body beyond the exact provider command", async () => {
+  it.each(["PUT", "PATCH", "DELETE"])(
+    "rejects a bodyless %s before mutation and without refreshing idle",
+    async (method) => {
+      const clock = new MutableClock(10_000);
+      const port = new RecordingQuotaPort();
+      const handle = await start(port, { clock, idleTimeoutMs: 100 });
+      const authenticated = await session(handle);
+      clock.advance(90);
+
+      const response = await fetch(`${handle.baseUrl}/api/quota/refresh`, {
+        method,
+        headers: {
+          cookie: authenticated.cookie,
+          origin: handle.baseUrl,
+          "x-csrf-token": authenticated.csrf,
+        },
+      });
+
+      expect(response.status).toBe(405);
+      expect(response.headers.get("allow")).toBe("POST");
+      expect(await response.text()).toBe("Method Not Allowed\n");
+      expect(port.invalidated).toEqual([]);
+      expect(port.refreshed).toEqual([]);
+      expect(port.resumed).toEqual([]);
+      expect(handle.status()).toEqual({ state: "active", idleDeadlineMs: 10_100 });
+      clock.advance(11);
+      expect(handle.status()).toEqual({ state: "locked" });
+    },
+  );
+
+  it("rejects any body beyond the exact provider command", async () => {
     const port = new RecordingQuotaPort();
     const handle = await start(port);
     const authenticated = await session(handle);
@@ -185,14 +239,6 @@ describe("quota UI secured mutations", () => {
       "x-csrf-token": authenticated.csrf,
       "content-type": "application/json",
     };
-
-    const wrongMethod = await fetch(`${handle.baseUrl}/api/quota/refresh`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ provider: "codex" }),
-    });
-    expect(wrongMethod.status).toBe(405);
-    expect(wrongMethod.headers.get("allow")).toBe("POST");
 
     const extraField = await fetch(`${handle.baseUrl}/api/quota/resume`, {
       method: "POST",
