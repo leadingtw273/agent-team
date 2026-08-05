@@ -37,13 +37,17 @@ describe("compiled CLI smoke", () => {
     expect(reconcileHelp.stdout).toContain("--all");
   });
 
-  it("returns the blocked contract instead of pretending an unwired command succeeded", () => {
+  it("reports the unwired manual reconcile path as blocked instead of pretending it ran", () => {
     const result = run(["reconcile", "--all"]);
 
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(3);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("尚未接上 Runtime composition");
+    expect(JSON.parse(result.stderr)).toEqual({
+      operation: "manual_reconcile",
+      state: "blocked",
+      evidenceCode: "manual_reconcile_runtime_unavailable",
+    });
   });
 
   it("previews safely and reports the unwired Runtime without touching a user unit directory", async () => {
@@ -59,6 +63,7 @@ describe("compiled CLI smoke", () => {
     const uninstallPreview = run(["systemd", "uninstall", "--dry-run"], environment);
     const install = run(["systemd", "install"], environment);
     const status = run(["systemd", "status"], environment);
+    const health = run(["health"], environment);
 
     expect(preview.status).toBe(0);
     expect(JSON.parse(preview.stdout)).toMatchObject({ operation: "install", dryRun: true });
@@ -74,6 +79,26 @@ describe("compiled CLI smoke", () => {
     expect(JSON.parse(status.stdout)).toMatchObject({
       installation: "not_installed",
       runtime: "runtime_unavailable",
+    });
+    expect(health.status).toBe(0);
+    expect(JSON.parse(health.stdout)).toEqual({
+      operation: "reconcile_wakeup_status",
+      state: "degraded",
+      mode: "manual_reconcile_only",
+      capabilities: {
+        scheduledReconcile: false,
+        eventDrivenIngress: false,
+        unattended: false,
+      },
+      sources: {
+        systemd: { state: "unavailable", evidenceCode: "systemd_runtime_unavailable" },
+        webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
+      },
+      evidenceCodes: [
+        "systemd_runtime_unavailable",
+        "webhook_runtime_unknown",
+        "manual_reconcile_required",
+      ],
     });
     await expect(
       readFile(join(unitDirectory, "agent-team-reconcile.service"), "utf8"),

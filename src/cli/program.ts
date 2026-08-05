@@ -28,6 +28,7 @@ export interface CliHandlers {
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly reconcile: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
+  readonly health: () => Promise<CliCommandOutcome>;
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
   readonly ui: () => Promise<CliCommandOutcome>;
   readonly systemd: (input: SystemdCommandInput) => Promise<CliCommandOutcome>;
@@ -53,6 +54,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
+  health: () => blocked("health"),
   project: () => blocked("project"),
   ui: () => blocked("ui"),
   systemd: () => blocked("systemd"),
@@ -132,6 +134,11 @@ export function createProgram(
     .description("對帳本機狀態、事件與權威服務")
     .addOption(new Option("--all", "對帳所有已註冊專案").makeOptionMandatory())
     .action(() => action(state, io, () => handlers.reconcile({ all: true }))());
+
+  program
+    .command("health")
+    .description("顯示 Reconcile 喚醒來源、降級原因與手動路徑")
+    .action(action(state, io, handlers.health));
 
   program
     .command("project")
