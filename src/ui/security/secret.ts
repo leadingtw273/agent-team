@@ -1,4 +1,5 @@
 import type { UiResponse } from "../server/index.js";
+import { containsSensitiveValue } from "../../infrastructure/redaction/index.js";
 
 const trustedSecretSafeResponses = new WeakSet<object>();
 
@@ -44,6 +45,93 @@ export function createSecretSafeJsonResponse(source: unknown): SecretSafeJsonRes
     statusCode: 200,
     headers: Object.freeze({ "content-type": "application/json; charset=utf-8" }),
     body: JSON.stringify(projectSecretSafeMetadata(source)),
+  });
+  trustedSecretSafeResponses.add(response);
+  return response;
+}
+
+const settingsErrorStatus = Object.freeze({
+  conflict: 409,
+  invalid_settings: 422,
+  method_not_allowed: 405,
+  settings_unavailable: 500,
+  store_failure: 500,
+  write_unconfirmed: 500,
+});
+
+function exactKeys(value: unknown, expected: readonly string[]): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Object.keys(value).length === expected.length &&
+    expected.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function validSettingsProjection(statusCode: number, value: unknown): boolean {
+  if (exactKeys(value, ["state", "code"]) && value["state"] === "error") {
+    const code = value["code"];
+    return (
+      typeof code === "string" &&
+      Object.hasOwn(settingsErrorStatus, code) &&
+      settingsErrorStatus[code as keyof typeof settingsErrorStatus] === statusCode
+    );
+  }
+  if (
+    statusCode !== 200 ||
+    !exactKeys(value, [
+      "state",
+      "source",
+      "revision",
+      "webhookRuntimeBaseUrl",
+      "concurrency",
+      "rawYaml",
+    ]) ||
+    value["state"] !== "ready" ||
+    (value["source"] !== "defaults" && value["source"] !== "persisted") ||
+    (value["revision"] !== null &&
+      (typeof value["revision"] !== "string" || !/^[a-f0-9]{64}$/u.test(value["revision"]))) ||
+    (value["webhookRuntimeBaseUrl"] !== null &&
+      typeof value["webhookRuntimeBaseUrl"] !== "string") ||
+    typeof value["rawYaml"] !== "string" ||
+    !exactKeys(value["concurrency"], [
+      "globalModelJobs",
+      "perProviderModelJobs",
+      "perProjectModelJobs",
+      "perRepositoryIntegrationJobs",
+    ])
+  ) {
+    return false;
+  }
+  const concurrency = value["concurrency"];
+  if (!exactKeys(concurrency["perProviderModelJobs"], ["codex", "claude", "gemini"])) {
+    return false;
+  }
+  return [
+    concurrency["globalModelJobs"],
+    concurrency["perProjectModelJobs"],
+    concurrency["perRepositoryIntegrationJobs"],
+    concurrency["perProviderModelJobs"]["codex"],
+    concurrency["perProviderModelJobs"]["claude"],
+    concurrency["perProviderModelJobs"]["gemini"],
+  ].every((limit) => Number.isSafeInteger(limit) && Number(limit) >= 0);
+}
+
+export function createSettingsSecretSafeJsonResponse(
+  statusCode: number,
+  projected: unknown,
+): SecretSafeJsonResponse {
+  if (!validSettingsProjection(statusCode, projected)) {
+    throw new TypeError("Invalid settings response projection.");
+  }
+  const body = JSON.stringify(projected);
+  if (Buffer.byteLength(body, "utf8") > 32_768 || containsSensitiveValue(body)) {
+    throw new TypeError("Unsafe secret-safe JSON response.");
+  }
+  const response = Object.freeze({
+    statusCode,
+    headers: Object.freeze({ "content-type": "application/json; charset=utf-8" }),
+    body,
   });
   trustedSecretSafeResponses.add(response);
   return response;

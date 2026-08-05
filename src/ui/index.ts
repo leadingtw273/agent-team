@@ -9,3 +9,4 @@ export type {
   UiShellReadModel,
 } from "./shell/index.js";
 export * from "./features/danger/index.js";
+export * from "./features/settings/index.js";

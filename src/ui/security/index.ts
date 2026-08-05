@@ -11,7 +11,11 @@ import type {
 import { responseLeaksCredentials, untrustedInputIsUnsafe } from "./canonical.js";
 import { isSecretSafeJsonResponse } from "./secret.js";
 
-export { createSecretSafeJsonResponse, projectSecretSafeMetadata } from "./secret.js";
+export {
+  createSettingsSecretSafeJsonResponse,
+  createSecretSafeJsonResponse,
+  projectSecretSafeMetadata,
+} from "./secret.js";
 export type { SecretSafeJsonResponse, SecretSafeMetadata } from "./secret.js";
 
 const sessionCookieName = "agent_team_session";
