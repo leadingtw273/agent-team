@@ -5,7 +5,11 @@ import {
   type IncomingMessage,
   type Server,
   type ServerResponse,
+  validateHeaderName,
+  validateHeaderValue,
 } from "node:http";
+
+import { canonicalResponseIsUnsafe, canonicalValueIsUnsafe } from "../security/canonical.js";
 
 export const localhostUiHost = "127.0.0.1";
 export const defaultUiIdleTimeoutMs = 15 * 60 * 1_000;
@@ -13,6 +17,7 @@ export const defaultUiIdleTimeoutMs = 15 * 60 * 1_000;
 const minimumTokenBytes = 32;
 const maximumTimerDelayMs = 2_147_483_647;
 const base64UrlTokenPattern = /^[A-Za-z0-9_-]+$/u;
+const handlerHeaders: Readonly<IncomingHttpHeaders> = Object.freeze({});
 
 export interface UiServerClock {
   now(): number;
@@ -22,6 +27,7 @@ export interface UiRequest {
   readonly method: string;
   readonly url: string;
   readonly headers: Readonly<IncomingHttpHeaders>;
+  readonly auth: Readonly<{ kind: UiAuthKind }>;
 }
 
 export interface UiResponse {
@@ -31,6 +37,39 @@ export interface UiResponse {
 }
 
 export type UiRequestHandler = (request: UiRequest) => UiResponse | Promise<UiResponse>;
+
+export type UiAuthKind = "public" | "bearer" | "session";
+
+export type UiHandlerResponseContract = "standard" | "secret-safe";
+
+export interface UiSecurityRequest {
+  readonly method: string;
+  readonly url: string;
+  readonly headers: Readonly<IncomingHttpHeaders>;
+  readonly bearerAuthenticated: boolean;
+  readonly serverOrigin: string;
+}
+
+export type UiSecurityDecision =
+  | Readonly<{
+      kind: "allow";
+      authKind: UiAuthKind;
+      handlerUrl: string;
+      responseContract: UiHandlerResponseContract;
+      refreshIdle: boolean;
+    }>
+  | Readonly<{ kind: "respond"; response: UiResponse; refreshIdle: boolean }>;
+
+export interface UiSecurityPolicy {
+  readonly authorize: (request: UiSecurityRequest) => UiSecurityDecision;
+  readonly secureResponse: (response: UiResponse) => UiResponse;
+  readonly handlerResponseIsAllowed: (
+    contract: UiHandlerResponseContract,
+    response: UiResponse,
+  ) => boolean;
+  readonly responseContainsSensitiveData: (response: UiResponse) => boolean;
+  readonly invalidate: () => void;
+}
 
 export type UiServerStatus = Readonly<
   { state: "active"; idleDeadlineMs: number } | { state: "locked" } | { state: "closed" }
@@ -50,6 +89,7 @@ export interface StartLocalUiServerOptions {
   readonly clock?: UiServerClock;
   readonly tokenSource?: () => Uint8Array;
   readonly handler?: UiRequestHandler;
+  readonly securityPolicy?: UiSecurityPolicy;
 }
 
 export class LocalUiServerError extends Error {
@@ -66,6 +106,8 @@ function fixedResponse(statusCode: number, body: string): UiResponse {
 }
 
 const defaultHandler: UiRequestHandler = () => fixedResponse(404, "Not Found\n");
+
+type OutboundResponseGuard = (response: UiResponse) => boolean;
 
 function validateOptions(host: string, port: number, idleTimeoutMs: number): void {
   if (host !== localhostUiHost) {
@@ -111,32 +153,51 @@ function authorized(request: IncomingMessage, expectedDigest: Uint8Array): boole
   return timingSafeEqual(expectedDigest, candidateDigest);
 }
 
-function sanitizedHeaders(headers: IncomingHttpHeaders): Readonly<IncomingHttpHeaders> {
+function sanitizedHeaders(
+  headers: Readonly<IncomingHttpHeaders>,
+  sensitiveNames: ReadonlySet<string>,
+): Readonly<IncomingHttpHeaders> {
   const result: IncomingHttpHeaders = {};
   for (const [name, value] of Object.entries(headers)) {
-    if (name.toLowerCase() === "authorization" || value === undefined) continue;
+    if (sensitiveNames.has(name.toLowerCase()) || value === undefined) continue;
     result[name] = Array.isArray(value) ? [...value] : value;
   }
   return Object.freeze(result);
 }
 
-function responseContainsToken(response: UiResponse, sessionToken: string): boolean {
-  if (response.headers !== undefined) {
-    for (const [name, value] of Object.entries(response.headers)) {
-      if (name.includes(sessionToken)) return true;
-      const values = typeof value === "string" ? [value] : value;
-      if (values.some((entry) => entry.includes(sessionToken))) return true;
-    }
+function distinctHeaders(request: IncomingMessage): Readonly<IncomingHttpHeaders> {
+  const result: IncomingHttpHeaders = {};
+  for (const [name, values] of Object.entries(request.headersDistinct)) {
+    if (values === undefined) continue;
+    result[name] = values.length === 1 ? values[0] : [...values];
   }
-  if (typeof response.body === "string") return response.body.includes(sessionToken);
-  if (response.body !== undefined) {
-    return Buffer.from(response.body).includes(Buffer.from(sessionToken, "utf8"));
-  }
-  return false;
+  return Object.freeze(result);
 }
 
-function send(response: ServerResponse, result: UiResponse): void {
+function responseHeadersAreValid(response: UiResponse): boolean {
+  if (response.headers === undefined) return true;
+  try {
+    for (const [name, value] of Object.entries(response.headers)) {
+      validateHeaderName(name);
+      const values = typeof value === "string" ? [value] : value;
+      for (const entry of values) validateHeaderValue(name, entry);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function send(
+  response: ServerResponse,
+  result: UiResponse,
+  outboundResponseIsAllowed: OutboundResponseGuard,
+): void {
   if (response.destroyed || response.writableEnded) return;
+  if (!outboundResponseIsAllowed(result)) {
+    response.destroy();
+    return;
+  }
   response.statusCode = result.statusCode;
   if (result.headers !== undefined) {
     for (const [name, value] of Object.entries(result.headers)) {
@@ -146,15 +207,72 @@ function send(response: ServerResponse, result: UiResponse): void {
   response.end(result.body);
 }
 
-function sendFixed(response: ServerResponse, statusCode: number, body: string): void {
+function sendFixed(
+  response: ServerResponse,
+  statusCode: number,
+  body: string,
+  outboundResponseIsAllowed: OutboundResponseGuard,
+  securityPolicy?: UiSecurityPolicy,
+): void {
   if (response.destroyed || response.writableEnded) return;
   if (response.headersSent) {
     response.destroy();
     return;
   }
   for (const name of response.getHeaderNames()) response.removeHeader(name);
-  response.writeHead(statusCode, { "content-type": "text/plain; charset=utf-8" });
-  response.end(body);
+  const secured = securityPolicy?.secureResponse({ statusCode, body }) ?? { statusCode, body };
+  const result: UiResponse = Object.freeze({
+    statusCode: secured.statusCode,
+    headers: Object.freeze({
+      ...secured.headers,
+      ...(Object.keys(secured.headers ?? {}).some((name) => name.toLowerCase() === "content-type")
+        ? {}
+        : { "content-type": "text/plain; charset=utf-8" }),
+    }),
+    ...(secured.body === undefined ? {} : { body: secured.body }),
+  });
+  send(response, result, outboundResponseIsAllowed);
+}
+
+function rawSocketResponse(
+  statusCode: 400 | 405,
+  outboundResponseIsAllowed: OutboundResponseGuard,
+  securityPolicy?: UiSecurityPolicy,
+): string | undefined {
+  const secured = securityPolicy?.secureResponse({ statusCode }) ?? { statusCode };
+  const result: UiResponse = Object.freeze({
+    statusCode: secured.statusCode,
+    headers: Object.freeze({
+      ...secured.headers,
+      connection: "close",
+      "content-length": "0",
+    }),
+  });
+  if (!outboundResponseIsAllowed(result)) return undefined;
+  const reason = statusCode === 400 ? "Bad Request" : "Method Not Allowed";
+  const lines = [`HTTP/1.1 ${String(statusCode)} ${reason}`];
+  if (result.headers !== undefined) {
+    for (const [name, value] of Object.entries(result.headers)) {
+      const values = typeof value === "string" ? [value] : value;
+      for (const entry of values) lines.push(`${name}: ${entry}`);
+    }
+  }
+  return `${lines.join("\r\n")}\r\n\r\n`;
+}
+
+function endRawSocket(
+  socket: NodeJS.WritableStream & Readonly<{ writable: boolean }>,
+  statusCode: 400 | 405,
+  outboundResponseIsAllowed: OutboundResponseGuard,
+  securityPolicy?: UiSecurityPolicy,
+): void {
+  if (!socket.writable) return;
+  const result = rawSocketResponse(statusCode, outboundResponseIsAllowed, securityPolicy);
+  if (result === undefined) {
+    socket.end();
+    return;
+  }
+  socket.end(result);
 }
 
 async function listen(server: Server, host: string, port: number): Promise<void> {
@@ -190,6 +308,7 @@ export async function startLocalUiServer(
   const clock = options.clock ?? systemClock;
   const tokenSource = options.tokenSource ?? (() => randomBytes(minimumTokenBytes));
   const handler = options.handler ?? defaultHandler;
+  const securityPolicy = options.securityPolicy;
   const initialNow = clockMilliseconds(clock);
   if (initialNow === undefined) {
     throw new LocalUiServerError("Unable to initialize local UI session.");
@@ -204,12 +323,22 @@ export async function startLocalUiServer(
   }
   let idleTimer: NodeJS.Timeout | undefined;
   let closePromise: Promise<void> | undefined;
+  let serverOrigin = "";
+
+  const outboundResponseIsAllowed: OutboundResponseGuard = (result) =>
+    Number.isInteger(result.statusCode) &&
+    result.statusCode >= 100 &&
+    result.statusCode <= 999 &&
+    responseHeadersAreValid(result) &&
+    !canonicalResponseIsUnsafe(result, [sessionToken]) &&
+    securityPolicy?.responseContainsSensitiveData(result) !== true;
 
   const lockIfExpired = (): void => {
     if (lifecycle !== "active") return;
     const now = clockMilliseconds(clock);
     if (now === undefined || !Number.isFinite(idleDeadlineMs) || now >= idleDeadlineMs) {
       lifecycle = "locked";
+      securityPolicy?.invalidate();
       if (idleTimer !== undefined) clearTimeout(idleTimer);
       idleTimer = undefined;
     }
@@ -238,68 +367,154 @@ export async function startLocalUiServer(
     const handleRequest = async (): Promise<void> => {
       lockIfExpired();
       if (lifecycle === "closed") {
-        sendFixed(response, 503, "Service Unavailable\n");
+        sendFixed(
+          response,
+          503,
+          "Service Unavailable\n",
+          outboundResponseIsAllowed,
+          securityPolicy,
+        );
         return;
       }
       if (lifecycle === "locked") {
-        sendFixed(response, 423, "Locked\n");
-        return;
-      }
-      if (!authorized(request, expectedDigest)) {
-        sendFixed(response, 401, "Unauthorized\n");
+        sendFixed(response, 423, "Locked\n", outboundResponseIsAllowed, securityPolicy);
         return;
       }
 
-      const now = clockMilliseconds(clock);
-      if (now === undefined) {
-        lifecycle = "locked";
-        sendFixed(response, 423, "Locked\n");
-        return;
-      }
-      idleDeadlineMs = now + idleTimeoutMs;
-      if (!Number.isSafeInteger(idleDeadlineMs)) {
-        lifecycle = "locked";
-        sendFixed(response, 423, "Locked\n");
-        return;
-      }
-      scheduleLock();
+      const bearerAuthenticated = authorized(request, expectedDigest);
+      const incomingHeaders = distinctHeaders(request);
+      const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
+      const rawUrl = request.url ?? "";
+      const decision: UiSecurityDecision = canonicalValueIsUnsafe(rawUrl, [sessionToken])
+        ? Object.freeze({
+            kind: "respond",
+            response: fixedResponse(400, "Bad Request\n"),
+            refreshIdle: false,
+          })
+        : (securityPolicy?.authorize(
+            Object.freeze({
+              method: request.method ?? "",
+              url: rawUrl,
+              headers: policyHeaders,
+              bearerAuthenticated,
+              serverOrigin,
+            }),
+          ) ??
+          (bearerAuthenticated
+            ? Object.freeze({
+                kind: "allow",
+                authKind: "bearer",
+                handlerUrl: rawUrl,
+                responseContract: "standard",
+                refreshIdle: true,
+              })
+            : Object.freeze({
+                kind: "respond",
+                response: fixedResponse(401, "Unauthorized\n"),
+                refreshIdle: false,
+              })));
+
+      const refreshIdle = (): boolean => {
+        const now = clockMilliseconds(clock);
+        if (now === undefined) {
+          lifecycle = "locked";
+          securityPolicy?.invalidate();
+          sendFixed(response, 423, "Locked\n", outboundResponseIsAllowed, securityPolicy);
+          return false;
+        }
+        idleDeadlineMs = now + idleTimeoutMs;
+        if (!Number.isSafeInteger(idleDeadlineMs)) {
+          lifecycle = "locked";
+          securityPolicy?.invalidate();
+          sendFixed(response, 423, "Locked\n", outboundResponseIsAllowed, securityPolicy);
+          return false;
+        }
+        scheduleLock();
+        return true;
+      };
 
       try {
-        const result = await handler(
-          Object.freeze({
-            method: request.method ?? "",
-            url: request.url ?? "",
-            headers: sanitizedHeaders(request.headers),
-          }),
-        );
+        const handlerResult =
+          decision.kind === "respond"
+            ? decision.response
+            : await handler(
+                Object.freeze({
+                  method: request.method ?? "",
+                  url: decision.handlerUrl,
+                  headers: handlerHeaders,
+                  auth: Object.freeze({ kind: decision.authKind }),
+                }),
+              );
         if (
-          !Number.isInteger(result.statusCode) ||
-          result.statusCode < 100 ||
-          result.statusCode > 999 ||
-          responseContainsToken(result, sessionToken)
+          decision.kind === "allow" &&
+          securityPolicy?.handlerResponseIsAllowed(decision.responseContract, handlerResult) ===
+            false
         ) {
-          sendFixed(response, 500, "Internal Server Error\n");
+          sendFixed(
+            response,
+            500,
+            "Internal Server Error\n",
+            outboundResponseIsAllowed,
+            securityPolicy,
+          );
           return;
         }
-        send(response, result);
+        const securedResult = securityPolicy?.secureResponse(handlerResult) ?? handlerResult;
+        if (!outboundResponseIsAllowed(securedResult)) {
+          sendFixed(
+            response,
+            500,
+            "Internal Server Error\n",
+            outboundResponseIsAllowed,
+            securityPolicy,
+          );
+          return;
+        }
+        if (
+          decision.refreshIdle &&
+          securedResult.statusCode >= 200 &&
+          securedResult.statusCode < 400 &&
+          !refreshIdle()
+        ) {
+          return;
+        }
+        send(response, securedResult, outboundResponseIsAllowed);
       } catch {
-        sendFixed(response, 500, "Internal Server Error\n");
+        sendFixed(
+          response,
+          500,
+          "Internal Server Error\n",
+          outboundResponseIsAllowed,
+          securityPolicy,
+        );
       }
     };
     void handleRequest().catch(() => {
-      sendFixed(response, 500, "Internal Server Error\n");
+      sendFixed(
+        response,
+        500,
+        "Internal Server Error\n",
+        outboundResponseIsAllowed,
+        securityPolicy,
+      );
     });
   });
 
   server.on("clientError", (_error, socket) => {
-    if (!socket.writable) return;
-    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    endRawSocket(socket, 400, outboundResponseIsAllowed, securityPolicy);
+  });
+  server.on("connect", (_request, socket) => {
+    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
+  });
+  server.on("upgrade", (_request, socket) => {
+    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
   });
 
   try {
     await listen(server, host, port);
   } catch {
     lifecycle = "closed";
+    securityPolicy?.invalidate();
     throw new LocalUiServerError("Unable to start local UI server.");
   }
   server.on("error", () => {
@@ -309,6 +524,7 @@ export async function startLocalUiServer(
   const address = server.address();
   if (address === null || typeof address === "string" || address.address !== localhostUiHost) {
     lifecycle = "closed";
+    securityPolicy?.invalidate();
     await new Promise<void>((resolve) => {
       server.close(() => {
         resolve();
@@ -317,6 +533,7 @@ export async function startLocalUiServer(
     throw new LocalUiServerError("Unable to start local UI server.");
   }
   const baseUrl = `http://${localhostUiHost}:${String(address.port)}`;
+  serverOrigin = baseUrl;
   scheduleLock();
 
   const status = (): UiServerStatus => {
@@ -328,6 +545,7 @@ export async function startLocalUiServer(
   const close = (): Promise<void> => {
     if (closePromise !== undefined) return closePromise;
     lifecycle = "closed";
+    securityPolicy?.invalidate();
     if (idleTimer !== undefined) clearTimeout(idleTimer);
     idleTimer = undefined;
     closePromise = new Promise<void>((resolve) => {
