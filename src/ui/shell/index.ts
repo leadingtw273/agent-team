@@ -337,8 +337,8 @@ function renderEvents(readModel: UiShellReadModel): string {
     </section>`;
 }
 
-function renderNavigation(activePath: PageDefinition["path"]): string {
-  return `<nav class="ui-nav" aria-label="主要導覽"><p class="ui-nav-caption">管理介面</p><ul class="navbar-nav">${navigation
+function renderNavigationItems(activePath: PageDefinition["path"]): string {
+  return navigation
     .map((item) => {
       const itemIcon = icon(item.icon, "ui-nav-icon");
       if (item.href === undefined) {
@@ -347,7 +347,26 @@ function renderNavigation(activePath: PageDefinition["path"]): string {
       const current = item.href === activePath ? ' aria-current="page"' : "";
       return `<li class="nav-item"><a class="ui-nav-link" href="${item.href}"${current}>${itemIcon}<span>${item.label}</span></a></li>`;
     })
-    .join("")}</ul></nav>`;
+    .join("");
+}
+
+function renderNavigation(
+  activePath: PageDefinition["path"],
+  variant: "desktop" | "mobile",
+): string {
+  return `<nav class="ui-nav ui-nav--${variant}" aria-label="主要導覽"><p class="ui-nav-caption">管理介面</p><ul class="navbar-nav">${renderNavigationItems(activePath)}</ul></nav>`;
+}
+
+function renderMobileNavigation(activePath: PageDefinition["path"]): string {
+  const activeItem = navigation.find((item) => item.href === activePath);
+  if (activeItem?.href === undefined) throw new Error("Active navigation item is missing.");
+  return `<details class="ui-mobile-nav">
+          <summary class="ui-mobile-nav-toggle">
+            <span class="ui-mobile-current">${icon(activeItem.icon, "ui-nav-icon")}<span class="ui-mobile-current-label">目前頁面：<strong>${activeItem.label}</strong></span></span>
+            <span class="ui-mobile-nav-action"><span class="ui-mobile-nav-open">開啟選單</span><span class="ui-mobile-nav-close">關閉選單</span><span class="ui-mobile-nav-chevron" aria-hidden="true"></span></span>
+          </summary>
+          ${renderNavigation(activePath, "mobile")}
+        </details>`;
 }
 
 function renderPage(page: PageDefinition, readModel: UiShellReadModel): string {
@@ -367,7 +386,8 @@ function renderPage(page: PageDefinition, readModel: UiShellReadModel): string {
     <div class="ui-app">
       <aside class="ui-sidebar" aria-label="Agent Team 導覽">
         <a class="ui-brand" href="/" aria-label="Agent Team 總覽">${icon("agent", "ui-inline-icon ui-brand-mark")}<span class="ui-brand-copy"><span class="ui-brand-title">Agent Team</span><span class="ui-brand-subtitle">Local control room</span></span></a>
-        ${renderNavigation(page.path)}
+        ${renderNavigation(page.path, "desktop")}
+        ${renderMobileNavigation(page.path)}
         <div class="ui-sidebar-spacer"></div>
         <p class="ui-sidebar-note">唯讀 UI Shell · 無遠端 JavaScript<br>後續功能會依階段逐步啟用。</p>
       </aside>
