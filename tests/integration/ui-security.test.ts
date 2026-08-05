@@ -73,6 +73,20 @@ function doublePercentEncoded(value: string): string {
   );
 }
 
+function percentEncoded(value: string): string {
+  return Buffer.from(value, "ascii").reduce(
+    (encoded, byte) => `${encoded}%${byte.toString(16).padStart(2, "0")}`,
+    "",
+  );
+}
+
+function triplePercentEncoded(value: string): string {
+  return Buffer.from(value, "ascii").reduce(
+    (encoded, byte) => `${encoded}%2525${byte.toString(16).padStart(2, "0")}`,
+    "",
+  );
+}
+
 async function rawHttpRequest(handle: LocalUiServerHandle, payload: string): Promise<string> {
   const port = Number(new URL(handle.baseUrl).port);
   return await new Promise<string>((resolve, reject) => {
@@ -689,19 +703,88 @@ describe("localhost UI browser security layer", () => {
     },
   );
 
-  it("fails closed on malformed or still-decodable outbound representations", async () => {
-    for (const representation of ["malformed-%GG", "%252541"]) {
-      const handle = await startSecured({
-        handler: () => ({ statusCode: 400, body: representation }),
-      });
-      const session = await exchange(handle);
-      const rejected = await fetch(`${handle.baseUrl}/api/projects`, {
-        headers: { cookie: session.cookie },
-      });
+  it("allows credential-free handler output containing CSS percentages, URLs, and malformed percent text", async () => {
+    const body =
+      ".progress{width:100%;background:url('/assets/font%20name.woff2?coverage=100%25')}/* literal %, malformed %GG/%FF, nested %252541 */";
+    const handle = await startSecured({
+      handler: () => ({
+        statusCode: 200,
+        headers: { "content-type": "text/css; charset=utf-8", "x-source-url": "/font%20name" },
+        body,
+      }),
+    });
+    const session = await exchange(handle);
+    const response = await fetch(`${handle.baseUrl}/api/projects`, {
+      headers: { cookie: session.cookie },
+    });
 
-      expect(rejected.status).toBe(500);
-      expect(await rejected.text()).toBe("Internal Server Error\n");
-      await handle.close();
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-source-url")).toBe("/font%20name");
+    expect(await response.text()).toBe(body);
+  });
+
+  it("blocks raw and one-, two-, or three-layer encoded bearer, session, and CSRF credentials in body or headers", async () => {
+    let body = "safe";
+    let header = "safe";
+    const handle = await startSecured({
+      handler: () => ({ statusCode: 200, headers: { "x-handler-result": header }, body }),
+    });
+    const session = await exchange(handle);
+    const sessionToken = session.cookie.split("=", 2)[1];
+    if (sessionToken === undefined) throw new Error("missing session token");
+
+    for (const credential of [handle.sessionToken, sessionToken, session.csrf]) {
+      for (const representation of [
+        credential,
+        percentEncoded(credential),
+        doublePercentEncoded(credential),
+        triplePercentEncoded(credential),
+      ]) {
+        for (const location of ["body", "header"] as const) {
+          body = location === "body" ? `malformed-%GG-${representation}-suffix` : "safe";
+          header = location === "header" ? `malformed-%GG-${representation}-suffix` : "safe";
+          const rejected = await fetch(`${handle.baseUrl}/api/projects`, {
+            headers: { cookie: session.cookie },
+          });
+          const rendered = `${await rejected.text()}${JSON.stringify([...rejected.headers])}`;
+
+          expect(rejected.status).toBe(500);
+          expect(rejected.headers.get("x-handler-result")).toBeNull();
+          expect(rendered).not.toContain(credential);
+          expect(rendered).not.toContain(representation);
+        }
+      }
+    }
+  });
+
+  it("does not let contiguous malformed percent escapes hide encoded credentials", async () => {
+    let body = "safe";
+    let header = "safe";
+    const handle = await startSecured({
+      handler: () => ({ statusCode: 200, headers: { "x-handler-result": header }, body }),
+    });
+    const session = await exchange(handle);
+    const sessionToken = session.cookie.split("=", 2)[1];
+    if (sessionToken === undefined) throw new Error("missing session token");
+
+    for (const credential of [handle.sessionToken, sessionToken, session.csrf]) {
+      for (const encoded of [percentEncoded(credential), doublePercentEncoded(credential)]) {
+        for (const representation of [`%FF${encoded}`, `${encoded}%FF`, `%41%FF${encoded}%FE%42`]) {
+          for (const location of ["body", "header"] as const) {
+            body = location === "body" ? representation : "safe";
+            header = location === "header" ? representation : "safe";
+            const rejected = await fetch(`${handle.baseUrl}/api/projects`, {
+              headers: { cookie: session.cookie },
+            });
+            const rendered = `${await rejected.text()}${JSON.stringify([...rejected.headers])}`;
+
+            expect(rejected.status).toBe(500);
+            expect(rejected.headers.get("x-handler-result")).toBeNull();
+            expect(rendered).not.toContain(credential);
+            expect(rendered).not.toContain(encoded);
+          }
+        }
+      }
     }
   });
 

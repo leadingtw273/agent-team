@@ -9,7 +9,7 @@ import {
   validateHeaderValue,
 } from "node:http";
 
-import { canonicalResponseIsUnsafe, canonicalValueIsUnsafe } from "../security/canonical.js";
+import { responseLeaksCredentials, untrustedInputIsUnsafe } from "../security/canonical.js";
 
 export const localhostUiHost = "127.0.0.1";
 export const defaultUiIdleTimeoutMs = 15 * 60 * 1_000;
@@ -330,7 +330,7 @@ export async function startLocalUiServer(
     result.statusCode >= 100 &&
     result.statusCode <= 999 &&
     responseHeadersAreValid(result) &&
-    !canonicalResponseIsUnsafe(result, [sessionToken]) &&
+    !responseLeaksCredentials(result, [sessionToken]) &&
     securityPolicy?.responseContainsSensitiveData(result) !== true;
 
   const lockIfExpired = (): void => {
@@ -385,7 +385,7 @@ export async function startLocalUiServer(
       const incomingHeaders = distinctHeaders(request);
       const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
       const rawUrl = request.url ?? "";
-      const decision: UiSecurityDecision = canonicalValueIsUnsafe(rawUrl, [sessionToken])
+      const decision: UiSecurityDecision = untrustedInputIsUnsafe(rawUrl, [sessionToken])
         ? Object.freeze({
             kind: "respond",
             response: fixedResponse(400, "Bad Request\n"),

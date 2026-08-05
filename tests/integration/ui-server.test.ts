@@ -90,6 +90,20 @@ describe("localhost UI server", () => {
     expect(received[0]?.headers.authorization).toBeUndefined();
   });
 
+  it("allows trusted handler output containing CSS percentages, URLs, and literal percent signs", async () => {
+    const css =
+      ".progress{width:100%;background:url('/assets/font%20name.woff2?coverage=100%25')}/* literal %, malformed %GG/%FF, nested %252541 */";
+    const handle = await start({
+      handler: () => ({
+        statusCode: 200,
+        headers: { "content-type": "text/css; charset=utf-8" },
+        body: css,
+      }),
+    });
+
+    await expect(request(handle, handle.sessionToken)).resolves.toEqual({ status: 200, body: css });
+  });
+
   it.each(["0.0.0.0", "localhost", "::1"])(
     "rejects non-exact loopback host %s before session initialization",
     async (host) => {
