@@ -14,7 +14,7 @@ export const githubRegistrationPolicyApiPath = "/api/registration/github-policy"
 export const githubRegistrationPolicyScriptPath = "/assets/registration-github-policy.js" as const;
 
 const revisionPattern = /^[a-f0-9]{64}$/u;
-const confirmationPattern = /^[A-Za-z0-9_-]{20,4096}\.[A-Za-z0-9_-]{43}$/u;
+const confirmationPattern = /^[A-Za-z0-9_-]{20,12288}\.[A-Za-z0-9_-]{43}$/u;
 const script = readFileSync(
   new URL("../../assets/registration-github-policy.js", import.meta.url),
   "utf8",
@@ -69,6 +69,17 @@ const blockLabels = Object.freeze({
   read_back_incomplete: "套用後 Read-back 尚未證明必要 Gate，設定維持未完成。",
   rulesets_unsupported: "此 Repository 不支援必要 Ruleset API，設定維持未完成。",
 } as const);
+
+const supportLabels = Object.freeze({ supported: "支援", unsupported: "不支援" } as const);
+const permissionLabels = Object.freeze({ admin: "管理員", read_only: "唯讀" } as const);
+
+function yesNo(value: boolean): string {
+  return value ? "是" : "否";
+}
+
+function inlineValues(values: readonly string[]): string {
+  return values.length === 0 ? "（無）" : values.map(escapeHtml).join("、");
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/gu, (character) => {
@@ -182,10 +193,44 @@ export function renderGitHubRegistrationPolicyPanel(preview: GitHubRegistrationP
   const changes = preview.changes
     .map((change) => `<li>${escapeHtml(changeLabels[change])}</li>`)
     .join("");
-  return `<section class="card ui-panel mt-3" data-github-policy-panel data-expected-revision="${preview.expectedRevision}" data-confirmation-token="${preview.confirmationToken}" aria-labelledby="github-policy-title"><div class="card-body">
+  const before = preview.policyDiff.before;
+  const desired = preview.policyDiff.after.desiredPolicy;
+  const ruleset = desired.ruleset;
+  return `<section class="card ui-panel mt-3" data-github-policy-panel data-expected-revision="${escapeHtml(preview.expectedRevision)}" data-confirmation-token="${escapeHtml(preview.confirmationToken)}" aria-labelledby="github-policy-title"><div class="card-body">
     ${header}
     <p id="github-policy-status" class="alert alert-info" role="status" aria-live="polite">以下是純預覽；尚未變更 GitHub。</p>
     <ul aria-label="GitHub 設定差異">${changes}</ul>
+    <div class="row g-3" aria-label="GitHub 政策套用前後完整差異">
+      <section class="col-12 col-lg-6" aria-labelledby="github-policy-before-title">
+        <h3 id="github-policy-before-title">套用前：GitHub 現況</h3>
+        <dl>
+          <dt>權限</dt><dd>${permissionLabels[before.permission]}</dd>
+          <dt>Rulesets API</dt><dd>${supportLabels[before.rulesets]}</dd>
+          <dt>Auto-merge API</dt><dd>${supportLabels[before.autoMerge]}</dd>
+          <dt>Auto-merge 已啟用</dt><dd>${yesNo(before.autoMergeEnabled)}</dd>
+          <dt>目前作用中的 required checks</dt><dd>${inlineValues(before.activeRequiredChecks)}</dd>
+          <dt>受管 Ruleset 完全相符</dt><dd>${yesNo(before.managedRulesetExact)}</dd>
+          <dt>受管 Ruleset ID</dt><dd>${before.managedRulesetId === null ? "（無）" : escapeHtml(before.managedRulesetId)}</dd>
+          <dt>保留名稱衝突</dt><dd>${yesNo(before.managedRulesetCollision)}</dd>
+          <dt>GitHub inventory revision</dt><dd><code>${escapeHtml(before.revision)}</code></dd>
+        </dl>
+      </section>
+      <section class="col-12 col-lg-6" aria-labelledby="github-policy-after-title">
+        <h3 id="github-policy-after-title">套用後：目標政策</h3>
+        <dl>
+          <dt>Ruleset 名稱</dt><dd>${escapeHtml(ruleset.name)}</dd>
+          <dt>目標／執行狀態</dt><dd>${escapeHtml(ruleset.target)}／${escapeHtml(ruleset.enforcement)}</dd>
+          <dt>包含分支</dt><dd>${inlineValues(ruleset.conditions.include)}</dd>
+          <dt>排除分支</dt><dd>${inlineValues(ruleset.conditions.exclude)}</dd>
+          <dt>Bypass actors</dt><dd>${inlineValues(ruleset.bypassActors)}</dd>
+          <dt>必要 status checks</dt><dd>${inlineValues(ruleset.requiredStatusChecks.contexts)}</dd>
+          <dt>Require branches to be up to date</dt><dd>${yesNo(ruleset.requiredStatusChecks.strictRequiredStatusChecksPolicy)}</dd>
+          <dt>建立分支時略過</dt><dd>${yesNo(ruleset.requiredStatusChecks.doNotEnforceOnCreate)}</dd>
+          <dt>Auto-merge</dt><dd>${yesNo(desired.autoMerge)}</dd>
+          <dt>保留既有作用中 checks</dt><dd>${inlineValues(preview.policyDiff.after.preservedActiveRequiredChecks)}</dd>
+        </dl>
+      </section>
+    </div>
     <button class="btn btn-primary" type="button" data-github-policy-review>檢視並確認套用</button>
     <section data-github-policy-confirm hidden aria-labelledby="github-policy-confirm-title">
       <h3 id="github-policy-confirm-title">確認套用 GitHub 合併保護</h3>

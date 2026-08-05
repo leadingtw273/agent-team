@@ -1,6 +1,7 @@
 import {
   createInMemoryGitHubPolicyOperationStore,
   createGitHubRegistrationPolicy,
+  githubRegistrationDesiredPolicy,
   type GitHubRegistrationInventory,
   type GitHubRegistrationPolicyPort,
   type GitHubRegistrationPolicyUseCase,
@@ -20,6 +21,24 @@ export const fixtureGitHubRegistrationPolicyPreview: Extract<
   expectedRevision: "a".repeat(64),
   confirmationToken: `${"a".repeat(20)}.${"b".repeat(43)}`,
   changes: Object.freeze(["ensure_required_checks", "enable_auto_merge"] as const),
+  policyDiff: Object.freeze({
+    schemaVersion: 1,
+    before: Object.freeze({
+      revision: "a".repeat(64),
+      permission: "admin",
+      rulesets: "supported",
+      autoMerge: "supported",
+      autoMergeEnabled: false,
+      activeRequiredChecks: Object.freeze(["security-scan"]),
+      managedRulesetCollision: false,
+      managedRulesetExact: false,
+      managedRulesetId: null,
+    }),
+    after: Object.freeze({
+      desiredPolicy: githubRegistrationDesiredPolicy,
+      preservedActiveRequiredChecks: Object.freeze(["security-scan"]),
+    }),
+  }),
 });
 
 /** Synthetic browser-only controller; it never calls GitHub or mutates host state. */

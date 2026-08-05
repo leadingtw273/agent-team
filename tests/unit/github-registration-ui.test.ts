@@ -17,6 +17,11 @@ describe("O004 GitHub registration UI component", () => {
 
     expect(html).toContain("以下是純預覽；尚未變更 GitHub");
     expect(html).toContain("CI、agent-team/review");
+    expect(html).toContain("套用前：GitHub 現況");
+    expect(html).toContain("套用後：目標政策");
+    expect(html).toContain("security-scan");
+    expect(html).toContain("refs/heads/__agent_team_never__");
+    expect(html).toContain("Require branches to be up to date");
     expect(html).toContain("不會刪除、停用、改名或降低現有保護");
     expect(html).toContain("data-github-policy-review");
     expect(html).toContain("data-github-policy-confirm hidden");
@@ -37,6 +42,29 @@ describe("O004 GitHub registration UI component", () => {
     expect(html).toContain("系統不會接管或覆寫");
     expect(html).not.toContain("external instruction");
     expect(html).not.toContain("<script>");
+  });
+
+  it("escapes provider-owned inventory detail in the before/after audit view", () => {
+    const untrustedCheck = "<script>external instruction</script>";
+    const preview = {
+      ...fixtureGitHubRegistrationPolicyPreview,
+      policyDiff: {
+        ...fixtureGitHubRegistrationPolicyPreview.policyDiff,
+        before: {
+          ...fixtureGitHubRegistrationPolicyPreview.policyDiff.before,
+          activeRequiredChecks: [untrustedCheck],
+        },
+        after: {
+          ...fixtureGitHubRegistrationPolicyPreview.policyDiff.after,
+          preservedActiveRequiredChecks: [untrustedCheck],
+        },
+      },
+    };
+
+    const html = renderGitHubRegistrationPolicyPanel(preview);
+
+    expect(html).toContain("&lt;script&gt;external instruction&lt;/script&gt;");
+    expect(html).not.toContain("<script>external instruction</script>");
   });
 
   it("binds the target server-side and contributes only one script plus one PUT API", async () => {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { MakeDirectoryOptions, Mode } from "node:fs";
+import { renameSync, type MakeDirectoryOptions, type Mode } from "node:fs";
 import { chmod, mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
 
@@ -20,15 +20,21 @@ export interface AtomicFileOperations {
   readonly mkdir: (path: string, options: MakeDirectoryOptions) => Promise<string | undefined>;
   readonly open: (path: string, flags: string | number, mode?: Mode) => Promise<FileHandle>;
   readonly rename: (oldPath: string, newPath: string) => Promise<void>;
+  readonly renameSync?: (oldPath: string, newPath: string) => void;
   readonly unlink: (path: string) => Promise<void>;
 }
 
-const nodeFileOperations: AtomicFileOperations = { chmod, mkdir, open, rename, unlink };
+const nodeFileOperations: AtomicFileOperations = { chmod, mkdir, open, rename, renameSync, unlink };
 
 export interface AtomicWriteOptions {
   readonly visibility?: "private" | "project";
   /** Runs after the temporary file is complete and fsynced, immediately before publication. */
   readonly commitGuard?: () => Result<void, DomainError> | Promise<Result<void, DomainError>>;
+  /**
+   * Synchronous security boundary. No event-loop turn occurs between this guard returning and
+   * the synchronous rename that publishes the file.
+   */
+  readonly publicationGuard?: () => Result<void, DomainError>;
 }
 
 export interface AtomicWriteReceipt {
@@ -103,7 +109,20 @@ export class AtomicFileStore {
           return guarded;
         }
       }
-      await this.#operations.rename(temporaryPath, targetPath);
+      if (options.publicationGuard !== undefined) {
+        if (this.#operations.renameSync === undefined) {
+          await unlinkQuietly(this.#operations, temporaryPath);
+          return err(domainError("external_failure"));
+        }
+        const guarded = options.publicationGuard();
+        if (!guarded.ok) {
+          await unlinkQuietly(this.#operations, temporaryPath);
+          return guarded;
+        }
+        this.#operations.renameSync(temporaryPath, targetPath);
+      } else {
+        await this.#operations.rename(temporaryPath, targetPath);
+      }
       renamed = true;
       await syncDirectory(directory, this.#operations);
       return ok(Object.freeze({ durability: "confirmed" as const }));

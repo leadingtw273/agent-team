@@ -1,6 +1,14 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, mkdirSync, openSync, type Stats } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  type Stats,
+} from "node:fs";
 import { mkdir, open, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 
@@ -38,12 +46,15 @@ export interface SecureLockIdentity {
   readonly device: number;
   readonly inode: number;
   readonly generation: string;
+  readonly ownerDigest: string;
+  readonly changeEpoch: string;
 }
 
 export interface SecureFileLockHandle {
   readonly path: string;
   readonly holderId: string;
   readonly identity: SecureLockIdentity;
+  assertOwnershipSync(): Result<void, DomainError>;
   assertOwnership(): Promise<Result<void, DomainError>>;
   release(): Promise<Result<void, DomainError>>;
 }
@@ -51,6 +62,7 @@ export interface SecureFileLockHandle {
 interface PermanentLockRecord {
   readonly schemaVersion: 1;
   readonly generation: string;
+  readonly ownerDigest: string;
 }
 
 interface HeldDirectoryHandle {
@@ -103,8 +115,35 @@ function validPermanentLockRecord(value: unknown): value is PermanentLockRecord 
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
       record["generation"],
     ) &&
-    Object.keys(record).length === 2
+    typeof record["ownerDigest"] === "string" &&
+    /^[a-f0-9]{64}$/u.test(record["ownerDigest"]) &&
+    Object.keys(record).length === 3
   );
+}
+
+function readPermanentLockRecordSync(fd: number): Result<PermanentLockRecord, DomainError> {
+  try {
+    const info = fstatSync(fd);
+    if (
+      !info.isFile() ||
+      (info.mode & 0o777) !== privateFileMode ||
+      info.size <= 0 ||
+      info.size > 4096
+    ) {
+      return err(domainError("permission_denied"));
+    }
+    const content = Buffer.alloc(info.size);
+    const bytesRead = readSync(fd, content, 0, content.length, 0);
+    if (bytesRead !== content.length) return err(domainError("external_failure"));
+    const parsed: unknown = JSON.parse(content.toString("utf8"));
+    return validPermanentLockRecord(parsed) ? ok(parsed) : err(domainError("invariant_violation"));
+  } catch (error) {
+    return err(fileError(error));
+  }
+}
+
+function samePermanentLockRecord(left: PermanentLockRecord, right: PermanentLockRecord): boolean {
+  return left.generation === right.generation && left.ownerDigest === right.ownerDigest;
 }
 
 async function readPermanentLockRecord(
@@ -331,6 +370,20 @@ export class HeldSecureDirectory {
     }
   }
 
+  verifyIdentitySync(): Result<void, DomainError> {
+    try {
+      const info = fstatSync(this.#handle.fd);
+      return info.isDirectory() &&
+        (info.mode & 0o777) === privateDirectoryMode &&
+        info.dev === this.identity.device &&
+        info.ino === this.identity.inode
+        ? ok(undefined)
+        : err(domainError("conflict"));
+    } catch (error) {
+      return err(fileError(error));
+    }
+  }
+
   async verifyPathIdentity(): Promise<Result<void, DomainError>> {
     let reopened: FileHandle | undefined;
     try {
@@ -344,6 +397,22 @@ export class HeldSecureDirectory {
       return err(domainError(mapped.code === "not_found" ? "conflict" : mapped.code));
     } finally {
       await closeQuietly(reopened);
+    }
+  }
+
+  verifyPathIdentitySync(): Result<void, DomainError> {
+    let reopened: HeldDirectoryHandle | undefined;
+    try {
+      reopened = openAbsoluteDirectorySync(this.#rootPath, this.#children, false);
+      const info = fstatSync(reopened.fd);
+      return info.dev === this.identity.device && info.ino === this.identity.inode
+        ? ok(undefined)
+        : err(domainError("conflict"));
+    } catch (error) {
+      const mapped = fileError(error);
+      return err(domainError(mapped.code === "not_found" ? "conflict" : mapped.code));
+    } finally {
+      if (reopened !== undefined) closeSync(reopened.fd);
     }
   }
 
@@ -369,6 +438,32 @@ export class HeldSecureDirectory {
       return err(fileError(error));
     } finally {
       await closeQuietly(file);
+    }
+  }
+
+  readFileSync(name: string, options: SecureFileReadOptions = {}): Result<Uint8Array, DomainError> {
+    const path = this.#path(name);
+    if (!path.ok) return path;
+    const maxBytes = options.maxBytes ?? 16 * 1024 * 1024;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      return err(domainError("invariant_violation"));
+    }
+    let fd: number | undefined;
+    try {
+      fd = openSync(path.value, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = fstatSync(fd);
+      if (!info.isFile() || (info.mode & 0o777) !== privateFileMode || info.size > maxBytes) {
+        return err(domainError("permission_denied"));
+      }
+      const content = Buffer.alloc(info.size);
+      const bytesRead = readSync(fd, content, 0, content.length, 0);
+      return bytesRead === content.length
+        ? ok(Uint8Array.from(content))
+        : err(domainError("external_failure"));
+    } catch (error) {
+      return err(fileError(error));
+    } finally {
+      if (fd !== undefined) closeSync(fd);
     }
   }
 
@@ -411,9 +506,14 @@ export class HeldSecureDirectory {
     try {
       try {
         handle = await open(path.value, "wx+", privateFileMode);
+        const generation = randomUUID();
         const created: PermanentLockRecord = Object.freeze({
           schemaVersion: 1,
-          generation: randomUUID(),
+          generation,
+          ownerDigest: createHash("sha256")
+            .update(randomBytes(32))
+            .update(generation, "utf8")
+            .digest("hex"),
         });
         await handle.writeFile(`${JSON.stringify(created)}\n`, "utf8");
         await handle.chmod(privateFileMode);
@@ -427,7 +527,6 @@ export class HeldSecureDirectory {
       }
 
       const ownedHandle = handle;
-      const ownedInfo = await ownedHandle.stat();
       const record = await readPermanentLockRecord(ownedHandle);
       if (!record.ok) {
         await closeQuietly(ownedHandle);
@@ -439,55 +538,69 @@ export class HeldSecureDirectory {
         return kernelLock;
       }
 
+      const ownedInfo = fstatSync(ownedHandle.fd, { bigint: true });
+
       const identity: SecureLockIdentity = Object.freeze({
-        device: ownedInfo.dev,
-        inode: ownedInfo.ino,
+        device: Number(ownedInfo.dev),
+        inode: Number(ownedInfo.ino),
         generation: record.value.generation,
+        ownerDigest: record.value.ownerDigest,
+        changeEpoch: ownedInfo.ctimeNs.toString(),
       });
       let finished = false;
-      const assertOwnership = async (): Promise<Result<void, DomainError>> => {
+      const assertOwnershipSync = (): Result<void, DomainError> => {
         if (finished) return err(domainError("conflict"));
-        const directoryIdentity = await this.verifyIdentity();
+        const directoryIdentity = this.verifyIdentitySync();
         if (!directoryIdentity.ok) return directoryIdentity;
-        const directoryPathIdentity = await this.verifyPathIdentity();
+        const directoryPathIdentity = this.verifyPathIdentitySync();
         if (!directoryPathIdentity.ok) return directoryPathIdentity;
-        let canonical: FileHandle | undefined;
+        let canonicalFd: number | undefined;
         try {
-          const heldInfo = await ownedHandle.stat();
+          const heldInfo = fstatSync(ownedHandle.fd, { bigint: true });
           if (
             !heldInfo.isFile() ||
-            (heldInfo.mode & 0o777) !== privateFileMode ||
-            heldInfo.dev !== identity.device ||
-            heldInfo.ino !== identity.inode
+            Number(heldInfo.mode & 0o777n) !== privateFileMode ||
+            Number(heldInfo.dev) !== identity.device ||
+            Number(heldInfo.ino) !== identity.inode ||
+            heldInfo.ctimeNs.toString() !== identity.changeEpoch
           ) {
             return err(domainError("conflict"));
           }
-          const heldRecord = await readPermanentLockRecord(ownedHandle);
-          if (!heldRecord.ok || heldRecord.value.generation !== identity.generation) {
+          const heldRecord = readPermanentLockRecordSync(ownedHandle.fd);
+          const expectedRecord: PermanentLockRecord = {
+            schemaVersion: 1,
+            generation: identity.generation,
+            ownerDigest: identity.ownerDigest,
+          };
+          if (!heldRecord.ok || !samePermanentLockRecord(heldRecord.value, expectedRecord)) {
             return err(domainError("conflict"));
           }
-          canonical = await open(path.value, constants.O_RDONLY | constants.O_NOFOLLOW);
-          const canonicalInfo = await canonical.stat();
+          canonicalFd = openSync(path.value, constants.O_RDONLY | constants.O_NOFOLLOW);
+          const canonicalInfo = fstatSync(canonicalFd, { bigint: true });
           if (
             !canonicalInfo.isFile() ||
-            (canonicalInfo.mode & 0o777) !== privateFileMode ||
-            canonicalInfo.dev !== identity.device ||
-            canonicalInfo.ino !== identity.inode
+            Number(canonicalInfo.mode & 0o777n) !== privateFileMode ||
+            Number(canonicalInfo.dev) !== identity.device ||
+            Number(canonicalInfo.ino) !== identity.inode ||
+            canonicalInfo.ctimeNs.toString() !== identity.changeEpoch
           ) {
             return err(domainError("conflict"));
           }
-          const canonicalRecord = await readPermanentLockRecord(canonical);
-          return canonicalRecord.ok && canonicalRecord.value.generation === identity.generation
+          const canonicalRecord = readPermanentLockRecordSync(canonicalFd);
+          return canonicalRecord.ok &&
+            samePermanentLockRecord(canonicalRecord.value, expectedRecord)
             ? ok(undefined)
             : err(domainError("conflict"));
         } catch (error) {
           const mapped = fileError(error);
           return err(domainError(mapped.code === "not_found" ? "conflict" : mapped.code));
         } finally {
-          await closeQuietly(canonical);
+          if (canonicalFd !== undefined) closeSync(canonicalFd);
         }
       };
-      const initialOwnership = await assertOwnership();
+      const assertOwnership = (): Promise<Result<void, DomainError>> =>
+        Promise.resolve(assertOwnershipSync());
+      const initialOwnership = assertOwnershipSync();
       if (!initialOwnership.ok) {
         await closeQuietly(ownedHandle);
         return initialOwnership;
@@ -497,6 +610,7 @@ export class HeldSecureDirectory {
           path: path.value,
           holderId,
           identity,
+          assertOwnershipSync,
           assertOwnership,
           release: async (): Promise<Result<void, DomainError>> => {
             if (finished) return err(domainError("conflict"));

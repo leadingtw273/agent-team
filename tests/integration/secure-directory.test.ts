@@ -159,6 +159,22 @@ describe("Linux held secure directory", () => {
         if (!active.ok) return active;
         const lockPath = join(root, "leases", "operation.lock");
         expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
+        const permanentRecord = JSON.parse(await readFile(lockPath, "utf8")) as Record<
+          string,
+          unknown
+        >;
+        expect(Object.keys(permanentRecord).sort()).toEqual([
+          "generation",
+          "ownerDigest",
+          "schemaVersion",
+        ]);
+        expect(permanentRecord).toMatchObject({
+          schemaVersion: 1,
+          generation: active.value.identity.generation,
+          ownerDigest: active.value.identity.ownerDigest,
+        });
+        expect(active.value.identity.ownerDigest).toMatch(/^[a-f0-9]{64}$/u);
+        expect(active.value.identity.changeEpoch).toMatch(/^\d+$/u);
         expect(await active.value.assertOwnership()).toEqual({ ok: true, value: undefined });
         const externalWhileHeld = spawnSync(
           "/usr/bin/flock",
@@ -187,6 +203,73 @@ describe("Linux held secure directory", () => {
 
     expect(result).toEqual({ ok: true, value: undefined });
     expect((await stat(join(root, "leases", "operation.lock"))).mode & 0o777).toBe(0o600);
+  });
+
+  it("fails closed for a malformed permanent lock record instead of replacing it", async () => {
+    const parent = await container();
+    const root = join(parent, "state");
+    const result = await withSecureDirectory(
+      root,
+      ["leases"],
+      { create: true },
+      async (directory) => {
+        const first = await directory.acquireLock("operation.lock", "owner-a");
+        if (!first.ok) return first;
+        const released = await first.value.release();
+        if (!released.ok) return released;
+        const lockPath = join(root, "leases", "operation.lock");
+        await writeFile(
+          lockPath,
+          `${JSON.stringify({ schemaVersion: 1, generation: first.value.identity.generation })}\n`,
+          { mode: 0o600 },
+        );
+
+        expect(await directory.acquireLock("operation.lock", "owner-b")).toMatchObject({
+          ok: false,
+          error: { code: "invariant_violation" },
+        });
+        expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual({
+          schemaVersion: 1,
+          generation: first.value.identity.generation,
+        });
+        return ok(undefined);
+      },
+    );
+
+    expect(result).toEqual({ ok: true, value: undefined });
+  });
+
+  it("rejects an ownerDigest rewrite for the lifetime of the original lock", async () => {
+    const parent = await container();
+    const root = join(parent, "state");
+    const result = await withSecureDirectory(
+      root,
+      ["leases"],
+      { create: true },
+      async (directory) => {
+        const active = await directory.acquireLock("operation.lock", "owner-a");
+        if (!active.ok) return active;
+        const lockPath = join(root, "leases", "operation.lock");
+        await writeFile(
+          lockPath,
+          `${JSON.stringify({ schemaVersion: 1, generation: active.value.identity.generation, ownerDigest: "f".repeat(64) })}\n`,
+          { mode: 0o600 },
+        );
+
+        expect(await active.value.assertOwnership()).toMatchObject({
+          ok: false,
+          error: { code: "conflict" },
+        });
+        expect(active.value.assertOwnershipSync()).toMatchObject({
+          ok: false,
+          error: { code: "conflict" },
+        });
+        expect(await active.value.release()).toEqual({ ok: true, value: undefined });
+        return ok(undefined);
+      },
+    );
+
+    expect(result).toEqual({ ok: true, value: undefined });
   });
 
   it("never moves or deletes a replacement owner during lock-path ABA", async () => {

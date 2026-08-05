@@ -157,6 +157,45 @@ class AfterCommitReplacingWriter extends AtomicFileStore {
   }
 }
 
+class AfterGuardReplacingWriter extends AtomicFileStore {
+  readonly #root: string;
+  replacement: SecureFileLockHandle | undefined;
+  replacementDirectory: HeldSecureDirectory | undefined;
+
+  constructor(root: string) {
+    super();
+    this.#root = root;
+  }
+
+  override write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    const guarded = options.commitGuard;
+    return super.write(targetPath, content, {
+      ...options,
+      commitGuard: async () => {
+        const result = guarded === undefined ? ok(undefined) : await guarded();
+        if (!result.ok || !targetPath.endsWith(`/${operationId}.json`)) return result;
+        const canonical = join(this.#root, `${operationId}.lock`);
+        await rename(canonical, join(this.#root, `${operationId}.lock.after-guard`));
+        const opened = openHeldSecureDirectory(this.#root, [], { create: false });
+        if (!opened.ok) return opened;
+        this.replacementDirectory = opened.value;
+        const replacement = await opened.value.acquireLock(
+          `${operationId}.lock`,
+          "after-guard-owner",
+        );
+        if (!replacement.ok) return replacement;
+        this.replacement = replacement.value;
+        return result;
+      },
+    });
+  }
+
+  async close(): Promise<void> {
+    if (this.replacement !== undefined) await this.replacement.release();
+    if (this.replacementDirectory !== undefined) await this.replacementDirectory.close();
+  }
+}
+
 class TransientRestoringWriter extends AtomicFileStore {
   readonly #root: string;
   #restored = false;
@@ -278,26 +317,30 @@ describe("O004 file GitHub policy operation store", () => {
         root,
         operationId,
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe", "ipc"] },
     );
-    let stdout = "";
     let stderr = "";
-    child.stdout.setEncoding("utf8");
+    if (child.stderr === null) throw new Error("expected child stderr pipe");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-    });
     child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
+    let childResult: unknown;
 
     await new Promise<void>((resolve, reject) => {
-      child.stdout.on("data", () => {
-        if (stdout.includes("held\n")) resolve();
+      child.on("message", (message: unknown) => {
+        if (
+          typeof message === "object" &&
+          message !== null &&
+          "type" in message &&
+          message.type === "held"
+        ) {
+          resolve();
+        }
       });
       child.once("error", reject);
       child.once("exit", (code) => {
-        if (!stdout.includes("held\n")) {
+        if (childResult === undefined) {
           reject(new Error(`child exited before holding lock: ${String(code)} ${stderr}`));
         }
       });
@@ -312,13 +355,23 @@ describe("O004 file GitHub policy operation store", () => {
     ).toMatchObject({ ok: false, error: { code: "conflict" } });
     expect(await exists(join(root, `${operationId}.json`))).toBe(false);
 
-    child.stdin.write("continue\n");
+    child.on("message", (message: unknown) => {
+      if (
+        typeof message === "object" &&
+        message !== null &&
+        "type" in message &&
+        message.type === "result" &&
+        "result" in message
+      ) {
+        childResult = message.result;
+      }
+    });
+    child.send({ type: "continue" });
     const childExit = await new Promise<number | null>((resolve, reject) => {
       child.once("error", reject);
       child.once("exit", resolve);
     });
     expect(childExit, stderr).toBe(0);
-    const childResult = JSON.parse(stdout.trim().split("\n").at(-1) ?? "null") as unknown;
     expect(childResult).toMatchObject({ ok: true, value: { revision: 1 } });
     expect(
       await second.compareAndSwap({
@@ -433,6 +486,32 @@ describe("O004 file GitHub policy operation store", () => {
     await store.close();
   });
 
+  it("never publishes when the real lock is replaced after the async guard but before rename", async () => {
+    const root = await directory();
+    const initialized = new FileGitHubPolicyOperationStore(root);
+    expect(
+      await initialized.compareAndSwap({ operationId, expectedRevision: null, next: initial }),
+    ).toMatchObject({ ok: true, value: { revision: 1 } });
+    await initialized.close();
+    const writer = new AfterGuardReplacingWriter(root);
+    const store = new FileGitHubPolicyOperationStore(root, writer);
+
+    expect(
+      await store.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false });
+    expect(await writer.replacement?.assertOwnership()).toEqual({ ok: true, value: undefined });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
+    });
+    await writer.close();
+    await store.close();
+  });
+
   it.each([
     [
       "strict-schema tamper",
@@ -445,6 +524,19 @@ describe("O004 file GitHub policy operation store", () => {
       (value: Record<string, unknown>) => ({
         ...value,
         device: Number(value["device"]) + 1,
+      }),
+    ],
+    [
+      "malformed ownerDigest",
+      "invariant_violation",
+      (value: Record<string, unknown>) => ({ ...value, ownerDigest: "not-a-digest" }),
+    ],
+    [
+      "ownerDigest mismatch",
+      "conflict",
+      (value: Record<string, unknown>) => ({
+        ...value,
+        ownerDigest: value["ownerDigest"] === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64),
       }),
     ],
   ] as const)(
@@ -478,7 +570,7 @@ describe("O004 file GitHub policy operation store", () => {
     },
   );
 
-  it("does not authorize another store while a lock path is replaced and later restored", async () => {
+  it("does not authorize another store while a lock path is replaced or after it is restored", async () => {
     const root = await directory();
     const initialized = new FileGitHubPolicyOperationStore(root);
     expect(
@@ -520,11 +612,15 @@ describe("O004 file GitHub policy operation store", () => {
         expectedRevision: 1,
         next: Object.freeze({ ...initial, phase: "mutation_started" }),
       }),
-    ).toMatchObject({ ok: true, value: { revision: 2 } });
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
+    });
     await competitor.close();
   });
 
-  it("allows one guarded mutation after a transient replace-restore but never a second CAS", async () => {
+  it("permanently fails closed after a transient replace-restore and never publishes", async () => {
     const root = await directory();
     const initialized = new FileGitHubPolicyOperationStore(root);
     expect(
@@ -540,7 +636,7 @@ describe("O004 file GitHub policy operation store", () => {
         expectedRevision: 1,
         next: Object.freeze({ ...initial, phase: "mutation_started" }),
       }),
-    ).toMatchObject({ ok: true, value: { revision: 2 } });
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
     expect(
       await second.compareAndSwap({
         operationId,
@@ -549,8 +645,8 @@ describe("O004 file GitHub policy operation store", () => {
       }),
     ).toMatchObject({ ok: false, error: { code: "conflict" } });
     expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
-      revision: 2,
-      phase: "mutation_started",
+      revision: 1,
+      phase: "reserved",
     });
     await first.close();
     await second.close();

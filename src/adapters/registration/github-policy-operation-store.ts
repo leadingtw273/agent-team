@@ -57,6 +57,8 @@ const lockIdentityManifestSchema: z.ZodType<LockIdentityManifest> = z
     device: z.number().int().nonnegative(),
     inode: z.number().int().nonnegative(),
     generation: z.string().regex(lockGenerationPattern),
+    ownerDigest: z.string().regex(/^[a-f0-9]{64}$/u),
+    changeEpoch: z.string().regex(/^[0-9]+$/u),
   })
   .strict();
 
@@ -120,6 +122,8 @@ function lockManifest(operationId: string, identity: SecureLockIdentity): LockId
     device: identity.device,
     inode: identity.inode,
     generation: identity.generation,
+    ownerDigest: identity.ownerDigest,
+    changeEpoch: identity.changeEpoch,
   });
 }
 
@@ -129,7 +133,9 @@ function sameLockManifest(left: LockIdentityManifest, right: LockIdentityManifes
     left.lockName === right.lockName &&
     left.device === right.device &&
     left.inode === right.inode &&
-    left.generation === right.generation
+    left.generation === right.generation &&
+    left.ownerDigest === right.ownerDigest &&
+    left.changeEpoch === right.changeEpoch
   );
 }
 
@@ -138,6 +144,25 @@ async function readLockManifest(
   operationId: string,
 ): Promise<Result<LockIdentityManifest | undefined, DomainError>> {
   const content = await directory.readFile(lockManifestName(operationId), { maxBytes: 64 * 1024 });
+  if (!content.ok) return content.error.code === "not_found" ? ok(undefined) : content;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(content.value).toString("utf8"));
+    const parsed = lockIdentityManifestSchema.safeParse(value);
+    if (!parsed.success) return err(domainError("invariant_violation"));
+    const expected = lockManifest(operationId, parsed.data);
+    return sameLockManifest(parsed.data, expected)
+      ? ok(parsed.data)
+      : err(domainError("invariant_violation"));
+  } catch {
+    return err(domainError("invariant_violation"));
+  }
+}
+
+function readLockManifestSync(
+  directory: HeldSecureDirectory,
+  operationId: string,
+): Result<LockIdentityManifest | undefined, DomainError> {
+  const content = directory.readFileSync(lockManifestName(operationId), { maxBytes: 64 * 1024 });
   if (!content.ok) return content.error.code === "not_found" ? ok(undefined) : content;
   try {
     const value: unknown = JSON.parse(Buffer.from(content.value).toString("utf8"));
@@ -207,10 +232,10 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
         content,
         this.#files,
         {
-          commitGuard: async () => {
-            const owned = await lock.assertOwnership();
+          publicationGuard: () => {
+            const owned = lock.assertOwnershipSync();
             if (!owned.ok) return owned;
-            const existing = await readLockManifest(directory, operationId);
+            const existing = readLockManifestSync(directory, operationId);
             return existing.ok && existing.value === undefined
               ? ok(undefined)
               : err(domainError("conflict"));
@@ -239,16 +264,24 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
     operationId: string,
     lock: SecureFileLockHandle,
   ): Promise<Result<void, DomainError>> {
-    const ownedBefore = await lock.assertOwnership();
+    return Promise.resolve(this.#assertLockBindingSync(directory, operationId, lock));
+  }
+
+  #assertLockBindingSync(
+    directory: HeldSecureDirectory,
+    operationId: string,
+    lock: SecureFileLockHandle,
+  ): Result<void, DomainError> {
+    const ownedBefore = lock.assertOwnershipSync();
     if (!ownedBefore.ok) return ownedBefore;
-    const observed = await readLockManifest(directory, operationId);
+    const observed = readLockManifestSync(directory, operationId);
     if (!observed.ok || observed.value === undefined) {
       return observed.ok ? err(domainError("conflict")) : observed;
     }
     if (!sameLockManifest(observed.value, lockManifest(operationId, lock.identity))) {
       return err(domainError("conflict"));
     }
-    return lock.assertOwnership();
+    return lock.assertOwnershipSync();
   }
 
   async #withOperationLock<Value>(
@@ -327,7 +360,8 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
           content.value,
           this.#files,
           {
-            commitGuard: () => this.#assertLockBinding(directory, command.operationId, lock),
+            publicationGuard: () =>
+              this.#assertLockBindingSync(directory, command.operationId, lock),
           },
         );
         if (!written.ok) return written;

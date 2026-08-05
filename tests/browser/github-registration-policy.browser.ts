@@ -38,6 +38,10 @@ test.describe("O004 GitHub registration policy component", () => {
     const review = page.getByRole("button", { name: "檢視並確認套用" });
     const confirmation = page.getByRole("heading", { name: "確認套用 GitHub 合併保護" });
     await expect(review).toBeVisible();
+    await expect(page.getByRole("heading", { name: "套用前：GitHub 現況" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "套用後：目標政策" })).toBeVisible();
+    await expect(page.getByText("目前作用中的 required checks", { exact: true })).toBeVisible();
+    await expect(page.getByText("CI、agent-team/review", { exact: true })).toBeVisible();
     await review.click();
     await expect(confirmation).toBeVisible();
     await expect(page.getByRole("button", { name: "確認套用", exact: true })).toBeFocused();

@@ -52,6 +52,27 @@ export interface GitHubRegistrationInventory {
   readonly managedRulesetId?: string;
 }
 
+export interface GitHubRegistrationPolicyBefore {
+  readonly revision: string;
+  readonly permission: "admin" | "read_only";
+  readonly rulesets: "supported" | "unsupported";
+  readonly autoMerge: "supported" | "unsupported";
+  readonly autoMergeEnabled: boolean;
+  readonly activeRequiredChecks: readonly string[];
+  readonly managedRulesetCollision: boolean;
+  readonly managedRulesetExact: boolean;
+  readonly managedRulesetId: string | null;
+}
+
+export interface GitHubRegistrationPolicyDiff {
+  readonly schemaVersion: 1;
+  readonly before: GitHubRegistrationPolicyBefore;
+  readonly after: Readonly<{
+    readonly desiredPolicy: typeof githubRegistrationDesiredPolicy;
+    readonly preservedActiveRequiredChecks: readonly string[];
+  }>;
+}
+
 export interface GitHubRegistrationCreateRulesetRequest {
   readonly target: GitHubRegistrationTarget;
   readonly expectedRevision: string;
@@ -134,6 +155,7 @@ export type GitHubRegistrationPreview =
       expectedRevision: string;
       confirmationToken: string;
       changes: readonly GitHubRegistrationChange[];
+      policyDiff: GitHubRegistrationPolicyDiff;
     }>
   | Readonly<{
       state: "configured";
@@ -194,8 +216,8 @@ interface CreateGitHubRegistrationPolicyOptions {
 }
 
 interface ConfirmationPayload {
-  readonly schemaVersion: 2;
-  readonly purpose: "agent-team-github-registration-confirmation-v2";
+  readonly schemaVersion: 3;
+  readonly purpose: "agent-team-github-registration-confirmation-v3";
   readonly authorityDigest: string;
   readonly operation: "apply_github_policy";
   readonly projectId: string;
@@ -206,6 +228,8 @@ interface ConfirmationPayload {
   readonly bindingRevision: string;
   readonly storeRevision: number;
   readonly changes: readonly GitHubRegistrationChange[];
+  readonly policyDiff: GitHubRegistrationPolicyDiff;
+  readonly policyDiffDigest: string;
 }
 
 const projectIdPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$/u;
@@ -213,8 +237,9 @@ const authorityDigestPattern = /^[a-f0-9]{64}$/u;
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/u;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/u;
 const revisionPattern = /^[a-f0-9]{64}$/u;
-const tokenPattern = /^[A-Za-z0-9_-]{20,4096}\.[A-Za-z0-9_-]{43}$/u;
+const tokenPattern = /^[A-Za-z0-9_-]{20,12288}\.[A-Za-z0-9_-]{43}$/u;
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u;
+const maximumActiveRequiredCheckCharacters = 3_000;
 const passedGates = Object.freeze({
   github_review_status: "passed" as const,
   github_auto_merge: "passed" as const,
@@ -260,10 +285,132 @@ function changesFor(inventory: GitHubRegistrationInventory): readonly GitHubRegi
   return Object.freeze(changes);
 }
 
+function policyBefore(inventory: GitHubRegistrationInventory): GitHubRegistrationPolicyBefore {
+  return Object.freeze({
+    revision: inventory.revision,
+    permission: inventory.permission,
+    rulesets: inventory.rulesets,
+    autoMerge: inventory.autoMerge,
+    autoMergeEnabled: inventory.autoMergeEnabled,
+    activeRequiredChecks: Object.freeze([...inventory.activeRequiredChecks]),
+    managedRulesetCollision: inventory.managedRulesetCollision,
+    managedRulesetExact: inventory.managedRulesetExact,
+    managedRulesetId: inventory.managedRulesetId ?? null,
+  });
+}
+
+function policyDiffFor(inventory: GitHubRegistrationInventory): GitHubRegistrationPolicyDiff {
+  const before = policyBefore(inventory);
+  return Object.freeze({
+    schemaVersion: 1,
+    before,
+    after: Object.freeze({
+      desiredPolicy: githubRegistrationDesiredPolicy,
+      preservedActiveRequiredChecks: Object.freeze([...before.activeRequiredChecks]),
+    }),
+  });
+}
+
+function inventoryFromPolicyBefore(
+  before: GitHubRegistrationPolicyBefore,
+): GitHubRegistrationInventory {
+  return Object.freeze({
+    revision: before.revision,
+    permission: before.permission,
+    rulesets: before.rulesets,
+    autoMerge: before.autoMerge,
+    autoMergeEnabled: before.autoMergeEnabled,
+    activeRequiredChecks: before.activeRequiredChecks,
+    managedRulesetCollision: before.managedRulesetCollision,
+    managedRulesetExact: before.managedRulesetExact,
+    ...(before.managedRulesetId === null ? {} : { managedRulesetId: before.managedRulesetId }),
+  });
+}
+
+function exactKeys(value: Readonly<Record<string, unknown>>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function totalCheckCharacters(checks: readonly unknown[]): number {
+  let total = 0;
+  for (const context of checks) {
+    if (typeof context !== "string") return maximumActiveRequiredCheckCharacters + 1;
+    total += context.length;
+  }
+  return total;
+}
+
+function policyDiffIsValid(value: unknown): value is GitHubRegistrationPolicyDiff {
+  if (typeof value !== "object" || value === null) return false;
+  const diff = value as Readonly<Record<string, unknown>>;
+  const beforeValue = diff["before"];
+  const afterValue = diff["after"];
+  if (
+    diff["schemaVersion"] !== 1 ||
+    !exactKeys(diff, ["after", "before", "schemaVersion"]) ||
+    typeof beforeValue !== "object" ||
+    beforeValue === null ||
+    typeof afterValue !== "object" ||
+    afterValue === null
+  ) {
+    return false;
+  }
+  const before = beforeValue as Readonly<Record<string, unknown>>;
+  const after = afterValue as Readonly<Record<string, unknown>>;
+  const checks = before["activeRequiredChecks"];
+  const managedRulesetId = before["managedRulesetId"];
+  if (
+    !exactKeys(before, [
+      "activeRequiredChecks",
+      "autoMerge",
+      "autoMergeEnabled",
+      "managedRulesetCollision",
+      "managedRulesetExact",
+      "managedRulesetId",
+      "permission",
+      "revision",
+      "rulesets",
+    ]) ||
+    typeof before["revision"] !== "string" ||
+    !revisionPattern.test(before["revision"]) ||
+    (before["permission"] !== "admin" && before["permission"] !== "read_only") ||
+    (before["rulesets"] !== "supported" && before["rulesets"] !== "unsupported") ||
+    (before["autoMerge"] !== "supported" && before["autoMerge"] !== "unsupported") ||
+    typeof before["autoMergeEnabled"] !== "boolean" ||
+    !Array.isArray(checks) ||
+    checks.length > 100 ||
+    totalCheckCharacters(checks) > maximumActiveRequiredCheckCharacters ||
+    !checks.every(
+      (context) =>
+        typeof context === "string" &&
+        context.length > 0 &&
+        context.length <= 100 &&
+        !/[\r\n\0]/u.test(context),
+    ) ||
+    typeof before["managedRulesetCollision"] !== "boolean" ||
+    typeof before["managedRulesetExact"] !== "boolean" ||
+    (managedRulesetId !== null &&
+      (typeof managedRulesetId !== "string" || !identifierPattern.test(managedRulesetId))) ||
+    (before["managedRulesetExact"] && managedRulesetId === null) ||
+    !exactKeys(after, ["desiredPolicy", "preservedActiveRequiredChecks"]) ||
+    JSON.stringify(after["desiredPolicy"]) !== JSON.stringify(githubRegistrationDesiredPolicy) ||
+    JSON.stringify(after["preservedActiveRequiredChecks"]) !== JSON.stringify(checks)
+  ) {
+    return false;
+  }
+  const typed = value as GitHubRegistrationPolicyDiff;
+  return (
+    JSON.stringify(typed) === JSON.stringify(policyDiffFor(inventoryFromPolicyBefore(typed.before)))
+  );
+}
+
 function inventoryIsValid(inventory: GitHubRegistrationInventory): boolean {
   return (
     revisionPattern.test(inventory.revision) &&
-    inventory.activeRequiredChecks.length <= 1_000 &&
+    Array.isArray(inventory.activeRequiredChecks) &&
+    inventory.activeRequiredChecks.length <= 100 &&
+    totalCheckCharacters(inventory.activeRequiredChecks) <= maximumActiveRequiredCheckCharacters &&
     inventory.activeRequiredChecks.every(
       (context) =>
         typeof context === "string" &&
@@ -307,23 +454,25 @@ function policyBlock(
 function confirmationPayload(
   authorityDigest: string,
   target: GitHubRegistrationTarget,
-  inventoryRevision: string,
   storeRevision: number,
   changes: readonly GitHubRegistrationChange[],
+  policyDiff: GitHubRegistrationPolicyDiff,
 ): ConfirmationPayload {
   return Object.freeze({
-    schemaVersion: 2,
-    purpose: "agent-team-github-registration-confirmation-v2",
+    schemaVersion: 3,
+    purpose: "agent-team-github-registration-confirmation-v3",
     authorityDigest,
     operation: "apply_github_policy",
     projectId: target.projectId,
     repository: target.repository,
     defaultBranch: target.defaultBranch,
     desiredPolicy: githubRegistrationDesiredPolicy,
-    inventoryRevision,
+    inventoryRevision: policyDiff.before.revision,
     bindingRevision: bindingRevision(target),
     storeRevision,
     changes,
+    policyDiff,
+    policyDiffDigest: stableHash(policyDiff),
   });
 }
 
@@ -355,8 +504,8 @@ function parseConfirmationToken(key: Uint8Array, token: string): ConfirmationPay
     const inventoryRevision = payload["inventoryRevision"];
     const binding = payload["bindingRevision"];
     if (
-      payload["schemaVersion"] !== 2 ||
-      payload["purpose"] !== "agent-team-github-registration-confirmation-v2" ||
+      payload["schemaVersion"] !== 3 ||
+      payload["purpose"] !== "agent-team-github-registration-confirmation-v3" ||
       typeof authority !== "string" ||
       !authorityDigestPattern.test(authority) ||
       payload["operation"] !== "apply_github_policy" ||
@@ -375,7 +524,32 @@ function parseConfirmationToken(key: Uint8Array, token: string): ConfirmationPay
       JSON.stringify(payload["desiredPolicy"]) !==
         JSON.stringify(githubRegistrationDesiredPolicy) ||
       !Array.isArray(payload["changes"]) ||
-      Object.keys(payload).length !== 12
+      !payload["changes"].every(
+        (change) => change === "ensure_required_checks" || change === "enable_auto_merge",
+      ) ||
+      !policyDiffIsValid(payload["policyDiff"]) ||
+      typeof payload["policyDiffDigest"] !== "string" ||
+      !revisionPattern.test(payload["policyDiffDigest"]) ||
+      payload["policyDiffDigest"] !== stableHash(payload["policyDiff"]) ||
+      payload["policyDiff"].before.revision !== inventoryRevision ||
+      JSON.stringify(payload["changes"]) !==
+        JSON.stringify(changesFor(inventoryFromPolicyBefore(payload["policyDiff"].before))) ||
+      !exactKeys(payload, [
+        "authorityDigest",
+        "bindingRevision",
+        "changes",
+        "defaultBranch",
+        "desiredPolicy",
+        "inventoryRevision",
+        "operation",
+        "policyDiff",
+        "policyDiffDigest",
+        "projectId",
+        "purpose",
+        "repository",
+        "schemaVersion",
+        "storeRevision",
+      ])
     ) {
       return undefined;
     }
@@ -488,9 +662,9 @@ export function createGitHubRegistrationPolicy(
     const payload = confirmationPayload(
       authorityDigest,
       target,
-      result.value.revision,
       operation.value?.revision ?? 0,
       changes,
+      policyDiffFor(result.value),
     );
     return Object.freeze({
       state: "ready",
@@ -498,6 +672,7 @@ export function createGitHubRegistrationPolicy(
       expectedRevision: result.value.revision,
       confirmationToken: signedToken(key, payload),
       changes,
+      policyDiff: payload.policyDiff,
     });
   };
 
@@ -566,7 +741,10 @@ export function createGitHubRegistrationPolicy(
       return blockedApply("inventory_changed");
     }
     const changes = changesFor(current.value);
-    if (JSON.stringify(changes) !== JSON.stringify(payload.changes)) {
+    if (
+      JSON.stringify(changes) !== JSON.stringify(payload.changes) ||
+      JSON.stringify(policyDiffFor(current.value)) !== JSON.stringify(payload.policyDiff)
+    ) {
       return blockedApply("inventory_changed");
     }
 
@@ -682,7 +860,8 @@ export function createGitHubRegistrationPolicy(
       !preRead.ok ||
       preRead.value.revision !== payload.inventoryRevision ||
       policyBlock(preRead.value) !== undefined ||
-      JSON.stringify(changesFor(preRead.value)) !== JSON.stringify(payload.changes)
+      JSON.stringify(changesFor(preRead.value)) !== JSON.stringify(payload.changes) ||
+      JSON.stringify(policyDiffFor(preRead.value)) !== JSON.stringify(payload.policyDiff)
     ) {
       return blockedApply(preRead.ok ? "inventory_changed" : blockReason(preRead.error));
     }

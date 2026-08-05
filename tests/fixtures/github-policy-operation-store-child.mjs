@@ -20,9 +20,9 @@ class PausingJournalWriter extends AtomicFileStore {
   async write(targetPath, content, options = {}) {
     if (targetPath.endsWith(`/${operationId}.json`) && !this.#paused) {
       this.#paused = true;
-      process.stdout.write("held\n");
+      process.send?.({ type: "held" });
       await new Promise((resolve) => {
-        process.stdin.once("data", resolve);
+        process.once("message", resolve);
       });
     }
     return super.write(targetPath, content, options);
@@ -35,6 +35,6 @@ const result = await store.compareAndSwap({
   expectedRevision: null,
   next: initial,
 });
-process.stdout.write(`${JSON.stringify(result)}\n`);
+process.send?.({ type: "result", result });
 await store.close();
 process.exit(result.ok ? 0 : 1);

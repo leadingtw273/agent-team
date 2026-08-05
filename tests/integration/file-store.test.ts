@@ -1,3 +1,4 @@
+import { renameSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -22,6 +23,7 @@ import {
   createFixedClock,
   domainError,
   err,
+  ok,
   parseInstant,
 } from "../../src/domain/foundation/index.js";
 import {
@@ -95,6 +97,62 @@ describe("file layout", () => {
 });
 
 describe("atomic schema files", () => {
+  it("publishes synchronously with no event-loop window after the ownership boundary", async () => {
+    const root = await temporaryDirectory();
+    const target = join(root, "state.json");
+    await writeFile(target, "old", "utf8");
+    let interposed = false;
+    const operations: AtomicFileOperations = {
+      chmod,
+      mkdir,
+      open,
+      rename,
+      renameSync: (from, to) => {
+        expect(interposed).toBe(false);
+        renameSync(from, to);
+      },
+      unlink,
+    };
+
+    const result = await new AtomicFileStore(operations).write(target, Buffer.from("new", "utf8"), {
+      publicationGuard: () => {
+        queueMicrotask(() => {
+          interposed = true;
+        });
+        return ok(undefined);
+      },
+    });
+
+    expect(result).toEqual({ ok: true, value: { durability: "confirmed" } });
+    expect(interposed).toBe(true);
+    await expect(readFile(target, "utf8")).resolves.toBe("new");
+  });
+
+  it("fails closed when a synchronous publication boundary has no synchronous rename", async () => {
+    const root = await temporaryDirectory();
+    const target = join(root, "state.json");
+    await writeFile(target, "old", "utf8");
+    let asynchronousRenameCount = 0;
+    const operations: AtomicFileOperations = {
+      chmod,
+      mkdir,
+      open,
+      rename: async (from, to) => {
+        asynchronousRenameCount += 1;
+        await rename(from, to);
+      },
+      unlink,
+    };
+
+    expect(
+      await new AtomicFileStore(operations).write(target, Buffer.from("new", "utf8"), {
+        publicationGuard: () => ok(undefined),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(asynchronousRenameCount).toBe(0);
+    await expect(readFile(target, "utf8")).resolves.toBe("old");
+  });
+
   it.each([
     ["synchronous", () => err(domainError("conflict"))],
     ["asynchronous", () => Promise.resolve(err(domainError("conflict")))],

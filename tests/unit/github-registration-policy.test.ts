@@ -1,3 +1,5 @@
+import { createHash, createHmac } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -16,6 +18,11 @@ const target = Object.freeze({
 });
 const key = Buffer.alloc(32, 7);
 const authorityDigest = "7".repeat(64);
+
+function signedPayload(payload: unknown): string {
+  const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return `${encoded}.${createHmac("sha256", key).update(encoded, "ascii").digest("base64url")}`;
+}
 
 function inventory(
   overrides: Partial<GitHubRegistrationInventory> = {},
@@ -193,11 +200,98 @@ describe("O004 GitHub registration policy", () => {
       },
       inventoryRevision: "a".repeat(64),
       storeRevision: 0,
+      policyDiff: {
+        schemaVersion: 1,
+        before: {
+          revision: "a".repeat(64),
+          permission: "admin",
+          rulesets: "supported",
+          autoMerge: "supported",
+          autoMergeEnabled: false,
+          activeRequiredChecks: [],
+          managedRulesetCollision: false,
+          managedRulesetExact: false,
+          managedRulesetId: null,
+        },
+        after: {
+          desiredPolicy: {
+            ruleset: {
+              requiredStatusChecks: { contexts: ["CI", "agent-team/review"] },
+            },
+            autoMerge: true,
+          },
+          preservedActiveRequiredChecks: [],
+        },
+      },
     });
-    if (typeof decoded !== "object" || decoded === null || !("bindingRevision" in decoded)) {
-      throw new Error("confirmation binding revision missing");
+    if (
+      typeof decoded !== "object" ||
+      decoded === null ||
+      !("bindingRevision" in decoded) ||
+      !("policyDiff" in decoded) ||
+      !("policyDiffDigest" in decoded)
+    ) {
+      throw new Error("confirmation binding details missing");
     }
     expect(decoded.bindingRevision).toMatch(/^[a-f0-9]{64}$/u);
+    expect(decoded.policyDiffDigest).toBe(
+      createHash("sha256").update(JSON.stringify(decoded.policyDiff), "utf8").digest("hex"),
+    );
+    expect(preview.policyDiff).toEqual(decoded.policyDiff);
+    expect(port.calls).toEqual([]);
+  });
+
+  it("rejects a semantically forged before/after diff even when the envelope is re-signed", async () => {
+    const port = fakePort(inventory());
+    const useCase = policy(port);
+    const command = await readyCommand(useCase);
+    const encoded = command.confirmationToken.split(".")[0];
+    if (encoded === undefined) throw new Error("confirmation payload missing");
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+    const policyDiff = structuredClone(payload["policyDiff"]) as {
+      after: { preservedActiveRequiredChecks: string[] };
+    };
+    policyDiff.after.preservedActiveRequiredChecks = ["forged-check"];
+    payload["policyDiff"] = policyDiff;
+    payload["policyDiffDigest"] = createHash("sha256")
+      .update(JSON.stringify(policyDiff), "utf8")
+      .digest("hex");
+
+    expect(
+      await useCase.apply({ ...command, confirmationToken: signedPayload(payload) }),
+    ).toMatchObject({ state: "blocked", reason: "confirmation_invalid" });
+    expect(port.calls).toEqual([]);
+  });
+
+  it("rejects same-revision inventory detail drift before any provider mutation", async () => {
+    const port = fakePort(inventory());
+    const useCase = policy(port);
+    const command = await readyCommand(useCase);
+    port.setInventory(inventory({ activeRequiredChecks: Object.freeze(["security-scan"]) }));
+
+    expect(await useCase.apply(command)).toMatchObject({
+      state: "blocked",
+      reason: "inventory_changed",
+    });
+    expect(port.calls).toEqual([]);
+  });
+
+  it("fails closed when complete audit detail would exceed the bounded confirmation envelope", async () => {
+    const oversizedChecks = Object.freeze(
+      Array.from(
+        { length: 31 },
+        (_, index) => `${String(index).padStart(3, "0")}-${"x".repeat(96)}`,
+      ),
+    );
+    const port = fakePort(inventory({ activeRequiredChecks: oversizedChecks }));
+
+    expect(await policy(port).preview(target)).toMatchObject({
+      state: "blocked",
+      reason: "provider_unavailable",
+    });
     expect(port.calls).toEqual([]);
   });
 
