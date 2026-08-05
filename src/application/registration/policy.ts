@@ -13,19 +13,23 @@ import {
   type RegistrationGateSnapshot,
   type RegistrationGateState,
   type RegistrationState,
-  type RegistrationTransitionRequest,
 } from "./model.js";
+import {
+  parseRegistrationGateSnapshot,
+  parseRegistrationState,
+  parseRegistrationTransitionRequest,
+} from "./schema.js";
 
 function blockerState(state: RegistrationGateState | undefined): RegistrationGateBlocker["state"] {
   return state === "failed" || state === "unknown" ? state : "missing";
 }
 
-export function evaluateRegistrationGates(
-  gates: RegistrationGateSnapshot,
-): RegistrationGateEvaluation {
+export function evaluateRegistrationGates(gates: unknown): RegistrationGateEvaluation {
+  const parsed = parseRegistrationGateSnapshot(gates);
+  const snapshot: RegistrationGateSnapshot = parsed.ok ? parsed.value : {};
   const blockers: RegistrationGateBlocker[] = [];
   for (const gate of registrationGateIds) {
-    const state = gates[gate];
+    const state = snapshot[gate];
     if (state !== "passed") {
       blockers.push(Object.freeze({ gate, state: blockerState(state) }));
     }
@@ -36,7 +40,15 @@ export function evaluateRegistrationGates(
   });
 }
 
-export function registrationCapabilities(state: RegistrationState): RegistrationCapabilities {
+function failClosedCapabilities(): RegistrationCapabilities {
+  return Object.freeze({
+    automaticDispatch: false,
+    automaticAutoMerge: false,
+    runningWorkCheckpoint: "required",
+  });
+}
+
+function capabilitiesForKnownState(state: RegistrationState): RegistrationCapabilities {
   switch (state) {
     case "configuration_incomplete":
       return Object.freeze({
@@ -65,6 +77,11 @@ export function registrationCapabilities(state: RegistrationState): Registration
   }
 }
 
+export function registrationCapabilities(state: unknown): RegistrationCapabilities {
+  const parsed = parseRegistrationState(state);
+  return parsed.ok ? capabilitiesForKnownState(parsed.value) : failClosedCapabilities();
+}
+
 function transitionConflict(): Result<RegistrationState, DomainError<"conflict">> {
   return err(domainError("conflict"));
 }
@@ -75,28 +92,36 @@ function transitionConflict(): Result<RegistrationState, DomainError<"conflict">
  * state; only a later successful Revalidation can restore automation.
  */
 export function transitionRegistrationState(
-  current: RegistrationState,
-  request: RegistrationTransitionRequest,
-): Result<RegistrationState, DomainError<"conflict">> {
-  if (current === "disabled") {
-    return request.cause === "user_enabled" ? ok("configuration_incomplete") : ok("disabled");
+  current: unknown,
+  request: unknown,
+): Result<RegistrationState, DomainError<"conflict" | "invariant_violation">> {
+  const parsedCurrent = parseRegistrationState(current);
+  if (!parsedCurrent.ok) return err(parsedCurrent.error);
+
+  const parsedRequest = parseRegistrationTransitionRequest(request);
+  if (!parsedRequest.ok) return err(parsedRequest.error);
+
+  const currentState = parsedCurrent.value;
+  const transition = parsedRequest.value;
+  if (currentState === "disabled") {
+    return transition.cause === "user_enabled" ? ok("configuration_incomplete") : ok("disabled");
   }
 
-  switch (request.cause) {
+  switch (transition.cause) {
     case "user_disabled":
       return ok("disabled");
     case "user_enabled":
       return transitionConflict();
     case "revalidation_succeeded":
-      return evaluateRegistrationGates(request.gates).complete
+      return evaluateRegistrationGates(transition.gates).complete
         ? ok("registered")
         : transitionConflict();
     case "revalidation_failed":
-      return evaluateRegistrationGates(request.gates).complete
+      return evaluateRegistrationGates(transition.gates).complete
         ? transitionConflict()
         : ok("configuration_incomplete");
     case "operational_degradation":
-      return current === "registered" || current === "degraded"
+      return currentState === "registered" || currentState === "degraded"
         ? ok("degraded")
         : ok("configuration_incomplete");
   }

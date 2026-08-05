@@ -1,19 +1,26 @@
+import { readFile } from "node:fs/promises";
+
 import { describe, expect, it } from "vitest";
 
 import { domainError } from "../../src/domain/foundation/index.js";
 import {
   evaluateRegistrationGates,
   initialRegistrationState,
+  parseRegistrationStateSnapshot,
   registrationCapabilities,
   registrationDegradationReasons,
   registrationGateIds,
   registrationGateStates,
   registrationStateLabels,
+  registrationStateSnapshotJsonSchema,
+  registrationStateSnapshotSchema,
   registrationStates,
   transitionRegistrationState,
   type RegistrationGateSnapshot,
   type RegistrationGateState,
+  type RegistrationGateRecord,
   type RegistrationState,
+  type RegistrationStateSnapshot,
   type RegistrationTransitionRequest,
 } from "../../src/application/registration/index.js";
 
@@ -24,6 +31,32 @@ function gateSnapshot(state: RegistrationGateState = "passed"): RegistrationGate
       RegistrationGateState
     >,
   );
+}
+
+function gateRecord(state: RegistrationGateState = "passed"): RegistrationGateRecord {
+  return Object.freeze(
+    Object.fromEntries(registrationGateIds.map((gate) => [gate, state])) as Record<
+      (typeof registrationGateIds)[number],
+      RegistrationGateState
+    >,
+  );
+}
+
+function persistedSnapshot(
+  overrides: Partial<RegistrationStateSnapshot> = {},
+): RegistrationStateSnapshot {
+  return Object.freeze({
+    schemaVersion: 1,
+    state: "configuration_incomplete",
+    gates: gateRecord(),
+    ...overrides,
+  });
+}
+
+async function readJson(relativePath: string): Promise<unknown> {
+  return JSON.parse(
+    await readFile(new URL(`../../${relativePath}`, import.meta.url), "utf8"),
+  ) as unknown;
 }
 
 function withGateState(
@@ -105,6 +138,41 @@ describe("registration domain", () => {
       complete: false,
       blockers: registrationGateIds.map((gate) => ({ gate, state: "missing" })),
     });
+  });
+
+  it("round-trips a versioned persisted Registration snapshot and its JSON Schema", async () => {
+    const snapshot = persistedSnapshot({ state: "disabled" });
+    const roundTripped = JSON.parse(JSON.stringify(snapshot)) as unknown;
+
+    expect(parseRegistrationStateSnapshot(roundTripped)).toEqual({ ok: true, value: snapshot });
+    expect(registrationStateSnapshotSchema.parse(roundTripped)).toEqual(snapshot);
+    await expect(readJson("schemas/registration-state-v1.json")).resolves.toEqual(
+      registrationStateSnapshotJsonSchema,
+    );
+  });
+
+  it("rejects corrupted persisted Registration state rather than normalizing it", () => {
+    const snapshot = persistedSnapshot({ state: "registered" });
+    const gatesWithoutWebhook = Object.fromEntries(
+      Object.entries(snapshot.gates).filter(([gate]) => gate !== "webhook_runtime"),
+    );
+    const invalidSnapshots: readonly unknown[] = [
+      { ...snapshot, schemaVersion: 2 },
+      { ...snapshot, state: "retired" },
+      { ...snapshot, gates: { ...snapshot.gates, webhook_runtime: "failed" } },
+      { ...snapshot, untrusted: true },
+      { schemaVersion: 1, state: "registered" },
+      { ...snapshot, gates: { ...snapshot.gates, webhook_runtime: "not_a_gate_state" } },
+      { ...snapshot, gates: { ...snapshot.gates, untrusted: "passed" } },
+      { ...snapshot, gates: gatesWithoutWebhook },
+    ];
+
+    for (const candidate of invalidSnapshots) {
+      expect(parseRegistrationStateSnapshot(candidate)).toEqual({
+        ok: false,
+        error: domainError("invariant_violation"),
+      });
+    }
   });
 
   it.each([
@@ -204,6 +272,49 @@ describe("registration domain", () => {
         value: "disabled",
       });
     }
+  });
+
+  it("fails closed for unrecognized runtime state, Gate snapshots, and transition causes", () => {
+    const safeCapabilities = {
+      automaticDispatch: false,
+      automaticAutoMerge: false,
+      runningWorkCheckpoint: "required",
+    } as const;
+    const successfulRevalidation = {
+      cause: "revalidation_succeeded",
+      gates: allGatesPassed,
+    } as const;
+
+    for (const state of ["retired", null, { state: "registered" }] as const) {
+      expect(transitionRegistrationState(state, successfulRevalidation)).toEqual({
+        ok: false,
+        error: domainError("invariant_violation"),
+      });
+      expect(registrationCapabilities(state)).toEqual(safeCapabilities);
+    }
+
+    for (const request of [
+      { cause: "later_auto_enable" },
+      { cause: "revalidation_succeeded" },
+      { cause: "operational_degradation" },
+      { cause: "user_enabled", untrusted: true },
+      { cause: "revalidation_succeeded", gates: { ...allGatesPassed, untrusted: "passed" } },
+      { cause: "revalidation_succeeded", gates: null },
+    ] as const) {
+      expect(transitionRegistrationState("registered", request)).toEqual({
+        ok: false,
+        error: domainError("invariant_violation"),
+      });
+    }
+
+    const expectedInvalidGateEvaluation = {
+      complete: false,
+      blockers: registrationGateIds.map((gate) => ({ gate, state: "missing" })),
+    };
+    expect(evaluateRegistrationGates(null)).toEqual(expectedInvalidGateEvaluation);
+    expect(evaluateRegistrationGates({ ...allGatesPassed, untrusted: "passed" })).toEqual(
+      expectedInvalidGateEvaluation,
+    );
   });
 
   it.each([

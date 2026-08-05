@@ -43,6 +43,15 @@ export type RegistrationGateSnapshot = Readonly<
   Partial<Record<RegistrationGateId, RegistrationGateState>>
 >;
 
+export type RegistrationGateRecord = Readonly<Record<RegistrationGateId, RegistrationGateState>>;
+
+/** The versioned registration state written to local file state. */
+export interface RegistrationStateSnapshot {
+  readonly schemaVersion: 1;
+  readonly state: RegistrationState;
+  readonly gates: RegistrationGateRecord;
+}
+
 export type RegistrationGateBlockerState = Exclude<RegistrationGateState, "passed"> | "missing";
 
 export interface RegistrationGateBlocker {
