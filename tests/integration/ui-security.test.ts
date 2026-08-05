@@ -224,16 +224,18 @@ describe("localhost UI browser security layer", () => {
     expect(secondTab.status).toBe(204);
     expect(secondTab.headers.get("x-csrf-token")).toBe(firstTab.csrf);
 
-    const mutation = await fetch(`${handle.baseUrl}/api/projects`, {
-      method: "PATCH",
+    const mutation = await fetch(`${handle.baseUrl}/api/settings`, {
+      method: "PUT",
       headers: {
         cookie: firstTab.cookie,
         origin: handle.baseUrl,
         "x-csrf-token": firstTab.csrf,
+        "content-type": "application/json",
       },
+      body: "{}",
     });
     expect(mutation.status).toBe(200);
-    await expect(mutation.json()).resolves.toEqual({ method: "PATCH", auth: "session" });
+    await expect(mutation.json()).resolves.toEqual({ configured: false });
   });
 
   it("rejects credentials anywhere in the URL and gives handlers only canonical allowlisted input", async () => {
@@ -364,7 +366,7 @@ describe("localhost UI browser security layer", () => {
     if (origin === "ORIGIN") headers["origin"] = handle.baseUrl;
     else if (origin !== undefined) headers["origin"] = origin;
 
-    const response = await fetch(`${handle.baseUrl}/api/settings`, { method: "POST", headers });
+    const response = await fetch(`${handle.baseUrl}/api/settings`, { method: "PUT", headers });
     expect(response.status).toBe(expectedStatus);
   });
 
@@ -472,6 +474,15 @@ describe("localhost UI browser security layer", () => {
   it("keeps the legacy six-method default when allowedMethods is omitted", async () => {
     const methods: string[] = [];
     const handle = await startSecured({
+      securityPolicy: createUiSecurityPolicy({
+        routes: [
+          {
+            path: "/api/legacy",
+            allowedQueryParameters: [],
+            response: "standard",
+          },
+        ],
+      }),
       handler: (request) => {
         methods.push(request.method);
         return { statusCode: 204 };
@@ -480,7 +491,7 @@ describe("localhost UI browser security layer", () => {
     const session = await exchange(handle);
 
     for (const method of ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]) {
-      const result = await fetch(`${handle.baseUrl}/api/projects`, {
+      const result = await fetch(`${handle.baseUrl}/api/legacy`, {
         method,
         headers:
           method === "GET" || method === "HEAD"
