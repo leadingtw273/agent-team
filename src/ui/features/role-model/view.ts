@@ -28,7 +28,7 @@ function renderMoveButton(name: string, direction: "up" | "down", isBoundary: bo
   const actionLabel = direction === "up" ? "上移" : "下移";
   const boundaryLabel = direction === "up" ? "已在最上" : "已在最下";
   const accessibleLabel = isBoundary ? `${name} ${boundaryLabel}` : `將 ${name} ${actionLabel}`;
-  return `<button class="btn btn-sm btn-outline-secondary${isBoundary ? " ui-role-model-action--boundary" : ""}" type="button" data-role-model-move="${direction}" aria-label="${escapeHtml(accessibleLabel)}"${isBoundary ? " disabled" : ""}>${boundaryLabel}</button>`;
+  return `<button class="btn btn-sm btn-outline-secondary${isBoundary ? " ui-role-model-action--boundary" : ""}" type="button" data-role-model-move="${direction}" aria-label="${escapeHtml(accessibleLabel)}"${isBoundary ? " disabled" : ""}>${isBoundary ? boundaryLabel : actionLabel}</button>`;
 }
 
 function activeAssignmentsFor(
@@ -87,7 +87,7 @@ function renderSaveAction(): string {
 
 export function renderRoleModelPage(snapshot: RoleModelSettingsSnapshot): string {
   return `<aside class="ui-fixture-notice" aria-label="設定範圍說明"><span>設定只會套用到後續建立的 Job；角色定義與額度設定不會寫入這個頁面。</span></aside>
-    <section class="ui-role-model-intro card ui-panel" aria-labelledby="role-model-intro-title"><div class="card-body"><h2 id="role-model-intro-title">模型候選順位</h2><p class="mb-0">Provider 不可用、Provider Slot 已滿或額度無法確認時，派工會依順序嘗試下一個候選。儲存前會驗證所有標準角色與候選，失敗時保留舊設定。</p></div></section>
+    <section class="ui-role-model-intro card ui-panel" aria-labelledby="role-model-intro-title"><div class="card-body"><h2 id="role-model-intro-title">模型候選順位</h2><p class="mb-0">Provider 不可用、Provider Slot 已滿或額度無法確認時，派工會依順序嘗試下一個候選。儲存前會驗證所有標準角色與候選；輸入驗證失敗時保留舊設定；寫入後讀回確認。</p></div></section>
     ${renderSaveAction()}
     <div class="ui-role-model-grid">${snapshot.routes
       .map((route) => renderRoute(route, snapshot.activeAssignments))

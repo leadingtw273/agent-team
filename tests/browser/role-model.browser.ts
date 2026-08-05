@@ -247,6 +247,49 @@ test.describe("U004 role model configuration", () => {
     await copyReviewScreenshot(page, "u004-role-model-desktop.png");
   });
 
+  test("reports read-back mismatch as uncertain without promising rollback", async ({ page }) => {
+    await visit(page);
+    await page.route("**/api/role-models", async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "read_back_mismatch" }),
+      });
+    });
+
+    await page.locator("[data-role-model-save]").click();
+
+    const status = page.locator("[data-role-model-status]");
+    await expect(status).toHaveText("儲存結果無法確認，請重新載入核對。");
+    await expect(status).toHaveAttribute("data-state", "uncertain");
+    await expect(status).not.toContainText(/未被覆寫|保留舊設定/u);
+  });
+
+  test("only promises no overwrite for a validation rejection", async ({ page }) => {
+    await visit(page);
+    await page.route("**/api/role-models", async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 422,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "invalid_input" }),
+      });
+    });
+
+    await page.locator("[data-role-model-save]").click();
+
+    const status = page.locator("[data-role-model-status]");
+    await expect(status).toHaveText("輸入驗證失敗；原設定未被覆寫。請修正後再試。");
+    await expect(status).toHaveAttribute("data-state", "error");
+  });
+
   test("keeps the sticky save action reachable without horizontal overflow at 390px", async ({
     page,
   }) => {

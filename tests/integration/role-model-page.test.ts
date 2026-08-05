@@ -6,6 +6,8 @@ import {
   createRoleModelFeature,
   defaultRoleModelRoutingConfig,
   roleModelUiSecurityRoutes,
+  type RoleModelFeature,
+  type RoleModelSettingsStore,
 } from "../../src/ui/features/role-model/index.js";
 import {
   createUiSecurityPolicy,
@@ -16,8 +18,37 @@ import {
 
 const handles: LocalUiServerHandle[] = [];
 
-async function start() {
-  const feature = createRoleModelFeature();
+class MismatchingReadBackStore implements RoleModelSettingsStore {
+  readonly replacements: Parameters<RoleModelSettingsStore["replace"]>[0][] = [];
+  readonly #initial = structuredClone(defaultRoleModelRoutingConfig());
+  readonly #conflictingReadBack: ReturnType<typeof defaultRoleModelRoutingConfig>;
+  #wasReplaced = false;
+
+  constructor() {
+    const config = structuredClone(defaultRoleModelRoutingConfig());
+    this.#conflictingReadBack = {
+      ...config,
+      routes: config.routes.map((route) =>
+        route.role === "team_lead"
+          ? { ...route, candidates: [...route.candidates].reverse() }
+          : route,
+      ),
+    };
+  }
+
+  read(): Promise<unknown> {
+    const value = this.#wasReplaced ? this.#conflictingReadBack : this.#initial;
+    return Promise.resolve(structuredClone(value));
+  }
+
+  replace(config: Parameters<RoleModelSettingsStore["replace"]>[0]): Promise<void> {
+    this.replacements.push(structuredClone(config));
+    this.#wasReplaced = true;
+    return Promise.resolve();
+  }
+}
+
+async function start(feature: RoleModelFeature = createRoleModelFeature()) {
   const handler = vi.fn(createUiShellHandler(undefined, feature));
   const handle = await startLocalUiServer({
     handler,
@@ -123,6 +154,8 @@ describe("role model page integration", () => {
     expect(page).toContain('href="/assets/role-model.css"');
     expect(page).not.toMatch(/<script(?![^>]*\bsrc=)/iu);
     expect(page).not.toMatch(/(?:--model|--provider|inline cli|行內 CLI)/iu);
+    expect(page).toContain("輸入驗證失敗時保留舊設定；寫入後讀回確認");
+    expect(page).not.toContain("失敗時保留舊設定。");
 
     const script = await fetch(`${handle.baseUrl}/assets/role-model.js`, {
       headers: { cookie: session.cookie },
@@ -166,6 +199,27 @@ describe("role model page integration", () => {
     expect(after.body).toMatchObject({
       activeAssignments: (before.body as { activeAssignments: unknown }).activeAssignments,
     });
+  });
+
+  it("returns 503 read_back_mismatch after one write without attempting rollback", async () => {
+    const store = new MismatchingReadBackStore();
+    const { handle } = await start(createRoleModelFeature({ settingsStore: store }));
+    const session = await exchange(handle);
+    const next = {
+      ...defaultRoleModelRoutingConfig(),
+      routes: defaultRoleModelRoutingConfig().routes.map((route) =>
+        route.role === "implementer"
+          ? { ...route, candidates: [...route.candidates].reverse() }
+          : route,
+      ),
+    };
+
+    const result = await putApi(handle, session, next);
+
+    expect(result.response.status).toBe(503);
+    expect(JSON.parse(result.body)).toEqual({ error: "read_back_mismatch" });
+    expect(store.replacements).toEqual([next]);
+    expect(await store.read()).not.toEqual(defaultRoleModelRoutingConfig());
   });
 
   it.each([

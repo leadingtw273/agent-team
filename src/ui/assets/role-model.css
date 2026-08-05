@@ -171,6 +171,10 @@
   color: #b42318;
 }
 
+.ui-role-model-status[data-state="uncertain"] {
+  color: #8a4b08;
+}
+
 @media (max-width: 900px) {
   .ui-role-model-grid {
     grid-template-columns: minmax(0, 1fr);

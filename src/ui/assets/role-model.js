@@ -14,6 +14,22 @@
   };
 
   const candidates = (list) => Array.from(list.querySelectorAll(":scope > [data-candidate-key]"));
+  const validationErrors = new Set([
+    "invalid_input",
+    "unknown_candidate",
+    "candidate_not_available_for_role",
+  ]);
+
+  const responseError = async (response) => {
+    try {
+      const payload = await response.json();
+      return typeof payload === "object" && payload !== null && typeof payload.error === "string"
+        ? payload.error
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
 
   const updateMoveButton = (button, name, direction, isBoundary) => {
     if (!(button instanceof HTMLButtonElement)) return;
@@ -172,16 +188,29 @@
         headers: { "content-type": "application/json", "x-csrf-token": csrf },
         body: JSON.stringify(currentConfig()),
       });
-      if (!saved.ok) throw new Error("save failed");
+      if (!saved.ok) {
+        const error = await responseError(saved);
+        if (error === "read_back_mismatch") {
+          setStatus("儲存結果無法確認，請重新載入核對。", "uncertain");
+        } else if (validationErrors.has(error)) {
+          setStatus("輸入驗證失敗；原設定未被覆寫。請修正後再試。", "error");
+        } else {
+          setStatus("儲存失敗；無法確認目前設定，請重新載入核對。", "uncertain");
+        }
+        return;
+      }
       const readBack = await fetch("/api/role-models", {
         method: "GET",
         credentials: "same-origin",
       });
-      if (!readBack.ok) throw new Error("read-back failed");
+      if (!readBack.ok) {
+        setStatus("儲存已送出，但讀回失敗；請重新載入核對。", "uncertain");
+        return;
+      }
       applyReadBack(await readBack.json());
       setStatus("已儲存並讀回目前設定。", "success");
     } catch {
-      setStatus("儲存失敗；原設定未被覆寫。請重新整理後再試。", "error");
+      setStatus("儲存結果無法確認，請重新載入核對。", "uncertain");
     } finally {
       saveButton.disabled = false;
     }

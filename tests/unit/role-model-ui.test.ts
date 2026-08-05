@@ -6,6 +6,7 @@ import {
   InMemoryRoleModelSettingsStore,
   RoleModelSettingsUseCase,
   defaultRoleModelRoutingConfig,
+  renderRoleModelPage,
   type RoleModelSettingsStore,
 } from "../../src/ui/features/role-model/index.js";
 
@@ -19,6 +20,18 @@ function reorderedImplementerConfig(): ReturnType<typeof defaultRoleModelRouting
     ...input,
     routes: input.routes.map((route) =>
       route.role === "implementer"
+        ? { ...route, candidates: [...route.candidates].reverse() }
+        : route,
+    ),
+  };
+}
+
+function reorderedTeamLeadConfig(): ReturnType<typeof defaultRoleModelRoutingConfig> {
+  const input = clone(defaultRoleModelRoutingConfig());
+  return {
+    ...input,
+    routes: input.routes.map((route) =>
+      route.role === "team_lead"
         ? { ...route, candidates: [...route.candidates].reverse() }
         : route,
     ),
@@ -40,6 +53,24 @@ class CountingStore implements RoleModelSettingsStore {
   replace(config: Parameters<InMemoryRoleModelSettingsStore["replace"]>[0]) {
     this.writes += 1;
     return this.#inner.replace(config);
+  }
+}
+
+class MismatchingReadBackStore implements RoleModelSettingsStore {
+  readonly replacements: Parameters<RoleModelSettingsStore["replace"]>[0][] = [];
+  readonly #readBack: ReturnType<typeof defaultRoleModelRoutingConfig>;
+
+  constructor(readBack = reorderedTeamLeadConfig()) {
+    this.#readBack = clone(readBack);
+  }
+
+  read(): Promise<unknown> {
+    return Promise.resolve(clone(this.#readBack));
+  }
+
+  replace(config: Parameters<RoleModelSettingsStore["replace"]>[0]): Promise<void> {
+    this.replacements.push(clone(config));
+    return Promise.resolve();
   }
 }
 
@@ -116,6 +147,32 @@ describe("role model settings use case", () => {
 
     const reread = await useCase.read();
     expect(reread).toEqual(saved);
+  });
+
+  it("reports a read-back mismatch after one write without attempting an unsafe rollback", async () => {
+    const conflictingReadBack = reorderedTeamLeadConfig();
+    const store = new MismatchingReadBackStore(conflictingReadBack);
+    const next = reorderedImplementerConfig();
+
+    const result = await createUseCase(store).save(next);
+
+    expect(result).toEqual({ ok: false, error: { code: "read_back_mismatch" } });
+    expect(store.replacements).toEqual([next]);
+    expect(await store.read()).toEqual(conflictingReadBack);
+  });
+
+  it("renders action labels for enabled SSR controls and boundary labels only when disabled", async () => {
+    const result = await createUseCase().read();
+    if (!result.ok) throw new Error(result.error.code);
+
+    const page = renderRoleModelPage(result.value);
+
+    expect(page).toMatch(
+      /data-role-model-move="up" aria-label="Codex \/ gpt-5\.6-sol 已在最上" disabled>已在最上<\/button>/u,
+    );
+    expect(page).toMatch(
+      /data-role-model-move="down" aria-label="將 Codex \/ gpt-5\.6-sol 下移">下移<\/button>/u,
+    );
   });
 
   it.each([
