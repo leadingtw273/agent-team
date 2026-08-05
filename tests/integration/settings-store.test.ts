@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createSettingsUseCase,
   FileSettingsStore,
-  renderSettingsPage,
+  renderSettingsContent,
   serializeUserSettingsYaml,
   userSettingsSchema,
   type UserSettings,
@@ -220,7 +220,7 @@ describe("U008 atomic private settings store", () => {
         ].join("\n"),
       });
       const readModel = await useCase.read();
-      const html = renderSettingsPage(readModel);
+      const html = renderSettingsContent(readModel);
       const authoritative = await readFile(fixture.path, "utf8");
 
       expect(userSettingsSchema.safeParse(candidate).success).toBe(false);

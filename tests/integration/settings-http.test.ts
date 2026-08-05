@@ -6,15 +6,20 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  createSettingsUiHandler,
   createSettingsSecretSafeJsonResponse,
+  createSettingsUiFeatureRegistration,
   createSettingsUseCase,
-  createUiSecurityPolicy,
+  createUiApplication,
+  DEFAULT_USER_SETTINGS,
   FileSettingsStore,
+  serializeUserSettingsYaml,
   startLocalUiServer,
   type LocalUiServerHandle,
+  type SettingsStore,
   type UiServerClock,
 } from "../../src/ui/index.js";
+import { ok } from "../../src/domain/foundation/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 
 const handles: LocalUiServerHandle[] = [];
 const directories: string[] = [];
@@ -63,9 +68,12 @@ async function fixture() {
   await mkdir(join(directory, "config"));
   const path = join(directory, "config", "settings.yaml");
   const useCase = createSettingsUseCase(new FileSettingsStore(path));
+  const application = createUiApplication({
+    features: [createSettingsUiFeatureRegistration(useCase)],
+  });
   const handle = await startLocalUiServer({
-    securityPolicy: createUiSecurityPolicy(),
-    handler: createSettingsUiHandler(useCase),
+    securityPolicy: application.securityPolicy,
+    handler: application.handler,
   });
   handles.push(handle);
   const exchanged = await fetch(`${handle.baseUrl}/__session/exchange`, {
@@ -84,49 +92,56 @@ afterEach(async () => {
 });
 
 describe("U008 settings HTTP route", () => {
-  it("declares every default page, asset, and projects route as GET with implicit HEAD", async () => {
-    const handler = vi.fn(() => ({ statusCode: 204 }));
-    const handle = await startLocalUiServer({
-      securityPolicy: createUiSecurityPolicy(),
-      handler,
+  it("composes the Role and Settings route union while each feature owns its assets", () => {
+    const useCase = createSettingsUseCase(
+      new FileSettingsStore("/tmp/agent-team-u008-registry-settings.yaml"),
+    );
+    const registration = createSettingsUiFeatureRegistration(useCase);
+    const core = createUiApplication();
+    const application = createUiApplication({
+      features: [createRoleModelFeature(), registration],
     });
-    handles.push(handle);
-    const exchanged = await fetch(`${handle.baseUrl}/__session/exchange`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${handle.sessionToken}` },
-    });
-    const cookie = exchanged.headers.get("set-cookie")?.split(";", 1)[0];
-    const csrf = exchanged.headers.get("x-csrf-token");
-    if (cookie === undefined || csrf === null) throw new Error("session exchange failed");
 
-    const readRoutes = [
+    expect(registration).toMatchObject({
+      id: "settings",
+      slot: "settings",
+      page: {
+        path: "/settings",
+        styles: ["/assets/settings.css"],
+        scripts: ["/assets/settings.js"],
+      },
+    });
+    expect(registration.routes.map((route) => route.contract.path)).toEqual([
+      "/assets/settings.css",
+      "/assets/settings.js",
+      "/api/settings",
+    ]);
+    expect(core.routeContracts.map((route) => route.path)).toEqual([
+      "/",
+      "/projects",
+      "/events",
       "/assets/icons.svg",
       "/assets/tabler-1.4.0.min.css",
       "/assets/ui-shell.css",
+    ]);
+    expect(application.routeContracts.map((route) => route.path)).toEqual([
+      ...core.routeContracts.map((route) => route.path),
+      "/roles-models",
+      "/assets/role-model.css",
+      "/assets/role-model.js",
+      "/api/role-models",
       "/settings",
+      "/assets/settings.css",
       "/assets/settings.js",
-      "/api/projects",
-    ];
-    for (const path of readRoutes) {
-      for (const method of ["GET", "HEAD"]) {
-        const allowed = await fetch(`${handle.baseUrl}${path}`, {
-          method,
-          headers: { cookie },
-        });
-        expect(allowed.status).toBe(204);
-      }
-      const rejected = await fetch(`${handle.baseUrl}${path}`, {
-        method: "POST",
-        headers: {
-          cookie,
-          origin: handle.baseUrl,
-          "x-csrf-token": csrf,
-        },
-      });
-      expect(rejected.status).toBe(405);
-      expect(rejected.headers.get("allow")).toBe("GET, HEAD");
-    }
-    expect(handler).toHaveBeenCalledTimes(readRoutes.length * 2);
+      "/api/settings",
+    ]);
+    expect(
+      application.routeContracts.find((route) => route.path === "/api/settings"),
+    ).toMatchObject({
+      allowedMethods: ["GET", "PUT"],
+      response: "secret-safe",
+      mutationBody: "bounded-json",
+    });
   });
 
   it("rejects disallowed settings methods before body, handler, or idle refresh", async () => {
@@ -134,14 +149,15 @@ describe("U008 settings HTTP route", () => {
     directories.push(directory);
     await mkdir(join(directory, "config"));
     const clock = new MutableClock(10_000);
-    const featureHandler = createSettingsUiHandler(
+    const registration = createSettingsUiFeatureRegistration(
       createSettingsUseCase(new FileSettingsStore(join(directory, "config", "settings.yaml"))),
     );
-    const handler = vi.fn(featureHandler);
+    const application = createUiApplication({ features: [registration] });
+    const handler = vi.fn(application.handler);
     const handle = await startLocalUiServer({
       clock,
       idleTimeoutMs: 100,
-      securityPolicy: createUiSecurityPolicy(),
+      securityPolicy: application.securityPolicy,
       handler,
     });
     handles.push(handle);
@@ -230,6 +246,46 @@ describe("U008 settings HTTP route", () => {
     ).toThrow("Unsafe secret-safe JSON response");
   });
 
+  it("never echoes a credential marker from a compromised store in page or API responses", async () => {
+    const marker = ["github", "_pat_", "abcdefghijklmnopqrstuvwxyz"].join("");
+    const compromised = Object.freeze({
+      settings: Object.freeze({
+        ...DEFAULT_USER_SETTINGS,
+        webhook: Object.freeze({ runtimeBaseUrl: `https://hooks.example.test/${marker}` }),
+      }),
+      rawYaml: `${serializeUserSettingsYaml(DEFAULT_USER_SETTINGS)}# ${marker}\n`,
+      revision: "a".repeat(64),
+    });
+    const store: SettingsStore = {
+      read: vi.fn(() => Promise.resolve(ok(compromised))),
+      save: vi.fn(),
+    };
+    const application = createUiApplication({
+      features: [createSettingsUiFeatureRegistration(createSettingsUseCase(store))],
+    });
+    const handle = await startLocalUiServer({
+      securityPolicy: application.securityPolicy,
+      handler: application.handler,
+    });
+    handles.push(handle);
+    const exchanged = await fetch(`${handle.baseUrl}/__session/exchange`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${handle.sessionToken}` },
+    });
+    const cookie = exchanged.headers.get("set-cookie")?.split(";", 1)[0];
+    if (cookie === undefined) throw new Error("session exchange failed");
+
+    const api = await fetch(`${handle.baseUrl}/api/settings`, { headers: { cookie } });
+    const page = await fetch(`${handle.baseUrl}/settings`, { headers: { cookie } });
+    const [apiBody, pageBody] = await Promise.all([api.text(), page.text()]);
+
+    expect(api.status).toBe(500);
+    expect(apiBody).toBe('{"state":"error","code":"settings_unavailable"}');
+    expect(page.status).toBe(200);
+    expect(`${apiBody}${pageBody}`).not.toContain(marker);
+    expect(pageBody).toContain("設定目前無法安全讀取");
+  });
+
   it("uses GET and PUT with session, Origin, CSRF, CAS, and safe fixed errors", async () => {
     const { handle, path, cookie, csrf } = await fixture();
     const headers = { cookie };
@@ -281,6 +337,10 @@ describe("U008 settings HTTP route", () => {
     const html = await page.text();
     expect(html).toContain("編輯 Raw YAML");
     expect(html).toContain("readonly");
+    expect(html).toContain("/assets/settings.css");
     expect(html).toContain("/assets/settings.js");
+    expect(html.match(/<html\b/gu)).toHaveLength(1);
+    expect(html.match(/class="ui-brand"/gu)).toHaveLength(1);
+    expect(html).toContain('href="/settings" aria-current="page"');
   });
 });

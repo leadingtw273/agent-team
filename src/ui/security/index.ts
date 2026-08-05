@@ -59,38 +59,15 @@ type ValidatedUiSecurityRouteContract = Readonly<
 >;
 
 const defaultRoutes: readonly UiSecurityRouteContract[] = Object.freeze([
-  ...["/assets/icons.svg", "/assets/tabler-1.4.0.min.css", "/assets/ui-shell.css"].map((path) =>
-    Object.freeze({
-      path,
-      allowedQueryParameters: Object.freeze([]),
-      allowedMethods: Object.freeze(["GET"] as const),
-      response: "standard" as const,
-    }),
-  ),
-  Object.freeze({
-    path: "/settings",
-    allowedQueryParameters: Object.freeze([]),
-    allowedMethods: Object.freeze(["GET"] as const),
-    response: "standard" as const,
-  }),
-  Object.freeze({
-    path: "/assets/settings.js",
-    allowedQueryParameters: Object.freeze([]),
-    allowedMethods: Object.freeze(["GET"] as const),
-    response: "standard" as const,
-  }),
   Object.freeze({
     path: "/api/projects",
     allowedQueryParameters: Object.freeze([]),
-    allowedMethods: Object.freeze(["GET"] as const),
     response: "standard" as const,
   }),
   Object.freeze({
     path: "/api/settings",
     allowedQueryParameters: Object.freeze([]),
-    allowedMethods: Object.freeze(["GET", "PUT"] as const),
     response: "secret-safe" as const,
-    mutationBody: "bounded-json" as const,
   }),
 ]);
 

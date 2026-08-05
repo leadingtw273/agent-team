@@ -43,7 +43,8 @@ function readyContent(model: Extract<SettingsReadModel, { state: "ready" }>): st
   </div></section></form>`;
 }
 
-function renderContent(model: SettingsReadModel): string {
+/** Renders feature-owned content only; the shared shell owns the document and navigation. */
+export function renderSettingsContent(model: SettingsReadModel): string {
   const parsedSettings =
     model.state === "ready"
       ? userSettingsSchema.safeParse({
@@ -64,22 +65,4 @@ function renderContent(model: SettingsReadModel): string {
   return model.state === "ready" && readyIsSafe
     ? readyContent(model)
     : `<section class="card ui-panel"><div class="card-body"><h2>設定無法載入</h2><p>${escapeHtml("設定目前無法安全讀取。")}</p></div></section>`;
-}
-
-export function renderSettingsPage(model: SettingsReadModel): string {
-  return `<!doctype html>
-<html lang="zh-Hant">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
-    <title>設定｜Agent Team</title>
-    <link rel="stylesheet" href="/assets/tabler-1.4.0.min.css">
-    <link rel="stylesheet" href="/assets/ui-shell.css">
-  </head>
-  <body class="ui-shell"><a class="skip-link" href="#main-content">跳至主要內容</a><div class="ui-app"><aside class="ui-sidebar" aria-label="Agent Team 導覽"><a class="ui-brand" href="/" aria-label="Agent Team 總覽"><span class="ui-brand-copy"><span class="ui-brand-title">Agent Team</span><span class="ui-brand-subtitle">Local control room</span></span></a><nav class="ui-nav" aria-label="主要導覽"><p class="ui-nav-caption">管理介面</p><ul class="navbar-nav"><li class="nav-item"><a class="ui-nav-link" href="/">總覽</a></li><li class="nav-item"><a class="ui-nav-link" href="/projects">專案</a></li><li class="nav-item"><a class="ui-nav-link" href="/events">事件</a></li><li class="nav-item"><a class="ui-nav-link" href="/settings" aria-current="page">設定</a></li></ul></nav></aside><main id="main-content" class="ui-content" tabindex="-1"><div class="ui-content-inner">
-    <header class="ui-page-header"><div><p class="ui-page-eyebrow">LOCALHOST 管理介面</p><h1>設定</h1><p class="ui-page-description">管理 Webhook Runtime 與既定併行限制；此頁不接受行內 CLI 參數或 Secret。</p></div></header>
-    ${renderContent(model)}
-  </div></main></div><script src="/assets/settings.js" defer></script></body>
-</html>`;
 }

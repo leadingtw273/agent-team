@@ -6,13 +6,14 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createSettingsUiHandler,
+  createSettingsUiFeatureRegistration,
   createSettingsUseCase,
-  createUiSecurityPolicy,
+  createUiApplication,
   FileSettingsStore,
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 
 let shell: LocalUiServerHandle | undefined;
 let directory: string | undefined;
@@ -43,11 +44,17 @@ function contrast(first: string, second: string): number {
 test.beforeAll(async () => {
   directory = await mkdtemp(join(tmpdir(), "settings-browser-"));
   await mkdir(join(directory, "config"));
+  const application = createUiApplication({
+    features: [
+      createRoleModelFeature(),
+      createSettingsUiFeatureRegistration(
+        createSettingsUseCase(new FileSettingsStore(join(directory, "config", "settings.yaml"))),
+      ),
+    ],
+  });
   shell = await startLocalUiServer({
-    securityPolicy: createUiSecurityPolicy(),
-    handler: createSettingsUiHandler(
-      createSettingsUseCase(new FileSettingsStore(join(directory, "config", "settings.yaml"))),
-    ),
+    securityPolicy: application.securityPolicy,
+    handler: application.handler,
   });
   const exchange = await fetch(`${shell.baseUrl}/__session/exchange`, {
     method: "POST",
@@ -128,6 +135,29 @@ async function expectCanonicalYamlAtWidth(page: Page, width: 320 | 390): Promise
   expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
 }
 
+async function expectNoHorizontalOverflow(page: Page): Promise<void> {
+  expect(
+    await page.evaluate(() => {
+      const browser = globalThis as typeof globalThis & {
+        readonly document: { readonly documentElement: { readonly scrollWidth: number } };
+        readonly innerWidth: number;
+      };
+      return browser.document.documentElement.scrollWidth <= browser.innerWidth;
+    }),
+  ).toBe(true);
+}
+
+async function expectNoAxeViolations(page: Page): Promise<void> {
+  const violations = await page.evaluate(async () => {
+    const browser = globalThis as typeof globalThis & {
+      axe: { run(document: unknown): Promise<{ violations: unknown[] }> };
+      readonly document: unknown;
+    };
+    return (await browser.axe.run(browser.document)).violations;
+  });
+  expect(violations).toEqual([]);
+}
+
 test("settings edit control has AA normal/focus contrast and no axe violations", async ({
   page,
 }) => {
@@ -172,14 +202,47 @@ test("settings edit control has AA normal/focus contrast and no axe violations",
   });
   expect(contrast(focused.outline, focused.background)).toBeGreaterThanOrEqual(3);
 
-  const violations = await page.evaluate(async () => {
-    const browser = globalThis as typeof globalThis & {
-      axe: { run(document: unknown): Promise<{ violations: unknown[] }> };
-      readonly document?: unknown;
-    };
-    return (await browser.axe.run(browser.document)).violations;
-  });
-  expect(violations).toEqual([]);
+  await expectNoAxeViolations(page);
+});
+
+test("Role and Settings share one collapsed mobile shell at 390px and 320px", async ({ page }) => {
+  await visitSettings(page);
+  if (shell === undefined) throw new Error("settings browser session missing");
+
+  for (const width of [390, 320] as const) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 720 });
+    for (const destination of [
+      { path: "/roles-models", title: "角色與模型" },
+      { path: "/settings", title: "設定" },
+    ] as const) {
+      await page.goto(`${shell.baseUrl}${destination.path}`, { waitUntil: "networkidle" });
+      const disclosure = page.locator("details.ui-mobile-nav");
+      const toggle = disclosure.locator("summary");
+      const navigation = disclosure.getByRole("navigation", { name: "主要導覽" });
+
+      await expect(page.getByRole("heading", { level: 1, name: destination.title })).toBeVisible();
+      await expect(page.locator(".ui-app")).toHaveCount(1);
+      await expect(page.locator(".ui-sidebar")).toHaveCount(1);
+      await expect(page.locator(".ui-brand")).toHaveCount(1);
+      await expect(page.locator('a.skip-link[href="#main-content"]')).toHaveCount(1);
+      await expect(disclosure).toBeVisible();
+      await expect(disclosure).not.toHaveAttribute("open", "");
+      await expect(toggle).toContainText(`目前頁面：${destination.title}`);
+      await expect(navigation).toBeHidden();
+      await expectNoHorizontalOverflow(page);
+
+      await toggle.click();
+      await expect(disclosure).toHaveAttribute("open", "");
+      await expect(
+        navigation.getByRole("link", { name: destination.title, exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await expectNoHorizontalOverflow(page);
+      await expectNoAxeViolations(page);
+
+      await toggle.click();
+      await expect(disclosure).not.toHaveAttribute("open", "");
+    }
+  }
 });
 
 test("raw YAML stays canonical on mobile and edit mode exposes the only save path", async ({
@@ -238,6 +301,15 @@ test("raw YAML stays canonical on mobile and edit mode exposes the only save pat
   );
 
   await expectCanonicalYamlAtWidth(page, 390);
+  await expect(page.locator("details.ui-mobile-nav")).not.toHaveAttribute("open", "");
+  await page.screenshot({
+    path: `${screenshotRoot}/u008-settings-390-final.png`,
+    fullPage: true,
+  });
+  await copyFile(
+    `${screenshotRoot}/u008-settings-390-final.png`,
+    join(screenshotWorktree, "u008-settings-390-final.png"),
+  );
   await edit.focus();
   await page.keyboard.press("Enter");
   await expect(editor).toBeFocused();
@@ -247,15 +319,6 @@ test("raw YAML stays canonical on mobile and edit mode exposes the only save pat
   await expect(save).toBeVisible();
   await expect(save).toBeEnabled();
   await expect(page.getByText("受控編輯已啟用；儲存前會重新驗證完整設定。")).toBeVisible();
-  await page.screenshot({
-    path: `${screenshotRoot}/u008-settings-mobile-final.png`,
-    fullPage: true,
-  });
-  await copyFile(
-    `${screenshotRoot}/u008-settings-mobile-final.png`,
-    join(screenshotWorktree, "u008-settings-mobile-final.png"),
-  );
-
   await editor.fill(
     (await editor.inputValue()).replace("globalModelJobs: 2", "globalModelJobs: 3"),
   );
@@ -267,12 +330,5 @@ test("raw YAML stays canonical on mobile and edit mode exposes the only save pat
   await expect(save).toBeHidden();
 
   await expectCanonicalYamlAtWidth(page, 320);
-  const violations = await page.evaluate(async () => {
-    const browser = globalThis as typeof globalThis & {
-      axe: { run(document: unknown): Promise<{ violations: unknown[] }> };
-      document: unknown;
-    };
-    return (await browser.axe.run(browser.document)).violations;
-  });
-  expect(violations).toEqual([]);
+  await expectNoAxeViolations(page);
 });

@@ -4,7 +4,7 @@ import {
   DEFAULT_USER_SETTINGS,
   createSettingsUseCase,
   parseUserSettingsYaml,
-  renderSettingsPage,
+  renderSettingsContent,
   serializeUserSettingsYaml,
   userSettingsSchema,
   type SettingsStore,
@@ -248,17 +248,16 @@ describe("U008 settings use case", () => {
 });
 
 describe("U008 settings view", () => {
-  it("renders a real settings page with read-only raw YAML and disabled save", async () => {
+  it("renders content-only settings UI with read-only raw YAML and disabled save", async () => {
     const store: SettingsStore = {
       read: vi.fn(() => Promise.resolve(ok(storedSettings()))),
       save: vi.fn(),
     };
     const model = await createSettingsUseCase(store).read();
 
-    const html = renderSettingsPage(model);
+    const html = renderSettingsContent(model);
 
-    expect(html).toContain('<html lang="zh-Hant">');
-    expect(html).toContain("設定｜Agent Team");
+    expect(html).not.toMatch(/<!doctype|<html|<head|<body|class="ui-brand"/iu);
     expect(html).toContain("Webhook Runtime URL");
     expect(html).toContain("全域模型工作");
     expect(html).toContain("進階 Raw YAML（唯讀）");
@@ -266,13 +265,12 @@ describe("U008 settings view", () => {
     expect(html).toContain("readonly");
     expect(html).toContain("disabled");
     expect(html).toContain("預設為唯讀；切換至受控編輯後才會送出");
-    expect(html).toContain('<script src="/assets/settings.js" defer>');
-    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("<script");
     expect(html).not.toMatch(/(?:--token|--secret|api[_-]?key|authorization:|bearer\s)/iu);
   });
 
   it("escapes read-model values and never renders invalid store content", () => {
-    const html = renderSettingsPage(
+    const html = renderSettingsContent(
       Object.freeze({ state: "error", message: '<script data-secret="token">bad</script>' }),
     );
 
@@ -284,7 +282,7 @@ describe("U008 settings view", () => {
 
   it("does not render a credential marker from a forged ready read model", () => {
     const marker = ["github", "_pat_", "abcdefghijklmnopqrstuvwxyz"].join("");
-    const html = renderSettingsPage(
+    const html = renderSettingsContent(
       Object.freeze({
         state: "ready",
         source: "persisted",

@@ -1,0 +1,32 @@
+#settings-form .form-control,
+#settings-raw-yaml {
+  min-width: 0;
+  max-width: 100%;
+}
+
+#settings-raw-yaml {
+  overflow: auto;
+  white-space: pre;
+}
+
+#settings-edit {
+  color: #0756a3;
+  background: #ffffff;
+  border-color: #0756a3;
+}
+
+#settings-edit:focus-visible {
+  outline-color: #2f6fed;
+}
+
+@media (max-width: 420px) {
+  #settings-edit,
+  #settings-cancel,
+  #settings-save {
+    flex: 1 1 100%;
+  }
+
+  #settings-status {
+    flex-basis: 100%;
+  }
+}
