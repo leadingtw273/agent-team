@@ -3,6 +3,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   mkdirSync,
   openSync,
@@ -36,6 +37,8 @@ export interface SecureDirectoryIdentity {
 
 export interface SecureDirectoryOpenOptions {
   readonly create?: boolean;
+  /** Safely narrows an already-open private directory to 0700 before use. */
+  readonly repairPermissions?: boolean;
 }
 
 export interface SecureFileReadOptions {
@@ -121,6 +124,18 @@ function validPermanentLockRecord(value: unknown): value is PermanentLockRecord 
   );
 }
 
+function createPermanentLockRecord(): PermanentLockRecord {
+  const generation = randomUUID();
+  return Object.freeze({
+    schemaVersion: 1,
+    generation,
+    ownerDigest: createHash("sha256")
+      .update(randomBytes(32))
+      .update(generation, "utf8")
+      .digest("hex"),
+  });
+}
+
 function readPermanentLockRecordSync(fd: number): Result<PermanentLockRecord, DomainError> {
   try {
     const info = fstatSync(fd);
@@ -185,7 +200,7 @@ export async function acquireKernelFileLock(
         stdio: ["ignore", "ignore", "ignore", fd],
       });
       child.once("error", () => {
-        settle(err(domainError("external_failure")));
+        settle(err(domainError("unavailable")));
       });
       child.once("exit", (code, signal) => {
         if (signal !== null || code === null) {
@@ -207,6 +222,7 @@ async function openChildDirectory(
   name: string,
   create: boolean,
   privateDirectory: boolean,
+  repairPermissions: boolean,
 ): Promise<FileHandle> {
   const path = `/proc/self/fd/${String(parent.fd)}/${name}`;
   if (create) {
@@ -217,7 +233,11 @@ async function openChildDirectory(
     }
   }
   const child = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  const info = await child.stat();
+  let info = await child.stat();
+  if (privateDirectory && (info.mode & 0o777) !== privateDirectoryMode && repairPermissions) {
+    await child.chmod(privateDirectoryMode);
+    info = await child.stat();
+  }
   if (!info.isDirectory() || (privateDirectory && (info.mode & 0o777) !== privateDirectoryMode)) {
     await child.close();
     throw Object.assign(new Error("unsafe_private_directory"), { code: "EACCES" });
@@ -229,6 +249,7 @@ async function openAbsoluteDirectory(
   rootPath: string,
   children: readonly string[],
   create: boolean,
+  repairPermissions: boolean,
 ): Promise<FileHandle> {
   const rootParts = resolve(rootPath)
     .split(sep)
@@ -237,12 +258,18 @@ async function openAbsoluteDirectory(
   try {
     for (const [index, part] of rootParts.entries()) {
       const isPrivateRoot = index === rootParts.length - 1;
-      const child = await openChildDirectory(current, part, create && isPrivateRoot, isPrivateRoot);
+      const child = await openChildDirectory(
+        current,
+        part,
+        create && isPrivateRoot,
+        isPrivateRoot,
+        repairPermissions,
+      );
       await current.close();
       current = child;
     }
     for (const childName of children) {
-      const child = await openChildDirectory(current, childName, create, true);
+      const child = await openChildDirectory(current, childName, create, true, repairPermissions);
       await current.close();
       current = child;
     }
@@ -272,6 +299,7 @@ function openAbsoluteDirectorySync(
   rootPath: string,
   children: readonly string[],
   create: boolean,
+  repairPermissions: boolean,
 ): HeldDirectoryHandle {
   const rootParts = resolve(rootPath)
     .split(sep)
@@ -292,7 +320,11 @@ function openAbsoluteDirectorySync(
         path,
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       );
-      const info = fstatSync(child);
+      let info = fstatSync(child);
+      if (isPrivateRoot && (info.mode & 0o777) !== privateDirectoryMode && repairPermissions) {
+        fchmodSync(child, privateDirectoryMode);
+        info = fstatSync(child);
+      }
       if (!info.isDirectory() || (isPrivateRoot && (info.mode & 0o777) !== privateDirectoryMode)) {
         closeSync(child);
         throw Object.assign(new Error("unsafe_private_directory"), { code: "EACCES" });
@@ -313,7 +345,11 @@ function openAbsoluteDirectorySync(
         path,
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
       );
-      const info = fstatSync(child);
+      let info = fstatSync(child);
+      if ((info.mode & 0o777) !== privateDirectoryMode && repairPermissions) {
+        fchmodSync(child, privateDirectoryMode);
+        info = fstatSync(child);
+      }
       if (!info.isDirectory() || (info.mode & 0o777) !== privateDirectoryMode) {
         closeSync(child);
         throw Object.assign(new Error("unsafe_private_directory"), { code: "EACCES" });
@@ -387,7 +423,7 @@ export class HeldSecureDirectory {
   async verifyPathIdentity(): Promise<Result<void, DomainError>> {
     let reopened: FileHandle | undefined;
     try {
-      reopened = await openAbsoluteDirectory(this.#rootPath, this.#children, false);
+      reopened = await openAbsoluteDirectory(this.#rootPath, this.#children, false, false);
       const info = await reopened.stat();
       return info.dev === this.identity.device && info.ino === this.identity.inode
         ? ok(undefined)
@@ -403,7 +439,7 @@ export class HeldSecureDirectory {
   verifyPathIdentitySync(): Result<void, DomainError> {
     let reopened: HeldDirectoryHandle | undefined;
     try {
-      reopened = openAbsoluteDirectorySync(this.#rootPath, this.#children, false);
+      reopened = openAbsoluteDirectorySync(this.#rootPath, this.#children, false, false);
       const info = fstatSync(reopened.fd);
       return info.dev === this.identity.device && info.ino === this.identity.inode
         ? ok(undefined)
@@ -498,27 +534,17 @@ export class HeldSecureDirectory {
   async acquireLock(
     name: string,
     holderId: string,
+    flockBinary = "/usr/bin/flock",
   ): Promise<Result<SecureFileLockHandle, DomainError>> {
     const path = this.#path(name);
     if (!path.ok) return path;
     if (holderId.trim().length === 0) return err(domainError("invariant_violation"));
     let handle: FileHandle | undefined;
     try {
+      let createdRecord: PermanentLockRecord | undefined;
       try {
         handle = await open(path.value, "wx+", privateFileMode);
-        const generation = randomUUID();
-        const created: PermanentLockRecord = Object.freeze({
-          schemaVersion: 1,
-          generation,
-          ownerDigest: createHash("sha256")
-            .update(randomBytes(32))
-            .update(generation, "utf8")
-            .digest("hex"),
-        });
-        await handle.writeFile(`${JSON.stringify(created)}\n`, "utf8");
-        await handle.chmod(privateFileMode);
-        await handle.sync();
-        await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+        createdRecord = createPermanentLockRecord();
       } catch (error) {
         await closeQuietly(handle);
         handle = undefined;
@@ -527,15 +553,31 @@ export class HeldSecureDirectory {
       }
 
       const ownedHandle = handle;
-      const record = await readPermanentLockRecord(ownedHandle);
-      if (!record.ok) {
-        await closeQuietly(ownedHandle);
-        return record;
-      }
-      const kernelLock = await acquireKernelFileLock(ownedHandle.fd);
+      const kernelLock = await acquireKernelFileLock(ownedHandle.fd, flockBinary);
       if (!kernelLock.ok) {
         await closeQuietly(ownedHandle);
         return kernelLock;
+      }
+      const lockedInfo = await ownedHandle.stat();
+      const needsInitialization =
+        lockedInfo.isFile() &&
+        (lockedInfo.mode & 0o777) === privateFileMode &&
+        lockedInfo.size === 0;
+      if (needsInitialization) {
+        const initialized = createdRecord ?? createPermanentLockRecord();
+        await ownedHandle.writeFile(`${JSON.stringify(initialized)}\n`, "utf8");
+        await ownedHandle.chmod(privateFileMode);
+        await ownedHandle.sync();
+        await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+        createdRecord = initialized;
+      }
+      const record =
+        needsInitialization && createdRecord !== undefined
+          ? ok(createdRecord)
+          : await readPermanentLockRecord(ownedHandle);
+      if (!record.ok) {
+        await closeQuietly(ownedHandle);
+        return record;
       }
 
       const ownedInfo = fstatSync(ownedHandle.fd, { bigint: true });
@@ -645,7 +687,12 @@ export function openHeldSecureDirectory(
   }
   try {
     const root = resolve(rootPath);
-    const handle = openAbsoluteDirectorySync(root, children, options.create === true);
+    const handle = openAbsoluteDirectorySync(
+      root,
+      children,
+      options.create === true,
+      options.repairPermissions === true,
+    );
     const info = fstatSync(handle.fd);
     return ok(
       new HeldSecureDirectory(handle, root, [...children], {
@@ -673,7 +720,12 @@ export async function withSecureDirectory<Value>(
   }
   let handle: FileHandle | undefined;
   try {
-    handle = await openAbsoluteDirectory(resolve(rootPath), children, options.create === true);
+    handle = await openAbsoluteDirectory(
+      resolve(rootPath),
+      children,
+      options.create === true,
+      options.repairPermissions === true,
+    );
     const info = await handle.stat();
     const held = new HeldSecureDirectory(handle, resolve(rootPath), [...children], {
       device: info.dev,

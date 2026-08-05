@@ -1,4 +1,6 @@
 import { renameSync } from "node:fs";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import {
   chmod,
   mkdir,
@@ -19,15 +21,10 @@ import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
-import {
-  createFixedClock,
-  domainError,
-  err,
-  ok,
-  parseInstant,
-} from "../../src/domain/foundation/index.js";
+import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import {
   acquireFileLock,
+  acquireRecoverableFileLock,
   AtomicFileStore,
   createAgentTeamProjectLayout,
   createAgentTeamUserLayout,
@@ -40,6 +37,7 @@ import {
   reclaimStaleFileLock,
   writeJsonWithSchema,
   type AtomicFileOperations,
+  type FileLockOperations,
 } from "../../src/infrastructure/files/index.js";
 
 const stateSchema = z
@@ -50,6 +48,15 @@ const stateSchema = z
   .strict();
 
 const temporaryDirectories: string[] = [];
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "agent-team-files-"));
@@ -297,67 +304,217 @@ describe("atomic schema files", () => {
 });
 
 describe("exclusive file lock", () => {
-  it("allows exactly one writer and permits a new writer only after verified release", async () => {
+  it("turns the old partial-publication race into one complete trusted permanent state", async () => {
     const root = await temporaryDirectory();
     const lockPath = join(root, "state", "locks", "events.lock");
-    const instant = parseInstant("2026-08-04T16:00:00.000Z");
-    if (!instant.ok) throw new Error(instant.error.code);
-    const clock = createFixedClock(instant.value);
+    await mkdir(join(root, "state", "locks"), { recursive: true, mode: 0o700 });
+    await writeFile(lockPath, "", { mode: 0o600 });
+    const partialIdentity = await stat(lockPath);
 
     const [first, second] = await Promise.all([
-      acquireFileLock(lockPath, "writer-a", clock),
-      acquireFileLock(lockPath, "writer-b", clock),
+      acquireFileLock(lockPath, "writer-a"),
+      acquireFileLock(lockPath, "writer-b"),
     ]);
     if (first.ok === second.ok) throw new Error("expected exactly one lock winner");
     const winner = first.ok ? first : second;
     const loser = first.ok ? second : first;
     if (!winner.ok || loser.ok) throw new Error("expected one winner and one loser");
     expect(loser.error.code).toBe("conflict");
-    expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
+
+    const beforeRelease = await stat(lockPath);
+    expect(beforeRelease.ino).toBe(partialIdentity.ino);
+    expect(beforeRelease.mode & 0o777).toBe(0o600);
+    const permanentRecord = JSON.parse(await readFile(lockPath, "utf8")) as Record<string, unknown>;
+    expect(Object.keys(permanentRecord).sort()).toEqual([
+      "generation",
+      "ownerDigest",
+      "schemaVersion",
+    ]);
+    expect(permanentRecord["schemaVersion"]).toBe(1);
+    expect(permanentRecord["generation"]).toEqual(expect.any(String));
+    expect(permanentRecord["generation"]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu,
+    );
+    expect(permanentRecord["ownerDigest"]).toEqual(expect.any(String));
+    expect(permanentRecord["ownerDigest"]).toMatch(/^[a-f0-9]{64}$/u);
+    expect(await inspectFileLock(lockPath)).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
 
     await expect(winner.value.release()).resolves.toEqual({ ok: true, value: undefined });
-    const next = await acquireFileLock(lockPath, "writer-c", clock);
-    expect(next.ok).toBe(true);
-    if (next.ok)
-      await expect(next.value.release()).resolves.toEqual({ ok: true, value: undefined });
+    const afterRelease = await stat(lockPath);
+    expect(afterRelease.ino).toBe(beforeRelease.ino);
+    expect(await inspectFileLock(lockPath)).toMatchObject({
+      ok: false,
+      error: { code: "not_found" },
+    });
+
+    const next = await acquireFileLock(lockPath, "writer-c");
+    if (!next.ok) throw new Error(next.error.code);
+    expect((await stat(lockPath)).ino).toBe(beforeRelease.ino);
+    await expect(next.value.release()).resolves.toEqual({ ok: true, value: undefined });
   });
 
-  it("reclaims a token-matched lock only after the recorded process is confirmed dead", async () => {
+  it("recovers after a process crashes without unlinking the permanent inode", async () => {
     const root = await temporaryDirectory();
-    const lockPath = join(root, "state", "locks", "stale.lock");
-    const lock = await acquireFileLock(lockPath, "crashed-writer");
-    if (!lock.ok) throw new Error(lock.error.code);
-    const snapshot = await inspectFileLock(lockPath);
-    if (!snapshot.ok) throw new Error(snapshot.error.code);
+    const lockPath = join(root, "locks", "crash.lock");
+    const child = fork(new URL("../fixtures/file-lock-child.mjs", import.meta.url), [lockPath], {
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    const message = await new Promise<unknown>((resolve) => {
+      child.once("message", (received: unknown) => {
+        resolve(received);
+      });
+    });
+    expect(message).toEqual({ state: "held" });
+    const heldIdentity = await stat(lockPath);
 
-    const active = await reclaimStaleFileLock(lockPath, snapshot.value.token, () => true);
-    expect(active.ok).toBe(false);
-    if (active.ok) throw new Error("active process lock must not be reclaimed");
-    expect(active.error.code).toBe("conflict");
+    expect(await acquireRecoverableFileLock(lockPath, "parent-contender")).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    child.kill("SIGKILL");
+    await once(child, "exit");
 
-    await expect(
-      reclaimStaleFileLock(lockPath, snapshot.value.token, () => false),
-    ).resolves.toEqual({ ok: true, value: undefined });
-    const recovered = await acquireFileLock(lockPath, "recovered-writer");
+    const recovered = await acquireRecoverableFileLock(lockPath, "parent-recovered");
     if (!recovered.ok) throw new Error(recovered.error.code);
+    expect((await stat(lockPath)).ino).toBe(heldIdentity.ino);
     await expect(recovered.value.release()).resolves.toEqual({ ok: true, value: undefined });
+    expect((await stat(lockPath)).ino).toBe(heldIdentity.ino);
   });
 
-  it("does not unlink a lock whose ownership record was replaced", async () => {
+  it("treats inspect and legacy reclaim as kernel-lock probes, never as stale-owner deletion", async () => {
     const root = await temporaryDirectory();
-    const lockPath = join(root, "lock");
-    const lock = await acquireFileLock(lockPath, "writer");
-    if (!lock.ok) throw new Error(lock.error.code);
-    await writeFile(
-      lockPath,
-      '{"schemaVersion":1,"token":"different","holderId":"other","pid":1,"acquiredAt":"2026-08-04T16:00:00.000Z"}\n',
-      "utf8",
-    );
+    const lockPath = join(root, "locks", "probe.lock");
+    const active = await acquireFileLock(lockPath, "active");
+    if (!active.ok) throw new Error(active.error.code);
+    const identity = await stat(lockPath);
 
-    const released = await lock.value.release();
-    expect(released.ok).toBe(false);
-    if (released.ok) throw new Error("expected replaced lock ownership to fail");
-    expect(released.error.code).toBe("conflict");
-    await expect(stat(lockPath)).resolves.toBeDefined();
+    expect(await inspectFileLock(lockPath)).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    expect(await reclaimStaleFileLock(lockPath, "legacy-token", () => false)).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    await expect(active.value.release()).resolves.toEqual({ ok: true, value: undefined });
+
+    await expect(reclaimStaleFileLock(lockPath, "legacy-token", () => true)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+    expect((await stat(lockPath)).ino).toBe(identity.ino);
+  });
+
+  it("fails ownership verification but never unlinks a rewritten manifest", async () => {
+    const root = await temporaryDirectory();
+    const lockPath = join(root, "locks", "manifest.lock");
+    const active = await acquireFileLock(lockPath, "owner");
+    if (!active.ok) throw new Error(active.error.code);
+    const original = JSON.parse(await readFile(lockPath, "utf8")) as {
+      schemaVersion: 1;
+      generation: string;
+      ownerDigest: string;
+    };
+    const rewritten = {
+      ...original,
+      ownerDigest: original.ownerDigest === "f".repeat(64) ? "e".repeat(64) : "f".repeat(64),
+    };
+    await writeFile(lockPath, `${JSON.stringify(rewritten)}\n`, { mode: 0o600 });
+
+    expect(await active.value.release()).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(`${JSON.stringify(rewritten)}\n`);
+  });
+
+  it("fails closed for a malformed permanent manifest instead of replacing it", async () => {
+    const root = await temporaryDirectory();
+    const lockPath = join(root, "locks", "malformed.lock");
+    const first = await acquireFileLock(lockPath, "owner-a");
+    if (!first.ok) throw new Error(first.error.code);
+    await expect(first.value.release()).resolves.toEqual({ ok: true, value: undefined });
+    const identity = await stat(lockPath);
+    await writeFile(lockPath, '{"schemaVersion":1}\n', { mode: 0o600 });
+
+    expect(await acquireFileLock(lockPath, "owner-b")).toMatchObject({
+      ok: false,
+      error: { code: "invariant_violation" },
+    });
+    expect((await stat(lockPath)).ino).toBe(identity.ino);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe('{"schemaVersion":1}\n');
+  });
+
+  it("detects canonical inode replacement on release and leaves both inodes intact", async () => {
+    const root = await temporaryDirectory();
+    const directory = join(root, "locks");
+    const lockPath = join(directory, "replacement.lock");
+    const displaced = join(directory, "replacement.lock.displaced");
+    const first = await acquireFileLock(lockPath, "owner-a");
+    if (!first.ok) throw new Error(first.error.code);
+    const firstIdentity = await stat(lockPath);
+    await rename(lockPath, displaced);
+
+    const replacement = await acquireFileLock(lockPath, "owner-b");
+    if (!replacement.ok) throw new Error(replacement.error.code);
+    const replacementIdentity = await stat(lockPath);
+    expect(replacementIdentity.ino).not.toBe(firstIdentity.ino);
+    expect(await first.value.release()).toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    expect((await stat(displaced)).ino).toBe(firstIdentity.ino);
+    expect((await stat(lockPath)).ino).toBe(replacementIdentity.ino);
+    await expect(replacement.value.release()).resolves.toEqual({ ok: true, value: undefined });
+    expect((await stat(lockPath)).ino).toBe(replacementIdentity.ino);
+  });
+
+  it("fails closed when held-directory or flock capability is unavailable", async () => {
+    const root = await temporaryDirectory();
+    const missingPath = join(root, "missing", "events.lock");
+    const unavailableOperations: FileLockOperations = {
+      openDirectory: () => err(domainError("unavailable")),
+    };
+    expect(
+      await acquireFileLock(missingPath, "writer", undefined, {}, unavailableOperations),
+    ).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    expect(await exists(join(root, "missing"))).toBe(false);
+
+    const lockPath = join(root, "locks", "events.lock");
+    const established = await acquireFileLock(lockPath, "establish");
+    if (!established.ok) throw new Error(established.error.code);
+    await expect(established.value.release()).resolves.toEqual({ ok: true, value: undefined });
+    const identity = await stat(lockPath);
+    expect(
+      await acquireFileLock(lockPath, "writer", undefined, {
+        flockBinary: "/definitely-missing/file-lock-flock",
+      }),
+    ).toMatchObject({ ok: false, error: { code: "unavailable" } });
+    expect((await stat(lockPath)).ino).toBe(identity.ino);
+  });
+
+  it("does not repair unsafe directory permissions unless the caller explicitly opts in", async () => {
+    const root = await temporaryDirectory();
+    const directory = join(root, "locks");
+    const lockPath = join(directory, "events.lock");
+    await mkdir(directory, { mode: 0o700 });
+    await chmod(directory, 0o755);
+
+    expect(await acquireFileLock(lockPath, "generic-writer")).toMatchObject({
+      ok: false,
+      error: { code: "permission_denied" },
+    });
+    expect((await stat(directory)).mode & 0o777).toBe(0o755);
+    expect(await exists(lockPath)).toBe(false);
+
+    const repaired = await acquireFileLock(lockPath, "settings-style-writer", undefined, {
+      repairPermissions: true,
+    });
+    if (!repaired.ok) throw new Error(repaired.error.code);
+    expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    await expect(repaired.value.release()).resolves.toEqual({ ok: true, value: undefined });
   });
 });

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -292,28 +292,27 @@ describe("JSONL event store", () => {
     expect(replayed).toMatchObject({ ok: true, value: { state: 2, duplicatesSkipped: 0 } });
   });
 
-  it("reclaims a lock left by a crashed process and retries the append once", async () => {
+  it("reuses the same permanent lock inode after the previous append releases it", async () => {
     const root = await temporaryDirectory();
     const path = join(root, "events.jsonl");
     const lockPath = `${path}.lock`;
-    await writeFile(
-      lockPath,
-      `${JSON.stringify({
-        schemaVersion: 1,
-        token: "crashed-owner-token",
-        holderId: "crashed-writer",
-        pid: 2_147_483_647,
-        acquiredAt: "2026-08-04T12:00:00.000Z",
-      })}\n`,
-      "utf8",
+    const store = new JsonlEventStore(path);
+    const first = await store.append(event());
+    if (!first.ok) throw new Error(first.error.code);
+    const firstIdentity = await stat(lockPath);
+    const second = await store.append(
+      event({
+        eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-4123456789ab"),
+        source: { kind: "external", provider: "github", deliveryId: "delivery-456" },
+      }),
     );
-
-    const appended = await new JsonlEventStore(path).append(event());
-    if (!appended.ok) throw new Error(appended.error.code);
-    expect(appended.value.persistence).toBe("persisted_confirmed");
+    if (!second.ok) throw new Error(second.error.code);
+    expect(first.value.persistence).toBe("persisted_confirmed");
+    expect(second.value.persistence).toBe("persisted_confirmed");
+    expect((await stat(lockPath)).ino).toBe(firstIdentity.ino);
     const log = await readEventLog(path);
     if (!log.ok) throw new Error(log.error.code);
-    expect(log.value.events).toHaveLength(1);
+    expect(log.value.events).toHaveLength(2);
   });
 
   it("ignores a partial tail during replay and repairs it before the next append", async () => {
