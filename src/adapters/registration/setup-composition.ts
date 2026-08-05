@@ -1,10 +1,7 @@
 import { isAbsolute } from "node:path";
 
 import {
-  RegistrationSetupController,
-  RegistrationSetupCoordinator,
-  createRegistrationSetupControllerMergeOperation,
-  HostRegistrationSetupConversationApprovalFacade,
+  createRegistrationSetupApplication,
   createUnwiredRegistrationSetupController,
   type RegistrationSetupControllerUseCase,
   type RegistrationSetupDraft,
@@ -168,8 +165,13 @@ export function createProductionRegistrationSetupComposition(
     },
   });
   const mergedConfig = new GitHubRegistrationMergedConfigReadBackAdapter(options.githubTransport);
-  const activationRegistry = new FileRegistrationSetupActivationRegistry(options.stateRoot);
-  const coordinator = new RegistrationSetupCoordinator({
+  const activationRegistry = new FileRegistrationSetupActivationRegistry(
+    options.stateRoot,
+    undefined,
+    sessionStore,
+    finalApproval,
+  );
+  const coordinatorPorts = {
     git,
     preflight: new GitPreflight(git),
     previewConfirmation,
@@ -184,31 +186,27 @@ export function createProductionRegistrationSetupComposition(
     squashMerge,
     mergedConfig,
     activationRegistry,
-  });
-  const approveAndMerge = createRegistrationSetupControllerMergeOperation(coordinator);
-  const conversationApproval =
-    options.conversationApprovalBridge === undefined
-      ? Object.freeze({})
-      : Object.freeze({
-          conversationApproval: new HostRegistrationSetupConversationApprovalFacade({
-            coordinator,
-            bridge: options.conversationApprovalBridge,
-            approveAndMerge,
-          }),
-        });
-
-  return Object.freeze({
-    controller: new RegistrationSetupController({
+  };
+  const application = createRegistrationSetupApplication({
+    coordinatorPorts,
+    controllerPorts: {
       stateRoot: options.stateRoot,
       draftSource,
       git,
-      coordinator,
       sessions: sessionStore,
       previewConfirmation,
       finalApproval,
-      approveAndMerge,
-    }),
-    ...conversationApproval,
+    },
+    ...(options.conversationApprovalBridge === undefined
+      ? {}
+      : { conversationApprovalBridge: options.conversationApprovalBridge }),
+  });
+
+  return Object.freeze({
+    controller: application.controller,
+    ...(application.conversationApproval === undefined
+      ? {}
+      : { conversationApproval: application.conversationApproval }),
     wiring: Object.freeze({
       state: "ready" as const,
       durableState: "w1_file_stores" as const,

@@ -4,8 +4,10 @@ import { z } from "zod";
 
 import {
   verifyRegistrationSetupActivationBinding,
+  verifyRegistrationSetupApprovalLedgerBinding,
   type RegistrationSetupActivationMarker,
   type RegistrationSetupActivationRegistryPort,
+  type RegistrationSetupFinalApprovalAuthorityPort,
   type RegistrationSetupSession,
 } from "../../application/registration/index.js";
 import type {
@@ -22,7 +24,10 @@ import {
 } from "../../domain/foundation/index.js";
 import { sha256Digest } from "../../domain/review/index.js";
 import { AtomicFileStore, withSecureDirectory } from "../../infrastructure/files/index.js";
-import { FileRegistrationSetupSessionStore } from "./setup-durable.js";
+import {
+  FileRegistrationSetupFinalApprovalAuthority,
+  FileRegistrationSetupSessionStore,
+} from "./setup-durable.js";
 
 const digestPattern = /^[0-9a-f]{64}$/u;
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
@@ -105,6 +110,7 @@ export class FileRegistrationSetupActivationRegistry implements RegistrationSetu
   readonly #stateRoot: string;
   readonly #atomicStore: AtomicFileStore;
   readonly #sessions: Pick<FileRegistrationSetupSessionStore, "load" | "readActivation">;
+  readonly #approvalLedger: Pick<RegistrationSetupFinalApprovalAuthorityPort, "readConsumed">;
 
   constructor(
     stateRoot: string,
@@ -113,11 +119,16 @@ export class FileRegistrationSetupActivationRegistry implements RegistrationSetu
       FileRegistrationSetupSessionStore,
       "load" | "readActivation"
     > = new FileRegistrationSetupSessionStore(stateRoot),
+    approvalLedger: Pick<
+      RegistrationSetupFinalApprovalAuthorityPort,
+      "readConsumed"
+    > = new FileRegistrationSetupFinalApprovalAuthority(stateRoot),
   ) {
     if (!isAbsolute(stateRoot)) throw new TypeError("state_root_must_be_absolute");
     this.#stateRoot = resolve(stateRoot);
     this.#atomicStore = atomicStore;
     this.#sessions = sessions;
+    this.#approvalLedger = approvalLedger;
   }
 
   async #verifyMarker(
@@ -128,10 +139,16 @@ export class FileRegistrationSetupActivationRegistry implements RegistrationSetu
     if (!session.ok) return session;
     const sessionMarker = await this.#sessions.readActivation(marker.setupSessionId, options);
     if (!sessionMarker.ok) return sessionMarker;
-    return session.value !== undefined &&
-      sessionMarker.value !== undefined &&
-      verifyRegistrationSetupActivationBinding(session.value, marker) &&
-      JSON.stringify(sessionMarker.value) === JSON.stringify(marker)
+    if (
+      session.value === undefined ||
+      sessionMarker.value === undefined ||
+      !verifyRegistrationSetupActivationBinding(session.value, marker) ||
+      JSON.stringify(sessionMarker.value) !== JSON.stringify(marker)
+    ) {
+      return err(domainError("conflict"));
+    }
+    const anchor = await this.#approvalLedger.readConsumed(marker.approvalReferenceDigest, options);
+    return anchor.ok && verifyRegistrationSetupApprovalLedgerBinding(session.value, anchor.value)
       ? ok(session.value)
       : err(domainError("conflict"));
   }

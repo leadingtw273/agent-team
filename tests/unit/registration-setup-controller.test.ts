@@ -106,6 +106,7 @@ function fixture(
         );
       },
       verifyAndConsume: () => Promise.resolve(ok({ state: "rejected" as const })),
+      readConsumed: () => Promise.resolve(ok(undefined)),
     },
   };
   return {

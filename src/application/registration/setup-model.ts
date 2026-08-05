@@ -88,6 +88,12 @@ export interface RegistrationSetupFinalApprovalReceipt extends RegistrationSetup
   readonly consumedAt: string;
 }
 
+export interface RegistrationSetupConsumedApprovalAnchor {
+  readonly receipt: RegistrationSetupFinalApprovalReceipt;
+  /** Digest of the durable consume operation stored only in the approval ledger. */
+  readonly consumeOperationDigest: Sha256Digest;
+}
+
 export interface RegistrationSetupTrustedAuthority {
   readonly authorityDigest: string;
 }
@@ -502,6 +508,11 @@ export interface RegistrationSetupFinalApprovalAuthorityPort {
     | Readonly<{ state: "verified_and_consumed"; receipt: RegistrationSetupFinalApprovalReceipt }>
     | Readonly<{ state: "replay" | "rejected" | "unknown" }>
   >;
+  /** Read-only recovery anchor from the independent approval ledger. */
+  readConsumed(
+    approvalReferenceDigest: Sha256Digest,
+    options?: ReadOptions,
+  ): AsyncPortResult<RegistrationSetupConsumedApprovalAnchor | undefined>;
 }
 
 export interface RegistrationSetupMergedConfigReceipt {

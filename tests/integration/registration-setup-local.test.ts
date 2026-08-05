@@ -1,4 +1,5 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import {
   chmod,
   mkdir,
@@ -234,30 +235,43 @@ function testAuditReceipt(destination: "linear" | "pull_request") {
   });
 }
 
-const mergeIdempotencyKey = `setup-merge:${preview.setupSessionId}:${testDigest.slice(0, 16)}`;
-const mergeIntentBinding = Object.freeze({
-  schemaVersion: 1 as const,
-  projectId: project.id,
-  repository: project.sourceControl.repository,
-  changeRequestId: "PR_node_1",
-  expectedHeadSha: headSha,
-  mergeMethod: "SQUASH" as const,
-  idempotencyKey: mergeIdempotencyKey,
-});
-const mergeIntent = Object.freeze({
-  ...mergeIntentBinding,
-  mergeIntentDigest: mustDigest({
-    kind: "registration_setup_merge_intent",
+function approvalReferenceFor(approvalId: string) {
+  return mustDigest({
+    schemaVersion: 1,
+    kind: "registration_setup_approval_reference",
+    approvalId,
+  });
+}
+
+function testMergeState(approvalReferenceDigest = testDigest) {
+  const mergeIdempotencyKey = `setup-merge:${preview.setupSessionId}:${approvalReferenceDigest.slice(0, 16)}`;
+  const mergeIntentBinding = Object.freeze({
+    schemaVersion: 1 as const,
+    projectId: project.id,
+    repository: project.sourceControl.repository,
+    changeRequestId: "PR_node_1",
+    expectedHeadSha: headSha,
+    mergeMethod: "SQUASH" as const,
+    idempotencyKey: mergeIdempotencyKey,
+  });
+  const mergeIntent = Object.freeze({
     ...mergeIntentBinding,
-  }),
-});
-const { idempotencyKey: _mergeIdempotencyKey, ...mergeReceiptBinding } = mergeIntent;
-void _mergeIdempotencyKey;
-const mergeReceipt = Object.freeze({
-  ...mergeReceiptBinding,
-  state: "merged" as const,
-  idempotencyKeyDigest: mustDigest(mergeIdempotencyKey),
-});
+    mergeIntentDigest: mustDigest({
+      kind: "registration_setup_merge_intent",
+      ...mergeIntentBinding,
+    }),
+  });
+  const { idempotencyKey: _mergeIdempotencyKey, ...mergeReceiptBinding } = mergeIntent;
+  void _mergeIdempotencyKey;
+  return {
+    mergeIntent,
+    mergeReceipt: Object.freeze({
+      ...mergeReceiptBinding,
+      state: "merged" as const,
+      idempotencyKeyDigest: mustDigest(mergeIdempotencyKey),
+    }),
+  };
+}
 
 function plannedJournal(): RegistrationSetupJournalDraft {
   return {
@@ -271,7 +285,11 @@ function plannedJournal(): RegistrationSetupJournalDraft {
 
 function sessionDraft(
   phase: "ci_waiting" | "activated" = "ci_waiting",
+  approvalReceipt?: import("../../src/application/registration/index.js").RegistrationSetupFinalApprovalReceipt,
 ): RegistrationSetupSessionDraft {
+  const approvalReferenceDigest =
+    approvalReceipt === undefined ? testDigest : approvalReferenceFor(approvalReceipt.approvalId);
+  const merge = testMergeState(approvalReferenceDigest);
   return {
     schemaVersion: 1,
     phase,
@@ -351,13 +369,13 @@ function sessionDraft(
         : [],
     ...(phase === "activated"
       ? {
-          approvalReferenceDigest: testDigest,
-          approvalNonceDigest: testDigest,
-          approvalAuthorityDigest: testDigest,
-          approvalSource: "local_ui" as const,
-          approvalSetupRevision: 1,
-          mergeIntent,
-          mergeReceipt,
+          approvalReferenceDigest,
+          approvalNonceDigest: approvalReceipt?.approvalNonceDigest ?? testDigest,
+          approvalAuthorityDigest: approvalReceipt?.authorityDigest ?? testDigest,
+          approvalSource: approvalReceipt?.issuer ?? ("local_ui" as const),
+          approvalSetupRevision: approvalReceipt?.setupSessionRevision ?? 1,
+          mergeIntent: merge.mergeIntent,
+          mergeReceipt: merge.mergeReceipt,
           mergedConfigReceipt: {
             schemaVersion: 1 as const,
             source: "source_control_default_branch" as const,
@@ -378,7 +396,35 @@ function sessionDraft(
   };
 }
 
+async function createConsumedApproval(
+  root: string,
+  revision = 1,
+): Promise<
+  import("../../src/application/registration/index.js").RegistrationSetupFinalApprovalReceipt
+> {
+  const authority = new FileRegistrationSetupFinalApprovalAuthority(root);
+  const issued = await authority.issue(binding(revision), localApprovalAuthority, {
+    idempotencyKey: `activation-anchor:issue:${String(revision)}`,
+  });
+  if (!issued.ok || issued.value.state !== "issued") throw new Error("approval_issue_failed");
+  const consumed = await authority.verifyAndConsume(
+    {
+      approvalId: issued.value.grant.approvalId,
+      userConfirmed: true,
+      expectedSetupRevision: revision,
+    },
+    binding(revision),
+    localApprovalAuthority,
+    { idempotencyKey: `activation-anchor:consume:${String(revision)}` },
+  );
+  if (!consumed.ok || consumed.value.state !== "verified_and_consumed") {
+    throw new Error("approval_consume_failed");
+  }
+  return consumed.value.receipt;
+}
+
 async function createActivatedFixture(root: string) {
+  const approvalReceipt = await createConsumedApproval(root);
   const sessions = new FileRegistrationSetupSessionStore(root);
   const initial = await withExecution(root, (lease) =>
     sessions.save(undefined, sessionDraft(), {
@@ -388,10 +434,15 @@ async function createActivatedFixture(root: string) {
   );
   if (!initial.ok) throw new Error(initial.error.code);
   const activated = await withExecution(root, (lease) =>
-    sessions.activate(initial.value.session.revision, sessionDraft("activated"), mergedSha, {
-      idempotencyKey: "tamper:activate",
-      executionFence: lease.fence,
-    }),
+    sessions.activate(
+      initial.value.session.revision,
+      sessionDraft("activated", approvalReceipt),
+      mergedSha,
+      {
+        idempotencyKey: "tamper:activate",
+        executionFence: lease.fence,
+      },
+    ),
   );
   if (!activated.ok) throw new Error(activated.error.code);
   const registry = new FileRegistrationSetupActivationRegistry(root);
@@ -405,6 +456,7 @@ async function createActivatedFixture(root: string) {
 interface MutableActivationRecord {
   marker: Record<string, unknown>;
   session: {
+    approvalNonceDigest: string;
     mergedConfigReceipt: {
       projectId: string;
       repository: string;
@@ -459,7 +511,7 @@ function binding(revision = 2): RegistrationSetupApprovalBinding {
     requirementsDigest: preview.requirementsDigest,
     diffDigest: testDigest,
     linearAuditIssueId: preview.linearAuditIssueId,
-    gateEvidenceDigest: testDigest,
+    gateEvidenceDigest: gateEvidenceReceipt.evidenceDigest,
   };
 }
 
@@ -593,6 +645,7 @@ describe("file-backed registration setup state", () => {
 
   it("publishes a digest-keyed project activation index with idempotent CAS", async () => {
     const root = await temporaryRoot();
+    const approvalReceipt = await createConsumedApproval(root);
     const sessions = new FileRegistrationSetupSessionStore(root);
     const initial = await withExecution(root, (lease) =>
       sessions.save(undefined, sessionDraft(), {
@@ -602,10 +655,15 @@ describe("file-backed registration setup state", () => {
     );
     if (!initial.ok) throw new Error(initial.error.code);
     const activated = await withExecution(root, (lease) =>
-      sessions.activate(initial.value.session.revision, sessionDraft("activated"), mergedSha, {
-        idempotencyKey: "activation-index:marker",
-        executionFence: lease.fence,
-      }),
+      sessions.activate(
+        initial.value.session.revision,
+        sessionDraft("activated", approvalReceipt),
+        mergedSha,
+        {
+          idempotencyKey: "activation-index:marker",
+          executionFence: lease.fence,
+        },
+      ),
     );
     if (!activated.ok) throw new Error(activated.error.code);
     const registry = new FileRegistrationSetupActivationRegistry(root);
@@ -649,6 +707,38 @@ describe("file-backed registration setup state", () => {
       await expectLoaderActivationUnavailable(registry);
     },
   );
+
+  it("rejects synchronized valid nonce substitution across session, marker, and project index", async () => {
+    const root = await temporaryRoot();
+    const { sessions, registry } = await createActivatedFixture(root);
+    const substitutedNonce = mustDigest("synchronized-nonce-substitution");
+    await tamperActivationRecord(sessions, (record) => {
+      record.session.approvalNonceDigest = substitutedNonce;
+      record.marker["approvalNonceDigest"] = substitutedNonce;
+    });
+    const projectKey = mustDigest({
+      kind: "registration_setup_activation_project",
+      projectId: project.id,
+    });
+    const indexPath = join(root, "registration-setup-activation", projectKey, "index.json");
+    const index = JSON.parse(await readFile(indexPath, "utf8")) as {
+      marker: Record<string, unknown>;
+      markerDigest: string;
+    };
+    index.marker["approvalNonceDigest"] = substitutedNonce;
+    index.markerDigest = mustDigest({
+      kind: "registration_setup_activation_marker",
+      marker: index.marker,
+    });
+    await writeFile(indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(sessions.load(preview.setupSessionId)).resolves.toMatchObject({ ok: true });
+    await expect(registry.read(project.id)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    await expectLoaderActivationUnavailable(registry);
+  });
 
   it.each(["project", "repository", "path", "config"] as const)(
     "rejects an activated W2 receipt with exact-binding %s tampering",
@@ -1185,6 +1275,22 @@ describe("registration setup local adapters", () => {
     });
     expect(consumed).toMatchObject({ ok: true, value: { state: "verified_and_consumed" } });
     expect(retried).toEqual(consumed);
+    if (!consumed.ok || consumed.value.state !== "verified_and_consumed") {
+      throw new Error("approval_not_consumed");
+    }
+    await expect(authority.readConsumed(approvalReferenceFor(request.approvalId))).resolves.toEqual(
+      {
+        ok: true,
+        value: {
+          receipt: consumed.value.receipt,
+          consumeOperationDigest: createHash("sha256").update("consume:1", "utf8").digest("hex"),
+        },
+      },
+    );
+    await expect(authority.readConsumed(mustDigest("unknown-approval"))).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
     await expect(
       authority.verifyAndConsume(
         request,

@@ -193,6 +193,7 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
     finalApproval: {
       issue: () => Promise.resolve(ok({ state: "rejected" as const })),
       verifyAndConsume: () => Promise.resolve(ok({ state: "rejected" as const })),
+      readConsumed: () => Promise.resolve(ok(undefined)),
     },
     squashMerge: { enable: () => Promise.resolve(err(domainError("unavailable"))) },
     mergedConfig: { read: () => Promise.resolve(err(domainError("unavailable"))) },

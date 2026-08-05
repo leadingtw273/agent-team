@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   RegistrationSetupCoordinator,
-  createRegistrationSetupControllerMergeOperation,
+  createRegistrationSetupApplication,
   createRegistrationSetupPreview,
   type RegistrationSetupPorts,
   type RegistrationSetupJournal,
@@ -125,6 +125,7 @@ interface HarnessOptions {
   readonly review?: CommitStatusesSnapshot;
   readonly driftDiff?: boolean;
   readonly driftHead?: boolean;
+  readonly mergePendingDrift?: "gate" | "head" | "diff";
   readonly recoveryDiffAttack?: "extra" | "mode" | "rename" | "symlink" | "submodule" | "object";
   readonly barrierStep?: RegistrationSetupJournalStep;
   readonly mergedReadBack?: boolean;
@@ -353,7 +354,14 @@ function harness(options: HarnessOptions = {}) {
       getEffectiveTreeDiff: () => {
         calls.push("diff");
         diffReads += 1;
-        return Promise.resolve(ok(treeDiff(options.driftDiff === true && diffReads > 1)));
+        return Promise.resolve(
+          ok(
+            treeDiff(
+              (options.driftDiff === true && diffReads > 1) ||
+                (options.mergePendingDrift === "diff" && calls.includes("save:merge_pending")),
+            ),
+          ),
+        );
       },
       getStagedTreeDiff: () =>
         Promise.resolve(
@@ -429,7 +437,10 @@ function harness(options: HarnessOptions = {}) {
       },
       getChangeRequest: () => {
         calls.push("pr-read");
-        if (options.driftHead)
+        if (
+          options.driftHead ||
+          (options.mergePendingDrift === "head" && calls.includes("save:merge_pending"))
+        )
           return Promise.resolve(ok(changeRequest({ headSha: "f".repeat(40) })));
         if (options.mergedReadBack && current.autoMergeEnabled)
           current = changeRequest({ state: "merged", draft: false, autoMergeEnabled: true });
@@ -452,6 +463,11 @@ function harness(options: HarnessOptions = {}) {
     gateEvidence: {
       read: (command) => {
         calls.push("ci-read", "review-read");
+        if (options.mergePendingDrift === "gate" && calls.includes("save:merge_pending")) {
+          return Promise.resolve(
+            ok({ state: "not_ready" as const, reason: "review_failed" as const }),
+          );
+        }
         const ci = options.ci ?? checks();
         const review = options.review ?? statuses();
         if (ci.headSha !== command.expectedHeadSha || review.headSha !== command.expectedHeadSha) {
@@ -726,6 +742,25 @@ function harness(options: HarnessOptions = {}) {
           ok({ state: "verified_and_consumed" as const, receipt: consumedApprovalReceipt }),
         );
       },
+      readConsumed: (approvalReference) => {
+        calls.push("approval-ledger-read");
+        if (consumedApprovalReceipt === undefined || consumedApprovalOperation === undefined) {
+          return Promise.resolve(ok(undefined));
+        }
+        const reference = sha256Digest({
+          schemaVersion: 1,
+          kind: "registration_setup_approval_reference",
+          approvalId: consumedApprovalReceipt.approvalId,
+        });
+        return Promise.resolve(
+          reference.ok && reference.value === approvalReference
+            ? ok({
+                receipt: consumedApprovalReceipt,
+                consumeOperationDigest: digest(consumedApprovalOperation),
+              })
+            : ok(undefined),
+        );
+      },
     },
     squashMerge: {
       enable: (_command, mutationOptions) => {
@@ -809,9 +844,36 @@ function harness(options: HarnessOptions = {}) {
     },
   };
   const coordinator = new RegistrationSetupCoordinator(ports);
+  const application = createRegistrationSetupApplication({
+    coordinatorPorts: ports,
+    controllerPorts: {
+      stateRoot: "/tmp/agent-team-registration-setup-unit",
+      git: {
+        inspectRepository: () => Promise.resolve(err(domainError("unavailable"))),
+      },
+      sessions: ports.sessions,
+      previewConfirmation: {
+        ...ports.previewConfirmation,
+        issue: () => Promise.resolve(ok({ state: "rejected" as const })),
+      },
+      finalApproval: ports.finalApproval,
+    },
+  });
   return {
     coordinator,
-    approveAndMerge: createRegistrationSetupControllerMergeOperation(coordinator),
+    approveAndMerge: (
+      request: import("../../src/application/registration/index.js").RegistrationSetupMergeRequest,
+      authority: import("../../src/application/registration/index.js").RegistrationSetupFinalApprovalAuthority,
+    ) =>
+      application.controller.approveAndMergeLocalUi(
+        {
+          setupSessionId: request.setupSessionId,
+          approvalId: request.approval?.approvalId ?? "invalid",
+          expectedSetupRevision: request.approval?.expectedSetupRevision ?? 0,
+          idempotencyKeyPrefix: request.idempotencyKeyPrefix,
+        },
+        { authorityDigest: authority.authorityDigest },
+      ),
     calls,
     sessions,
     journals,
@@ -856,13 +918,16 @@ function approval(session: RegistrationSetupSession, overrides: Record<string, u
 const trustedAuthority = { issuer: "local_ui" as const, authorityDigest: uiSessionDigest };
 
 describe("O005 registration Setup PR flow", () => {
-  it("keeps coordinator capabilities private and exposes no B1 merge alias", () => {
+  it("keeps coordinator capabilities private and exposes no raw merge extractor", async () => {
     const test = harness();
+    const publicApi = await import("../../src/application/registration/index.js");
     expect(Object.keys(test.coordinator)).toEqual([]);
+    expect(Reflect.ownKeys(test.coordinator)).toEqual([]);
     expect(test.coordinator).not.toHaveProperty("ports");
     expect(test.coordinator).not.toHaveProperty("approveAndMerge");
     expect(test.coordinator).not.toHaveProperty("enableAutoMerge");
     expect(test.coordinator).not.toHaveProperty("activate");
+    expect(publicApi).not.toHaveProperty("createRegistrationSetupControllerMergeOperation");
   });
 
   it("serializes trusted config deterministically and rejects recognizable secrets", () => {
@@ -1608,6 +1673,30 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
     expect(test.mutationKeys.filter((item) => item.step === "merge")).toHaveLength(1);
   });
+
+  it.each(["gate", "head", "diff"] as const)(
+    "revalidates %s after durable merge intent and before the mutation",
+    async (mergePendingDrift) => {
+      const test = await prepared(harness({ mergePendingDrift }));
+      const ready = await test.coordinator.refresh({
+        setupSessionId: preview.setupSessionId,
+        idempotencyKeyPrefix: `refresh:merge-pending-${mergePendingDrift}`,
+      });
+      if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+      await expect(
+        test.approveAndMerge(
+          {
+            setupSessionId: preview.setupSessionId,
+            approval: approval(ready.session),
+            idempotencyKeyPrefix: `merge:merge-pending-${mergePendingDrift}`,
+          },
+          trustedAuthority,
+        ),
+      ).resolves.toMatchObject({ state: "failed", stage: "merge" });
+      expect(test.calls.filter((call) => call === "merge")).toHaveLength(0);
+      expect(test.mutationKeys.filter((item) => item.step === "merge")).toHaveLength(0);
+    },
+  );
 
   it("repairs only the project index after a W1-marker-to-index crash", async () => {
     const test = await prepared(harness({ mergedReadBack: true, activationIndexFailOnce: true }));

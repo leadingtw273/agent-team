@@ -53,7 +53,7 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import { projectSchema } from "../../domain/project/index.js";
-import { sha256Digest } from "../../domain/review/index.js";
+import { sha256Digest, type Sha256Digest } from "../../domain/review/index.js";
 import {
   AtomicFileStore,
   withSecureDirectory,
@@ -600,6 +600,15 @@ type PreviewConfirmationLedger = z.infer<typeof previewConfirmationLedgerSchema>
 
 function hash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function approvalReferenceDigest(approvalId: string): string | undefined {
+  const digest = sha256Digest({
+    schemaVersion: 1,
+    kind: "registration_setup_approval_reference",
+    approvalId,
+  });
+  return digest.ok ? digest.value : undefined;
 }
 
 function sameValue(left: unknown, right: unknown): boolean {
@@ -1784,5 +1793,43 @@ export class FileRegistrationSetupFinalApprovalAuthority implements Registration
           : ok({ state: "unknown" as const });
       },
     );
+  }
+
+  async readConsumed(approvalReference: Sha256Digest, options: ReadOptions = {}) {
+    if (!digestPattern.test(approvalReference) || options.signal?.aborted === true) {
+      return err(domainError("invariant_violation"));
+    }
+    const read = await withSecureDirectory(
+      this.#stateRoot,
+      ["registration-setup", "approval-authority"],
+      { create: false },
+      async (directory) => {
+        const ledger = await this.#load(directory);
+        if (!ledger.ok) return ledger;
+        const matches = ledger.value.grants.filter(
+          (grant) =>
+            grant.state === "consumed" &&
+            approvalReferenceDigest(grant.approvalId) === approvalReference,
+        );
+        const grant = matches[0];
+        if (matches.length > 1) return err(domainError("conflict"));
+        if (grant?.state !== "consumed") return ok(undefined);
+        const expectedReceipt = {
+          ...grant.binding,
+          approvalId: grant.approvalId,
+          issuer: grant.issuer,
+          authorityDigest: grant.authorityDigest,
+          approvalNonceDigest: grant.approvalNonceDigest,
+          consumedAt: grant.receipt.consumedAt,
+        };
+        return sameValue(grant.receipt, expectedReceipt)
+          ? ok({
+              receipt: grant.receipt,
+              consumeOperationDigest: grant.consumeOperationDigest as Sha256Digest,
+            })
+          : err(domainError("conflict"));
+      },
+    );
+    return !read.ok && read.error.code === "not_found" ? ok(undefined) : read;
   }
 }
