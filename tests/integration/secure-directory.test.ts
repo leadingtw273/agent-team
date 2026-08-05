@@ -1,8 +1,8 @@
+import { spawnSync } from "node:child_process";
 import {
   chmod,
   mkdir,
   mkdtemp,
-  readdir,
   readFile,
   rename,
   rm,
@@ -127,7 +127,7 @@ describe("Linux held secure directory", () => {
     });
   });
 
-  it("provides 0600 active-owner locks and stale-owner reclamation within the held directory", async () => {
+  it("keeps a permanent 0600 kernel lock until the parent-held fd closes", async () => {
     const parent = await container();
     const root = join(parent, "state");
     const result = await withSecureDirectory(
@@ -137,33 +137,39 @@ describe("Linux held secure directory", () => {
       async (directory) => {
         const active = await directory.acquireLock("operation.lock", "active-owner");
         if (!active.ok) return active;
-        expect((await stat(join(root, "leases", "operation.lock"))).mode & 0o777).toBe(0o600);
+        const lockPath = join(root, "leases", "operation.lock");
+        expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
+        expect(await active.value.assertOwnership()).toEqual({ ok: true, value: undefined });
+        const externalWhileHeld = spawnSync(
+          "/usr/bin/flock",
+          ["-E", "75", "-n", lockPath, "true"],
+          { encoding: "utf8" },
+        );
+        expect(externalWhileHeld.status).toBe(75);
         const conflict = await directory.acquireLock("operation.lock", "second-owner");
         expect(conflict).toMatchObject({ ok: false, error: { code: "conflict" } });
         const released = await active.value.release();
         if (!released.ok) return released;
 
-        const stale = await directory.acquireLock("operation.lock", "stale-owner");
-        if (!stale.ok) return stale;
-        const observed = await directory.inspectLock("operation.lock");
-        if (!observed.ok) return observed;
-        const reclaimed = await directory.reclaimStaleLock(
-          "operation.lock",
-          observed.value.token,
-          () => false,
+        expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
+        const externalAfterClose = spawnSync(
+          "/usr/bin/flock",
+          ["-E", "75", "-n", lockPath, "true"],
+          { encoding: "utf8" },
         );
-        if (!reclaimed.ok) return reclaimed;
-        return ok(undefined);
+        expect(externalAfterClose.status).toBe(0);
+        const next = await directory.acquireLock("operation.lock", "next-owner");
+        if (!next.ok) return next;
+        expect(await next.value.assertOwnership()).toEqual({ ok: true, value: undefined });
+        return next.value.release();
       },
     );
 
     expect(result).toEqual({ ok: true, value: undefined });
-    await expect(stat(join(root, "leases", "operation.lock"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
+    expect((await stat(join(root, "leases", "operation.lock"))).mode & 0o777).toBe(0o600);
   });
 
-  it("never unlinks a replacement owner during lock-release ABA", async () => {
+  it("never moves or deletes a replacement owner during lock-path ABA", async () => {
     const parent = await container();
     const root = join(parent, "state");
     const lockDirectory = join(root, "leases");
@@ -179,23 +185,20 @@ describe("Linux held secure directory", () => {
         const replacement = await directory.acquireLock("operation.lock", "owner-b");
         if (!replacement.ok) return replacement;
 
-        expect(await first.value.release()).toMatchObject({
+        expect(await first.value.assertOwnership()).toMatchObject({
           ok: false,
           error: { code: "conflict" },
         });
-        const entries = await readdir(lockDirectory);
-        const quarantined = entries.find((entry) => entry.includes(".release-"));
-        if (quarantined === undefined) throw new Error("replacement quarantine missing");
-        expect(JSON.parse(await readFile(displaced, "utf8"))).toMatchObject({
-          holderId: "owner-a",
-        });
-        expect(JSON.parse(await readFile(join(lockDirectory, quarantined), "utf8"))).toMatchObject({
-          holderId: "owner-b",
-        });
-        return ok(undefined);
+        expect(await first.value.release()).toEqual({ ok: true, value: undefined });
+        expect(await replacement.value.assertOwnership()).toEqual({ ok: true, value: undefined });
+        expect((await stat(displaced)).mode & 0o777).toBe(0o600);
+        expect((await stat(join(lockDirectory, "operation.lock"))).mode & 0o777).toBe(0o600);
+        return replacement.value.release();
       },
     );
 
     expect(result).toEqual({ ok: true, value: undefined });
+    expect((await stat(displaced)).mode & 0o777).toBe(0o600);
+    expect((await stat(join(lockDirectory, "operation.lock"))).mode & 0o777).toBe(0o600);
   });
 });

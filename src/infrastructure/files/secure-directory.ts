@@ -1,26 +1,18 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fstatSync, mkdirSync, openSync, type Stats } from "node:fs";
-import { mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, open, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 
 import {
   domainError,
-  createClock,
   err,
   ok,
-  type Clock,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
 import { AtomicFileStore, privateFileMode, syncDirectory } from "./atomic.js";
 import { privateDirectoryMode } from "./layout.js";
-import {
-  inspectFileLock,
-  reclaimStaleFileLock,
-  type FileLockHandle,
-  type FileLockSnapshot,
-  type ProcessLivenessProbe,
-} from "./lock.js";
 
 const entryNamePattern = /^(?!\.{1,2}$)[A-Za-z0-9][A-Za-z0-9._@+-]{0,254}$/u;
 
@@ -35,6 +27,25 @@ export interface SecureDirectoryOpenOptions {
 
 export interface SecureFileReadOptions {
   readonly maxBytes?: number;
+}
+
+export interface SecureLockIdentity {
+  readonly device: number;
+  readonly inode: number;
+  readonly generation: string;
+}
+
+export interface SecureFileLockHandle {
+  readonly path: string;
+  readonly holderId: string;
+  readonly identity: SecureLockIdentity;
+  assertOwnership(): Promise<Result<void, DomainError>>;
+  release(): Promise<Result<void, DomainError>>;
+}
+
+interface PermanentLockRecord {
+  readonly schemaVersion: 1;
+  readonly generation: string;
 }
 
 interface HeldDirectoryHandle {
@@ -76,6 +87,72 @@ async function closeQuietly(handle: FileHandle | undefined): Promise<void> {
 
 function validEntryName(name: string): boolean {
   return entryNamePattern.test(name);
+}
+
+function validPermanentLockRecord(value: unknown): value is PermanentLockRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Readonly<Record<string, unknown>>;
+  return (
+    record["schemaVersion"] === 1 &&
+    typeof record["generation"] === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+      record["generation"],
+    ) &&
+    Object.keys(record).length === 2
+  );
+}
+
+async function readPermanentLockRecord(
+  handle: FileHandle,
+): Promise<Result<PermanentLockRecord, DomainError>> {
+  try {
+    const info = await handle.stat();
+    if (
+      !info.isFile() ||
+      (info.mode & 0o777) !== privateFileMode ||
+      info.size <= 0 ||
+      info.size > 4096
+    ) {
+      return err(domainError("permission_denied"));
+    }
+    const content = Buffer.alloc(info.size);
+    const { bytesRead } = await handle.read(content, 0, content.length, 0);
+    if (bytesRead !== content.length) return err(domainError("external_failure"));
+    const parsed: unknown = JSON.parse(content.toString("utf8"));
+    return validPermanentLockRecord(parsed) ? ok(parsed) : err(domainError("invariant_violation"));
+  } catch (error) {
+    return err(fileError(error));
+  }
+}
+
+async function acquireKernelLock(fd: number): Promise<Result<void, DomainError>> {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    const settle = (result: Result<void, DomainError>): void => {
+      if (settled) return;
+      settled = true;
+      resolveResult(result);
+    };
+    try {
+      const child = spawn("/usr/bin/flock", ["-E", "75", "-n", "3"], {
+        stdio: ["ignore", "ignore", "ignore", fd],
+      });
+      child.once("error", () => {
+        settle(err(domainError("external_failure")));
+      });
+      child.once("exit", (code, signal) => {
+        if (signal !== null || code === null) {
+          settle(err(domainError("external_failure")));
+        } else if (code === 0) {
+          settle(ok(undefined));
+        } else {
+          settle(err(domainError(code === 75 ? "conflict" : "external_failure")));
+        }
+      });
+    } catch {
+      settle(err(domainError("external_failure")));
+    }
+  });
 }
 
 async function openChildDirectory(
@@ -316,91 +393,117 @@ export class HeldSecureDirectory {
   async acquireLock(
     name: string,
     holderId: string,
-    clock?: Clock,
-  ): Promise<Result<FileLockHandle, DomainError>> {
+  ): Promise<Result<SecureFileLockHandle, DomainError>> {
     const path = this.#path(name);
     if (!path.ok) return path;
     if (holderId.trim().length === 0) return err(domainError("invariant_violation"));
-    const token = randomUUID();
-    const record: FileLockSnapshot = Object.freeze({
-      schemaVersion: 1,
-      token,
-      holderId,
-      pid: process.pid,
-      acquiredAt: (clock ?? createClock()).now(),
-    });
     let handle: FileHandle | undefined;
     try {
-      handle = await open(path.value, "wx", privateFileMode);
-      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
-      await handle.chmod(privateFileMode);
-      await handle.sync();
-      await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+      try {
+        handle = await open(path.value, "wx+", privateFileMode);
+        const created: PermanentLockRecord = Object.freeze({
+          schemaVersion: 1,
+          generation: randomUUID(),
+        });
+        await handle.writeFile(`${JSON.stringify(created)}\n`, "utf8");
+        await handle.chmod(privateFileMode);
+        await handle.sync();
+        await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+      } catch (error) {
+        await closeQuietly(handle);
+        handle = undefined;
+        if (!hasCode(error, "EEXIST")) throw error;
+        handle = await open(path.value, constants.O_RDWR | constants.O_NOFOLLOW);
+      }
+
+      const ownedHandle = handle;
+      const ownedInfo = await ownedHandle.stat();
+      const record = await readPermanentLockRecord(ownedHandle);
+      if (!record.ok) {
+        await closeQuietly(ownedHandle);
+        return record;
+      }
+      const kernelLock = await acquireKernelLock(ownedHandle.fd);
+      if (!kernelLock.ok) {
+        await closeQuietly(ownedHandle);
+        return kernelLock;
+      }
+
+      const identity: SecureLockIdentity = Object.freeze({
+        device: ownedInfo.dev,
+        inode: ownedInfo.ino,
+        generation: record.value.generation,
+      });
+      let finished = false;
+      const assertOwnership = async (): Promise<Result<void, DomainError>> => {
+        if (finished) return err(domainError("conflict"));
+        const directoryIdentity = await this.verifyIdentity();
+        if (!directoryIdentity.ok) return directoryIdentity;
+        const directoryPathIdentity = await this.verifyPathIdentity();
+        if (!directoryPathIdentity.ok) return directoryPathIdentity;
+        let canonical: FileHandle | undefined;
+        try {
+          const heldInfo = await ownedHandle.stat();
+          if (
+            !heldInfo.isFile() ||
+            (heldInfo.mode & 0o777) !== privateFileMode ||
+            heldInfo.dev !== identity.device ||
+            heldInfo.ino !== identity.inode
+          ) {
+            return err(domainError("conflict"));
+          }
+          const heldRecord = await readPermanentLockRecord(ownedHandle);
+          if (!heldRecord.ok || heldRecord.value.generation !== identity.generation) {
+            return err(domainError("conflict"));
+          }
+          canonical = await open(path.value, constants.O_RDONLY | constants.O_NOFOLLOW);
+          const canonicalInfo = await canonical.stat();
+          if (
+            !canonicalInfo.isFile() ||
+            (canonicalInfo.mode & 0o777) !== privateFileMode ||
+            canonicalInfo.dev !== identity.device ||
+            canonicalInfo.ino !== identity.inode
+          ) {
+            return err(domainError("conflict"));
+          }
+          const canonicalRecord = await readPermanentLockRecord(canonical);
+          return canonicalRecord.ok && canonicalRecord.value.generation === identity.generation
+            ? ok(undefined)
+            : err(domainError("conflict"));
+        } catch (error) {
+          const mapped = fileError(error);
+          return err(domainError(mapped.code === "not_found" ? "conflict" : mapped.code));
+        } finally {
+          await closeQuietly(canonical);
+        }
+      };
+      const initialOwnership = await assertOwnership();
+      if (!initialOwnership.ok) {
+        await closeQuietly(ownedHandle);
+        return initialOwnership;
+      }
+      return ok(
+        Object.freeze({
+          path: path.value,
+          holderId,
+          identity,
+          assertOwnership,
+          release: async (): Promise<Result<void, DomainError>> => {
+            if (finished) return err(domainError("conflict"));
+            finished = true;
+            try {
+              await ownedHandle.close();
+              return ok(undefined);
+            } catch (error) {
+              return err(fileError(error));
+            }
+          },
+        }),
+      );
     } catch (error) {
       await closeQuietly(handle);
-      return err(domainError(hasCode(error, "EEXIST") ? "conflict" : fileError(error).code));
+      return err(fileError(error));
     }
-    const ownedHandle = handle;
-    const ownedInfo = await ownedHandle.stat();
-    let finished = false;
-    return ok(
-      Object.freeze({
-        path: path.value,
-        holderId,
-        release: async (): Promise<Result<void, DomainError>> => {
-          if (finished) return err(domainError("conflict"));
-          finished = true;
-          const quarantineName = `${name}.release-${token}`;
-          const quarantine = this.#path(quarantineName);
-          if (!quarantine.ok) {
-            await closeQuietly(ownedHandle);
-            return quarantine;
-          }
-          let observed: FileHandle | undefined;
-          try {
-            await rename(path.value, quarantine.value);
-            observed = await open(quarantine.value, constants.O_RDONLY | constants.O_NOFOLLOW);
-            const observedInfo = await observed.stat();
-            if (
-              !observedInfo.isFile() ||
-              observedInfo.dev !== ownedInfo.dev ||
-              observedInfo.ino !== ownedInfo.ino
-            ) {
-              return err(domainError("conflict"));
-            }
-            await unlink(quarantine.value);
-            await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
-            return ok(undefined);
-          } catch (error) {
-            return err(fileError(error));
-          } finally {
-            await closeQuietly(observed);
-            await closeQuietly(ownedHandle);
-          }
-        },
-      }),
-    );
-  }
-
-  async inspectLock(name: string): Promise<Result<FileLockSnapshot, DomainError>> {
-    const path = this.#path(name);
-    if (!path.ok) return path;
-    const readable = await this.readFile(name, { maxBytes: 64 * 1024 });
-    return readable.ok ? inspectFileLock(path.value) : readable;
-  }
-
-  async reclaimStaleLock(
-    name: string,
-    expectedToken: string,
-    isProcessAlive?: ProcessLivenessProbe,
-  ): Promise<Result<void, DomainError>> {
-    const path = this.#path(name);
-    if (!path.ok) return path;
-    const readable = await this.readFile(name, { maxBytes: 64 * 1024 });
-    if (!readable.ok) return readable;
-    return isProcessAlive === undefined
-      ? reclaimStaleFileLock(path.value, expectedToken)
-      : reclaimStaleFileLock(path.value, expectedToken, isProcessAlive);
   }
 }
 
