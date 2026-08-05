@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   createRegistrationWizardUiFeatureRegistration,
   fixtureRegistrationReadOnlyScanUseCase,
+  linearProvisionApiPath,
   registrationWizardCssPath,
   registrationWizardPagePath,
+  registrationWizardScriptPath,
   renderRegistrationWizard,
   safeRegistrationText,
   type RegistrationWizardReadModel,
@@ -14,8 +16,8 @@ function joined(...parts: readonly string[]): string {
   return parts.join("");
 }
 
-describe("O002 registration wizard UI", () => {
-  it("renders every O001 Gate through a content-only registration with evidence and repair", async () => {
+describe("O002/O003 registration wizard UI", () => {
+  it("keeps every O001 Gate and composes the Linear preview in the same Registry feature", async () => {
     const registration = createRegistrationWizardUiFeatureRegistration(
       fixtureRegistrationReadOnlyScanUseCase,
     );
@@ -25,19 +27,30 @@ describe("O002 registration wizard UI", () => {
     expect(registration).toMatchObject({
       id: "registration-wizard",
       slot: "registration",
-      page: { path: registrationWizardPagePath, styles: [registrationWizardCssPath] },
+      page: {
+        path: registrationWizardPagePath,
+        styles: [registrationWizardCssPath],
+        scripts: [registrationWizardScriptPath],
+      },
     });
-    expect(registration.page.scripts).toBeUndefined();
     expect(registration.routes.map((route) => route.contract.path)).toEqual([
       registrationWizardCssPath,
+      registrationWizardScriptPath,
+      linearProvisionApiPath,
     ]);
     expect(registration.routes[0]?.contract.allowedMethods).toEqual(["GET"]);
+    expect(registration.routes[2]?.contract).toMatchObject({
+      allowedMethods: ["GET", "PUT"],
+      mutationBody: "bounded-json",
+    });
     expect(content).toContain("這是合成示範資料");
-    expect(content).toContain("不建立 PR、不變更 GitHub／Linear／CI／Webhook");
+    expect(content).toContain("O002 掃描仍只讀");
     expect(content).toContain("O002 只執行 7 項 read-only scan");
+    expect(content).toContain("Linear 設定預覽");
+    expect(content).toContain("第二步確認");
+    expect(content).toContain("不刪除、不改名");
     expect(content).not.toContain("<html");
     expect(content).not.toContain("<form");
-    expect(content).not.toContain("/api/registration");
     expect(scan.gates).toHaveLength(11);
     for (const gate of scan.gates) {
       expect(content).toContain(gate.label);

@@ -127,9 +127,7 @@ describe("O003 Linear provision GraphQL contract", () => {
       );
     };
     const port = adapter(fetch);
-    const group = linearProvisionDesiredObjects.find(
-      (desired) => desired.kind === "label_group",
-    );
+    const group = linearProvisionDesiredObjects.find((desired) => desired.kind === "label_group");
     const template = linearProvisionDesiredObjects.find(
       (desired) => desired.kind === "form_template",
     );
@@ -148,7 +146,12 @@ describe("O003 Linear provision GraphQL contract", () => {
   });
 
   it.each([
-    ["401", 401, { errors: [{ extensions: { code: "AUTHENTICATION_ERROR" } }] }, "permission_denied"],
+    [
+      "401",
+      401,
+      { errors: [{ extensions: { code: "AUTHENTICATION_ERROR" } }] },
+      "permission_denied",
+    ],
     ["429", 429, { errors: [{ extensions: { code: "RATELIMITED" } }] }, "rate_limited"],
     [
       "GraphQL partial",

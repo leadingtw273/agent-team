@@ -12,12 +12,7 @@ import {
   type LinearProvisionRemoteObject,
   type LinearProvisionTarget,
 } from "../../src/application/registration/index.js";
-import {
-  domainError,
-  err,
-  ok,
-  type DomainErrorCode,
-} from "../../src/domain/foundation/index.js";
+import { domainError, err, ok, type DomainErrorCode } from "../../src/domain/foundation/index.js";
 
 const target = Object.freeze({ teamId: "team-o003", projectId: "project-o003" });
 

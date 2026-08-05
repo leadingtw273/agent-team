@@ -38,9 +38,7 @@ const identitySchema = z
       .nullable(),
   })
   .strict();
-const stateSchema = z
-  .object({ id: idSchema, name: nameSchema, type: nameSchema })
-  .strict();
+const stateSchema = z.object({ id: idSchema, name: nameSchema, type: nameSchema }).strict();
 const statesPageSchema = z
   .object({
     team: z
@@ -146,10 +144,7 @@ function failure<Value>(code: DomainError["code"] = "external_failure") {
   return err(domainError(code)) as Result<Value, DomainError>;
 }
 
-function payloadString(
-  desired: LinearProvisionDesiredObject,
-  key: string,
-): string | undefined {
+function payloadString(desired: LinearProvisionDesiredObject, key: string): string | undefined {
   const value = desired.payload[key];
   return typeof value === "string" ? value : undefined;
 }

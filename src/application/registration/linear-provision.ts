@@ -198,9 +198,7 @@ function actionFor(
     kind: desired.kind,
     name: desired.name,
     state,
-    ...(state === "manual_create"
-      ? { instruction: manualInstruction(desired.kind, false) }
-      : {}),
+    ...(state === "manual_create" ? { instruction: manualInstruction(desired.kind, false) } : {}),
   });
 }
 
@@ -266,7 +264,13 @@ function onlyExpectedAddition(
   const afterById = new Map(after.objects.map((object) => [object.id, object]));
   if (afterById.size !== beforeById.size + 1 || beforeById.has(createdId)) return false;
   for (const [id, object] of beforeById) {
-    if (linearProvisionDigest(object) !== linearProvisionDigest(afterById.get(id))) return false;
+    const afterObject = afterById.get(id);
+    if (
+      afterObject === undefined ||
+      linearProvisionDigest(object) !== linearProvisionDigest(afterObject)
+    ) {
+      return false;
+    }
   }
   return afterById.has(createdId);
 }
@@ -326,12 +330,8 @@ export class LinearProvisionUseCase {
     if (context.value.bindings.byKey[command.logicalKey] !== undefined) {
       return failure("conflict");
     }
-    const desired = linearProvisionDesiredObjects.find(
-      (item) => item.key === command.logicalKey,
-    );
-    const remote = context.value.inventory.objects.find(
-      (object) => object.id === command.remoteId,
-    );
+    const desired = linearProvisionDesiredObjects.find((item) => item.key === command.logicalKey);
+    const remote = context.value.inventory.objects.find((object) => object.id === command.remoteId);
     if (
       desired === undefined ||
       remote === undefined ||

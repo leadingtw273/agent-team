@@ -1,15 +1,21 @@
 import { readFileSync } from "node:fs";
 
-import type { RegistrationReadOnlyScanUseCase } from "../../../application/registration/index.js";
+import type {
+  LinearProvisionUseCase,
+  RegistrationReadOnlyScanUseCase,
+} from "../../../application/registration/index.js";
 import type { UiFeatureRegistration, UiFeatureRoute } from "../../registry/index.js";
 import type { UiRequest, UiResponse } from "../../server/index.js";
 
 import { fixtureRegistrationReadOnlyScanUseCase } from "./fixture.js";
+import { createFixtureLinearProvisionUseCase } from "./linear-fixture.js";
+import { handleLinearProvisionApiRequest, linearProvisionApiPath } from "./linear-http.js";
 import {
   registrationWizardCssPath,
   registrationWizardPageDescription,
   registrationWizardPagePath,
   registrationWizardPageTitle,
+  registrationWizardScriptPath,
 } from "./metadata.js";
 import { registrationWizardFeatureSecurityRoutes } from "./routes.js";
 import { renderRegistrationWizard } from "./view.js";
@@ -18,8 +24,12 @@ const registrationWizardCss = readFileSync(
   new URL("../../assets/registration.css", import.meta.url),
   "utf8",
 );
+const registrationWizardScript = readFileSync(
+  new URL("../../assets/registration.js", import.meta.url),
+  "utf8",
+);
 
-function assetResponse(request: UiRequest, content: string): UiResponse {
+function assetResponse(request: UiRequest, content: string, contentType: string): UiResponse {
   if (request.method !== "GET" && request.method !== "HEAD") {
     return Object.freeze({
       statusCode: 405,
@@ -32,7 +42,7 @@ function assetResponse(request: UiRequest, content: string): UiResponse {
   }
   const headers = Object.freeze({
     "cache-control": "no-store",
-    "content-type": "text/css; charset=utf-8",
+    "content-type": contentType,
   });
   return request.method === "HEAD"
     ? Object.freeze({ statusCode: 200, headers })
@@ -40,12 +50,12 @@ function assetResponse(request: UiRequest, content: string): UiResponse {
 }
 
 /**
- * Content-only O002 registration. The supplied use case may perform seven
- * bounded read-only probes, but this UI contributes no scan endpoint, script,
- * or mutation route of its own.
+ * O002 owns the single Registration page. O003 composes a typed Linear
+ * preview/provision section into that page without creating another Shell.
  */
 export function createRegistrationWizardUiFeatureRegistration(
   useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
+  linearUseCase: LinearProvisionUseCase = createFixtureLinearProvisionUseCase(),
 ): UiFeatureRegistration {
   const contracts = new Map(
     registrationWizardFeatureSecurityRoutes.map((contract) => [contract.path, contract]),
@@ -53,10 +63,25 @@ export function createRegistrationWizardUiFeatureRegistration(
   const cssContract = contracts.get(registrationWizardCssPath);
   if (cssContract === undefined)
     throw new TypeError("Missing Registration Wizard stylesheet route.");
+  const scriptContract = contracts.get(registrationWizardScriptPath);
+  const apiContract = contracts.get(linearProvisionApiPath);
+  if (scriptContract === undefined || apiContract === undefined) {
+    throw new TypeError("Missing Registration Wizard O003 route.");
+  }
   const routes: readonly UiFeatureRoute[] = Object.freeze([
     Object.freeze({
       contract: cssContract,
-      handler: (request: UiRequest) => assetResponse(request, registrationWizardCss),
+      handler: (request: UiRequest) =>
+        assetResponse(request, registrationWizardCss, "text/css; charset=utf-8"),
+    }),
+    Object.freeze({
+      contract: scriptContract,
+      handler: (request: UiRequest) =>
+        assetResponse(request, registrationWizardScript, "text/javascript; charset=utf-8"),
+    }),
+    Object.freeze({
+      contract: apiContract,
+      handler: (request: UiRequest) => handleLinearProvisionApiRequest(linearUseCase, request),
     }),
   ]);
   return Object.freeze({
@@ -67,7 +92,11 @@ export function createRegistrationWizardUiFeatureRegistration(
       title: registrationWizardPageTitle,
       description: registrationWizardPageDescription,
       styles: Object.freeze([registrationWizardCssPath]),
-      render: async () => renderRegistrationWizard(await useCase.scan()),
+      scripts: Object.freeze([registrationWizardScriptPath]),
+      render: async () => {
+        const [scan, preview] = await Promise.all([useCase.scan(), linearUseCase.preview()]);
+        return renderRegistrationWizard(scan, preview);
+      },
     }),
     routes,
   });

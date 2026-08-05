@@ -131,13 +131,13 @@ const readyGateTemplateDescription = `## 目標（必填）
 ## 背景（必填）
 
 ## 驗收條件（必填）
-- 
+- （請填寫）
 
 ## 範圍內（必填）
-- 
+- （請填寫）
 
 ## 範圍外（必填）
-- 
+- （請填寫）
 
 ## 依賴關係（必填；沒有請填「無」）
 
@@ -219,40 +219,41 @@ function slug(value: string): string {
 }
 
 /** Fixed O003 catalog. Display names are product-owned, never provider-owned strings. */
-export const linearProvisionDesiredObjects: readonly LinearProvisionDesiredObject[] = Object.freeze([
-  ...workStatuses.map(([key, name, type]) =>
-    desired(`work_status.${key}`, "workflow_state", name, { type }),
-  ),
-  ...labelGroups.flatMap(([groupKey, groupName, childNames]) => {
-    const parentKey = `label_group.${groupKey}`;
-    return [
-      desired(parentKey, "label_group", groupName, {
-        color: "#5E6AD2",
-        description: `Agent Team 管理的${groupName}單選群組。`,
-        isGroup: true,
-      }),
-      ...childNames.map((name) =>
-        desired(
-          `label.${groupKey}.${slug(name)}`,
-          "label",
-          name,
-          {
-            color: "#26B5CE",
-            description: `Agent Team 管理的${groupName}值。`,
-            isGroup: false,
-          },
-          parentKey,
+export const linearProvisionDesiredObjects: readonly LinearProvisionDesiredObject[] = Object.freeze(
+  [
+    ...workStatuses.map(([key, name, type]) =>
+      desired(`work_status.${key}`, "workflow_state", name, { type }),
+    ),
+    ...labelGroups.flatMap(([groupKey, groupName, childNames]) => {
+      const parentKey = `label_group.${groupKey}`;
+      return [
+        desired(parentKey, "label_group", groupName, {
+          color: "#5E6AD2",
+          description: `Agent Team 管理的${groupName}單選群組。`,
+          isGroup: true,
+        }),
+        ...childNames.map((name) =>
+          desired(
+            `label.${groupKey}.${slug(name)}`,
+            "label",
+            name,
+            {
+              color: "#26B5CE",
+              description: `Agent Team 管理的${groupName}值。`,
+              isGroup: false,
+            },
+            parentKey,
+          ),
         ),
-      ),
-    ];
-  }),
-  desired("form_template.ready_gate", "form_template", "Agent Team｜需求受理", {
-    type: "issue",
-    description: "Agent Team Ready Gate 中文需求表單。",
-    templateData: Object.freeze({
-      title: "[需求] 請填寫簡短標題",
-      description: readyGateTemplateDescription,
+      ];
     }),
-  }),
-]);
-
+    desired("form_template.ready_gate", "form_template", "Agent Team｜需求受理", {
+      type: "issue",
+      description: "Agent Team Ready Gate 中文需求表單。",
+      templateData: Object.freeze({
+        title: "[需求] 請填寫簡短標題",
+        description: readyGateTemplateDescription,
+      }),
+    }),
+  ],
+);

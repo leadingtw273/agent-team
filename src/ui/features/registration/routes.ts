@@ -1,18 +1,32 @@
 import type { UiSecurityRouteContract } from "../../security/index.js";
 import { uiShellCoreRouteContracts } from "../../shell/index.js";
 
-import { registrationWizardCssPath, registrationWizardPagePath } from "./metadata.js";
+import { linearProvisionApiPath } from "./linear-http.js";
+import {
+  registrationWizardCssPath,
+  registrationWizardPagePath,
+  registrationWizardScriptPath,
+} from "./metadata.js";
 
 const readOnlyMethods = Object.freeze(["GET"] as const);
 
-/** O002 owns only a static stylesheet; no scan API or mutation endpoint is exposed. */
+/** O003 adds one typed, bounded mutation route under O002's existing Registry feature. */
 export const registrationWizardFeatureSecurityRoutes: readonly UiSecurityRouteContract[] =
   Object.freeze([
+    ...[registrationWizardCssPath, registrationWizardScriptPath].map((path) =>
+      Object.freeze({
+        path,
+        allowedQueryParameters: Object.freeze([]),
+        allowedMethods: readOnlyMethods,
+        response: "standard" as const,
+      }),
+    ),
     Object.freeze({
-      path: registrationWizardCssPath,
+      path: linearProvisionApiPath,
       allowedQueryParameters: Object.freeze([]),
-      allowedMethods: readOnlyMethods,
+      allowedMethods: Object.freeze(["GET", "PUT"] as const),
       response: "standard" as const,
+      mutationBody: "bounded-json" as const,
     }),
   ]);
 
