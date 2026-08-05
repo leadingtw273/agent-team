@@ -1,0 +1,32 @@
+{
+  "provenance": {
+    "sourceService": "provider-runtime",
+    "obtainedAt": "2026-08-04",
+    "originalEventType": "quota sample",
+    "deidentification": "synthetic account fingerprints and rounded percentages",
+    "removedFields": ["rawOutput", "credentials", "providerAccountId"]
+  },
+  "record": {
+    "provider": "gemini",
+    "activeIdentity": {
+      "provider": "gemini",
+      "accountFingerprint": "gemini-new-account-002"
+    },
+    "snapshot": {
+      "provider": "gemini",
+      "accountFingerprint": "gemini-old-account-001",
+      "samples": [
+        {
+          "provider": "gemini",
+          "accountFingerprint": "gemini-old-account-001",
+          "cliVersion": "0.52.0",
+          "source": "provider-structured-event",
+          "observedAt": "2026-08-04T12:00:00.000Z",
+          "kind": "availability",
+          "state": "confirmed",
+          "available": true
+        }
+      ]
+    }
+  }
+}

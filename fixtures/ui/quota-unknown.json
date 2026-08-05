@@ -1,0 +1,35 @@
+{
+  "provenance": {
+    "sourceService": "provider-runtime",
+    "obtainedAt": "2026-08-04",
+    "originalEventType": "quota sample",
+    "deidentification": "synthetic account fingerprints and rounded percentages",
+    "removedFields": ["rawOutput", "credentials", "providerAccountId"]
+  },
+  "record": {
+    "provider": "claude",
+    "activeIdentity": {
+      "provider": "claude",
+      "accountFingerprint": "claude-current-account-001"
+    },
+    "weeklyUsageLimitPercent": 75,
+    "snapshot": {
+      "provider": "claude",
+      "accountFingerprint": "claude-current-account-001",
+      "samples": [
+        {
+          "provider": "claude",
+          "accountFingerprint": "claude-current-account-001",
+          "cliVersion": "2.1.221",
+          "source": "provider-structured-event",
+          "observedAt": "2026-08-04T12:00:00.000Z",
+          "kind": "usage",
+          "bucket": "weekly",
+          "state": "confirmed",
+          "remainingPercent": 7,
+          "resetsAt": "2026-08-10T12:00:00.000Z"
+        }
+      ]
+    }
+  }
+}
