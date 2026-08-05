@@ -1,0 +1,47 @@
+{
+  "provenance": {
+    "sourceService": "provider-runtime",
+    "obtainedAt": "2026-08-04",
+    "originalEventType": "quota sample",
+    "deidentification": "synthetic account fingerprints and rounded percentages",
+    "removedFields": ["rawOutput", "credentials", "providerAccountId"]
+  },
+  "record": {
+    "provider": "codex",
+    "activeIdentity": {
+      "provider": "codex",
+      "accountFingerprint": "codex-current-account-001"
+    },
+    "weeklyUsageLimitPercent": 80,
+    "snapshot": {
+      "provider": "codex",
+      "accountFingerprint": "codex-current-account-001",
+      "samples": [
+        {
+          "provider": "codex",
+          "accountFingerprint": "codex-current-account-001",
+          "cliVersion": "0.146.0",
+          "source": "provider-structured-event",
+          "observedAt": "2026-08-04T11:00:00.000Z",
+          "kind": "usage",
+          "bucket": "weekly",
+          "state": "confirmed",
+          "remainingPercent": 58,
+          "resetsAt": "2026-08-11T12:00:00.000Z"
+        },
+        {
+          "provider": "codex",
+          "accountFingerprint": "codex-current-account-001",
+          "cliVersion": "0.146.0",
+          "source": "provider-structured-event",
+          "observedAt": "2026-08-04T11:00:00.000Z",
+          "kind": "usage",
+          "bucket": "five_hour",
+          "state": "confirmed",
+          "remainingPercent": 72,
+          "resetsAt": "2026-08-04T16:00:00.000Z"
+        }
+      ]
+    }
+  }
+}

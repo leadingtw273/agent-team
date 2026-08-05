@@ -1,0 +1,118 @@
+.ui-quota-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.ui-quota-provider .card-body {
+  display: grid;
+  gap: 1rem;
+}
+
+.ui-quota-provider .ui-section-heading,
+.ui-quota-bucket .ui-section-heading {
+  margin-bottom: 0;
+}
+
+.ui-quota-configuration,
+.ui-quota-no-five-hour-config {
+  margin: 0;
+}
+
+.ui-quota-no-five-hour-config {
+  color: var(--ui-muted);
+  font-size: 0.875rem;
+}
+
+.ui-quota-buckets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: 1rem;
+}
+
+.ui-quota-bucket {
+  display: grid;
+  gap: 0.875rem;
+  padding: 1rem;
+  background: #f8fafc;
+  border: 1px solid var(--ui-border);
+  border-radius: 0.75rem;
+}
+
+.ui-quota-bucket h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.ui-quota-state-badge {
+  border: 1px solid currentcolor;
+  font-weight: 700;
+}
+
+.ui-quota-state--fresh {
+  color: #14532d;
+  background: #dcfce7;
+}
+
+.ui-quota-state--stale {
+  color: #78350f;
+  background: #fef3c7;
+}
+
+.ui-quota-state--unknown {
+  color: #7f1d1d;
+  background: #fee2e2;
+}
+
+.ui-quota-state-symbol {
+  display: inline-grid;
+  width: 1rem;
+  height: 1rem;
+  place-items: center;
+  border: 1px solid currentcolor;
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  line-height: 1;
+}
+
+.ui-quota-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0;
+}
+
+.ui-quota-details div {
+  min-width: 0;
+}
+
+.ui-quota-details dt {
+  color: var(--ui-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.ui-quota-details dd {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.ui-quota-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+@media (max-width: 640px) {
+  .ui-fixture-notice {
+    flex-direction: column;
+  }
+
+  .ui-quota-buckets,
+  .ui-quota-details {
+    grid-template-columns: 1fr;
+  }
+
+  .ui-quota-actions .btn {
+    flex: 1 1 10rem;
+  }
+}
