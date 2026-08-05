@@ -1,80 +1,162 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "properties": {
-    "schemaVersion": {
-      "type": "number",
-      "const": 1
-    },
-    "state": {
-      "type": "string",
-      "enum": ["configuration_incomplete", "registered", "degraded", "disabled"]
-    },
-    "gates": {
+  "oneOf": [
+    {
       "type": "object",
       "properties": {
-        "local_repository": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
         },
-        "node_runtime": {
+        "state": {
           "type": "string",
-          "enum": ["passed", "failed", "unknown"]
+          "const": "registered"
         },
-        "agent_cli": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "trusted_project_config": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "linear_access": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "github_access": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "continuous_integration": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "github_review_status": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "github_auto_merge": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "webhook_runtime": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
-        },
-        "reconcile_wakeup": {
-          "type": "string",
-          "enum": ["passed", "failed", "unknown"]
+        "gates": {
+          "type": "object",
+          "properties": {
+            "local_repository": {
+              "type": "string",
+              "const": "passed"
+            },
+            "node_runtime": {
+              "type": "string",
+              "const": "passed"
+            },
+            "agent_cli": {
+              "type": "string",
+              "const": "passed"
+            },
+            "trusted_project_config": {
+              "type": "string",
+              "const": "passed"
+            },
+            "linear_access": {
+              "type": "string",
+              "const": "passed"
+            },
+            "github_access": {
+              "type": "string",
+              "const": "passed"
+            },
+            "continuous_integration": {
+              "type": "string",
+              "const": "passed"
+            },
+            "github_review_status": {
+              "type": "string",
+              "const": "passed"
+            },
+            "github_auto_merge": {
+              "type": "string",
+              "const": "passed"
+            },
+            "webhook_runtime": {
+              "type": "string",
+              "const": "passed"
+            },
+            "reconcile_wakeup": {
+              "type": "string",
+              "const": "passed"
+            }
+          },
+          "required": [
+            "local_repository",
+            "node_runtime",
+            "agent_cli",
+            "trusted_project_config",
+            "linear_access",
+            "github_access",
+            "continuous_integration",
+            "github_review_status",
+            "github_auto_merge",
+            "webhook_runtime",
+            "reconcile_wakeup"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": [
-        "local_repository",
-        "node_runtime",
-        "agent_cli",
-        "trusted_project_config",
-        "linear_access",
-        "github_access",
-        "continuous_integration",
-        "github_review_status",
-        "github_auto_merge",
-        "webhook_runtime",
-        "reconcile_wakeup"
-      ],
+      "required": ["schemaVersion", "state", "gates"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "state": {
+          "type": "string",
+          "enum": ["configuration_incomplete", "degraded", "disabled"]
+        },
+        "gates": {
+          "type": "object",
+          "properties": {
+            "local_repository": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "node_runtime": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "agent_cli": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "trusted_project_config": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "linear_access": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "github_access": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "continuous_integration": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "github_review_status": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "github_auto_merge": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "webhook_runtime": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            },
+            "reconcile_wakeup": {
+              "type": "string",
+              "enum": ["passed", "failed", "unknown"]
+            }
+          },
+          "required": [
+            "local_repository",
+            "node_runtime",
+            "agent_cli",
+            "trusted_project_config",
+            "linear_access",
+            "github_access",
+            "continuous_integration",
+            "github_review_status",
+            "github_auto_merge",
+            "webhook_runtime",
+            "reconcile_wakeup"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": ["schemaVersion", "state", "gates"],
       "additionalProperties": false
     }
-  },
-  "required": ["schemaVersion", "state", "gates"],
-  "additionalProperties": false,
-  "description": "Versioned Registration state. Unknown state or Gate fields fail closed; registered requires every Gate to pass at runtime."
+  ],
+  "description": "Versioned Registration state. Unknown state or Gate fields fail closed; registered requires every Gate to pass."
 }

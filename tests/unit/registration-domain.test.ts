@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 
+import { Ajv2020, type AnySchema } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
 
 import { domainError } from "../../src/domain/foundation/index.js";
@@ -149,6 +150,38 @@ describe("registration domain", () => {
     await expect(readJson("schemas/registration-state-v1.json")).resolves.toEqual(
       registrationStateSnapshotJsonSchema,
     );
+  });
+
+  it("enforces the registered Gate invariant with the published Draft 2020-12 schema", async () => {
+    const publishedSchema = (await readJson("schemas/registration-state-v1.json")) as AnySchema;
+    const validate = new Ajv2020({ allErrors: true, strict: true }).compile(publishedSchema);
+    const registeredWithAllGatesPassed = persistedSnapshot({ state: "registered" });
+    const degradedWithFailedGate = {
+      ...registeredWithAllGatesPassed,
+      state: "degraded",
+      gates: { ...registeredWithAllGatesPassed.gates, webhook_runtime: "failed" },
+    };
+
+    for (const [snapshot, accepted] of [
+      [registeredWithAllGatesPassed, true],
+      [degradedWithFailedGate, true],
+    ] as const) {
+      expect(validate(snapshot)).toBe(accepted);
+      expect(registrationStateSnapshotSchema.safeParse(snapshot).success).toBe(accepted);
+    }
+
+    for (const gate of registrationGateIds) {
+      for (const gateState of ["failed", "unknown"] as const) {
+        const registeredWithUnpassedGate = {
+          ...registeredWithAllGatesPassed,
+          gates: { ...registeredWithAllGatesPassed.gates, [gate]: gateState },
+        };
+        expect(validate(registeredWithUnpassedGate)).toBe(false);
+        expect(registrationStateSnapshotSchema.safeParse(registeredWithUnpassedGate).success).toBe(
+          false,
+        );
+      }
+    }
   });
 
   it("rejects corrupted persisted Registration state rather than normalizing it", () => {

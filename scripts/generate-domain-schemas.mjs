@@ -1,4 +1,7 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
+
+import { format, resolveConfig } from "prettier";
 
 import {
   checkpointJsonSchema,
@@ -20,11 +23,25 @@ const schemas = [
   ["registration-state-v1.json", registrationStateSnapshotJsonSchema],
 ];
 
-await Promise.all(
-  schemas.map(([filename, schema]) =>
-    writeFile(
-      new URL(`../schemas/${filename}`, import.meta.url),
-      `${JSON.stringify(schema, null, 2)}\n`,
-    ),
-  ),
-);
+const schemaFormattingOptions = {
+  ...(await resolveConfig(new URL("../.prettierrc", import.meta.url))),
+  parser: "json",
+};
+
+async function writeSchemaIfChanged(filename, schema) {
+  const destination = new URL(`../schemas/${filename}`, import.meta.url);
+  try {
+    const existing = JSON.parse(await readFile(destination, "utf8"));
+    if (isDeepStrictEqual(existing, schema)) return;
+  } catch {
+    // A missing or malformed generated file must be replaced by the source schema.
+  }
+
+  const formattedSchema = await format(
+    `${JSON.stringify(schema, null, 2)}\n`,
+    schemaFormattingOptions,
+  );
+  await writeFile(destination, formattedSchema);
+}
+
+await Promise.all(schemas.map(([filename, schema]) => writeSchemaIfChanged(filename, schema)));

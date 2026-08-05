@@ -27,6 +27,10 @@ const registrationGateRecordShape = Object.fromEntries(
   registrationGateIds.map((gate) => [gate, registrationGateStateSchema]),
 ) as Record<(typeof registrationGateIds)[number], typeof registrationGateStateSchema>;
 
+const registeredRegistrationGateRecordShape = Object.fromEntries(
+  registrationGateIds.map((gate) => [gate, z.literal("passed")]),
+) as Record<(typeof registrationGateIds)[number], z.ZodLiteral<"passed">>;
+
 const registrationGateSnapshotShape = Object.fromEntries(
   registrationGateIds.map((gate) => [gate, registrationGateStateSchema.optional()]),
 ) as Record<
@@ -35,29 +39,39 @@ const registrationGateSnapshotShape = Object.fromEntries(
 >;
 
 export const registrationGateRecordSchema = z.object(registrationGateRecordShape).strict();
+const registeredRegistrationGateRecordSchema = z
+  .object(registeredRegistrationGateRecordShape)
+  .strict();
 export const registrationGateSnapshotSchema = z.object(registrationGateSnapshotShape).strict();
 
-export const registrationStateSnapshotSchema = z
+const registeredRegistrationStateSnapshotSchema = z
   .object({
     schemaVersion: z.literal(1),
-    state: registrationStateSchema,
+    state: z.literal("registered"),
+    gates: registeredRegistrationGateRecordSchema,
+  })
+  .strict();
+
+const nonRegisteredRegistrationStateSnapshotSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    state: z.enum(["configuration_incomplete", "degraded", "disabled"]),
     gates: registrationGateRecordSchema,
   })
-  .strict()
-  .superRefine((snapshot, context) => {
-    if (snapshot.state !== "registered") return;
-    for (const gate of registrationGateIds) {
-      if (snapshot.gates[gate] !== "passed") {
-        context.addIssue({
-          code: "custom",
-          message: "A registered project requires every Registration Gate to pass.",
-          path: ["gates", gate],
-        });
-      }
-    }
-  })
+  .strict();
+
+/**
+ * The registered branch carries literal "passed" Gate values instead of a
+ * runtime-only refinement so Zod and the published Draft 2020-12 schema
+ * enforce the same persistence invariant.
+ */
+export const registrationStateSnapshotSchema = z
+  .discriminatedUnion("state", [
+    registeredRegistrationStateSnapshotSchema,
+    nonRegisteredRegistrationStateSnapshotSchema,
+  ])
   .describe(
-    "Versioned Registration state. Unknown state or Gate fields fail closed; registered requires every Gate to pass at runtime.",
+    "Versioned Registration state. Unknown state or Gate fields fail closed; registered requires every Gate to pass.",
   );
 
 export const registrationTransitionRequestSchema = z.discriminatedUnion("cause", [
