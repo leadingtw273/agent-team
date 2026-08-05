@@ -78,6 +78,7 @@ interface StaticAsset {
 const navigation: readonly NavigationItem[] = Object.freeze([
   Object.freeze({ label: "總覽", href: "/", icon: "overview" }),
   Object.freeze({ label: "專案", href: "/projects", icon: "projects" }),
+  Object.freeze({ label: "註冊精靈", slot: "registration", icon: "settings" }),
   Object.freeze({ label: "執行中", slot: "running", icon: "running" }),
   Object.freeze({ label: "角色與模型", slot: "role-models", icon: "roles" }),
   Object.freeze({ label: "額度", slot: "quota", icon: "quota" }),

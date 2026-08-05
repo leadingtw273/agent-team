@@ -1,7 +1,8 @@
 import type { UiRequestHandler } from "../server/index.js";
 import type { UiSecurityRouteContract } from "../security/index.js";
 
-export type UiFeatureSlot = "running" | "role-models" | "quota" | "security" | "settings";
+export type UiFeatureSlot =
+  "running" | "role-models" | "quota" | "security" | "settings" | "registration";
 
 export interface UiFeaturePage {
   readonly path: string;

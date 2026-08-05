@@ -172,11 +172,12 @@ test.describe("U003 localhost UI shell", () => {
 
     await expect(page.getByRole("heading", { level: 1, name: "總覽" })).toBeVisible();
     await expect(page.locator(".ui-mobile-nav")).toBeHidden();
-    await expect(navigation.locator(".ui-nav-link")).toHaveCount(8);
+    await expect(navigation.locator(".ui-nav-link")).toHaveCount(9);
     await expect(navigation.getByRole("link", { name: "總覽", exact: true })).toHaveAttribute(
       "aria-current",
       "page",
     );
+    await expect(navigation.getByText("註冊精靈", { exact: true })).toBeVisible();
     await expect(navigation.getByText("執行中", { exact: true })).toBeVisible();
     await expect(navigation.getByText("後續", { exact: true }).first()).toBeVisible();
 
@@ -307,7 +308,7 @@ test.describe("U003 localhost UI shell", () => {
     await expect(disclosure).toHaveAttribute("open", "");
     await expect(toggle).toContainText("關閉選單");
     await expect(navigation).toBeVisible();
-    await expect(navigation.locator(".ui-nav-link")).toHaveCount(8);
+    await expect(navigation.locator(".ui-nav-link")).toHaveCount(9);
     await expect(navigation.getByRole("link", { name: "事件", exact: true })).toHaveAttribute(
       "aria-current",
       "page",
