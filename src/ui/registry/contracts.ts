@@ -1,4 +1,4 @@
-import type { UiRequestHandler } from "../server/index.js";
+import type { UiRequestHandler, UiTrustedRequestContext } from "../server/index.js";
 import type { UiSecurityRouteContract } from "../security/index.js";
 
 export type UiFeatureSlot =
@@ -10,7 +10,7 @@ export interface UiFeaturePage {
   readonly description: string;
   readonly styles?: readonly string[];
   readonly scripts?: readonly string[];
-  readonly render: () => string | Promise<string>;
+  readonly render: (trustedContext: UiTrustedRequestContext) => string | Promise<string>;
 }
 
 export interface UiFeatureRoute {

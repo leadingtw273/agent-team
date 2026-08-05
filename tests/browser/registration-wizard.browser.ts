@@ -118,7 +118,7 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
     const root = browser.document.documentElement;
     const overflowingSelectors: string[] = [];
     for (const element of browser.document.querySelectorAll(
-      ".ui-registration-card, .ui-registration-detail, .ui-registration-facts dd",
+      ".ui-registration-card, .ui-registration-detail, .ui-registration-facts dd, .ui-linear-provision, .ui-linear-action, .ui-linear-controls",
     )) {
       const rect = element.getBoundingClientRect();
       if (element.scrollWidth > element.clientWidth + 1 || rect.right > root.clientWidth + 1) {
@@ -200,7 +200,7 @@ test.describe("O002 registration wizard", () => {
     await expect(page.getByText("這是合成示範資料")).toBeVisible();
   });
 
-  test("renders eleven synthetic Gate cards without scripts, captures desktop, and passes axe", async ({
+  test("renders eleven synthetic Gate cards with the registered O003 script and passes axe", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -213,7 +213,7 @@ test.describe("O002 registration wizard", () => {
     await expect(cards.filter({ hasText: "Webhook Runtime" })).toContainText(
       "主動 delivery 驗證留待 O006",
     );
-    await expect(page.locator("script")).toHaveCount(0);
+    await expect(page.locator('script[src="/assets/registration.js"]')).toHaveCount(1);
     await expectNoAxeViolations(page);
     await copyReviewScreenshot(page, "o002-registration-wizard-desktop.png");
   });

@@ -20,7 +20,7 @@ function joined(...parts: readonly string[]): string {
 describe("runtime status read model", () => {
   it("declares content-only registration in the running slot with a feature-owned stylesheet", () => {
     const registration = createRuntimeStatusUiFeatureRegistration(fixtureRuntimeStatusReadModel);
-    const content = registration.page.render();
+    const content = registration.page.render({});
 
     expect(registration.id).toBe("runtime-status");
     expect(registration.slot).toBe("running");

@@ -5,7 +5,12 @@ import type {
   UiFeatureRoute,
   UiFeatureSlot,
 } from "../registry/contracts.js";
-import type { UiRequest, UiRequestHandler, UiResponse } from "../server/index.js";
+import type {
+  UiRequest,
+  UiRequestHandler,
+  UiResponse,
+  UiTrustedRequestContext,
+} from "../server/index.js";
 import type { UiSecurityRouteContract } from "../security/index.js";
 
 const tablerCoreVersion = "1.4.0";
@@ -64,7 +69,10 @@ interface PageDefinition {
   readonly path: string;
   readonly title: string;
   readonly description: string;
-  readonly render: (readModel: UiShellReadModel) => string | Promise<string>;
+  readonly render: (
+    readModel: UiShellReadModel,
+    trustedContext: UiTrustedRequestContext,
+  ) => string | Promise<string>;
   readonly styles?: readonly string[];
   readonly scripts?: readonly string[];
 }
@@ -420,6 +428,7 @@ async function renderPage(
   page: PageDefinition,
   readModel: UiShellReadModel,
   slotPages: ReadonlyMap<UiFeatureSlot, string>,
+  trustedContext: UiTrustedRequestContext,
 ): Promise<string> {
   const pageAssets = [
     ...(page.styles ?? []).map((path) => `    <link rel="stylesheet" href="${escapeHtml(path)}">`),
@@ -450,7 +459,7 @@ ${pageAssets}
       <main id="main-content" class="ui-content" tabindex="-1">
         <div class="ui-content-inner">
           <header class="ui-page-header"><div><p class="ui-page-eyebrow">LOCALHOST 管理介面</p><h1>${escapeHtml(page.title)}</h1><p class="ui-page-description">${escapeHtml(page.description)}</p></div></header>
-          ${await page.render(readModel)}
+          ${await page.render(readModel, trustedContext)}
         </div>
       </main>
     </div>
@@ -526,7 +535,8 @@ export function createUiShellRequestHandler(
         ...(feature.page.scripts === undefined
           ? {}
           : { scripts: Object.freeze([...feature.page.scripts]) }),
-        render: () => feature.page.render(),
+        render: (_readModel: UiShellReadModel, trustedContext: UiTrustedRequestContext) =>
+          feature.page.render(trustedContext),
       }),
     ),
   ]);
@@ -537,12 +547,15 @@ export function createUiShellRequestHandler(
     features.flatMap((feature) => feature.routes.map((route) => [route.contract.path, route])),
   );
 
-  return async (request: UiRequest): Promise<UiResponse> => {
+  return async (
+    request: UiRequest,
+    trustedContext: UiTrustedRequestContext,
+  ): Promise<UiResponse> => {
     const path = routePath(request.url);
     if (path === undefined) return textResponse(request.method, 404, "Not Found\n");
 
     const featureRoute = featureRoutes.get(path);
-    if (featureRoute !== undefined) return await featureRoute.handler(request);
+    if (featureRoute !== undefined) return await featureRoute.handler(request, trustedContext);
 
     if (request.method !== "GET" && request.method !== "HEAD") {
       return textResponse(request.method, 405, "Method Not Allowed\n", "GET, HEAD");
@@ -555,7 +568,10 @@ export function createUiShellRequestHandler(
     if (page === undefined) return textResponse(request.method, 404, "Not Found\n");
 
     try {
-      return htmlResponse(request.method, await renderPage(page, readModel, slotPages));
+      return htmlResponse(
+        request.method,
+        await renderPage(page, readModel, slotPages, trustedContext),
+      );
     } catch {
       return textResponse(request.method, 500, "Internal Server Error\n");
     }

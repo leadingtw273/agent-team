@@ -22,7 +22,7 @@ describe("U006 dangerous operation approval", () => {
   it("registers content-only security UI with independently owned assets and API", async () => {
     const useCase = createDangerApprovalUseCase(new InMemoryDangerApprovalStore([request]));
     const registration = createDangerUiFeatureRegistration(useCase);
-    const content = await registration.page.render();
+    const content = await registration.page.render({});
 
     expect(registration).toMatchObject({
       id: "danger",

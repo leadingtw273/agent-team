@@ -94,12 +94,15 @@ describe("shared UI feature registry", () => {
       ],
     });
 
-    const result = await application.handler({
-      method: "GET",
-      url: "/quota",
-      headers: Object.freeze({}),
-      auth: Object.freeze({ kind: "session" }),
-    });
+    const result = await application.handler(
+      {
+        method: "GET",
+        url: "/quota",
+        headers: Object.freeze({}),
+        auth: Object.freeze({ kind: "session" }),
+      },
+      {},
+    );
     const body = String(result.body);
 
     expect(body.match(/<html\b/gu)).toHaveLength(1);
@@ -129,12 +132,15 @@ describe("shared UI feature registry", () => {
 
     expect(application.routeContracts.map((route) => route.path)).toContain("/quota");
     expect(application.routeContracts.map((route) => route.path)).toContain("/assets/quota.css");
-    const response = await application.handler({
-      method: "GET",
-      url: "/quota",
-      headers: Object.freeze({}),
-      auth: Object.freeze({ kind: "session" }),
-    });
+    const response = await application.handler(
+      {
+        method: "GET",
+        url: "/quota",
+        headers: Object.freeze({}),
+        auth: Object.freeze({ kind: "session" }),
+      },
+      {},
+    );
     expect(response.statusCode).toBe(200);
   });
 
