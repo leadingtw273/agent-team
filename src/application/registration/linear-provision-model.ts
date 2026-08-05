@@ -49,14 +49,19 @@ export interface LinearProvisionBindings {
   readonly reservations: Readonly<Record<string, LinearProvisionReservation>>;
 }
 
-export type LinearProvisionReservationPhase = "reserved" | "mutation_started";
+export type LinearProvisionReservationPhase =
+  "reserved" | "mutation_started" | "verification_pending";
 
 export interface LinearProvisionReservation {
   readonly logicalKey: string;
-  readonly operation: "provision";
+  readonly operation: "provision" | "manual_readback";
   readonly ownerDigest: string;
   readonly desiredFingerprint: string;
   readonly phase: LinearProvisionReservationPhase;
+  readonly candidateRemoteId?: string;
+  readonly candidateResourceFingerprint?: string;
+  readonly authoritativeInventoryDigest?: string;
+  readonly confirmationProofDigest?: string;
 }
 
 export interface LinearProvisionBindingMutation {
@@ -160,7 +165,7 @@ export interface LinearProvisionConfirmationContext {
 }
 
 export interface LinearProvisionUseCaseOptions {
-  readonly confirmationContext?: LinearProvisionConfirmationContext;
+  readonly confirmationContext: LinearProvisionConfirmationContext;
   readonly desiredObjects?: readonly LinearProvisionDesiredObject[];
 }
 

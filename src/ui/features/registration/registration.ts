@@ -1,14 +1,15 @@
 import { readFileSync } from "node:fs";
 
 import type {
+  LinearProvisionConfirmationContext,
   LinearProvisionUseCase,
   RegistrationReadOnlyScanUseCase,
 } from "../../../application/registration/index.js";
 import type { UiFeatureRegistration, UiFeatureRoute } from "../../registry/index.js";
-import type { UiRequest, UiResponse } from "../../server/index.js";
+import type { UiRequest, UiResponse, UiTrustedRequestContext } from "../../server/index.js";
 
 import { fixtureRegistrationReadOnlyScanUseCase } from "./fixture.js";
-import { createFixtureLinearProvisionUseCase } from "./linear-fixture.js";
+import { createFixtureLinearProvisionUseCaseFactory } from "./linear-fixture.js";
 import { handleLinearProvisionApiRequest, linearProvisionApiPath } from "./linear-http.js";
 import {
   registrationWizardCssPath,
@@ -55,8 +56,16 @@ function assetResponse(request: UiRequest, content: string, contentType: string)
  */
 export function createRegistrationWizardUiFeatureRegistration(
   useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
-  linearUseCase: LinearProvisionUseCase = createFixtureLinearProvisionUseCase(),
+  linearUseCaseFactory: (
+    context: LinearProvisionConfirmationContext,
+  ) => LinearProvisionUseCase = createFixtureLinearProvisionUseCaseFactory(),
 ): UiFeatureRegistration {
+  const sessionUseCase = (
+    trustedContext: UiTrustedRequestContext,
+  ): LinearProvisionUseCase | undefined => {
+    const digest = trustedContext.session?.authorityDigest;
+    return digest === undefined ? undefined : linearUseCaseFactory(Object.freeze({ digest }));
+  };
   const contracts = new Map(
     registrationWizardFeatureSecurityRoutes.map((contract) => [contract.path, contract]),
   );
@@ -81,7 +90,12 @@ export function createRegistrationWizardUiFeatureRegistration(
     }),
     Object.freeze({
       contract: apiContract,
-      handler: (request: UiRequest) => handleLinearProvisionApiRequest(linearUseCase, request),
+      handler: (request: UiRequest, trustedContext: UiTrustedRequestContext) => {
+        const linearUseCase = sessionUseCase(trustedContext);
+        return linearUseCase === undefined
+          ? Object.freeze({ statusCode: 403, body: "Forbidden\n" })
+          : handleLinearProvisionApiRequest(linearUseCase, request);
+      },
     }),
   ]);
   return Object.freeze({
@@ -93,7 +107,9 @@ export function createRegistrationWizardUiFeatureRegistration(
       description: registrationWizardPageDescription,
       styles: Object.freeze([registrationWizardCssPath]),
       scripts: Object.freeze([registrationWizardScriptPath]),
-      render: async () => {
+      render: async (trustedContext: UiTrustedRequestContext) => {
+        const linearUseCase = sessionUseCase(trustedContext);
+        if (linearUseCase === undefined) throw new TypeError("Missing trusted UI session.");
         const [scan, preview] = await Promise.all([useCase.scan(), linearUseCase.preview()]);
         return renderRegistrationWizard(scan, preview);
       },

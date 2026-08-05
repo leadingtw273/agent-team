@@ -21,7 +21,9 @@ describe("O002/O003 registration wizard UI", () => {
     const registration = createRegistrationWizardUiFeatureRegistration(
       fixtureRegistrationReadOnlyScanUseCase,
     );
-    const content = await registration.page.render();
+    const content = await registration.page.render({
+      session: { authorityDigest: "a".repeat(64) },
+    });
     const scan = await fixtureRegistrationReadOnlyScanUseCase.scan();
 
     expect(registration).toMatchObject({

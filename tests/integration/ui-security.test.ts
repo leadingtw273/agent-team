@@ -347,6 +347,25 @@ describe("localhost UI browser security layer", () => {
     expect(JSON.stringify(received[0])).not.toContain(session.cookie);
   });
 
+  it("never allows the server-only session authority digest into a response", async () => {
+    let observedAuthorityDigest = "";
+    const handle = await startSecured({
+      handler: (_request, trustedContext) => {
+        observedAuthorityDigest = trustedContext.session?.authorityDigest ?? "";
+        return { statusCode: 200, body: observedAuthorityDigest };
+      },
+    });
+    const session = await exchange(handle);
+
+    const response = await fetch(`${handle.baseUrl}/api/projects`, {
+      headers: { cookie: session.cookie },
+    });
+    const rendered = `${await response.text()}${JSON.stringify([...response.headers])}`;
+    expect(observedAuthorityDigest).toMatch(/^[a-f0-9]{64}$/u);
+    expect(response.status).toBe(500);
+    expect(rendered).not.toContain(observedAuthorityDigest);
+  });
+
   it.each([
     ["missing cookie", {}, 401],
     ["missing origin", { cookie: "COOKIE", csrf: "CSRF" }, 403],

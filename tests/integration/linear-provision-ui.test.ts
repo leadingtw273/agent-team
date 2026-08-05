@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  createFixtureLinearProvisionUseCase,
+  createFixtureLinearProvisionUseCaseFactory,
   createRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureManualRemoteId,
@@ -12,10 +12,13 @@ import {
 
 const handles: LocalUiServerHandle[] = [];
 
-async function fixture(maxJsonMutationBodyBytes = 16_384) {
+async function fixture(
+  maxJsonMutationBodyBytes = 16_384,
+  linearUseCaseFactory = createFixtureLinearProvisionUseCaseFactory(),
+) {
   const feature = createRegistrationWizardUiFeatureRegistration(
     fixtureRegistrationReadOnlyScanUseCase,
-    createFixtureLinearProvisionUseCase(),
+    linearUseCaseFactory,
   );
   const application = createUiApplication({ features: [feature] });
   const handle = await startLocalUiServer({
@@ -166,5 +169,84 @@ describe("O003 Linear provision localhost UI", () => {
     });
     expect(replayed.status).toBe(409);
     expect(await replayed.json()).toEqual({ state: "error", code: "conflict" });
+  });
+
+  it("binds provision confirmation to two real authenticated route sessions", async () => {
+    const sharedUseCaseFactory = createFixtureLinearProvisionUseCaseFactory();
+    const first = await fixture(16_384, sharedUseCaseFactory);
+    const second = await fixture(16_384, sharedUseCaseFactory);
+    const firstEndpoint = `${first.handle.baseUrl}/api/registration/linear-provision`;
+    const secondEndpoint = `${second.handle.baseUrl}/api/registration/linear-provision`;
+    const previews = (await Promise.all([
+      fetch(firstEndpoint, { headers: { cookie: first.cookie } }).then((response) =>
+        response.json(),
+      ),
+      fetch(secondEndpoint, { headers: { cookie: second.cookie } }).then((response) =>
+        response.json(),
+      ),
+    ])) as readonly Readonly<Record<string, unknown>>[];
+    const firstPreview = previews[0];
+    const secondPreview = previews[1];
+    if (firstPreview === undefined || secondPreview === undefined) {
+      throw new Error("missing route previews");
+    }
+    expect(firstPreview["confirmationToken"]).not.toBe(secondPreview["confirmationToken"]);
+
+    const crossed = await fetch(secondEndpoint, {
+      method: "PUT",
+      headers: {
+        cookie: second.cookie,
+        origin: second.handle.baseUrl,
+        "content-type": "application/json",
+        "x-csrf-token": second.csrf,
+      },
+      body: JSON.stringify({
+        operation: "provision",
+        expectedRevision: firstPreview["expectedRevision"],
+        confirmationToken: firstPreview["confirmationToken"],
+        confirmationText: "套用 Linear 設定",
+      }),
+    });
+    expect(crossed.status).toBe(409);
+  });
+
+  it("binds manual confirmation to two real authenticated route sessions", async () => {
+    const sharedUseCaseFactory = createFixtureLinearProvisionUseCaseFactory();
+    const first = await fixture(16_384, sharedUseCaseFactory);
+    const second = await fixture(16_384, sharedUseCaseFactory);
+    const firstEndpoint = `${first.handle.baseUrl}/api/registration/linear-provision`;
+    const secondEndpoint = `${second.handle.baseUrl}/api/registration/linear-provision`;
+    const logicalKey = "work_status.backlog";
+    const remoteId = fixtureManualRemoteId(logicalKey);
+    const firstPreviewResponse = await fetch(firstEndpoint, {
+      method: "PUT",
+      headers: {
+        cookie: first.cookie,
+        origin: first.handle.baseUrl,
+        "content-type": "application/json",
+        "x-csrf-token": first.csrf,
+      },
+      body: JSON.stringify({ operation: "preview_manual_readback", logicalKey, remoteId }),
+    });
+    const firstPreview = (await firstPreviewResponse.json()) as Readonly<Record<string, unknown>>;
+
+    const crossed = await fetch(secondEndpoint, {
+      method: "PUT",
+      headers: {
+        cookie: second.cookie,
+        origin: second.handle.baseUrl,
+        "content-type": "application/json",
+        "x-csrf-token": second.csrf,
+      },
+      body: JSON.stringify({
+        operation: "confirm_manual_readback",
+        logicalKey,
+        remoteId,
+        expectedRevision: firstPreview["expectedRevision"],
+        confirmationToken: firstPreview["confirmationToken"],
+        confirmationText: "確認 Linear ID read-back",
+      }),
+    });
+    expect(crossed.status).toBe(409);
   });
 });

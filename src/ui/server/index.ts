@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -34,13 +34,21 @@ export interface UiRequest {
   readonly body?: UiJsonObject;
 }
 
+/** Server-created authority context. It is never populated from request headers, URL, or body. */
+export interface UiTrustedRequestContext {
+  readonly session?: Readonly<{ authorityDigest: string }>;
+}
+
 export interface UiResponse {
   readonly statusCode: number;
   readonly headers?: Readonly<Record<string, string | readonly string[]>>;
   readonly body?: string | Uint8Array;
 }
 
-export type UiRequestHandler = (request: UiRequest) => UiResponse | Promise<UiResponse>;
+export type UiRequestHandler = (
+  request: UiRequest,
+  trustedContext: UiTrustedRequestContext,
+) => UiResponse | Promise<UiResponse>;
 
 export type UiAuthKind = "public" | "bearer" | "session";
 
@@ -328,6 +336,10 @@ export async function startLocalUiServer(
   }
   const sessionToken = createSessionToken(tokenSource);
   const expectedDigest = createHash("sha256").update(sessionToken, "utf8").digest();
+  const authoritySecret = randomBytes(minimumTokenBytes);
+  const sessionAuthorityDigest = createHmac("sha256", authoritySecret)
+    .update(expectedDigest)
+    .digest("hex");
 
   let lifecycle: "active" | "locked" | "closed" = "active";
   let idleDeadlineMs = initialNow + idleTimeoutMs;
@@ -344,7 +356,7 @@ export async function startLocalUiServer(
     result.statusCode >= 100 &&
     result.statusCode <= 999 &&
     responseHeadersAreValid(result) &&
-    !responseLeaksCredentials(result, [sessionToken]) &&
+    !responseLeaksCredentials(result, [sessionToken, sessionAuthorityDigest]) &&
     securityPolicy?.responseContainsSensitiveData(result) !== true;
 
   const authorizeRequest = (request: IncomingMessage): UiSecurityDecision => {
@@ -509,6 +521,15 @@ export async function startLocalUiServer(
                   headers: handlerHeaders,
                   auth: Object.freeze({ kind: decision.authKind }),
                   ...(mutationBody === undefined ? {} : { body: mutationBody }),
+                }),
+                Object.freeze({
+                  ...(decision.authKind === "session"
+                    ? {
+                        session: Object.freeze({
+                          authorityDigest: sessionAuthorityDigest,
+                        }),
+                      }
+                    : {}),
                 }),
               );
         if (

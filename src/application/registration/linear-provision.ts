@@ -7,7 +7,6 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import {
-  createLinearProvisionConfirmationContext,
   linearProvisionDesiredObjects,
   linearProvisionDigest,
   linearProvisionObjectKinds,
@@ -36,6 +35,8 @@ import {
 export * from "./linear-provision-model.js";
 
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u;
+const canonicalLinearIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const digestPattern = /^[a-f0-9]{64}$/u;
 const storeRevisionPattern = /^(?:0|[1-9][0-9]{0,15})$/u;
 const provisionConfirmationText = "套用 Linear 設定" as const;
@@ -58,6 +59,10 @@ function failure<Value>(code: DomainError["code"]): Result<Value, DomainError> {
 
 function validTarget(target: LinearProvisionTarget): boolean {
   return idPattern.test(target.teamId) && idPattern.test(target.projectId);
+}
+
+function validCanonicalLinearId(value: string): boolean {
+  return value.length <= 36 && canonicalLinearIdPattern.test(value);
 }
 
 function sortedObjects(objects: readonly LinearProvisionRemoteObject[]) {
@@ -124,13 +129,32 @@ function validReservation(
 ): boolean {
   const operation: unknown = reservation.operation;
   const phase: unknown = reservation.phase;
-  return (
+  const commonValid =
     desiredKeys.has(key) &&
     reservation.logicalKey === key &&
-    operation === "provision" &&
     digestPattern.test(reservation.ownerDigest) &&
     digestPattern.test(reservation.desiredFingerprint) &&
-    (phase === "reserved" || phase === "mutation_started")
+    (phase === "reserved" || phase === "mutation_started" || phase === "verification_pending");
+  if (!commonValid) return false;
+  if (phase === "verification_pending") {
+    return (
+      operation === "manual_readback" &&
+      reservation.candidateRemoteId !== undefined &&
+      validCanonicalLinearId(reservation.candidateRemoteId) &&
+      reservation.candidateResourceFingerprint !== undefined &&
+      digestPattern.test(reservation.candidateResourceFingerprint) &&
+      reservation.authoritativeInventoryDigest !== undefined &&
+      digestPattern.test(reservation.authoritativeInventoryDigest) &&
+      reservation.confirmationProofDigest !== undefined &&
+      digestPattern.test(reservation.confirmationProofDigest)
+    );
+  }
+  return (
+    operation === "provision" &&
+    reservation.candidateRemoteId === undefined &&
+    reservation.candidateResourceFingerprint === undefined &&
+    reservation.authoritativeInventoryDigest === undefined &&
+    reservation.confirmationProofDigest === undefined
   );
 }
 
@@ -255,6 +279,7 @@ function actionFor(
       });
     }
     const ownerMayResume =
+      reservation.operation === "provision" &&
       reservation.ownerDigest === context.digest &&
       reservation.desiredFingerprint === desired.fingerprint &&
       reservation.phase === "reserved";
@@ -269,7 +294,9 @@ function actionFor(
             instruction:
               reservation.phase === "mutation_started"
                 ? "前次 mutation outcome 無法確認；不得重送建立。請查明 Linear 物件 ID 後做 manual read-back。"
-                : "另一個本機工作階段已保留此建立操作；本工作階段不會送出 mutation。",
+                : reservation.phase === "verification_pending"
+                  ? "Manual ID read-back 尚待 authoritative post-read；不得自動建立或接管。"
+                  : "另一個本機工作階段已保留此建立操作；本工作階段不會送出 mutation。",
           }),
     });
   }
@@ -442,10 +469,9 @@ export class LinearProvisionUseCase {
     readonly target: LinearProvisionTarget,
     readonly remote: LinearProvisionPort,
     readonly bindingStore: LinearProvisionBindingPort,
-    options: LinearProvisionUseCaseOptions = {},
+    options: LinearProvisionUseCaseOptions,
   ) {
-    const confirmationContext =
-      options.confirmationContext ?? createLinearProvisionConfirmationContext();
+    const confirmationContext = options.confirmationContext;
     const desiredObjects = options.desiredObjects ?? linearProvisionDesiredObjects;
     if (
       !validTarget(target) ||
@@ -492,27 +518,39 @@ export class LinearProvisionUseCase {
     request: LinearManualReadBackRequest,
     options: ReadOptions = {},
   ): Promise<Result<LinearManualReadBackPreview, DomainError>> {
-    if (!idPattern.test(request.remoteId)) return failure("conflict");
+    if (!validCanonicalLinearId(request.remoteId)) return failure("conflict");
     const desired = this.#desiredObjects.find((item) => item.key === request.logicalKey);
     if (desired === undefined) return failure("conflict");
     const context = await this.#readContext(options);
     if (!context.ok) return context;
-    if (context.value.bindings.byKey[desired.key] !== undefined) return failure("conflict");
-    const remote = context.value.inventory.objects.find((object) => object.id === request.remoteId);
+    return this.#manualPreview(request, desired, context.value);
+  }
+
+  #manualPreview(
+    request: LinearManualReadBackRequest,
+    desired: LinearProvisionDesiredObject,
+    context: ReadContext,
+  ): Result<LinearManualReadBackPreview, DomainError> {
+    if (context.bindings.byKey[desired.key] !== undefined) return failure("conflict");
+    const remote = context.inventory.objects.find((object) => object.id === request.remoteId);
     if (
       remote === undefined ||
-      !matchesDesired(remote, desired, this.target, context.value.bindings.byKey)
+      !matchesDesired(remote, desired, this.target, context.bindings.byKey)
     ) {
       return failure("conflict");
     }
-    const reservation = context.value.bindings.reservations[desired.key];
-    if (reservation !== undefined && reservation.desiredFingerprint !== desired.fingerprint) {
+    const reservation = context.bindings.reservations[desired.key];
+    if (
+      reservation !== undefined &&
+      (reservation.desiredFingerprint !== desired.fingerprint ||
+        reservation.phase === "verification_pending")
+    ) {
       return failure("conflict");
     }
     const expectedRevision = snapshotRevision(
       this.target,
-      context.value.inventory,
-      context.value.bindings,
+      context.inventory,
+      context.bindings,
       this.#desiredConfigDigest,
     );
     const confirmationToken = linearProvisionDigest({
@@ -521,8 +559,8 @@ export class LinearProvisionUseCase {
       contextDigest: this.#confirmationContext.digest,
       target: this.target,
       desiredConfigDigest: this.#desiredConfigDigest,
-      inventoryRevision: inventoryDigest(context.value.inventory),
-      bindingRevision: context.value.bindings.revision,
+      inventoryRevision: inventoryDigest(context.inventory),
+      bindingRevision: context.bindings.revision,
       expectedRevision,
       logicalKey: desired.key,
       desiredFingerprint: desired.fingerprint,
@@ -549,12 +587,27 @@ export class LinearProvisionUseCase {
     if (
       suppliedOperation !== "manual_readback" ||
       suppliedConfirmation !== manualConfirmationText ||
+      !validCanonicalLinearId(command.remoteId) ||
       !digestPattern.test(command.expectedRevision) ||
       !digestPattern.test(command.confirmationToken)
     ) {
       return failure("conflict");
     }
-    const preview = await this.previewManualReadBack(command, options);
+    const context = await this.#readContext(options);
+    if (!context.ok) return context;
+    const desired = this.#desiredObjects.find((item) => item.key === command.logicalKey);
+    if (desired === undefined) return failure("conflict");
+    const existing = context.value.bindings.reservations[command.logicalKey];
+    if (existing?.phase === "verification_pending") {
+      return this.#completeManualVerification(
+        command,
+        desired,
+        existing,
+        context.value.bindings,
+        options,
+      );
+    }
+    const preview = this.#manualPreview(command, desired, context.value);
     if (
       !preview.ok ||
       preview.value.expectedRevision !== command.expectedRevision ||
@@ -562,12 +615,8 @@ export class LinearProvisionUseCase {
     ) {
       return preview.ok ? failure("conflict") : preview;
     }
-    const context = await this.#readContext(options);
-    if (!context.ok) return context;
-    const desired = this.#desiredObjects.find((item) => item.key === command.logicalKey);
     const remote = context.value.inventory.objects.find((object) => object.id === command.remoteId);
     if (
-      desired === undefined ||
       remote === undefined ||
       context.value.bindings.byKey[command.logicalKey] !== undefined ||
       snapshotRevision(
@@ -580,14 +629,67 @@ export class LinearProvisionUseCase {
     ) {
       return failure("conflict");
     }
-    const saved = await this.#cas(
+    const pending: LinearProvisionReservation = Object.freeze({
+      logicalKey: desired.key,
+      operation: "manual_readback",
+      ownerDigest: this.#confirmationContext.digest,
+      desiredFingerprint: desired.fingerprint,
+      phase: "verification_pending",
+      candidateRemoteId: remote.id,
+      candidateResourceFingerprint: remote.fingerprint,
+      authoritativeInventoryDigest: inventoryDigest(context.value.inventory),
+      confirmationProofDigest: linearProvisionDigest(command.confirmationToken),
+    });
+    const staged = await this.#cas(
       context.value.bindings,
       Object.freeze({
-        byKey: Object.freeze({
-          ...context.value.bindings.byKey,
-          [command.logicalKey]: remote.id,
+        byKey: context.value.bindings.byKey,
+        reservations: Object.freeze({
+          ...context.value.bindings.reservations,
+          [command.logicalKey]: pending,
         }),
-        reservations: withoutReservation(context.value.bindings.reservations, command.logicalKey),
+      }),
+      options,
+    );
+    if (!staged.ok) return staged;
+    return this.#completeManualVerification(command, desired, pending, staged.value, options);
+  }
+
+  async #completeManualVerification(
+    command: LinearManualReadBackCommand,
+    desired: LinearProvisionDesiredObject,
+    pending: LinearProvisionReservation,
+    bindings: LinearProvisionBindings,
+    options: ReadOptions,
+  ): Promise<Result<LinearProvisionPreview, DomainError>> {
+    if (
+      pending.operation !== "manual_readback" ||
+      pending.phase !== "verification_pending" ||
+      pending.ownerDigest !== this.#confirmationContext.digest ||
+      pending.desiredFingerprint !== desired.fingerprint ||
+      pending.candidateRemoteId !== command.remoteId ||
+      pending.confirmationProofDigest !== linearProvisionDigest(command.confirmationToken) ||
+      bindings.byKey[desired.key] !== undefined
+    ) {
+      return failure("conflict");
+    }
+    const postRead = await this.remote.readInventory(this.target, options);
+    if (!postRead.ok) return postRead;
+    const remote = postRead.value.objects.find((object) => object.id === pending.candidateRemoteId);
+    if (
+      !validInventory(this.target, postRead.value) ||
+      inventoryDigest(postRead.value) !== pending.authoritativeInventoryDigest ||
+      remote === undefined ||
+      remote.fingerprint !== pending.candidateResourceFingerprint ||
+      !matchesDesired(remote, desired, this.target, bindings.byKey)
+    ) {
+      return failure("conflict");
+    }
+    const saved = await this.#cas(
+      bindings,
+      Object.freeze({
+        byKey: Object.freeze({ ...bindings.byKey, [desired.key]: remote.id }),
+        reservations: withoutReservation(bindings.reservations, desired.key),
       }),
       options,
     );
@@ -649,6 +751,24 @@ export class LinearProvisionUseCase {
         return failure("conflict");
       }
 
+      const justBefore = await this.remote.readInventory(this.target, options);
+      if (!justBefore.ok) {
+        const released = await this.#releaseReserved(bindings, desired.key, reservation, options);
+        return released.ok ? justBefore : released;
+      }
+      if (
+        !validInventory(this.target, justBefore.value) ||
+        inventoryDigest(justBefore.value) !== inventoryDigest(inventory)
+      ) {
+        const released = await this.#releaseReserved(bindings, desired.key, reservation, options);
+        return released.ok ? failure("conflict") : released;
+      }
+      const parentId = expectedParentId(desired, bindings.byKey);
+      if (desired.parentKey !== undefined && parentId === undefined) {
+        const released = await this.#releaseReserved(bindings, desired.key, reservation, options);
+        return released.ok ? failure("conflict") : released;
+      }
+
       const mutationStartedReservation: LinearProvisionReservation = Object.freeze({
         ...reservation,
         phase: "mutation_started",
@@ -667,16 +787,6 @@ export class LinearProvisionUseCase {
       if (!mutationStarted.ok) return mutationStarted;
       bindings = mutationStarted.value;
 
-      const justBefore = await this.remote.readInventory(this.target, options);
-      if (!justBefore.ok) return justBefore;
-      if (
-        !validInventory(this.target, justBefore.value) ||
-        inventoryDigest(justBefore.value) !== inventoryDigest(inventory)
-      ) {
-        return failure("conflict");
-      }
-      const parentId = expectedParentId(desired, bindings.byKey);
-      if (desired.parentKey !== undefined && parentId === undefined) return failure("conflict");
       const created = await this.remote.create(this.target, desired, parentId, options);
       if (!created.ok) return created;
       if (!idPattern.test(created.value.id)) return failure("external_failure");
@@ -728,6 +838,31 @@ export class LinearProvisionUseCase {
       projected.preview.confirmationToken === command.confirmationToken
       ? ok(projected)
       : failure("conflict");
+  }
+
+  async #releaseReserved(
+    bindings: LinearProvisionBindings,
+    logicalKey: string,
+    reservation: LinearProvisionReservation,
+    options: ReadOptions,
+  ): Promise<Result<LinearProvisionBindings, DomainError>> {
+    const current = bindings.reservations[logicalKey];
+    if (
+      current?.operation !== "provision" ||
+      current.ownerDigest !== this.#confirmationContext.digest ||
+      current.phase !== "reserved" ||
+      linearProvisionDigest(current) !== linearProvisionDigest(reservation)
+    ) {
+      return failure("conflict");
+    }
+    return this.#cas(
+      bindings,
+      Object.freeze({
+        byKey: bindings.byKey,
+        reservations: withoutReservation(bindings.reservations, logicalKey),
+      }),
+      options,
+    );
   }
 
   async #cas(

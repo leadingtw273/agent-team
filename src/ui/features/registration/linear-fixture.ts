@@ -1,6 +1,7 @@
 import {
   LinearProvisionUseCase,
   linearProvisionDesiredObjects,
+  linearProvisionDigest,
   type LinearProvisionBindingMutation,
   type LinearProvisionBindingPort,
   type LinearProvisionBindings,
@@ -9,6 +10,7 @@ import {
   type LinearProvisionPort,
   type LinearProvisionRemoteObject,
   type LinearProvisionTarget,
+  type LinearProvisionConfirmationContext,
 } from "../../../application/registration/index.js";
 import { domainError, err, ok } from "../../../domain/foundation/index.js";
 
@@ -98,14 +100,18 @@ class FixtureLinearPort implements LinearProvisionPort {
 }
 
 export function fixtureManualRemoteId(logicalKey: string): string {
-  return `fixture-manual-${logicalKey}`;
+  const digest = linearProvisionDigest({ fixtureManualLogicalKey: logicalKey });
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
 }
 
 /** Synthetic, in-memory composition only. It never reads credentials or calls Linear. */
-export function createFixtureLinearProvisionUseCase(): LinearProvisionUseCase {
-  return new LinearProvisionUseCase(
-    fixtureLinearProvisionTarget,
-    new FixtureLinearPort(),
-    new FixtureBindingPort(),
-  );
+export function createFixtureLinearProvisionUseCaseFactory(): (
+  context: LinearProvisionConfirmationContext,
+) => LinearProvisionUseCase {
+  const remote = new FixtureLinearPort();
+  const bindings = new FixtureBindingPort();
+  return (context) =>
+    new LinearProvisionUseCase(fixtureLinearProvisionTarget, remote, bindings, {
+      confirmationContext: context,
+    });
 }

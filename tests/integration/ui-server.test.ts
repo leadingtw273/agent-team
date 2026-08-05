@@ -86,6 +86,7 @@ describe("localhost UI server", () => {
     expect(handler).toHaveBeenCalledOnce();
     expect(handler).toHaveBeenCalledWith(
       expect.objectContaining({ method: "POST", url: "/probe?value=1" }),
+      {},
     );
     expect(received[0]?.headers.authorization).toBeUndefined();
   });

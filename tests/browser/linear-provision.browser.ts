@@ -5,7 +5,7 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createFixtureLinearProvisionUseCase,
+  createFixtureLinearProvisionUseCaseFactory,
   createRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureManualRemoteId,
@@ -114,7 +114,7 @@ test.describe("O003 Linear provision UI", () => {
       features: [
         createRegistrationWizardUiFeatureRegistration(
           fixtureRegistrationReadOnlyScanUseCase,
-          createFixtureLinearProvisionUseCase(),
+          createFixtureLinearProvisionUseCaseFactory(),
         ),
       ],
     });
