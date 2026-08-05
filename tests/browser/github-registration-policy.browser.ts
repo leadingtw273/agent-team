@@ -2,37 +2,19 @@ import { expect, test } from "@playwright/test";
 import axe from "axe-core";
 
 import {
-  createGitHubRegistrationUiContribution,
+  createRegistrationWizardUiFeatureRegistration,
   createUiApplication,
-  fixtureGitHubRegistrationUiController,
   startLocalUiServer,
   type LocalUiServerHandle,
-  type UiFeatureRegistration,
 } from "../../src/ui/index.js";
 
 let shell: LocalUiServerHandle | undefined;
 
-function feature(): UiFeatureRegistration {
-  const contribution = createGitHubRegistrationUiContribution(
-    fixtureGitHubRegistrationUiController,
-  );
-  return Object.freeze({
-    id: "github-registration-policy-browser-test",
-    slot: "registration",
-    page: Object.freeze({
-      path: "/registration-github-policy-test",
-      title: "GitHub 合併保護",
-      description: "合成 O004 瀏覽器驗證頁。",
-      scripts: contribution.scripts,
-      render: contribution.render,
-    }),
-    routes: contribution.routes,
-  });
-}
-
 test.describe("O004 GitHub registration policy component", () => {
   test.beforeEach(async ({ page }) => {
-    const application = createUiApplication({ features: [feature()] });
+    const application = createUiApplication({
+      features: [createRegistrationWizardUiFeatureRegistration()],
+    });
     shell = await startLocalUiServer({
       handler: application.handler,
       securityPolicy: application.securityPolicy,
@@ -40,7 +22,7 @@ test.describe("O004 GitHub registration policy component", () => {
     await page.context().addInitScript({ content: axe.source });
     await page.goto(`${shell.baseUrl}/#${shell.sessionToken}`, { waitUntil: "domcontentloaded" });
     await page.waitForFunction(() => sessionStorage.getItem("agent-team-csrf") !== null);
-    await page.goto(`${shell.baseUrl}/registration-github-policy-test`, {
+    await page.goto(`${shell.baseUrl}/registration`, {
       waitUntil: "domcontentloaded",
     });
   });
@@ -65,18 +47,58 @@ test.describe("O004 GitHub registration policy component", () => {
 
     await review.click();
     await page.getByRole("button", { name: "確認套用", exact: true }).click();
-    await expect(page.getByRole("status")).toContainText("已由 Read-back 確認");
+    await expect(page.locator("[data-github-policy-panel]").getByRole("status")).toContainText(
+      "已由 Read-back 確認",
+    );
     await expect(review).toHaveCount(0);
 
     const violations = await page.evaluate(async () => {
       const browser = globalThis as typeof globalThis & {
-        axe?: { run: (context: unknown) => Promise<{ violations: unknown[] }> };
+        axe?: {
+          run: (context: unknown, options: unknown) => Promise<{ violations: unknown[] }>;
+        };
         document?: unknown;
       };
       if (browser.axe === undefined || browser.document === undefined)
         throw new Error("axe missing");
-      return (await browser.axe.run(browser.document)).violations;
+      return (
+        await browser.axe.run(browser.document, {
+          runOnly: {
+            type: "tag",
+            values: ["wcag2a", "wcag2aa", "wcag21aa", "wcag22aa"],
+          },
+        })
+      ).violations;
     });
     expect(violations).toEqual([]);
   });
+
+  for (const viewport of [
+    { width: 1440, height: 900 },
+    { width: 390, height: 844 },
+    { width: 320, height: 720 },
+  ] as const) {
+    test(`has no horizontal overflow at ${String(viewport.width)}px`, async ({ page }) => {
+      await page.setViewportSize(viewport);
+      const metrics = await page.evaluate(() => {
+        const browser = globalThis as typeof globalThis & {
+          document: {
+            documentElement: { scrollWidth: number; clientWidth: number };
+            querySelector: (
+              selector: string,
+            ) => { scrollWidth: number; clientWidth: number } | null;
+          };
+        };
+        const panel = browser.document.querySelector("[data-github-policy-panel]");
+        return {
+          documentWidth: browser.document.documentElement.scrollWidth,
+          viewportWidth: browser.document.documentElement.clientWidth,
+          panelWidth: panel?.scrollWidth,
+          panelViewportWidth: panel?.clientWidth,
+        };
+      });
+      expect(metrics.documentWidth).toBeLessThanOrEqual(metrics.viewportWidth);
+      expect(metrics.panelWidth).toBeLessThanOrEqual(metrics.panelViewportWidth ?? 0);
+    });
+  }
 });

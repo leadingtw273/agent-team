@@ -111,10 +111,14 @@ function assetResponse(request: UiRequest): UiResponse {
 function parseConfirmation(
   body: UiRequest["body"],
 ): Readonly<{ expectedRevision: string; confirmationToken: string }> | undefined {
-  if (body === undefined || Object.keys(body).length !== 2) return undefined;
+  if (body === undefined || Object.keys(body).length !== 4) return undefined;
+  const operation = body["operation"];
+  const confirmationText = body["confirmationText"];
   const expectedRevision = body["expectedRevision"];
   const confirmationToken = body["confirmationToken"];
-  return typeof expectedRevision === "string" &&
+  return operation === "apply_github_policy" &&
+    confirmationText === "套用 GitHub 合併保護" &&
+    typeof expectedRevision === "string" &&
     revisionPattern.test(expectedRevision) &&
     typeof confirmationToken === "string" &&
     confirmationPattern.test(confirmationToken)
@@ -130,7 +134,14 @@ export function createGitHubRegistrationUiController(
   return Object.freeze({
     preview: () => policy.preview(boundTarget),
     apply: (command: Parameters<GitHubRegistrationUiController["apply"]>[0]) =>
-      policy.apply(Object.freeze({ ...boundTarget, ...command })),
+      policy.apply(
+        Object.freeze({
+          ...boundTarget,
+          operation: "apply_github_policy",
+          confirmationText: "套用 GitHub 合併保護",
+          ...command,
+        }),
+      ),
   });
 }
 

@@ -75,6 +75,8 @@ describe("O004 GitHub registration policy", () => {
 
     const applied = await useCase.apply({
       ...target,
+      operation: "apply_github_policy",
+      confirmationText: "套用 GitHub 合併保護",
       expectedRevision: preview.expectedRevision,
       confirmationToken: preview.confirmationToken,
     });
@@ -106,6 +108,8 @@ describe("O004 GitHub registration policy", () => {
     expect(
       await useCase.apply({
         ...target,
+        operation: "apply_github_policy",
+        confirmationText: "套用 GitHub 合併保護",
         expectedRevision: preview.expectedRevision,
         confirmationToken: `${preview.confirmationToken.slice(0, -1)}${preview.confirmationToken.endsWith("x") ? "y" : "x"}`,
       }),
@@ -114,6 +118,8 @@ describe("O004 GitHub registration policy", () => {
     expect(
       await useCase.apply({
         ...target,
+        operation: "apply_github_policy",
+        confirmationText: "套用 GitHub 合併保護",
         expectedRevision: preview.expectedRevision,
         confirmationToken: preview.confirmationToken,
       }),
@@ -185,6 +191,8 @@ describe("O004 GitHub registration policy", () => {
     expect(
       await useCase.apply({
         ...target,
+        operation: "apply_github_policy",
+        confirmationText: "套用 GitHub 合併保護",
         expectedRevision: preview.expectedRevision,
         confirmationToken: preview.confirmationToken,
       }),

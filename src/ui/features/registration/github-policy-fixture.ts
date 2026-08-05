@@ -1,4 +1,12 @@
-import type { GitHubRegistrationPreview } from "../../../application/registration/index.js";
+import {
+  createGitHubRegistrationPolicy,
+  type GitHubRegistrationInventory,
+  type GitHubRegistrationPolicyPort,
+  type GitHubRegistrationPolicyUseCase,
+  type GitHubRegistrationPreview,
+  type LinearProvisionConfirmationContext,
+} from "../../../application/registration/index.js";
+import { ok } from "../../../domain/foundation/index.js";
 
 import type { GitHubRegistrationUiController } from "./github-policy.js";
 
@@ -36,3 +44,38 @@ export const fixtureGitHubRegistrationUiController: GitHubRegistrationUiControll
           }),
     ),
 });
+
+const initialInventory: GitHubRegistrationInventory = Object.freeze({
+  revision: "a".repeat(64),
+  permission: "admin",
+  rulesets: "supported",
+  autoMerge: "supported",
+  autoMergeEnabled: false,
+  activeRequiredChecks: Object.freeze([]),
+  managedRulesetCollision: false,
+});
+
+/** Per-trusted-session synthetic factory for the combined Registration page. */
+export function createFixtureGitHubRegistrationPolicyUseCaseFactory(): (
+  context: LinearProvisionConfirmationContext,
+) => GitHubRegistrationPolicyUseCase {
+  return (context) => {
+    let inventory = initialInventory;
+    const port: GitHubRegistrationPolicyPort = Object.freeze({
+      inspect: () => Promise.resolve(ok(inventory)),
+      provision: () => {
+        inventory = Object.freeze({
+          ...initialInventory,
+          revision: "c".repeat(64),
+          autoMergeEnabled: true,
+          activeRequiredChecks: Object.freeze(["CI", "agent-team/review"]),
+        });
+        return Promise.resolve(ok(Object.freeze({ changed: true })));
+      },
+    });
+    return createGitHubRegistrationPolicy({
+      port,
+      confirmationKey: Buffer.from(context.digest, "hex"),
+    });
+  };
+}

@@ -68,6 +68,8 @@ describe("O004 GitHub registration UI component", () => {
     expect(apply).toHaveBeenCalledWith({
       repository: "owner/repository",
       defaultBranch: "main",
+      operation: "apply_github_policy",
+      confirmationText: "套用 GitHub 合併保護",
       expectedRevision: "a".repeat(64),
       confirmationToken: "b".repeat(43),
     });

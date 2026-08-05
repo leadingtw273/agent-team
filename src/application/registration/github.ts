@@ -83,6 +83,8 @@ export type GitHubRegistrationPreview =
     }>;
 
 export interface GitHubRegistrationApplyCommand extends GitHubRegistrationTarget {
+  readonly operation: "apply_github_policy";
+  readonly confirmationText: "套用 GitHub 合併保護";
   readonly expectedRevision: string;
   readonly confirmationToken: string;
   readonly signal?: AbortSignal;
@@ -203,6 +205,8 @@ function signingPayload(
 ): string {
   return JSON.stringify({
     schemaVersion: 1,
+    purpose: "agent-team-github-registration-confirmation-v1",
+    operation: "apply_github_policy",
     repository: target.repository,
     defaultBranch: target.defaultBranch,
     expectedRevision,
@@ -268,6 +272,9 @@ export function createGitHubRegistrationPolicy(
       Object.freeze({ state: "blocked", setupState: "configuration_incomplete", reason });
     if (
       !validTarget(command) ||
+      (command as { readonly operation?: unknown }).operation !== "apply_github_policy" ||
+      (command as { readonly confirmationText?: unknown }).confirmationText !==
+        "套用 GitHub 合併保護" ||
       !revisionPattern.test(command.expectedRevision) ||
       !tokenPattern.test(command.confirmationToken)
     ) {

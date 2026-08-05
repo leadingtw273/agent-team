@@ -42,6 +42,8 @@
         credentials: "same-origin",
         headers: { "content-type": "application/json", "x-csrf-token": csrf },
         body: JSON.stringify({
+          operation: "apply_github_policy",
+          confirmationText: "套用 GitHub 合併保護",
           expectedRevision: panel.dataset.expectedRevision,
           confirmationToken: panel.dataset.confirmationToken,
         }),

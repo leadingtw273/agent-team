@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 
 import type {
+  GitHubRegistrationPolicyUseCase,
+  GitHubRegistrationTarget,
   LinearProvisionConfirmationContext,
   LinearProvisionUseCase,
   RegistrationReadOnlyScanUseCase,
@@ -9,6 +11,18 @@ import type { UiFeatureRegistration, UiFeatureRoute } from "../../registry/index
 import type { UiRequest, UiResponse, UiTrustedRequestContext } from "../../server/index.js";
 
 import { fixtureRegistrationReadOnlyScanUseCase } from "./fixture.js";
+import {
+  createFixtureGitHubRegistrationPolicyUseCaseFactory,
+  fixtureGitHubRegistrationUiController,
+} from "./github-policy-fixture.js";
+import {
+  createGitHubRegistrationUiContribution,
+  createGitHubRegistrationUiController,
+  githubRegistrationPolicyApiPath,
+  githubRegistrationPolicyScriptPath,
+  handleGitHubRegistrationPolicyRequest,
+  type GitHubRegistrationUiController,
+} from "./github-policy.js";
 import { createFixtureLinearProvisionUseCaseFactory } from "./linear-fixture.js";
 import { handleLinearProvisionApiRequest, linearProvisionApiPath } from "./linear-http.js";
 import {
@@ -59,6 +73,13 @@ export function createRegistrationWizardUiFeatureRegistration(
   linearUseCaseFactory: (
     context: LinearProvisionConfirmationContext,
   ) => LinearProvisionUseCase = createFixtureLinearProvisionUseCaseFactory(),
+  githubUseCaseFactory: (
+    context: LinearProvisionConfirmationContext,
+  ) => GitHubRegistrationPolicyUseCase = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+  githubTarget: GitHubRegistrationTarget = Object.freeze({
+    repository: "fixture/registered-project",
+    defaultBranch: "main",
+  }),
 ): UiFeatureRegistration {
   const sessionUseCase = (
     trustedContext: UiTrustedRequestContext,
@@ -66,6 +87,22 @@ export function createRegistrationWizardUiFeatureRegistration(
     const digest = trustedContext.session?.authorityDigest;
     return digest === undefined ? undefined : linearUseCaseFactory(Object.freeze({ digest }));
   };
+  let githubSession:
+    Readonly<{ digest: string; controller: GitHubRegistrationUiController }> | undefined;
+  const sessionGitHubController = (
+    trustedContext: UiTrustedRequestContext,
+  ): GitHubRegistrationUiController | undefined => {
+    const digest = trustedContext.session?.authorityDigest;
+    if (digest === undefined) return undefined;
+    if (githubSession?.digest === digest) return githubSession.controller;
+    const policy = githubUseCaseFactory(Object.freeze({ digest }));
+    const controller = createGitHubRegistrationUiController(policy, githubTarget);
+    githubSession = Object.freeze({ digest, controller });
+    return controller;
+  };
+  const githubContribution = createGitHubRegistrationUiContribution(
+    fixtureGitHubRegistrationUiController,
+  );
   const contracts = new Map(
     registrationWizardFeatureSecurityRoutes.map((contract) => [contract.path, contract]),
   );
@@ -76,6 +113,15 @@ export function createRegistrationWizardUiFeatureRegistration(
   const apiContract = contracts.get(linearProvisionApiPath);
   if (scriptContract === undefined || apiContract === undefined) {
     throw new TypeError("Missing Registration Wizard O003 route.");
+  }
+  const githubScriptRoute = githubContribution.routes.find(
+    (route) => route.contract.path === githubRegistrationPolicyScriptPath,
+  );
+  const githubApiContract = githubContribution.routes.find(
+    (route) => route.contract.path === githubRegistrationPolicyApiPath,
+  )?.contract;
+  if (githubScriptRoute === undefined || githubApiContract === undefined) {
+    throw new TypeError("Missing Registration Wizard O004 route.");
   }
   const routes: readonly UiFeatureRoute[] = Object.freeze([
     Object.freeze({
@@ -88,6 +134,7 @@ export function createRegistrationWizardUiFeatureRegistration(
       handler: (request: UiRequest) =>
         assetResponse(request, registrationWizardScript, "text/javascript; charset=utf-8"),
     }),
+    githubScriptRoute,
     Object.freeze({
       contract: apiContract,
       handler: (request: UiRequest, trustedContext: UiTrustedRequestContext) => {
@@ -95,6 +142,15 @@ export function createRegistrationWizardUiFeatureRegistration(
         return linearUseCase === undefined
           ? Object.freeze({ statusCode: 403, body: "Forbidden\n" })
           : handleLinearProvisionApiRequest(linearUseCase, request);
+      },
+    }),
+    Object.freeze({
+      contract: githubApiContract,
+      handler: (request: UiRequest, trustedContext: UiTrustedRequestContext) => {
+        const controller = sessionGitHubController(trustedContext);
+        return controller === undefined
+          ? Object.freeze({ statusCode: 403, body: "Forbidden\n" })
+          : handleGitHubRegistrationPolicyRequest(controller, request);
       },
     }),
   ]);
@@ -106,12 +162,19 @@ export function createRegistrationWizardUiFeatureRegistration(
       title: registrationWizardPageTitle,
       description: registrationWizardPageDescription,
       styles: Object.freeze([registrationWizardCssPath]),
-      scripts: Object.freeze([registrationWizardScriptPath]),
+      scripts: Object.freeze([registrationWizardScriptPath, githubRegistrationPolicyScriptPath]),
       render: async (trustedContext: UiTrustedRequestContext) => {
         const linearUseCase = sessionUseCase(trustedContext);
-        if (linearUseCase === undefined) throw new TypeError("Missing trusted UI session.");
-        const [scan, preview] = await Promise.all([useCase.scan(), linearUseCase.preview()]);
-        return renderRegistrationWizard(scan, preview);
+        const githubController = sessionGitHubController(trustedContext);
+        if (linearUseCase === undefined || githubController === undefined) {
+          throw new TypeError("Missing trusted UI session.");
+        }
+        const [scan, preview, githubPreview] = await Promise.all([
+          useCase.scan(),
+          linearUseCase.preview(),
+          githubController.preview(),
+        ]);
+        return renderRegistrationWizard(scan, preview, githubPreview);
       },
     }),
     routes,
