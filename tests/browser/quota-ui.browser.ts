@@ -346,6 +346,10 @@ test.describe("U005 quota management UI", () => {
     await expect(page).toHaveTitle("額度｜Agent Team");
     await expect(page.getByRole("main")).toHaveCSS("display", "block");
     await expect(page.locator(".ui-app")).toHaveCSS("display", "grid");
+    await expect(page.getByRole("region", { name: "Claude 週額度" })).toHaveCount(1);
+    await expect(page.getByRole("region", { name: "Claude 五小時額度" })).toHaveCount(1);
+    await expect(page.getByRole("region", { name: "Codex 週額度" })).toHaveCount(1);
+    await expect(page.getByRole("region", { name: "Codex 五小時額度" })).toHaveCount(1);
     await expectNoAxeViolations(page);
     expect(await hasNoHorizontalOverflow(page)).toBe(true);
     const stateBadges = page.locator(".ui-quota-state-badge");
