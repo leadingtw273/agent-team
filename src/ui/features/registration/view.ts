@@ -1,5 +1,6 @@
 import {
   linearProvisionDesiredObjects,
+  type GitHubRegistrationPreview,
   type LinearProvisionAction,
   type LinearProvisionPreview,
   type RegistrationScanGate,
@@ -7,6 +8,7 @@ import {
 import type { DomainError, Result } from "../../../domain/foundation/index.js";
 
 import { safeRegistrationText, type RegistrationWizardReadModel } from "./model.js";
+import { renderGitHubRegistrationPolicyPanel } from "./github-policy.js";
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/gu, (character) => {
@@ -267,6 +269,7 @@ function renderLinearProvision(result: Result<LinearProvisionPreview, DomainErro
 export function renderRegistrationWizard(
   readModel: RegistrationWizardReadModel,
   linearPreview?: Result<LinearProvisionPreview, DomainError>,
+  githubPreview?: GitHubRegistrationPreview,
 ): string {
   const gateCounts = counts(readModel);
   const sourceNotice =
@@ -292,5 +295,6 @@ export function renderRegistrationWizard(
     <section class="ui-registration-gates" aria-label="註冊 Gate 掃描結果">
       ${readModel.gates.map((gate, index) => renderGate(gate, index)).join("")}
     </section>
-    ${linearPreview === undefined ? "" : renderLinearProvision(linearPreview)}`;
+    ${linearPreview === undefined ? "" : renderLinearProvision(linearPreview)}
+    ${githubPreview === undefined ? "" : renderGitHubRegistrationPolicyPanel(githubPreview)}`;
 }

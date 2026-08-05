@@ -35,8 +35,8 @@ afterEach(async () => {
   await Promise.all(handles.splice(0).map((handle) => handle.close()));
 });
 
-describe("O002/O003 registration wizard HTTP integration", () => {
-  it("composes one page with a bounded Linear mutation API under the shared policy", async () => {
+describe("O002/O003/O004 registration wizard HTTP integration", () => {
+  it("composes one page with bounded Linear and GitHub mutation APIs under the shared policy", async () => {
     const { application, handle, cookie } = await registrationFixture();
     const routePaths = application.routeContracts.map((route) => route.path);
     const page = await fetch(`${handle.baseUrl}/registration`, { headers: { cookie } });
@@ -48,6 +48,9 @@ describe("O002/O003 registration wizard HTTP integration", () => {
       headers: { cookie },
     });
     const script = await fetch(`${handle.baseUrl}/assets/registration.js`, {
+      headers: { cookie },
+    });
+    const githubScript = await fetch(`${handle.baseUrl}/assets/registration-github-policy.js`, {
       headers: { cookie },
     });
     const preview = await fetch(`${handle.baseUrl}/api/registration/linear-provision`, {
@@ -69,16 +72,23 @@ describe("O002/O003 registration wizard HTTP integration", () => {
       "/registration",
       "/assets/registration.css",
       "/assets/registration.js",
+      "/assets/registration-github-policy.js",
       "/api/registration/linear-provision",
+      "/api/registration/github-policy",
     ]);
     expect(page.status).toBe(200);
-    expect(await page.text()).toContain("註冊精靈");
+    const pageBody = await page.text();
+    expect(pageBody).toContain("註冊精靈");
+    expect(pageBody).toContain("Linear 設定預覽");
+    expect(pageBody).toContain("GitHub 合併保護");
     expect(stylesheet.status).toBe(200);
     expect(stylesheet.headers.get("content-type")).toContain("text/css");
     expect(stylesheetHead.status).toBe(200);
     expect(await stylesheetHead.text()).toBe("");
     expect(script.status).toBe(200);
     expect(script.headers.get("content-type")).toContain("text/javascript");
+    expect(githubScript.status).toBe(200);
+    expect(githubScript.headers.get("content-type")).toContain("text/javascript");
     expect(preview.status).toBe(200);
     expect(await preview.json()).toMatchObject({ state: "preview", readiness: "incomplete" });
     expect(deniedMutation.status).toBe(403);
