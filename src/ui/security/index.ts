@@ -19,12 +19,21 @@ const csrfHeaderName = "x-csrf-token";
 const tokenBytes = 32;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/u;
 const forbiddenQueryKeyPattern = /^(?:authorization|csrf|secret|session|token)$/iu;
-const mutationMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 const readMethods = new Set(["GET", "HEAD"]);
+const routeMethodOrder = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] as const;
+const routeMethods = new Set<string>(routeMethodOrder);
+
+export type UiSecurityRouteMethod = (typeof routeMethodOrder)[number];
 
 export interface UiSecurityRouteContract {
   readonly path: string;
   readonly allowedQueryParameters: readonly string[];
+  /**
+   * Exact methods accepted by this route. GET implicitly enables HEAD, while HEAD may be declared
+   * independently; the policy emits methods in canonical Allow order. Omission preserves the
+   * legacy six-method U001-U003 contract. New bounded mutation routes should always declare it.
+   */
+  readonly allowedMethods?: readonly UiSecurityRouteMethod[];
   readonly response: UiHandlerResponseContract;
   readonly mutationBody?: "bounded-json";
 }
@@ -36,8 +45,14 @@ export interface CreateUiSecurityPolicyOptions {
 interface ParsedRequestTarget {
   readonly path: string;
   readonly handlerUrl: string;
-  readonly route?: UiSecurityRouteContract;
+  readonly route?: ValidatedUiSecurityRouteContract;
 }
+
+type ValidatedUiSecurityRouteContract = Readonly<
+  Omit<UiSecurityRouteContract, "allowedMethods"> & {
+    readonly allowedMethods: readonly UiSecurityRouteMethod[];
+  }
+>;
 
 const defaultRoutes: readonly UiSecurityRouteContract[] = Object.freeze([
   Object.freeze({
@@ -173,10 +188,11 @@ function cookieValue(headers: Readonly<IncomingHttpHeaders>): string | undefined
 
 function validatedRoutes(
   configured: readonly UiSecurityRouteContract[] | undefined,
-): ReadonlyMap<string, UiSecurityRouteContract> {
-  const result = new Map<string, UiSecurityRouteContract>();
+): ReadonlyMap<string, ValidatedUiSecurityRouteContract> {
+  const result = new Map<string, ValidatedUiSecurityRouteContract>();
   for (const route of configured ?? defaultRoutes) {
     const configuredMutationBody: unknown = route.mutationBody;
+    const configuredAllowedMethods: unknown = route.allowedMethods;
     if (
       !route.path.startsWith("/") ||
       route.path.startsWith("//") ||
@@ -185,10 +201,27 @@ function validatedRoutes(
       route.path.includes("\\") ||
       decodeURI(route.path) !== route.path ||
       result.has(route.path) ||
-      (configuredMutationBody !== undefined && configuredMutationBody !== "bounded-json")
+      (configuredMutationBody !== undefined && configuredMutationBody !== "bounded-json") ||
+      (configuredAllowedMethods !== undefined &&
+        (!Array.isArray(configuredAllowedMethods) || configuredAllowedMethods.length === 0))
     ) {
       throw new TypeError("Invalid UI security route contract.");
     }
+    const declaredMethods = new Set<UiSecurityRouteMethod>();
+    for (const method of configuredAllowedMethods ?? routeMethodOrder) {
+      if (
+        typeof method !== "string" ||
+        !routeMethods.has(method) ||
+        declaredMethods.has(method as UiSecurityRouteMethod)
+      ) {
+        throw new TypeError("Invalid UI security route contract.");
+      }
+      declaredMethods.add(method as UiSecurityRouteMethod);
+    }
+    if (declaredMethods.has("GET")) declaredMethods.add("HEAD");
+    const allowedMethods = Object.freeze(
+      routeMethodOrder.filter((method) => declaredMethods.has(method)),
+    );
     const allowed = new Set<string>();
     for (const parameter of route.allowedQueryParameters) {
       if (
@@ -205,6 +238,7 @@ function validatedRoutes(
       Object.freeze({
         path: route.path,
         allowedQueryParameters: Object.freeze([...route.allowedQueryParameters]),
+        allowedMethods,
         response: route.response,
         ...(route.mutationBody === undefined ? {} : { mutationBody: route.mutationBody }),
       }),
@@ -215,7 +249,7 @@ function validatedRoutes(
 
 function parseRequestTarget(
   target: string,
-  routes: ReadonlyMap<string, UiSecurityRouteContract>,
+  routes: ReadonlyMap<string, ValidatedUiSecurityRouteContract>,
 ): ParsedRequestTarget | undefined {
   if (
     !target.startsWith("/") ||
@@ -373,13 +407,28 @@ export function createUiSecurityPolicy(
       const denied = authenticateSession(request);
       if (denied !== undefined) return denied;
       if (target.route === undefined) return respond(response(404, "Not Found\n"));
+      if (!target.route.allowedMethods.includes(request.method as UiSecurityRouteMethod)) {
+        return respond(
+          responseWithHeaders(
+            405,
+            { allow: target.route.allowedMethods.join(", ") },
+            "Method Not Allowed\n",
+          ),
+        );
+      }
       return allowSession(target.handlerUrl, target.route.response, undefined);
     }
     const denied = authenticateSession(request);
     if (denied !== undefined) return denied;
     if (target.route === undefined) return respond(response(404, "Not Found\n"));
-    if (!mutationMethods.has(request.method)) {
-      return respond(response(405, "Method Not Allowed\n"));
+    if (!target.route.allowedMethods.includes(request.method as UiSecurityRouteMethod)) {
+      return respond(
+        responseWithHeaders(
+          405,
+          { allow: target.route.allowedMethods.join(", ") },
+          "Method Not Allowed\n",
+        ),
+      );
     }
 
     if (singleHeader(request.headers, "origin") !== request.serverOrigin) {

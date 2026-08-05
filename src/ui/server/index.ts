@@ -243,11 +243,12 @@ function sendFixed(
 }
 
 function rawSocketResponse(
-  statusCode: 400 | 405,
+  source: UiResponse,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
 ): string | undefined {
-  const secured = securityPolicy?.secureResponse({ statusCode }) ?? { statusCode };
+  const secured = securityPolicy?.secureResponse(source) ?? source;
+  if (secured.statusCode !== 400 && secured.statusCode !== 405) return undefined;
   const result: UiResponse = Object.freeze({
     statusCode: secured.statusCode,
     headers: Object.freeze({
@@ -257,8 +258,8 @@ function rawSocketResponse(
     }),
   });
   if (!outboundResponseIsAllowed(result)) return undefined;
-  const reason = statusCode === 400 ? "Bad Request" : "Method Not Allowed";
-  const lines = [`HTTP/1.1 ${String(statusCode)} ${reason}`];
+  const reason = secured.statusCode === 400 ? "Bad Request" : "Method Not Allowed";
+  const lines = [`HTTP/1.1 ${String(secured.statusCode)} ${reason}`];
   if (result.headers !== undefined) {
     for (const [name, value] of Object.entries(result.headers)) {
       const values = typeof value === "string" ? [value] : value;
@@ -270,12 +271,12 @@ function rawSocketResponse(
 
 function endRawSocket(
   socket: NodeJS.WritableStream & Readonly<{ writable: boolean }>,
-  statusCode: 400 | 405,
+  source: UiResponse,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
 ): void {
   if (!socket.writable) return;
-  const result = rawSocketResponse(statusCode, outboundResponseIsAllowed, securityPolicy);
+  const result = rawSocketResponse(source, outboundResponseIsAllowed, securityPolicy);
   if (result === undefined) {
     socket.end();
     return;
@@ -346,6 +347,42 @@ export async function startLocalUiServer(
     !responseLeaksCredentials(result, [sessionToken]) &&
     securityPolicy?.responseContainsSensitiveData(result) !== true;
 
+  const authorizeRequest = (request: IncomingMessage): UiSecurityDecision => {
+    const bearerAuthenticated = authorized(request, expectedDigest);
+    const incomingHeaders = distinctHeaders(request);
+    const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
+    const rawUrl = request.url ?? "";
+    return untrustedInputIsUnsafe(rawUrl, [sessionToken])
+      ? Object.freeze({
+          kind: "respond",
+          response: fixedResponse(400, "Bad Request\n"),
+          refreshIdle: false,
+        })
+      : (securityPolicy?.authorize(
+          Object.freeze({
+            method: request.method ?? "",
+            url: rawUrl,
+            headers: policyHeaders,
+            bearerAuthenticated,
+            serverOrigin,
+          }),
+        ) ??
+          (bearerAuthenticated
+            ? Object.freeze({
+                kind: "allow",
+                authKind: "bearer",
+                handlerUrl: rawUrl,
+                responseContract: "standard",
+                mutationBody: "none",
+                refreshIdle: true,
+              })
+            : Object.freeze({
+                kind: "respond",
+                response: fixedResponse(401, "Unauthorized\n"),
+                refreshIdle: false,
+              })));
+  };
+
   const lockIfExpired = (): void => {
     if (lifecycle !== "active") return;
     const now = clockMilliseconds(clock);
@@ -394,39 +431,7 @@ export async function startLocalUiServer(
         return;
       }
 
-      const bearerAuthenticated = authorized(request, expectedDigest);
-      const incomingHeaders = distinctHeaders(request);
-      const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
-      const rawUrl = request.url ?? "";
-      const decision: UiSecurityDecision = untrustedInputIsUnsafe(rawUrl, [sessionToken])
-        ? Object.freeze({
-            kind: "respond",
-            response: fixedResponse(400, "Bad Request\n"),
-            refreshIdle: false,
-          })
-        : (securityPolicy?.authorize(
-            Object.freeze({
-              method: request.method ?? "",
-              url: rawUrl,
-              headers: policyHeaders,
-              bearerAuthenticated,
-              serverOrigin,
-            }),
-          ) ??
-          (bearerAuthenticated
-            ? Object.freeze({
-                kind: "allow",
-                authKind: "bearer",
-                handlerUrl: rawUrl,
-                responseContract: "standard",
-                mutationBody: "none",
-                refreshIdle: true,
-              })
-            : Object.freeze({
-                kind: "respond",
-                response: fixedResponse(401, "Unauthorized\n"),
-                refreshIdle: false,
-              })));
+      const decision = authorizeRequest(request);
 
       const refreshIdle = (): boolean => {
         const now = clockMilliseconds(clock);
@@ -562,13 +567,35 @@ export async function startLocalUiServer(
   });
 
   server.on("clientError", (_error, socket) => {
-    endRawSocket(socket, 400, outboundResponseIsAllowed, securityPolicy);
+    endRawSocket(
+      socket,
+      fixedResponse(400, "Bad Request\n"),
+      outboundResponseIsAllowed,
+      securityPolicy,
+    );
   });
-  server.on("connect", (_request, socket) => {
-    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
+  server.on("connect", (request, socket) => {
+    let rejected = fixedResponse(405, "Method Not Allowed\n");
+    try {
+      lockIfExpired();
+      if (currentLifecycle() === "active") {
+        const decision = authorizeRequest(request);
+        if (decision.kind === "respond" && decision.response.statusCode === 405) {
+          rejected = decision.response;
+        }
+      }
+    } catch {
+      // A CONNECT request never bypasses the fixed denial if policy evaluation fails.
+    }
+    endRawSocket(socket, rejected, outboundResponseIsAllowed, securityPolicy);
   });
   server.on("upgrade", (_request, socket) => {
-    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
+    endRawSocket(
+      socket,
+      fixedResponse(405, "Method Not Allowed\n"),
+      outboundResponseIsAllowed,
+      securityPolicy,
+    );
   });
 
   try {

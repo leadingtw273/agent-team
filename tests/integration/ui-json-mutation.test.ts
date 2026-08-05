@@ -83,6 +83,20 @@ function createMutationSecurityPolicy(): UiSecurityPolicy {
   });
 }
 
+function createPutMutationSecurityPolicy(): UiSecurityPolicy {
+  return createUiSecurityPolicy({
+    routes: [
+      {
+        path: "/api/mutations",
+        allowedQueryParameters: [],
+        allowedMethods: ["GET", "PUT"],
+        response: "standard",
+        mutationBody: "bounded-json",
+      },
+    ],
+  });
+}
+
 function observedMutationPolicy(onAuthorized: () => void): Readonly<{
   policy: UiSecurityPolicy;
   invalidate: () => void;
@@ -378,6 +392,68 @@ describe("bounded JSON mutation transport", () => {
     expect(head.response).toContain(" 200 ");
     expect(bodies).toEqual([undefined, undefined]);
     expect(connect.response).toContain(" 405 ");
+  });
+
+  it("rejects disallowed bounded-json mutations before reading the body or refreshing idle", async () => {
+    const clock = new MutableClock(10_000);
+    const handler = vi.fn(() => ({ statusCode: 204 }));
+    const handle = await startMutationServer(handler, {
+      clock,
+      idleTimeoutMs: 100,
+      securityPolicy: createPutMutationSecurityPolicy(),
+    });
+    const session = await exchange(handle);
+    clock.advance(90);
+    const common = authenticatedHeaders(handle, session, [
+      "Content-Type: application/json",
+      "Content-Length: 2",
+    ]);
+
+    for (const method of ["POST", "PATCH", "DELETE"]) {
+      const pending = await openRawRequest(
+        handle,
+        `${method} /api/mutations HTTP/1.1\r\n${common}\r\n\r\n{`,
+      );
+      const response = await pending.response;
+      expect(response).toContain(" 405 ");
+      expect(response).toMatch(/allow: GET, HEAD, PUT/iu);
+    }
+
+    expect(handler).not.toHaveBeenCalled();
+    expect(handle.status()).toEqual({ state: "active", idleDeadlineMs: 10_100 });
+    clock.advance(11);
+    const expired = await fetch(`${handle.baseUrl}/api/mutations`, {
+      headers: { cookie: session.cookie },
+    });
+    expect(expired.status).toBe(423);
+  });
+
+  it("reads bounded JSON only for an allowed mutation method", async () => {
+    const received: UiRequest[] = [];
+    const handle = await startMutationServer(
+      (request) => {
+        received.push(request);
+        return { statusCode: 204 };
+      },
+      { securityPolicy: createPutMutationSecurityPolicy() },
+    );
+    const session = await exchange(handle);
+
+    const response = await fetch(`${handle.baseUrl}/api/mutations`, {
+      method: "PUT",
+      headers: {
+        cookie: session.cookie,
+        origin: handle.baseUrl,
+        "x-csrf-token": session.csrf,
+        "content-type": "application/json",
+      },
+      body: '{"action":"save"}',
+    });
+
+    expect(response.status).toBe(204);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.method).toBe("PUT");
+    expect(received[0]?.body).toEqual({ action: "save" });
   });
 
   it("never reflects a rejected raw body", async () => {
