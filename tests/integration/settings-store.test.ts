@@ -91,7 +91,7 @@ afterEach(async () => {
 });
 
 describe("U008 atomic private settings store", () => {
-  it("writes private canonical YAML, reads it back, and removes temp/lock files", async () => {
+  it("writes private canonical YAML and retains one permanent private lock inode", async () => {
     const fixture = await temporaryStore();
 
     const saved = await fixture.store.save(null, settings);
@@ -104,7 +104,8 @@ describe("U008 atomic private settings store", () => {
     expect((await stat(fixture.path)).mode & 0o777).toBe(privateFileMode);
     expect((await stat(join(fixture.root, "config"))).mode & 0o777).toBe(0o700);
     const names = await readdir(join(fixture.root, "config"));
-    expect(names).toEqual([basename(fixture.path)]);
+    expect(names.sort()).toEqual([basename(fixture.path), `${basename(fixture.path)}.lock`]);
+    expect((await stat(`${fixture.path}.lock`)).mode & 0o777).toBe(privateFileMode);
     await expect(fixture.store.read()).resolves.toEqual({ ok: true, value: saved.stored });
   });
 
