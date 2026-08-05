@@ -155,11 +155,4 @@ describe("GitHub CLI ingest", () => {
       reason: "ack_deadline_exceeded",
     });
   });
-
-  it("keeps Linear blocked without consuming stdin or writing GitHub Inbox", async () => {
-    const file = await files();
-    const outcome = await handler(file)({ provider: "linear", headersFile: file.headersFile });
-
-    expect(outcome).toMatchObject({ state: "blocked" });
-  });
 });

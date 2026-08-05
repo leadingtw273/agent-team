@@ -6,6 +6,7 @@ import { isAbsolute, join } from "node:path";
 import { z } from "zod";
 
 import { GitHubWebhookAdapter } from "../../adapters/github/index.js";
+import { LinearWebhookAdapter } from "../../adapters/linear/index.js";
 import type { WebhookHeaderValue, WebhookInbox } from "../../adapters/webhook/index.js";
 import { createClock, type Clock } from "../../domain/foundation/index.js";
 import { DurableInbox } from "../../infrastructure/events/index.js";
@@ -27,7 +28,7 @@ const headersSchema = z
 
 type InputChunk = Uint8Array | string;
 
-export interface LocalGitHubIngestOptions {
+export interface LocalWebhookIngestOptions {
   readonly agentTeamHome?: string;
   readonly secretFile?: string;
   readonly inbox?: WebhookInbox;
@@ -35,6 +36,9 @@ export interface LocalGitHubIngestOptions {
   readonly clock?: Clock;
   readonly ackDeadlineMs?: number;
 }
+
+/** @deprecated Use LocalWebhookIngestOptions for provider-neutral ingest configuration. */
+export type LocalGitHubIngestOptions = LocalWebhookIngestOptions;
 
 type ReadResult = Readonly<{ ok: true; bytes: Uint8Array; mode: number }> | Readonly<{ ok: false }>;
 
@@ -125,36 +129,33 @@ function rejection(reason: string, statusCode: number): string {
 }
 
 export function createLocalWebhookIngestHandler(
-  options: LocalGitHubIngestOptions = {},
+  options: LocalWebhookIngestOptions = {},
 ): CliHandlers["ingest"] {
   const agentTeamHome = options.agentTeamHome ?? join(homedir(), ".agent-team");
-  const secretFile = options.secretFile ?? join(agentTeamHome, "secrets", "github-webhook-secret");
+  const githubSecretFile =
+    options.secretFile ?? join(agentTeamHome, "secrets", "github-webhook-secret");
+  const linearSecretFile =
+    options.secretFile ?? join(agentTeamHome, "secrets", "linear-webhook-secret");
   const inbox = options.inbox ?? new DurableInbox(join(agentTeamHome, "state", "inbox"));
   const stream = options.stdin ?? process.stdin;
   const clock = options.clock ?? createClock();
   const ackDeadlineMs = options.ackDeadlineMs ?? defaultAckDeadlineMs;
 
   return async (input) => {
-    if (input.provider !== "github") {
-      return Object.freeze({
-        state: "blocked",
-        message: "Linear Webhook ingest 尚未完成，未寫入 Inbox。",
-      });
-    }
     if (!Number.isSafeInteger(ackDeadlineMs) || ackDeadlineMs <= 0 || ackDeadlineMs > 30_000) {
       return Object.freeze({ state: "failed", message: rejection("invalid_deadline", 500) });
     }
     const completed = await withinDeadline(
       (async () => {
         const [secret, headers, rawBody] = await Promise.all([
-          readSecret(secretFile),
+          readSecret(input.provider === "github" ? githubSecretFile : linearSecretFile),
           readHeaders(input.headersFile),
           readRawBody(stream),
         ]);
         if (secret === undefined) {
           return Object.freeze({
             state: "blocked" as const,
-            message: "GitHub Webhook Secret 未配置、不是 0600，或無法安全讀取。",
+            message: `${input.provider} Webhook Secret 未配置、不是 0600，或無法安全讀取。`,
           });
         }
         if (headers === undefined) {
@@ -166,7 +167,11 @@ export function createLocalWebhookIngestHandler(
         if (rawBody === "payload_too_large") {
           return Object.freeze({ state: "failed" as const, message: rejection(rawBody, 400) });
         }
-        const ingested = await new GitHubWebhookAdapter(inbox, secret).ingest({
+        const adapter =
+          input.provider === "github"
+            ? new GitHubWebhookAdapter(inbox, secret)
+            : new LinearWebhookAdapter(inbox, secret);
+        const ingested = await adapter.ingest({
           rawBody,
           headers,
           receivedAt: clock.now(),
