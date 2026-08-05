@@ -6,12 +6,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  createDangerApprovalUseCase,
+  createDangerUiFeatureRegistration,
   createSettingsSecretSafeJsonResponse,
   createSettingsUiFeatureRegistration,
   createSettingsUseCase,
   createUiApplication,
   DEFAULT_USER_SETTINGS,
   FileSettingsStore,
+  InMemoryDangerApprovalStore,
   serializeUserSettingsYaml,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -120,16 +123,19 @@ afterEach(async () => {
 });
 
 describe("U008 settings HTTP route", () => {
-  it("composes the Role, Quota, and Settings route union while each feature owns its assets", () => {
+  it("composes the Role, Quota, Danger, and Settings route union with owned assets", () => {
     const useCase = createSettingsUseCase(
       new FileSettingsStore("/tmp/agent-team-u008-registry-settings.yaml"),
     );
     const registration = createSettingsUiFeatureRegistration(useCase);
     const quota = quotaFeature();
     const quotaRegistration = quota.uiFeatureRegistration();
+    const dangerRegistration = createDangerUiFeatureRegistration(
+      createDangerApprovalUseCase(new InMemoryDangerApprovalStore()),
+    );
     const core = createUiApplication();
     const application = createUiApplication({
-      features: [createRoleModelFeature(), quota, registration],
+      features: [createRoleModelFeature(), quota, dangerRegistration, registration],
     });
 
     expect(registration).toMatchObject({
@@ -157,6 +163,16 @@ describe("U008 settings HTTP route", () => {
       "/api/quota/refresh",
       "/api/quota/resume",
     ]);
+    expect(dangerRegistration.page).toMatchObject({
+      path: "/security",
+      styles: ["/assets/danger.css"],
+      scripts: ["/assets/danger.js"],
+    });
+    expect(dangerRegistration.routes.map((route) => route.contract.path)).toEqual([
+      "/assets/danger.css",
+      "/assets/danger.js",
+      "/api/danger",
+    ]);
     expect(core.routeContracts.map((route) => route.path)).toEqual([
       "/",
       "/projects",
@@ -176,6 +192,10 @@ describe("U008 settings HTTP route", () => {
       "/assets/quota.js",
       "/api/quota/refresh",
       "/api/quota/resume",
+      "/security",
+      "/assets/danger.css",
+      "/assets/danger.js",
+      "/api/danger",
       "/settings",
       "/assets/settings.css",
       "/assets/settings.js",
@@ -204,6 +224,11 @@ describe("U008 settings HTTP route", () => {
         mutationBody: "bounded-json",
       }),
     ]);
+    expect(application.routeContracts.find((route) => route.path === "/api/danger")).toMatchObject({
+      allowedMethods: ["GET", "PUT"],
+      response: "standard",
+      mutationBody: "bounded-json",
+    });
   });
 
   it("rejects disallowed settings methods before body, handler, or idle refresh", async () => {
@@ -326,6 +351,9 @@ describe("U008 settings HTTP route", () => {
       features: [
         createRoleModelFeature(),
         quotaFeature(),
+        createDangerUiFeatureRegistration(
+          createDangerApprovalUseCase(new InMemoryDangerApprovalStore()),
+        ),
         createSettingsUiFeatureRegistration(createSettingsUseCase(store)),
       ],
     });

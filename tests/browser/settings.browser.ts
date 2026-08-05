@@ -7,10 +7,13 @@ import axe from "axe-core";
 
 import { parseInstant, type Instant } from "../../src/domain/foundation/index.js";
 import {
+  createDangerApprovalUseCase,
+  createDangerUiFeatureRegistration,
   createSettingsUiFeatureRegistration,
   createSettingsUseCase,
   createUiApplication,
   FileSettingsStore,
+  InMemoryDangerApprovalStore,
   startLocalUiServer,
   type LocalUiServerHandle,
 } from "../../src/ui/index.js";
@@ -77,6 +80,9 @@ test.beforeAll(async () => {
     features: [
       createRoleModelFeature(),
       quotaFeature(),
+      createDangerUiFeatureRegistration(
+        createDangerApprovalUseCase(new InMemoryDangerApprovalStore()),
+      ),
       createSettingsUiFeatureRegistration(
         createSettingsUseCase(new FileSettingsStore(join(directory, "config", "settings.yaml"))),
       ),
@@ -235,7 +241,7 @@ test("settings edit control has AA normal/focus contrast and no axe violations",
   await expectNoAxeViolations(page);
 });
 
-test("Role, Quota, and Settings share one collapsed mobile shell at 390px and 320px", async ({
+test("Role, Quota, Danger, and Settings share one mobile shell at 390px and 320px", async ({
   page,
 }) => {
   await visitSettings(page);
@@ -244,9 +250,10 @@ test("Role, Quota, and Settings share one collapsed mobile shell at 390px and 32
   for (const width of [390, 320] as const) {
     await page.setViewportSize({ width, height: width === 390 ? 844 : 720 });
     for (const destination of [
-      { path: "/roles-models", title: "角色與模型" },
-      { path: "/quota", title: "額度" },
-      { path: "/settings", title: "設定" },
+      { path: "/roles-models", title: "角色與模型", link: "角色與模型" },
+      { path: "/quota", title: "額度", link: "額度" },
+      { path: "/security", title: "安全核可", link: "安全" },
+      { path: "/settings", title: "設定", link: "設定" },
     ] as const) {
       await page.goto(`${shell.baseUrl}${destination.path}`, { waitUntil: "networkidle" });
       const disclosure = page.locator("details.ui-mobile-nav");
@@ -260,14 +267,14 @@ test("Role, Quota, and Settings share one collapsed mobile shell at 390px and 32
       await expect(page.locator('a.skip-link[href="#main-content"]')).toHaveCount(1);
       await expect(disclosure).toBeVisible();
       await expect(disclosure).not.toHaveAttribute("open", "");
-      await expect(toggle).toContainText(`目前頁面：${destination.title}`);
+      await expect(toggle).toContainText(`目前頁面：${destination.link}`);
       await expect(navigation).toBeHidden();
       await expectNoHorizontalOverflow(page);
 
       await toggle.click();
       await expect(disclosure).toHaveAttribute("open", "");
       await expect(
-        navigation.getByRole("link", { name: destination.title, exact: true }),
+        navigation.getByRole("link", { name: destination.link, exact: true }),
       ).toHaveAttribute("aria-current", "page");
       await expectNoHorizontalOverflow(page);
       await expectNoAxeViolations(page);
