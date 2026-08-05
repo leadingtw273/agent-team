@@ -147,6 +147,151 @@ describe("JSONL event store", () => {
     expect(projected.value.duplicatesSkipped).toBe(0);
   });
 
+  it("atomically persists one external revision across different concurrent deliveries", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "events", "events.jsonl");
+    const providerEventId = `provider-revision:v1:github:pull_request:UFJfaWQ:2026-08-04T12:00:00.000Z:${"a".repeat(64)}`;
+    const first = event({
+      eventType: "github.pull_request",
+      payload: { providerEventId, representation: "webhook" },
+    });
+    const second = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-8123456789ab"),
+      eventType: "github.pull_request",
+      source: { kind: "external", provider: "github", deliveryId: "readback-delivery" },
+      payload: { providerEventId, representation: "readback" },
+    });
+
+    const receipts = await Promise.all([
+      new JsonlEventStore(path).append(first),
+      new JsonlEventStore(path).append(second),
+    ]);
+    const log = await readEventLog(path);
+
+    expect(
+      receipts.every((receipt) => receipt.ok),
+      JSON.stringify(receipts),
+    ).toBe(true);
+    expect(
+      receipts.map((receipt) => (receipt.ok ? receipt.value.persistence : "failed")).sort(),
+    ).toEqual(["duplicate", "persisted_confirmed"]);
+    expect(log.ok && log.value.events).toHaveLength(1);
+  });
+
+  it("persists distinct github.push deliveries despite valid pull-request revision metadata", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "events", "events.jsonl");
+    const store = new JsonlEventStore(path);
+    const providerEventId = `provider-revision:v1:github:pull_request:UFJfaWQ:2026-08-04T12:00:00.000Z:${"d".repeat(64)}`;
+    const first = event({
+      eventType: "github.push",
+      payload: { providerEventId, representation: "push-webhook" },
+    });
+    const second = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-2123456789ab"),
+      eventType: "github.push",
+      source: { kind: "external", provider: "github", deliveryId: "push-readback-delivery" },
+      payload: { providerEventId, representation: "push-readback" },
+    });
+
+    const firstReceipt = await store.append(first);
+    const secondReceipt = await store.append(second);
+    const log = await readEventLog(path);
+
+    expect(firstReceipt).toMatchObject({ ok: true, value: { persistence: "persisted_confirmed" } });
+    expect(secondReceipt).toMatchObject({
+      ok: true,
+      value: { persistence: "persisted_confirmed" },
+    });
+    expect(log.ok && log.value.events).toHaveLength(2);
+  });
+
+  it("skips historical semantic duplicates during projection but ignores invalid claims", async () => {
+    const root = await temporaryDirectory();
+    const semanticPath = join(root, "semantic-duplicates.jsonl");
+    const invalidPath = join(root, "invalid-semantic-claims.jsonl");
+    const overlongPath = join(root, "overlong-semantic-claims.jsonl");
+    const crossProviderPath = join(root, "cross-provider-claims.jsonl");
+    const providerEventId = `provider-revision:v1:github:pull_request:UFJfaWQ:2026-08-04T12:00:00.000Z:${"b".repeat(64)}`;
+    const first = event({
+      eventType: "github.pull_request",
+      payload: { providerEventId, representation: "webhook" },
+    });
+    const second = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-7123456789ab"),
+      eventType: "github.pull_request",
+      source: { kind: "external", provider: "github", deliveryId: "different-delivery" },
+      payload: { providerEventId, representation: "readback" },
+    });
+    const invalidFirst = event({ payload: { providerEventId: "not-a-provider-revision" } });
+    const invalidSecond = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-6123456789ab"),
+      source: { kind: "external", provider: "github", deliveryId: "another-delivery" },
+      payload: { providerEventId: "not-a-provider-revision" },
+    });
+    const overlongProviderEventId = `provider-revision:v1:github:pull_request:${"x".repeat(400)}:2026-08-04T12:00:00.000Z:${"c".repeat(64)}`;
+    const overlongFirst = event({ payload: { providerEventId: overlongProviderEventId } });
+    const overlongSecond = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-5123456789ab"),
+      source: { kind: "external", provider: "github", deliveryId: "overlong-delivery" },
+      payload: { providerEventId: overlongProviderEventId },
+    });
+    await writeFile(semanticPath, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`, "utf8");
+    const invalidReceipts = await Promise.all([
+      new JsonlEventStore(invalidPath).append(invalidFirst),
+      new JsonlEventStore(invalidPath).append(invalidSecond),
+    ]);
+    const overlongReceipts = await Promise.all([
+      new JsonlEventStore(overlongPath).append(overlongFirst),
+      new JsonlEventStore(overlongPath).append(overlongSecond),
+    ]);
+    const crossProviderReceipts = await Promise.all([
+      new JsonlEventStore(crossProviderPath).append(first),
+      new JsonlEventStore(crossProviderPath).append(
+        event({
+          eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-4123456789ab"),
+          eventType: "linear.issue",
+          source: { kind: "external", provider: "linear", deliveryId: "linear-delivery" },
+          payload: { providerEventId, representation: "provider-mismatch" },
+        }),
+      ),
+    ]);
+
+    const semantic = await replayProjection(semanticPath, 0, (count) => ok(count + 1));
+    const invalid = await replayProjection(invalidPath, 0, (count) => ok(count + 1));
+    const overlong = await replayProjection(overlongPath, 0, (count) => ok(count + 1));
+    const crossProvider = await replayProjection(crossProviderPath, 0, (count) => ok(count + 1));
+
+    expect(semantic).toMatchObject({ ok: true, value: { state: 1, duplicatesSkipped: 1 } });
+    expect(invalidReceipts.every((receipt) => receipt.ok)).toBe(true);
+    expect(invalid).toMatchObject({ ok: true, value: { state: 2, duplicatesSkipped: 0 } });
+    expect(overlongReceipts.every((receipt) => receipt.ok)).toBe(true);
+    expect(overlong).toMatchObject({ ok: true, value: { state: 2, duplicatesSkipped: 0 } });
+    expect(crossProviderReceipts.every((receipt) => receipt.ok)).toBe(true);
+    expect(crossProvider).toMatchObject({ ok: true, value: { state: 2, duplicatesSkipped: 0 } });
+  });
+
+  it("replays distinct github.push deliveries despite valid pull-request revision metadata", async () => {
+    const root = await temporaryDirectory();
+    const path = join(root, "push-revisions.jsonl");
+    const providerEventId = `provider-revision:v1:github:pull_request:UFJfaWQ:2026-08-04T12:00:00.000Z:${"e".repeat(64)}`;
+    const first = event({
+      eventType: "github.push",
+      payload: { providerEventId, representation: "push-webhook" },
+    });
+    const second = event({
+      eventId: eventId("event_018f47d2-77a4-7cc1-8ef2-3123456789ab"),
+      eventType: "github.push",
+      source: { kind: "external", provider: "github", deliveryId: "push-replay-delivery" },
+      payload: { providerEventId, representation: "push-readback" },
+    });
+    await writeFile(path, `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`, "utf8");
+
+    const replayed = await replayProjection(path, 0, (count) => ok(count + 1));
+
+    expect(replayed).toMatchObject({ ok: true, value: { state: 2, duplicatesSkipped: 0 } });
+  });
+
   it("reclaims a lock left by a crashed process and retries the append once", async () => {
     const root = await temporaryDirectory();
     const path = join(root, "events.jsonl");

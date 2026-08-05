@@ -21,6 +21,7 @@ import {
 import { sha256Digest } from "../../domain/review/index.js";
 import { privateDirectoryMode, privateFileMode, syncDirectory } from "../files/index.js";
 import { acquireRecoverableFileLock } from "./locking.js";
+import { semanticProviderRevisionKey } from "../../application/reconcile/provider-revision.js";
 
 export interface EventLogRead {
   readonly events: readonly EventEnvelopeV1[];
@@ -33,6 +34,24 @@ export interface AppendEventReceipt {
   readonly persistence: "duplicate" | "persisted_confirmed" | "persisted_unknown";
   readonly partialTailRecovered: boolean;
   readonly lockRelease: "confirmed" | "unknown";
+}
+
+async function acquireEventStoreLock(lockPath: string) {
+  const maximumAttempts = 500;
+  for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+    const acquired = await acquireRecoverableFileLock(
+      lockPath,
+      `event-store:${String(process.pid)}`,
+    );
+    if (
+      acquired.ok ||
+      (acquired.error.code !== "conflict" && acquired.error.code !== "not_found")
+    ) {
+      return acquired;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  }
+  return acquireRecoverableFileLock(lockPath, `event-store:${String(process.pid)}`);
 }
 
 function hasNodeErrorCode(error: unknown, code: string): boolean {
@@ -180,10 +199,7 @@ export class JsonlEventStore {
   async append(input: unknown): Promise<Result<AppendEventReceipt, DomainError>> {
     const event = upgradeEventEnvelope(input);
     if (!event.ok) return event;
-    const acquired = await acquireRecoverableFileLock(
-      this.#lockPath,
-      `event-store:${String(process.pid)}`,
-    );
+    const acquired = await acquireEventStoreLock(this.#lockPath);
     if (!acquired.ok) return acquired;
 
     const operation = await this.#appendLocked(event.value);
@@ -217,6 +233,22 @@ export class JsonlEventStore {
       if (existingDigest.value !== candidateDigest.value) {
         return err(domainError("conflict"));
       }
+    }
+    const semanticKey = semanticProviderRevisionKey(event);
+    if (
+      semanticKey !== undefined &&
+      current.value.events.some(
+        (persisted) => semanticProviderRevisionKey(persisted) === semanticKey,
+      )
+    ) {
+      return ok(
+        Object.freeze({
+          classification: "duplicate" as const,
+          persistence: "duplicate" as const,
+          partialTailRecovered,
+          lockRelease: "confirmed" as const,
+        }),
+      );
     }
     const latest = latestOccurredAt(current.value.events);
     const decision = classifyDelivery(

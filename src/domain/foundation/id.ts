@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { domainError, type DomainError } from "./error.js";
 import { err, ok, type Result } from "./result.js";
@@ -38,4 +38,15 @@ export function generateIdentifier<Scope extends string>(
   generateUuid: () => string = randomUUID,
 ): Result<Identifier<Scope>, DomainError<"invalid_identifier">> {
   return parseIdentifier(scope, `${scope}_${generateUuid().toLowerCase()}`);
+}
+
+export function generateDeterministicIdentifier<Scope extends string>(
+  scope: Scope,
+  seed: string | Uint8Array,
+): Result<Identifier<Scope>, DomainError<"invalid_identifier">> {
+  const bytes = typeof seed === "string" ? Buffer.from(seed, "utf8") : Uint8Array.from(seed);
+  if (bytes.byteLength === 0) return err(domainError("invalid_identifier"));
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const uuid = `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-8${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+  return parseIdentifier(scope, `${scope}_${uuid}`);
 }
