@@ -1,4 +1,5 @@
 export * from "./model.js";
+export * from "./provision.js";
 export * from "./read.js";
 export * from "./reconcile.js";
 export * from "./transport.js";
