@@ -8,6 +8,7 @@ import {
   createFixtureLinearProvisionUseCase,
   createRegistrationWizardUiFeatureRegistration,
   createUiApplication,
+  fixtureManualRemoteId,
   fixtureRegistrationReadOnlyScanUseCase,
   fixtureUiShellReadModel,
   startLocalUiServer,
@@ -82,7 +83,7 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
     const root = browser.document.documentElement;
     let overflowing = 0;
     for (const element of browser.document.querySelectorAll(
-      ".ui-linear-provision, .ui-linear-summary, .ui-linear-action, .ui-linear-controls, .ui-linear-confirmation",
+      ".ui-linear-provision, .ui-linear-summary, .ui-linear-action, .ui-linear-controls, .ui-linear-confirmation, .ui-linear-manual, .ui-linear-manual-row, .ui-linear-manual-confirmation",
     )) {
       if (
         element.scrollWidth > element.clientWidth + 1 ||
@@ -152,7 +153,7 @@ test.describe("O003 Linear provision UI", () => {
     await expect(review).toBeFocused();
     await page.keyboard.press("Enter");
     await page.keyboard.press("Enter");
-    await expect(section.getByRole("status")).toContainText("已建立並 read-back 27 項");
+    await expect(section.locator(".js-linear-status")).toContainText("已建立並 read-back 27 項");
   });
 
   test("has no horizontal overflow at 390px and 320px and captures synthetic evidence", async ({
@@ -166,5 +167,29 @@ test.describe("O003 Linear provision UI", () => {
       await expectNoAxeViolations(page);
       await screenshot(page, `o003-linear-provision-${String(width)}.png`);
     }
+  });
+
+  test("supports keyboard-only manual ID preview, cancellation, and confirmed read-back", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await visit(page);
+    const section = page.getByRole("region", { name: "Linear 設定預覽" });
+    const input = section.getByLabel("Linear 物件 ID").first();
+    const panel = input.locator("..").locator("..");
+    const previewButton = panel.getByRole("button", { name: "預覽 ID read-back" });
+    await input.fill(fixtureManualRemoteId("work_status.backlog"));
+    await previewButton.focus();
+    await page.keyboard.press("Enter");
+    const confirm = panel.getByRole("button", { name: "確認 Linear ID read-back" });
+    await expect(confirm).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(previewButton).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(confirm).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(panel.getByRole("status")).toContainText("已保存 Linear ID read-back");
+    await expectNoAxeViolations(page);
+    await expectNoHorizontalOverflow(page);
   });
 });

@@ -115,7 +115,59 @@ function provisionCommand(body: UiRequest["body"]) {
   ) {
     return undefined;
   }
-  return Object.freeze({ expectedRevision, confirmationToken, confirmationText });
+  return Object.freeze({
+    operation: "provision" as const,
+    expectedRevision,
+    confirmationToken,
+    confirmationText,
+  });
+}
+
+function manualPreviewRequest(body: UiRequest["body"]) {
+  if (body === undefined || Object.keys(body).length !== 3) return undefined;
+  const operation = body["operation"];
+  const logicalKey = body["logicalKey"];
+  const remoteId = body["remoteId"];
+  if (
+    operation !== "preview_manual_readback" ||
+    typeof logicalKey !== "string" ||
+    !fixedNames.has(logicalKey) ||
+    typeof remoteId !== "string"
+  ) {
+    return undefined;
+  }
+  return Object.freeze({ logicalKey, remoteId });
+}
+
+function manualCommand(body: UiRequest["body"]) {
+  if (body === undefined || Object.keys(body).length !== 6) return undefined;
+  const operation = body["operation"];
+  const logicalKey = body["logicalKey"];
+  const remoteId = body["remoteId"];
+  const expectedRevision = body["expectedRevision"];
+  const confirmationToken = body["confirmationToken"];
+  const confirmationText = body["confirmationText"];
+  if (
+    operation !== "confirm_manual_readback" ||
+    typeof logicalKey !== "string" ||
+    !fixedNames.has(logicalKey) ||
+    typeof remoteId !== "string" ||
+    typeof expectedRevision !== "string" ||
+    !digestPattern.test(expectedRevision) ||
+    typeof confirmationToken !== "string" ||
+    !digestPattern.test(confirmationToken) ||
+    confirmationText !== "確認 Linear ID read-back"
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    operation: "manual_readback" as const,
+    logicalKey,
+    remoteId,
+    expectedRevision,
+    confirmationToken,
+    confirmationText,
+  });
 }
 
 export async function handleLinearProvisionApiRequest(
@@ -131,11 +183,34 @@ export async function handleLinearProvisionApiRequest(
   if (request.method !== "PUT") {
     return jsonResponse(request, 405, { state: "error", code: "method_not_allowed" });
   }
-  const command = provisionCommand(request.body);
-  if (command === undefined) {
+  const manualPreview = manualPreviewRequest(request.body);
+  if (manualPreview !== undefined) {
+    const preview = await useCase.previewManualReadBack(manualPreview);
+    return preview.ok
+      ? jsonResponse(request, 200, {
+          state: "manual_preview",
+          logicalKey: preview.value.logicalKey,
+          name: fixedNames.get(preview.value.logicalKey),
+          expectedRevision: preview.value.expectedRevision,
+          confirmationToken: preview.value.confirmationToken,
+        })
+      : errorResponse(request, preview.error);
+  }
+  const manual = manualCommand(request.body);
+  if (manual !== undefined) {
+    const preview = await useCase.readBackManual(manual);
+    return preview.ok
+      ? jsonResponse(request, 200, {
+          state: "manual_applied",
+          preview: safeProjection(preview.value),
+        })
+      : errorResponse(request, preview.error);
+  }
+  const provision = provisionCommand(request.body);
+  if (provision === undefined) {
     return jsonResponse(request, 422, { state: "error", code: "invalid_operation" });
   }
-  const outcome = await useCase.provision(command);
+  const outcome = await useCase.provision(provision);
   return outcome.ok
     ? jsonResponse(request, 200, {
         state: "applied",

@@ -194,6 +194,7 @@ function linearKindLabel(kind: LinearProvisionAction["kind"]): string {
 function renderLinearAction(action: LinearProvisionAction): string {
   const fixedName = fixedLinearNames.get(action.key);
   const name = fixedName === action.name ? fixedName : "已隱藏不安全的原始內容";
+  const manualId = `linear-manual-${action.key.replace(/[^A-Za-z0-9_-]/gu, "-")}`;
   return `<li class="ui-linear-action ui-linear-action--${action.state}">
     <div><span class="ui-linear-kind">${linearKindLabel(action.kind)}</span><strong>${escapeHtml(name)}</strong></div>
     <span class="ui-linear-action-state">${linearActionLabel(action.state)}</span>
@@ -201,6 +202,19 @@ function renderLinearAction(action: LinearProvisionAction): string {
       action.instruction === undefined
         ? ""
         : `<p>${escapeHtml(safeRegistrationText(action.instruction))}</p>`
+    }
+    ${
+      action.state === "manual_readback"
+        ? `<div class="ui-linear-manual js-linear-manual" data-logical-key="${escapeHtml(action.key)}">
+          <label for="${manualId}">Linear 物件 ID</label>
+          <div class="ui-linear-manual-row"><input id="${manualId}" class="form-control js-linear-manual-id" type="text" maxlength="255" autocomplete="off" spellcheck="false"><button class="btn btn-outline-primary js-linear-manual-preview" type="button">預覽 ID read-back</button></div>
+          <p class="js-linear-manual-status" role="status" aria-live="polite">尚未核對 ID。</p>
+          <section class="ui-linear-manual-confirmation js-linear-manual-confirmation" aria-label="${escapeHtml(`${name} ID read-back 第二步確認`)}" hidden>
+            <p>已按這個 ID 完成 authoritative read-back。確認後才會保存綁定；不會只憑名稱接管。</p>
+            <div><button class="btn btn-primary js-linear-manual-confirm" type="button">確認 Linear ID read-back</button><button class="btn btn-outline-secondary js-linear-manual-cancel" type="button">取消</button></div>
+          </section>
+        </div>`
+        : ""
     }
   </li>`;
 }

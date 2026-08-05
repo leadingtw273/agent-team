@@ -386,6 +386,47 @@
   overflow-wrap: anywhere;
 }
 
+.ui-linear-action > .ui-linear-manual {
+  grid-column: 1 / -1;
+  gap: 0.45rem;
+  padding-block-start: 0.25rem;
+}
+
+.ui-linear-manual label {
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.ui-linear-manual-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.ui-linear-manual-row input {
+  min-width: 0;
+}
+
+.ui-linear-manual-confirmation {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.7rem;
+  background: #fff8e5;
+  border: 1px solid #ead394;
+  border-radius: 0.5rem;
+}
+
+.ui-linear-manual-confirmation[hidden] {
+  display: none;
+}
+
+.ui-linear-manual-confirmation > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 .ui-linear-controls {
   display: flex;
   gap: 0.75rem;
@@ -475,5 +516,9 @@
   .ui-linear-action-state,
   .ui-linear-action p {
     grid-column: 1;
+  }
+
+  .ui-linear-manual-row {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

@@ -7,15 +7,20 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import {
+  createLinearProvisionConfirmationContext,
   linearProvisionDesiredObjects,
   linearProvisionDigest,
   linearProvisionObjectKinds,
   type LinearManualReadBackCommand,
+  type LinearManualReadBackPreview,
+  type LinearManualReadBackRequest,
   type LinearProvisionAction,
   type LinearProvisionActionState,
+  type LinearProvisionBindingMutation,
   type LinearProvisionBindingPort,
   type LinearProvisionBindings,
   type LinearProvisionCommand,
+  type LinearProvisionConfirmationContext,
   type LinearProvisionDesiredObject,
   type LinearProvisionInventory,
   type LinearProvisionObjectKind,
@@ -23,17 +28,26 @@ import {
   type LinearProvisionPort,
   type LinearProvisionPreview,
   type LinearProvisionRemoteObject,
+  type LinearProvisionReservation,
   type LinearProvisionTarget,
+  type LinearProvisionUseCaseOptions,
 } from "./linear-provision-model.js";
 
 export * from "./linear-provision-model.js";
 
 const idPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/u;
 const digestPattern = /^[a-f0-9]{64}$/u;
-const confirmationText = "套用 Linear 設定" as const;
+const storeRevisionPattern = /^(?:0|[1-9][0-9]{0,15})$/u;
+const provisionConfirmationText = "套用 Linear 設定" as const;
+const manualConfirmationText = "確認 Linear ID read-back" as const;
 
 interface PreviewContext {
   readonly preview: LinearProvisionPreview;
+  readonly inventory: LinearProvisionInventory;
+  readonly bindings: LinearProvisionBindings;
+}
+
+interface ReadContext {
   readonly inventory: LinearProvisionInventory;
   readonly bindings: LinearProvisionBindings;
 }
@@ -81,14 +95,73 @@ function validInventory(
   );
 }
 
-function validBindings(bindings: LinearProvisionBindings): boolean {
-  const desiredKeys = new Set(linearProvisionDesiredObjects.map((item) => item.key));
-  const entries = Object.entries(bindings.byKey);
+function validDesiredObjects(objects: readonly LinearProvisionDesiredObject[]): boolean {
+  if (objects.length === 0 || new Set(objects.map((item) => item.key)).size !== objects.length) {
+    return false;
+  }
+  const seen = new Set<string>();
+  for (const desired of objects) {
+    if (
+      !idPattern.test(desired.key) ||
+      !linearProvisionObjectKinds.includes(desired.kind) ||
+      desired.name.trim().length === 0 ||
+      desired.name.length > 255 ||
+      !digestPattern.test(desired.fingerprint) ||
+      linearProvisionDigest(desired.payload) !== desired.fingerprint ||
+      (desired.parentKey !== undefined && !seen.has(desired.parentKey))
+    ) {
+      return false;
+    }
+    seen.add(desired.key);
+  }
+  return true;
+}
+
+function validReservation(
+  key: string,
+  reservation: LinearProvisionReservation,
+  desiredKeys: ReadonlySet<string>,
+): boolean {
+  const operation: unknown = reservation.operation;
+  const phase: unknown = reservation.phase;
   return (
-    digestPattern.test(bindings.revision) &&
-    entries.every(([key, id]) => desiredKeys.has(key) && idPattern.test(id)) &&
-    new Set(entries.map(([, id]) => id)).size === entries.length
+    desiredKeys.has(key) &&
+    reservation.logicalKey === key &&
+    operation === "provision" &&
+    digestPattern.test(reservation.ownerDigest) &&
+    digestPattern.test(reservation.desiredFingerprint) &&
+    (phase === "reserved" || phase === "mutation_started")
   );
+}
+
+function validBindings(
+  bindings: LinearProvisionBindings,
+  desiredObjects: readonly LinearProvisionDesiredObject[],
+): boolean {
+  const desiredByKey = new Map(desiredObjects.map((item) => [item.key, item]));
+  const desiredKeys = new Set(desiredByKey.keys());
+  const bindingEntries = Object.entries(bindings.byKey);
+  const reservationEntries = Object.entries(bindings.reservations);
+  return (
+    storeRevisionPattern.test(bindings.revision) &&
+    bindingEntries.every(([key, id]) => desiredKeys.has(key) && idPattern.test(id)) &&
+    new Set(bindingEntries.map(([, id]) => id)).size === bindingEntries.length &&
+    reservationEntries.every(([key, reservation]) =>
+      validReservation(key, reservation, desiredKeys),
+    ) &&
+    reservationEntries.every(
+      ([key, reservation]) => reservation.desiredFingerprint === desiredByKey.get(key)?.fingerprint,
+    ) &&
+    reservationEntries.every(([key]) => bindings.byKey[key] === undefined)
+  );
+}
+
+function revisionAdvanced(previous: string, next: string): boolean {
+  try {
+    return BigInt(next) > BigInt(previous);
+  } catch {
+    return false;
+  }
 }
 
 function expectedParentId(
@@ -115,18 +188,30 @@ function matchesDesired(
 
 function manualInstruction(kind: LinearProvisionObjectKind, readBack: boolean): string {
   if (readBack) {
-    return "請在本機 UI 以 Linear 物件 ID 完成 read-back 綁定；系統不會只憑名稱接管既有項目。";
+    return "請在本機 UI 輸入 Linear 物件 ID，先預覽 authoritative read-back，再做第二步確認；系統不會只憑名稱接管。";
   }
   switch (kind) {
     case "workflow_state":
-      return "請在 Linear Team 工作流程中建立此中文狀態，再回本機 UI 輸入物件 ID 做 read-back。";
+      return "請在 Linear Team 工作流程中建立此中文狀態，重新預覽後在本機 UI 輸入物件 ID。";
     case "label_group":
-      return "請在 Linear 建立單選 Label Group，再回本機 UI 輸入 Group ID 做 read-back。";
+      return "請在 Linear 建立單選 Label Group，重新預覽後在本機 UI 輸入 Group ID。";
     case "label":
-      return "請先完成父 Label Group，再建立子 Label，最後回本機 UI 以子 Label ID 做 read-back。";
+      return "請先完成父 Label Group，再建立子 Label，重新預覽後在本機 UI 輸入子 Label ID。";
     case "form_template":
-      return "請在 Linear 建立中文 Issue Form Template，再回本機 UI 輸入 Template ID 做 read-back。";
+      return "請在 Linear 建立中文 Issue Form Template，重新預覽後在本機 UI 輸入 Template ID。";
   }
+}
+
+function exactSameNameObjects(
+  desired: LinearProvisionDesiredObject,
+  inventory: LinearProvisionInventory,
+  bindings: LinearProvisionBindings,
+): readonly LinearProvisionRemoteObject[] {
+  return inventory.objects.filter(
+    (object) =>
+      object.name === desired.name &&
+      matchesDesired(object, desired, inventory.target, bindings.byKey),
+  );
 }
 
 function actionFor(
@@ -134,27 +219,57 @@ function actionFor(
   inventory: LinearProvisionInventory,
   bindings: LinearProvisionBindings,
   priorActions: ReadonlyMap<string, LinearProvisionAction>,
+  context: LinearProvisionConfirmationContext,
 ): LinearProvisionAction {
   const boundId = bindings.byKey[desired.key];
   if (boundId !== undefined) {
     const matches = inventory.objects.filter((object) => object.id === boundId);
+    const unchanged =
+      matches.length === 1 &&
+      matches[0] !== undefined &&
+      matchesDesired(matches[0], desired, inventory.target, bindings.byKey);
     return Object.freeze({
       key: desired.key,
       kind: desired.kind,
       name: desired.name,
-      state:
-        matches.length === 1 &&
-        matches[0] !== undefined &&
-        matchesDesired(matches[0], desired, inventory.target, bindings.byKey)
-          ? "unchanged"
-          : "conflict",
-      ...(matches.length === 1 &&
-      matches[0] !== undefined &&
-      matchesDesired(matches[0], desired, inventory.target, bindings.byKey)
+      state: unchanged ? "unchanged" : "conflict",
+      ...(unchanged
         ? {}
         : {
             instruction:
               "已綁定的 Linear 物件遺失或內容不符；系統不會刪除、改名或改綁，請人工查明。",
+          }),
+    });
+  }
+
+  const reservation = bindings.reservations[desired.key];
+  if (reservation !== undefined) {
+    const exact = exactSameNameObjects(desired, inventory, bindings);
+    if (exact.length === 1) {
+      return Object.freeze({
+        key: desired.key,
+        kind: desired.kind,
+        name: desired.name,
+        state: "manual_readback",
+        instruction: manualInstruction(desired.kind, true),
+      });
+    }
+    const ownerMayResume =
+      reservation.ownerDigest === context.digest &&
+      reservation.desiredFingerprint === desired.fingerprint &&
+      reservation.phase === "reserved";
+    return Object.freeze({
+      key: desired.key,
+      kind: desired.kind,
+      name: desired.name,
+      state: ownerMayResume ? "create" : "conflict",
+      ...(ownerMayResume
+        ? {}
+        : {
+            instruction:
+              reservation.phase === "mutation_started"
+                ? "前次 mutation outcome 無法確認；不得重送建立。請查明 Linear 物件 ID 後做 manual read-back。"
+                : "另一個本機工作階段已保留此建立操作；本工作階段不會送出 mutation。",
           }),
     });
   }
@@ -210,26 +325,59 @@ function inventoryDigest(inventory: LinearProvisionInventory): string {
   });
 }
 
+function configDigest(desiredObjects: readonly LinearProvisionDesiredObject[]): string {
+  return linearProvisionDigest(
+    desiredObjects.map((desired) => ({
+      key: desired.key,
+      kind: desired.kind,
+      name: desired.name,
+      parentKey: desired.parentKey ?? null,
+      payload: desired.payload,
+      fingerprint: desired.fingerprint,
+    })),
+  );
+}
+
+function snapshotRevision(
+  target: LinearProvisionTarget,
+  inventory: LinearProvisionInventory,
+  bindings: LinearProvisionBindings,
+  desiredConfigDigest: string,
+): string {
+  return linearProvisionDigest({
+    target,
+    desiredConfigDigest,
+    inventoryRevision: inventoryDigest(inventory),
+    bindingRevision: bindings.revision,
+    bindings: bindings.byKey,
+    reservations: bindings.reservations,
+  });
+}
+
 function previewContext(
   target: LinearProvisionTarget,
   inventory: LinearProvisionInventory,
   bindings: LinearProvisionBindings,
+  desiredObjects: readonly LinearProvisionDesiredObject[],
+  context: LinearProvisionConfirmationContext,
+  desiredConfigDigest: string,
 ): PreviewContext {
   const actions: LinearProvisionAction[] = [];
   const priorActions = new Map<string, LinearProvisionAction>();
-  for (const desired of linearProvisionDesiredObjects) {
-    const action = actionFor(desired, inventory, bindings, priorActions);
+  for (const desired of desiredObjects) {
+    const action = actionFor(desired, inventory, bindings, priorActions, context);
     actions.push(action);
     priorActions.set(action.key, action);
   }
-  const expectedRevision = linearProvisionDigest({
-    target,
-    inventory: inventoryDigest(inventory),
-    bindingRevision: bindings.revision,
-    bindings: bindings.byKey,
-  });
+  const expectedRevision = snapshotRevision(target, inventory, bindings, desiredConfigDigest);
   const confirmationToken = linearProvisionDigest({
-    purpose: "agent-team-linear-provision-confirmation-v1",
+    purpose: "agent-team-linear-confirmation-v2",
+    operation: "provision",
+    contextDigest: context.digest,
+    target,
+    desiredConfigDigest,
+    inventoryRevision: inventoryDigest(inventory),
+    bindingRevision: bindings.revision,
     expectedRevision,
     actions,
   });
@@ -275,35 +423,62 @@ function onlyExpectedAddition(
   return afterById.has(createdId);
 }
 
+function withoutReservation(
+  reservations: LinearProvisionBindings["reservations"],
+  key: string,
+): Readonly<Record<string, LinearProvisionReservation>> {
+  return Object.freeze(
+    Object.fromEntries(Object.entries(reservations).filter(([candidate]) => candidate !== key)),
+  );
+}
+
 export class LinearProvisionUseCase {
   readonly #inFlight = new Map<string, Promise<Result<LinearProvisionOutcome, DomainError>>>();
+  readonly #confirmationContext: LinearProvisionConfirmationContext;
+  readonly #desiredObjects: readonly LinearProvisionDesiredObject[];
+  readonly #desiredConfigDigest: string;
 
   constructor(
     readonly target: LinearProvisionTarget,
     readonly remote: LinearProvisionPort,
     readonly bindingStore: LinearProvisionBindingPort,
+    options: LinearProvisionUseCaseOptions = {},
   ) {
-    if (!validTarget(target)) throw new TypeError("Invalid Linear provision target.");
+    const confirmationContext =
+      options.confirmationContext ?? createLinearProvisionConfirmationContext();
+    const desiredObjects = options.desiredObjects ?? linearProvisionDesiredObjects;
+    if (
+      !validTarget(target) ||
+      !digestPattern.test(confirmationContext.digest) ||
+      !validDesiredObjects(desiredObjects)
+    ) {
+      throw new TypeError("Invalid Linear provision composition.");
+    }
+    this.#confirmationContext = Object.freeze({ ...confirmationContext });
+    this.#desiredObjects = Object.freeze([...desiredObjects]);
+    this.#desiredConfigDigest = configDigest(this.#desiredObjects);
   }
 
   async preview(options: ReadOptions = {}): Promise<Result<LinearProvisionPreview, DomainError>> {
     const context = await this.#readContext(options);
-    return context.ok ? ok(context.value.preview) : context;
+    return context.ok ? ok(this.#previewContext(context.value).preview) : context;
   }
 
   provision(
     command: LinearProvisionCommand,
     options: ReadOptions = {},
   ): Promise<Result<LinearProvisionOutcome, DomainError>> {
+    const suppliedOperation: unknown = command.operation;
     const suppliedConfirmation: unknown = command.confirmationText;
     if (
+      suppliedOperation !== "provision" ||
       !digestPattern.test(command.expectedRevision) ||
       !digestPattern.test(command.confirmationToken) ||
-      suppliedConfirmation !== confirmationText
+      suppliedConfirmation !== provisionConfirmationText
     ) {
       return Promise.resolve(failure("conflict"));
     }
-    const operationKey = `${command.expectedRevision}:${command.confirmationToken}`;
+    const operationKey = `provision:${command.expectedRevision}:${command.confirmationToken}`;
     const pending = this.#inFlight.get(operationKey);
     if (pending !== undefined) return pending;
     const operation = this.#provision(command, options).finally(() => {
@@ -313,36 +488,107 @@ export class LinearProvisionUseCase {
     return operation;
   }
 
-  async readBackManual(
-    command: LinearManualReadBackCommand,
+  async previewManualReadBack(
+    request: LinearManualReadBackRequest,
     options: ReadOptions = {},
-  ): Promise<Result<LinearProvisionPreview, DomainError>> {
-    const suppliedConfirmation: unknown = command.confirmationText;
-    if (
-      !idPattern.test(command.remoteId) ||
-      !linearProvisionDesiredObjects.some((item) => item.key === command.logicalKey) ||
-      suppliedConfirmation !== confirmationText
-    ) {
-      return failure("conflict");
-    }
-    const context = await this.#confirmedContext(command, options);
+  ): Promise<Result<LinearManualReadBackPreview, DomainError>> {
+    if (!idPattern.test(request.remoteId)) return failure("conflict");
+    const desired = this.#desiredObjects.find((item) => item.key === request.logicalKey);
+    if (desired === undefined) return failure("conflict");
+    const context = await this.#readContext(options);
     if (!context.ok) return context;
-    if (context.value.bindings.byKey[command.logicalKey] !== undefined) {
-      return failure("conflict");
-    }
-    const desired = linearProvisionDesiredObjects.find((item) => item.key === command.logicalKey);
-    const remote = context.value.inventory.objects.find((object) => object.id === command.remoteId);
+    if (context.value.bindings.byKey[desired.key] !== undefined) return failure("conflict");
+    const remote = context.value.inventory.objects.find((object) => object.id === request.remoteId);
     if (
-      desired === undefined ||
       remote === undefined ||
       !matchesDesired(remote, desired, this.target, context.value.bindings.byKey)
     ) {
       return failure("conflict");
     }
-    const saved = await this.bindingStore.compareAndSwap(
+    const reservation = context.value.bindings.reservations[desired.key];
+    if (reservation !== undefined && reservation.desiredFingerprint !== desired.fingerprint) {
+      return failure("conflict");
+    }
+    const expectedRevision = snapshotRevision(
       this.target,
-      context.value.bindings.revision,
-      Object.freeze({ ...context.value.bindings.byKey, [desired.key]: remote.id }),
+      context.value.inventory,
+      context.value.bindings,
+      this.#desiredConfigDigest,
+    );
+    const confirmationToken = linearProvisionDigest({
+      purpose: "agent-team-linear-confirmation-v2",
+      operation: "manual_readback",
+      contextDigest: this.#confirmationContext.digest,
+      target: this.target,
+      desiredConfigDigest: this.#desiredConfigDigest,
+      inventoryRevision: inventoryDigest(context.value.inventory),
+      bindingRevision: context.value.bindings.revision,
+      expectedRevision,
+      logicalKey: desired.key,
+      desiredFingerprint: desired.fingerprint,
+      remoteIdDigest: linearProvisionDigest(request.remoteId),
+    });
+    return ok(
+      Object.freeze({
+        operation: "manual_readback",
+        state: "ready",
+        logicalKey: desired.key,
+        name: desired.name,
+        expectedRevision,
+        confirmationToken,
+      }),
+    );
+  }
+
+  async readBackManual(
+    command: LinearManualReadBackCommand,
+    options: ReadOptions = {},
+  ): Promise<Result<LinearProvisionPreview, DomainError>> {
+    const suppliedOperation: unknown = command.operation;
+    const suppliedConfirmation: unknown = command.confirmationText;
+    if (
+      suppliedOperation !== "manual_readback" ||
+      suppliedConfirmation !== manualConfirmationText ||
+      !digestPattern.test(command.expectedRevision) ||
+      !digestPattern.test(command.confirmationToken)
+    ) {
+      return failure("conflict");
+    }
+    const preview = await this.previewManualReadBack(command, options);
+    if (
+      !preview.ok ||
+      preview.value.expectedRevision !== command.expectedRevision ||
+      preview.value.confirmationToken !== command.confirmationToken
+    ) {
+      return preview.ok ? failure("conflict") : preview;
+    }
+    const context = await this.#readContext(options);
+    if (!context.ok) return context;
+    const desired = this.#desiredObjects.find((item) => item.key === command.logicalKey);
+    const remote = context.value.inventory.objects.find((object) => object.id === command.remoteId);
+    if (
+      desired === undefined ||
+      remote === undefined ||
+      context.value.bindings.byKey[command.logicalKey] !== undefined ||
+      snapshotRevision(
+        this.target,
+        context.value.inventory,
+        context.value.bindings,
+        this.#desiredConfigDigest,
+      ) !== command.expectedRevision ||
+      !matchesDesired(remote, desired, this.target, context.value.bindings.byKey)
+    ) {
+      return failure("conflict");
+    }
+    const saved = await this.#cas(
+      context.value.bindings,
+      Object.freeze({
+        byKey: Object.freeze({
+          ...context.value.bindings.byKey,
+          [command.logicalKey]: remote.id,
+        }),
+        reservations: withoutReservation(context.value.bindings.reservations, command.logicalKey),
+      }),
       options,
     );
     if (!saved.ok) return saved;
@@ -359,7 +605,7 @@ export class LinearProvisionUseCase {
     command: LinearProvisionCommand,
     options: ReadOptions,
   ): Promise<Result<LinearProvisionOutcome, DomainError>> {
-    const confirmed = await this.#confirmedContext(command, options);
+    const confirmed = await this.#confirmedProvisionContext(command, options);
     if (!confirmed.ok) return confirmed;
     let inventory = confirmed.value.inventory;
     let bindings = confirmed.value.bindings;
@@ -368,10 +614,59 @@ export class LinearProvisionUseCase {
     for (const action of confirmed.value.preview.actions) {
       if (action.state !== "create") continue;
       if (options.signal?.aborted === true) return failure("interrupted");
-      const desired = linearProvisionDesiredObjects.find((item) => item.key === action.key);
+      const desired = this.#desiredObjects.find((item) => item.key === action.key);
       if (desired === undefined || bindings.byKey[desired.key] !== undefined) {
         return failure("conflict");
       }
+
+      let reservation = bindings.reservations[desired.key];
+      if (reservation === undefined) {
+        reservation = Object.freeze({
+          logicalKey: desired.key,
+          operation: "provision",
+          ownerDigest: this.#confirmationContext.digest,
+          desiredFingerprint: desired.fingerprint,
+          phase: "reserved",
+        });
+        const reserved = await this.#cas(
+          bindings,
+          Object.freeze({
+            byKey: bindings.byKey,
+            reservations: Object.freeze({
+              ...bindings.reservations,
+              [desired.key]: reservation,
+            }),
+          }),
+          options,
+        );
+        if (!reserved.ok) return reserved;
+        bindings = reserved.value;
+      } else if (
+        reservation.ownerDigest !== this.#confirmationContext.digest ||
+        reservation.desiredFingerprint !== desired.fingerprint ||
+        reservation.phase !== "reserved"
+      ) {
+        return failure("conflict");
+      }
+
+      const mutationStartedReservation: LinearProvisionReservation = Object.freeze({
+        ...reservation,
+        phase: "mutation_started",
+      });
+      const mutationStarted = await this.#cas(
+        bindings,
+        Object.freeze({
+          byKey: bindings.byKey,
+          reservations: Object.freeze({
+            ...bindings.reservations,
+            [desired.key]: mutationStartedReservation,
+          }),
+        }),
+        options,
+      );
+      if (!mutationStarted.ok) return mutationStarted;
+      bindings = mutationStarted.value;
+
       const justBefore = await this.remote.readInventory(this.target, options);
       if (!justBefore.ok) return justBefore;
       if (
@@ -397,10 +692,12 @@ export class LinearProvisionUseCase {
       ) {
         return failure("external_failure");
       }
-      const saved = await this.bindingStore.compareAndSwap(
-        this.target,
-        bindings.revision,
-        Object.freeze({ ...bindings.byKey, [desired.key]: remote.id }),
+      const saved = await this.#cas(
+        bindings,
+        Object.freeze({
+          byKey: Object.freeze({ ...bindings.byKey, [desired.key]: remote.id }),
+          reservations: withoutReservation(bindings.reservations, desired.key),
+        }),
         options,
       );
       if (!saved.ok) return saved;
@@ -420,19 +717,53 @@ export class LinearProvisionUseCase {
     );
   }
 
-  async #confirmedContext(
+  async #confirmedProvisionContext(
     command: LinearProvisionCommand,
     options: ReadOptions,
   ): Promise<Result<PreviewContext, DomainError>> {
     const context = await this.#readContext(options);
     if (!context.ok) return context;
-    return context.value.preview.expectedRevision === command.expectedRevision &&
-      context.value.preview.confirmationToken === command.confirmationToken
-      ? context
+    const projected = this.#previewContext(context.value);
+    return projected.preview.expectedRevision === command.expectedRevision &&
+      projected.preview.confirmationToken === command.confirmationToken
+      ? ok(projected)
       : failure("conflict");
   }
 
-  async #readContext(options: ReadOptions): Promise<Result<PreviewContext, DomainError>> {
+  async #cas(
+    current: LinearProvisionBindings,
+    next: LinearProvisionBindingMutation,
+    options: ReadOptions,
+  ): Promise<Result<LinearProvisionBindings, DomainError>> {
+    const saved = await this.bindingStore.compareAndSwap(
+      this.target,
+      current.revision,
+      next,
+      options,
+    );
+    if (!saved.ok) return saved;
+    return validBindings(saved.value, this.#desiredObjects) &&
+      revisionAdvanced(current.revision, saved.value.revision) &&
+      linearProvisionDigest({
+        byKey: saved.value.byKey,
+        reservations: saved.value.reservations,
+      }) === linearProvisionDigest(next)
+      ? saved
+      : failure("external_failure");
+  }
+
+  #previewContext(context: ReadContext): PreviewContext {
+    return previewContext(
+      this.target,
+      context.inventory,
+      context.bindings,
+      this.#desiredObjects,
+      this.#confirmationContext,
+      this.#desiredConfigDigest,
+    );
+  }
+
+  async #readContext(options: ReadOptions): Promise<Result<ReadContext, DomainError>> {
     if (options.signal?.aborted === true) return failure("interrupted");
     const [inventory, bindings] = await Promise.all([
       this.remote.readInventory(this.target, options),
@@ -440,9 +771,12 @@ export class LinearProvisionUseCase {
     ]);
     if (!inventory.ok) return inventory;
     if (!bindings.ok) return bindings;
-    if (!validInventory(this.target, inventory.value) || !validBindings(bindings.value)) {
+    if (
+      !validInventory(this.target, inventory.value) ||
+      !validBindings(bindings.value, this.#desiredObjects)
+    ) {
       return failure("external_failure");
     }
-    return ok(previewContext(this.target, inventory.value, bindings.value));
+    return ok(Object.freeze({ inventory: inventory.value, bindings: bindings.value }));
   }
 }

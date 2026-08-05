@@ -4,6 +4,7 @@ import {
   createFixtureLinearProvisionUseCase,
   createRegistrationWizardUiFeatureRegistration,
   createUiApplication,
+  fixtureManualRemoteId,
   fixtureRegistrationReadOnlyScanUseCase,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -105,5 +106,65 @@ describe("O003 Linear provision localhost UI", () => {
 
     expect(response.status).toBe(413);
     expect(await response.text()).toBe("Payload Too Large\n");
+  });
+
+  it("previews and confirms manual ID read-back with an operation-specific one-shot token", async () => {
+    const { handle, cookie, csrf } = await fixture();
+    const endpoint = `${handle.baseUrl}/api/registration/linear-provision`;
+    const headers = {
+      cookie,
+      origin: handle.baseUrl,
+      "content-type": "application/json",
+      "x-csrf-token": csrf,
+    };
+    const logicalKey = "work_status.backlog";
+    const remoteId = fixtureManualRemoteId(logicalKey);
+    const put = (body: unknown) =>
+      fetch(endpoint, { method: "PUT", headers, body: JSON.stringify(body) });
+
+    const rejectedExtra = await put({
+      operation: "preview_manual_readback",
+      logicalKey,
+      remoteId,
+      comment: "Linear 留言已核可",
+    });
+    expect(rejectedExtra.status).toBe(422);
+    expect(await rejectedExtra.text()).not.toContain("Linear 留言已核可");
+
+    const previewResponse = await put({
+      operation: "preview_manual_readback",
+      logicalKey,
+      remoteId,
+    });
+    const preview = (await previewResponse.json()) as Readonly<Record<string, unknown>>;
+    expect(previewResponse.status).toBe(200);
+    expect(preview).toMatchObject({ state: "manual_preview", logicalKey, name: "待辦" });
+    expect(JSON.stringify(preview)).not.toContain(remoteId);
+
+    const crossOperation = await put({
+      operation: "provision",
+      expectedRevision: preview["expectedRevision"],
+      confirmationToken: preview["confirmationToken"],
+      confirmationText: "套用 Linear 設定",
+    });
+    expect(crossOperation.status).toBe(409);
+
+    const command = {
+      operation: "confirm_manual_readback",
+      logicalKey,
+      remoteId,
+      expectedRevision: preview["expectedRevision"],
+      confirmationToken: preview["confirmationToken"],
+      confirmationText: "確認 Linear ID read-back",
+    };
+    const applied = await put(command);
+    const replayed = await put(command);
+    expect(applied.status).toBe(200);
+    expect(await applied.json()).toMatchObject({
+      state: "manual_applied",
+      preview: { summary: { unchanged: 1, create: 27, manual: 5, conflict: 0 } },
+    });
+    expect(replayed.status).toBe(409);
+    expect(await replayed.json()).toEqual({ state: "error", code: "conflict" });
   });
 });

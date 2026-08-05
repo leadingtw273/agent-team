@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import type { ReadOptions } from "../ports/common.js";
 import type { DomainError, Result } from "../../domain/foundation/index.js";
@@ -43,8 +43,25 @@ export interface LinearProvisionInventory {
 }
 
 export interface LinearProvisionBindings {
+  /** Store-owned, monotonically increasing decimal revision. */
   readonly revision: string;
   readonly byKey: Readonly<Record<string, string>>;
+  readonly reservations: Readonly<Record<string, LinearProvisionReservation>>;
+}
+
+export type LinearProvisionReservationPhase = "reserved" | "mutation_started";
+
+export interface LinearProvisionReservation {
+  readonly logicalKey: string;
+  readonly operation: "provision";
+  readonly ownerDigest: string;
+  readonly desiredFingerprint: string;
+  readonly phase: LinearProvisionReservationPhase;
+}
+
+export interface LinearProvisionBindingMutation {
+  readonly byKey: Readonly<Record<string, string>>;
+  readonly reservations: Readonly<Record<string, LinearProvisionReservation>>;
 }
 
 export interface LinearProvisionCreateReceipt {
@@ -72,7 +89,7 @@ export interface LinearProvisionBindingPort {
   readonly compareAndSwap: (
     target: LinearProvisionTarget,
     expectedRevision: string,
-    nextByKey: Readonly<Record<string, string>>,
+    next: LinearProvisionBindingMutation,
     options?: ReadOptions,
   ) => Promise<Result<LinearProvisionBindings, DomainError>>;
 }
@@ -110,14 +127,41 @@ export interface LinearProvisionPreview {
 }
 
 export interface LinearProvisionCommand {
+  readonly operation: "provision";
   readonly expectedRevision: string;
   readonly confirmationToken: string;
   readonly confirmationText: "套用 Linear 設定";
 }
 
-export interface LinearManualReadBackCommand extends LinearProvisionCommand {
+export interface LinearManualReadBackRequest {
   readonly logicalKey: string;
   readonly remoteId: string;
+}
+
+export interface LinearManualReadBackPreview {
+  readonly operation: "manual_readback";
+  readonly state: "ready";
+  readonly logicalKey: string;
+  readonly name: string;
+  readonly expectedRevision: string;
+  readonly confirmationToken: string;
+}
+
+export interface LinearManualReadBackCommand extends LinearManualReadBackRequest {
+  readonly operation: "manual_readback";
+  readonly expectedRevision: string;
+  readonly confirmationToken: string;
+  readonly confirmationText: "確認 Linear ID read-back";
+}
+
+export interface LinearProvisionConfirmationContext {
+  /** One-way digest scoped to one localhost UI/session lifecycle; never the raw session secret. */
+  readonly digest: string;
+}
+
+export interface LinearProvisionUseCaseOptions {
+  readonly confirmationContext?: LinearProvisionConfirmationContext;
+  readonly desiredObjects?: readonly LinearProvisionDesiredObject[];
 }
 
 export interface LinearProvisionOutcome {
@@ -161,6 +205,15 @@ function canonical(value: unknown): string {
 
 export function linearProvisionDigest(value: unknown): string {
   return createHash("sha256").update(canonical(value), "utf8").digest("hex");
+}
+
+export function createLinearProvisionConfirmationContext(
+  entropy: Uint8Array = randomBytes(32),
+): LinearProvisionConfirmationContext {
+  if (entropy.byteLength < 32) throw new TypeError("Linear confirmation entropy is too short.");
+  return Object.freeze({
+    digest: createHash("sha256").update(entropy).digest("hex"),
+  });
 }
 
 function desired(
