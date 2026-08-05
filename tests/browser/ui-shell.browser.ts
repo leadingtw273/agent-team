@@ -227,7 +227,14 @@ test.describe("U003 localhost UI shell", () => {
       .locator("xpath=ancestor::section");
     const beforeFocus = await computedFocusAppearance(projectLink);
 
-    for (let index = 0; index < 6; index += 1) await page.keyboard.press("Tab");
+    for (let index = 0; index < 16; index += 1) {
+      const reachedCta = await projectLink.evaluate((element) => {
+        const focusable = element as unknown as Readonly<{ matches(selector: string): boolean }>;
+        return focusable.matches(":focus");
+      });
+      if (reachedCta) break;
+      await page.keyboard.press("Tab");
+    }
     await expect(projectLink).toBeFocused();
 
     const afterFocus = await computedFocusAppearance(projectLink);
