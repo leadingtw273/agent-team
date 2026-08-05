@@ -71,15 +71,15 @@ describe("O002 concrete local read-only probes", () => {
 
     expect(repositoryProbe).toMatchObject({
       ok: true,
-      value: { state: "passed", provenance: "local_git" },
+      value: { evidenceCode: "local_repository_clean" },
     });
     expect(nodeProbe).toMatchObject({
       ok: true,
-      value: { state: "passed", provenance: "node_runtime" },
+      value: { evidenceCode: "node_runtime_detected", detectedMajor: currentMajor },
     });
     expect(cliProbe).toMatchObject({
       ok: true,
-      value: { state: "passed", provenance: "compiled_cli" },
+      value: { evidenceCode: "compiled_cli_version_verified", version: "0.1.0" },
     });
     expect(JSON.stringify(cliProbe)).toContain("0.1.0");
     expect((await stat(cliPath)).isFile()).toBe(true);
@@ -122,9 +122,18 @@ describe("O002 concrete local read-only probes", () => {
       adapter.compiledCli.inspect(),
     ]);
 
-    expect(repositoryProbe).toMatchObject({ ok: true, value: { state: "unknown" } });
-    expect(nodeProbe).toMatchObject({ ok: true, value: { state: "failed" } });
-    expect(cliProbe).toMatchObject({ ok: true, value: { state: "unknown" } });
+    expect(repositoryProbe).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "local_repository_unconfigured" },
+    });
+    expect(nodeProbe).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "node_runtime_detected", detectedMajor: 23, requiredMajor: 24 },
+    });
+    expect(cliProbe).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "compiled_cli_unconfigured" },
+    });
   });
 
   it("rejects repository roots that are symlinks or non-directories before invoking Git", async () => {

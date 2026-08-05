@@ -5,9 +5,7 @@ import {
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import { containsSensitiveValue } from "../../infrastructure/redaction/index.js";
 import type {
-  RegistrationProbeProvenance,
   RegistrationReadOnlyGateObservation,
   RegistrationReadOnlyScanPorts,
 } from "../ports/registration.js";
@@ -23,12 +21,15 @@ import {
 
 const registrationProbeTimeoutMs = 4_000;
 const probeSettlementGraceMs = 150;
-const maximumEvidenceItems = 4;
-const maximumEvidenceLength = 280;
-const unsafeProbeTextPattern =
-  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|hidden\s+reasoning|chain\s+of\s+thought)/iu;
-const completeCommandPattern =
-  /(?:^|\s)(?:gh|curl|wget|git|systemctl|node|pnpm|npm|npx|yarn|bun|codex|claude|gemini|bash|zsh|sh|rm)\s+\S/u;
+
+export type RegistrationProbeProvenance =
+  | "local_git"
+  | "node_runtime"
+  | "compiled_cli"
+  | "github_read_only"
+  | "linear_read_only"
+  | "ci_read_only"
+  | "webhook_configuration";
 
 const gateProvenance = Object.freeze({
   local_repository: "local_git",
@@ -162,47 +163,181 @@ const gateMetadata: Readonly<Record<RegistrationGateId, RegistrationGateMetadata
   }),
 });
 
-function isRegistrationGateState(value: unknown): value is RegistrationGateState {
-  return value === "passed" || value === "failed" || value === "unknown";
+function safeObservedAt(value: unknown): string | undefined {
+  return typeof value === "string" && parseInstant(value).ok ? value : undefined;
 }
 
-function isProbeProvenance(value: unknown): value is RegistrationProbeProvenance {
+function exactKeys(
+  candidate: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(candidate).sort();
+  const sortedExpected = [...expected].sort();
   return (
-    value === "local_git" ||
-    value === "node_runtime" ||
-    value === "compiled_cli" ||
-    value === "github_read_only" ||
-    value === "linear_read_only" ||
-    value === "ci_read_only" ||
-    value === "webhook_configuration" ||
-    value === "fixture"
+    keys.length === sortedExpected.length &&
+    keys.every((key, index) => key === sortedExpected[index])
   );
 }
 
-function safeEvidence(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.length === 0 || value.length > maximumEvidenceItems) {
-    return undefined;
-  }
-  const unique = new Set<string>();
-  for (const item of value) {
-    if (typeof item !== "string") return undefined;
-    const normalized = item.replace(/\s+/gu, " ").trim();
-    if (
-      normalized.length === 0 ||
-      normalized.length > maximumEvidenceLength ||
-      containsSensitiveValue(normalized) ||
-      unsafeProbeTextPattern.test(normalized) ||
-      completeCommandPattern.test(normalized)
-    ) {
-      return undefined;
-    }
-    unique.add(normalized);
-  }
-  return unique.size === 0 ? undefined : Object.freeze([...unique]);
+function safeNodeMajor(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= 99;
 }
 
-function safeObservedAt(value: unknown): string | undefined {
-  return typeof value === "string" && parseInstant(value).ok ? value : undefined;
+function safeSemver(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 128 &&
+    /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.test(
+      value,
+    )
+  );
+}
+
+interface RegistrationEvidenceSummary {
+  readonly state: RegistrationGateState;
+  readonly evidence: string;
+}
+
+function fixedEvidence(
+  id: RegistrationReadOnlyScanGateId,
+  candidate: Readonly<Record<string, unknown>>,
+): RegistrationEvidenceSummary | undefined {
+  const code = candidate["evidenceCode"];
+  const basicKeys = ["evidenceCode", "observedAt"] as const;
+  switch (id) {
+    case "local_repository":
+      if (!exactKeys(candidate, basicKeys)) return undefined;
+      switch (code) {
+        case "local_repository_unconfigured":
+          return { state: "unknown", evidence: "尚未設定本機 Repository 路徑。" };
+        case "local_repository_clean":
+          return { state: "passed", evidence: "已確認本機 Git Repository；工作樹目前乾淨。" };
+        case "local_repository_dirty":
+          return {
+            state: "passed",
+            evidence: "已確認本機 Git Repository；工作樹目前有未提交變更。",
+          };
+        default:
+          return undefined;
+      }
+    case "node_runtime": {
+      if (!exactKeys(candidate, ["detectedMajor", "evidenceCode", "observedAt", "requiredMajor"])) {
+        return undefined;
+      }
+      const detectedMajor = candidate["detectedMajor"];
+      const requiredMajor = candidate["requiredMajor"];
+      if (
+        code !== "node_runtime_detected" ||
+        !safeNodeMajor(detectedMajor) ||
+        !safeNodeMajor(requiredMajor)
+      ) {
+        return undefined;
+      }
+      return {
+        state: detectedMajor === requiredMajor ? "passed" : "failed",
+        evidence: `已偵測 Node.js ${String(detectedMajor)}.x；專案要求 Node.js ${String(requiredMajor)}.x。`,
+      };
+    }
+    case "agent_cli":
+      if (code === "compiled_cli_unconfigured" && exactKeys(candidate, basicKeys)) {
+        return { state: "unknown", evidence: "尚未設定編譯後 Agent Team CLI 路徑。" };
+      }
+      if (
+        code === "compiled_cli_version_verified" &&
+        exactKeys(candidate, ["evidenceCode", "observedAt", "version"]) &&
+        safeSemver(candidate["version"])
+      ) {
+        return {
+          state: "passed",
+          evidence: `已安全驗證編譯後 CLI 版本；版本 ${candidate["version"]}。`,
+        };
+      }
+      return undefined;
+    case "github_access":
+      if (!exactKeys(candidate, basicKeys)) return undefined;
+      switch (code) {
+        case "github_target_unconfigured":
+          return { state: "unknown", evidence: "尚未設定有效的 GitHub Repository 與預設分支。" };
+        case "github_repository_readable":
+          return { state: "passed", evidence: "已確認 GitHub Repository 可由唯讀介面讀取。" };
+        case "github_repository_unreadable":
+          return {
+            state: "failed",
+            evidence: "GitHub 唯讀檢查顯示目前身分沒有 Repository 讀取權限。",
+          };
+        case "github_default_branch_mismatch":
+          return { state: "failed", evidence: "GitHub 唯讀檢查顯示實際預設分支與設定不一致。" };
+        default:
+          return undefined;
+      }
+    case "linear_access":
+      if (!exactKeys(candidate, basicKeys)) return undefined;
+      switch (code) {
+        case "linear_target_unconfigured":
+          return { state: "unknown", evidence: "尚未設定 Linear Team 與 Project 的唯讀目標。" };
+        case "linear_adapter_unavailable":
+          return { state: "unknown", evidence: "尚未注入 Linear 唯讀介面，因此未發出外部查詢。" };
+        case "linear_context_verified":
+          return {
+            state: "passed",
+            evidence: "已確認指定 Linear Team 與 Project 可由唯讀介面讀取。",
+          };
+        default:
+          return undefined;
+      }
+    case "continuous_integration":
+      if (!exactKeys(candidate, basicKeys)) return undefined;
+      switch (code) {
+        case "ci_target_unconfigured":
+          return {
+            state: "unknown",
+            evidence: "尚未設定有效的 GitHub Repository 與預設分支，無法讀取 CI 摘要。",
+          };
+        case "ci_default_branch_mismatch":
+          return { state: "failed", evidence: "CI 唯讀檢查顯示實際預設分支與設定不一致。" };
+        case "ci_no_active_workflow":
+          return { state: "failed", evidence: "CI 唯讀檢查未找到啟用中的 workflow。" };
+        case "ci_no_completed_run":
+          return { state: "unknown", evidence: "CI 唯讀檢查尚無預設分支的已完成執行紀錄。" };
+        case "ci_run_branch_unverified":
+          return { state: "unknown", evidence: "CI 最近執行摘要無法對應設定的預設分支。" };
+        case "ci_run_succeeded":
+          return {
+            state: "passed",
+            evidence: "已確認啟用中的 workflow，且預設分支最近一次已完成執行成功。",
+          };
+        case "ci_run_conclusion_unknown":
+          return { state: "unknown", evidence: "CI 最近執行尚無可驗證的完成結論。" };
+        case "ci_run_unsuccessful":
+          return { state: "failed", evidence: "CI 預設分支最近一次已完成執行未成功。" };
+        default:
+          return undefined;
+      }
+    case "webhook_runtime":
+      if (!exactKeys(candidate, basicKeys)) return undefined;
+      switch (code) {
+        case "webhook_reader_unavailable":
+          return {
+            state: "unknown",
+            evidence: "尚未設定 Webhook Runtime 設定讀取器，因此未發出網路請求。",
+          };
+        case "webhook_url_unconfigured":
+          return { state: "unknown", evidence: "Webhook Runtime URL 尚未設定。" };
+        case "webhook_url_invalid":
+          return {
+            state: "failed",
+            evidence: "Webhook Runtime URL 格式不符合 HTTPS 與無帳密／Query／Fragment 的安全條件。",
+          };
+        case "webhook_url_format_verified":
+          return {
+            state: "unknown",
+            evidence:
+              "Webhook Runtime URL 格式已確認；O002 未送出 delivery，因此可達性與簽章仍無法確認。",
+          };
+        default:
+          return undefined;
+      }
+  }
 }
 
 function unknownGate(
@@ -227,26 +362,17 @@ function unknownGate(
 function normalizedGate(
   id: RegistrationReadOnlyScanGateId,
   observation: unknown,
-  source: RegistrationScanSource,
 ): RegistrationScanGate {
   if (typeof observation !== "object" || observation === null || Array.isArray(observation)) {
-    return unknownGate(id, "not_scanned", "invalid_evidence", "Probe 回傳格式無法安全驗證。");
+    return unknownGate(id, gateProvenance[id], "invalid_evidence", "Probe 回傳格式無法安全驗證。");
   }
   const candidate = observation as Readonly<Record<string, unknown>>;
-  const evidence = safeEvidence(candidate["evidence"]);
-  const provenance = candidate["provenance"];
   const observedAt = safeObservedAt(candidate["observedAt"]);
-  const expectedProvenance = source === "fixture" ? "fixture" : gateProvenance[id];
-  if (
-    !isRegistrationGateState(candidate["state"]) ||
-    evidence === undefined ||
-    !isProbeProvenance(provenance) ||
-    provenance !== expectedProvenance ||
-    observedAt === undefined
-  ) {
+  const summary = fixedEvidence(id, candidate);
+  if (observedAt === undefined || summary === undefined) {
     return unknownGate(
       id,
-      "not_scanned",
+      gateProvenance[id],
       "invalid_evidence",
       "Probe 證據無法安全顯示，未將此 Gate 視為通過。",
     );
@@ -256,10 +382,10 @@ function normalizedGate(
     id,
     label: metadata.label,
     scope: metadata.scope,
-    state: candidate["state"],
-    evidence,
+    state: summary.state,
+    evidence: Object.freeze([summary.evidence]),
     repair: metadata.repair,
-    provenance,
+    provenance: gateProvenance[id],
     observedAt,
   });
 }
@@ -348,12 +474,11 @@ function invokeProbe(
 async function inspectBounded(
   id: RegistrationReadOnlyScanGateId,
   ports: RegistrationReadOnlyScanPorts,
-  source: RegistrationScanSource,
   timeoutMs: number,
   options: ReadOptions,
 ): Promise<RegistrationScanGate> {
   if (options.signal?.aborted === true) {
-    return unknownGate(id, "not_scanned", "interrupted", errorEvidence("interrupted"));
+    return unknownGate(id, gateProvenance[id], "interrupted", errorEvidence("interrupted"));
   }
   const controller = new AbortController();
   let resolveInterrupted: (() => void) | undefined;
@@ -381,13 +506,13 @@ async function inspectBounded(
     const outcome = await Promise.race([probeOutcome, timedOut, interrupted]);
     if (outcome === "timeout" || outcome === "interrupted") {
       await waitForProbeSettlement(probeOutcome);
-      return unknownGate(id, "not_scanned", outcome, errorEvidence(outcome));
+      return unknownGate(id, gateProvenance[id], outcome, errorEvidence(outcome));
     }
     if (!outcome.ok) {
       const kind = errorKind(outcome.error);
-      return unknownGate(id, "not_scanned", kind, errorEvidence(kind));
+      return unknownGate(id, gateProvenance[id], kind, errorEvidence(kind));
     }
-    return normalizedGate(id, outcome.value, source);
+    return normalizedGate(id, outcome.value);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     options.signal?.removeEventListener("abort", forwardAbort);
@@ -430,7 +555,7 @@ export function createRegistrationReadOnlyScanUseCase(
     scan: async (readOptions: ReadOptions = {}) => {
       const scanned = await Promise.all(
         registrationReadOnlyScanGateIds.map((id) =>
-          inspectBounded(id, options.ports, options.source, timeoutMs, readOptions),
+          inspectBounded(id, options.ports, timeoutMs, readOptions),
         ),
       );
       const scannedById = new Map(scanned.map((gate) => [gate.id, gate]));

@@ -159,9 +159,7 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
     const repositoryRoot = this.#repositoryRoot;
     if (repositoryRoot === undefined || invalidPath(repositoryRoot)) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未設定本機 Repository 路徑。"]),
-        provenance: "local_git",
+        evidenceCode: "local_repository_unconfigured",
         observedAt: at,
       });
     }
@@ -177,11 +175,7 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
     const result = await this.#git.inspectRepository({ rootPath: canonicalRoot }, options);
     if (!result.ok) return result;
     return ok({
-      state: "passed",
-      evidence: Object.freeze([
-        `已確認本機 Git Repository；工作樹目前${result.value.clean ? "乾淨" : "有未提交變更"}。`,
-      ]),
-      provenance: "local_git",
+      evidenceCode: result.value.clean ? "local_repository_clean" : "local_repository_dirty",
       observedAt: at,
     });
   }
@@ -198,11 +192,9 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
     if (!Number.isSafeInteger(major)) return Promise.resolve(err(domainError("external_failure")));
     return Promise.resolve(
       ok({
-        state: major === this.#requiredNodeMajor ? "passed" : "failed",
-        evidence: Object.freeze([
-          `已偵測 Node.js ${String(major)}.x；專案要求 Node.js ${String(this.#requiredNodeMajor)}.x。`,
-        ]),
-        provenance: "node_runtime",
+        evidenceCode: "node_runtime_detected",
+        detectedMajor: major,
+        requiredMajor: this.#requiredNodeMajor,
         observedAt: at,
       }),
     );
@@ -215,9 +207,7 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
     const compiledCliPath = this.#compiledCliPath;
     if (compiledCliPath === undefined || invalidPath(compiledCliPath)) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未設定編譯後 Agent Team CLI 路徑。"]),
-        provenance: "compiled_cli",
+        evidenceCode: "compiled_cli_unconfigured",
         observedAt: at,
       });
     }
@@ -239,9 +229,8 @@ export class LocalRegistrationReadOnlyProbeAdapter implements LocalRegistrationR
       output.value.length <= 128 ? exactCliVersionPattern.exec(output.value)?.[1] : undefined;
     if (version === undefined) return err(domainError("external_failure"));
     return ok({
-      state: "passed",
-      evidence: Object.freeze([`已安全執行編譯後 CLI 的 --version；版本 ${version}。`]),
-      provenance: "compiled_cli",
+      evidenceCode: "compiled_cli_version_verified",
+      version,
       observedAt: at,
     });
   }

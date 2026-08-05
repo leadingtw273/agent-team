@@ -32,19 +32,30 @@ const successfulCiSnapshot = Object.freeze({
 });
 
 function unavailableLocalProbes(): LocalRegistrationReadOnlyProbes {
-  const unknown = (provenance: "local_git" | "node_runtime" | "compiled_cli") =>
-    Promise.resolve(
-      ok({
-        state: "unknown" as const,
-        evidence: Object.freeze(["本機 Probe 未設定；這是整合測試的合成資料。"]),
-        provenance,
-        observedAt: fixedNow(),
-      }),
-    );
   return Object.freeze({
-    localRepository: Object.freeze({ inspect: () => unknown("local_git") }),
-    nodeRuntime: Object.freeze({ inspect: () => unknown("node_runtime") }),
-    compiledCli: Object.freeze({ inspect: () => unknown("compiled_cli") }),
+    localRepository: Object.freeze({
+      inspect: () =>
+        Promise.resolve(
+          ok({ evidenceCode: "local_repository_unconfigured", observedAt: fixedNow() } as const),
+        ),
+    }),
+    nodeRuntime: Object.freeze({
+      inspect: () =>
+        Promise.resolve(
+          ok({
+            evidenceCode: "node_runtime_detected",
+            detectedMajor: 24,
+            requiredMajor: 24,
+            observedAt: fixedNow(),
+          } as const),
+        ),
+    }),
+    compiledCli: Object.freeze({
+      inspect: () =>
+        Promise.resolve(
+          ok({ evidenceCode: "compiled_cli_unconfigured", observedAt: fixedNow() } as const),
+        ),
+    }),
   });
 }
 
@@ -83,9 +94,18 @@ describe("O002 concrete external read-only probes", () => {
     ]);
 
     expect(calls).toEqual([]);
-    expect(githubResult).toMatchObject({ ok: true, value: { state: "unknown" } });
-    expect(ciResult).toMatchObject({ ok: true, value: { state: "unknown" } });
-    expect(linearResult).toMatchObject({ ok: true, value: { state: "unknown" } });
+    expect(githubResult).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "github_target_unconfigured" },
+    });
+    expect(ciResult).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "ci_target_unconfigured" },
+    });
+    expect(linearResult).toMatchObject({
+      ok: true,
+      value: { evidenceCode: "linear_target_unconfigured" },
+    });
   });
 
   it("assembles all seven typed ports while keeping GitHub, Linear, CI, and Webhook observational", async () => {
@@ -189,7 +209,7 @@ describe("O002 concrete external read-only probes", () => {
 
     expect(result).toMatchObject({
       ok: true,
-      value: { state: "failed", provenance: "github_read_only" },
+      value: { evidenceCode: "github_default_branch_mismatch" },
     });
   });
 
@@ -253,17 +273,17 @@ describe("O002 concrete external read-only probes", () => {
     {
       name: "API default branch drift",
       snapshot: { ...successfulCiSnapshot, actualDefaultBranch: "trunk" },
-      expected: "failed",
+      expected: "ci_default_branch_mismatch",
     },
     {
       name: "no active workflow",
       snapshot: { ...successfulCiSnapshot, activeWorkflowCount: 0 },
-      expected: "failed",
+      expected: "ci_no_active_workflow",
     },
     {
       name: "no completed run",
       snapshot: { ...successfulCiSnapshot, latest: null },
-      expected: "unknown",
+      expected: "ci_no_completed_run",
     },
     {
       name: "run belongs to another branch",
@@ -271,7 +291,7 @@ describe("O002 concrete external read-only probes", () => {
         ...successfulCiSnapshot,
         latest: { ...successfulCiSnapshot.latest, headBranch: "feature" },
       },
-      expected: "unknown",
+      expected: "ci_run_branch_unverified",
     },
     {
       name: "completed run failed",
@@ -279,7 +299,7 @@ describe("O002 concrete external read-only probes", () => {
         ...successfulCiSnapshot,
         latest: { ...successfulCiSnapshot.latest, conclusion: "failure" as const },
       },
-      expected: "failed",
+      expected: "ci_run_unsuccessful",
     },
     {
       name: "completed run has no conclusion",
@@ -287,7 +307,7 @@ describe("O002 concrete external read-only probes", () => {
         ...successfulCiSnapshot,
         latest: { ...successfulCiSnapshot.latest, conclusion: null },
       },
-      expected: "unknown",
+      expected: "ci_run_conclusion_unknown",
     },
   ])("does not pass CI for $name", async ({ snapshot, expected }) => {
     const client: GitHubRegistrationReadOnlyClient = Object.freeze({
@@ -303,7 +323,7 @@ describe("O002 concrete external read-only probes", () => {
 
     const result = await adapter.continuousIntegration.inspect();
 
-    expect(result).toMatchObject({ ok: true, value: { state: expected } });
+    expect(result).toMatchObject({ ok: true, value: { evidenceCode: expected } });
   });
 
   it("fails a malformed Webhook configuration without ever sending a delivery", async () => {
@@ -321,7 +341,7 @@ describe("O002 concrete external read-only probes", () => {
     const result = await adapter.inspect();
 
     expect(reads).toBe(1);
-    expect(result).toMatchObject({ ok: true, value: { state: "failed" } });
+    expect(result).toMatchObject({ ok: true, value: { evidenceCode: "webhook_url_invalid" } });
     expect(JSON.stringify(result)).not.toContain("password");
     expect(JSON.stringify(result)).not.toContain("key=value");
   });

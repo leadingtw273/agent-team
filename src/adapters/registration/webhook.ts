@@ -55,9 +55,7 @@ export class WebhookRuntimeConfigurationProbeAdapter implements RegistrationWebh
     const at = observedAt(this.#now);
     if (this.#reader === undefined) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未設定 Webhook Runtime 設定讀取器，因此未發出網路請求。"]),
-        provenance: "webhook_configuration",
+        evidenceCode: "webhook_reader_unavailable",
         observedAt: at,
       });
     }
@@ -66,28 +64,18 @@ export class WebhookRuntimeConfigurationProbeAdapter implements RegistrationWebh
     if (!configured.ok) return configured;
     if (configured.value === null) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["Webhook Runtime URL 尚未設定。"]),
-        provenance: "webhook_configuration",
+        evidenceCode: "webhook_url_unconfigured",
         observedAt: at,
       });
     }
     if (!safeRuntimeBaseUrl(configured.value)) {
       return ok({
-        state: "failed",
-        evidence: Object.freeze([
-          "Webhook Runtime URL 格式不符合 HTTPS 與無帳密／Query／Fragment 的安全條件。",
-        ]),
-        provenance: "webhook_configuration",
+        evidenceCode: "webhook_url_invalid",
         observedAt: at,
       });
     }
     return ok({
-      state: "unknown",
-      evidence: Object.freeze([
-        "Webhook Runtime URL 格式已確認；O002 未送出 delivery，因此可達性與簽章仍無法確認。",
-      ]),
-      provenance: "webhook_configuration",
+      evidenceCode: "webhook_url_format_verified",
       observedAt: at,
     });
   }

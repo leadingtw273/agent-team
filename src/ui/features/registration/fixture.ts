@@ -2,29 +2,10 @@ import {
   createRegistrationReadOnlyScanUseCase,
   type RegistrationReadOnlyScanUseCase,
 } from "../../../application/registration/index.js";
-import type {
-  RegistrationReadOnlyGateObservation,
-  RegistrationReadOnlyScanPorts,
-} from "../../../application/ports/index.js";
+import type { RegistrationReadOnlyScanPorts } from "../../../application/ports/index.js";
 import { ok } from "../../../domain/foundation/index.js";
 
 const observedAt = "2026-08-05T12:00:00.000Z";
-
-function observation(
-  state: RegistrationReadOnlyGateObservation["state"],
-  evidence: string,
-): RegistrationReadOnlyGateObservation {
-  return Object.freeze({
-    state,
-    evidence: Object.freeze([evidence]),
-    provenance: "fixture",
-    observedAt,
-  });
-}
-
-function fixtureProbe(state: RegistrationReadOnlyGateObservation["state"], evidence: string) {
-  return () => Promise.resolve(ok(observation(state, evidence)));
-}
 
 /**
  * Browser and visual tests use only this synthetic port set. It still goes
@@ -32,25 +13,45 @@ function fixtureProbe(state: RegistrationReadOnlyGateObservation["state"], evide
  */
 export const fixtureRegistrationReadOnlyScanPorts: RegistrationReadOnlyScanPorts = Object.freeze({
   localRepository: Object.freeze({
-    inspect: fixtureProbe("passed", "合成資料：本機 Git Repository 已確認，工作樹沒有未提交變更。"),
+    inspect: () =>
+      Promise.resolve(ok({ evidenceCode: "local_repository_clean", observedAt } as const)),
   }),
   nodeRuntime: Object.freeze({
-    inspect: fixtureProbe("passed", "合成資料：已偵測 Node.js 24.x，符合專案要求。"),
+    inspect: () =>
+      Promise.resolve(
+        ok({
+          evidenceCode: "node_runtime_detected",
+          detectedMajor: 24,
+          requiredMajor: 24,
+          observedAt,
+        } as const),
+      ),
   }),
   compiledCli: Object.freeze({
-    inspect: fixtureProbe("passed", "合成資料：編譯後 CLI 的版本摘要可安全讀取。"),
+    inspect: () =>
+      Promise.resolve(
+        ok({
+          evidenceCode: "compiled_cli_version_verified",
+          version: "0.1.0",
+          observedAt,
+        } as const),
+      ),
   }),
   github: Object.freeze({
-    inspect: fixtureProbe("unknown", "合成資料尚未設定 GitHub read-only 目標，因此未發出查詢。"),
+    inspect: () =>
+      Promise.resolve(ok({ evidenceCode: "github_target_unconfigured", observedAt } as const)),
   }),
   linear: Object.freeze({
-    inspect: fixtureProbe("unknown", "合成資料尚未設定 Linear read-only 目標，因此未發出查詢。"),
+    inspect: () =>
+      Promise.resolve(ok({ evidenceCode: "linear_target_unconfigured", observedAt } as const)),
   }),
   continuousIntegration: Object.freeze({
-    inspect: fixtureProbe("failed", "合成資料：CI 摘要未找到可確認的 workflow。"),
+    inspect: () =>
+      Promise.resolve(ok({ evidenceCode: "ci_no_active_workflow", observedAt } as const)),
   }),
   webhookRuntime: Object.freeze({
-    inspect: fixtureProbe("unknown", "合成資料：Webhook Runtime URL 尚未設定。"),
+    inspect: () =>
+      Promise.resolve(ok({ evidenceCode: "webhook_url_unconfigured", observedAt } as const)),
   }),
 });
 

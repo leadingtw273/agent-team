@@ -65,8 +65,6 @@ function provenanceLabel(provenance: unknown): string {
       return "GitHub Actions read-only query";
     case "webhook_configuration":
       return "Webhook Runtime 設定讀取";
-    case "fixture":
-      return "合成示範資料";
     case "not_scanned":
       return "O002 未掃描";
     default:

@@ -58,17 +58,13 @@ export class LinearRegistrationReadOnlyProbeAdapter implements RegistrationLinea
     const at = observedAt(this.#now);
     if (!configuredIdentifier(this.#teamId) || !configuredIdentifier(this.#projectId)) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未設定 Linear Team 與 Project 的 read-only 目標。"]),
-        provenance: "linear_read_only",
+        evidenceCode: "linear_target_unconfigured",
         observedAt: at,
       });
     }
     if (this.#client === undefined) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未注入 Linear read-only adapter，因此未發出外部查詢。"]),
-        provenance: "linear_read_only",
+        evidenceCode: "linear_adapter_unavailable",
         observedAt: at,
       });
     }
@@ -76,9 +72,7 @@ export class LinearRegistrationReadOnlyProbeAdapter implements RegistrationLinea
     const context = await this.#client.readContext(this.#teamId, this.#projectId, options);
     if (!context.ok) return context;
     return ok({
-      state: "passed",
-      evidence: Object.freeze(["已以 Linear read-only query 確認指定 Team 與 Project。"]),
-      provenance: "linear_read_only",
+      evidenceCode: "linear_context_verified",
       observedAt: at,
     });
   }

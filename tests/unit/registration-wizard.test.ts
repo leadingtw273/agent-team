@@ -79,12 +79,13 @@ describe("O002 registration wizard UI", () => {
     expect(html).not.toContain("internal chain of thought");
   });
 
-  it("keeps normal Chinese and Git / Node labels readable while hiding raw commands", () => {
+  it("keeps fixed-model text readable and leaves command exclusion to the typed Application boundary", () => {
     expect(safeRegistrationText("已確認本機 Git Repository；Node.js 24.x 符合要求。")).toBe(
       "已確認本機 Git Repository；Node.js 24.x 符合要求。",
     );
-    expect(safeRegistrationText("git reset --hard")).toBe("已隱藏不安全的原始內容");
-    expect(safeRegistrationText("gh repo view")).toBe("已隱藏不安全的原始內容");
-    expect(safeRegistrationText("codex exec review")).toBe("已隱藏不安全的原始內容");
+    expect(safeRegistrationText("git status")).toBe("git status");
+    expect(safeRegistrationText("Authorization: Bearer secret-value")).toBe(
+      "已隱藏不安全的原始內容",
+    );
   });
 });

@@ -2,6 +2,8 @@ import { z } from "zod";
 
 import type {
   RegistrationContinuousIntegrationReadOnlyProbePort,
+  RegistrationContinuousIntegrationObservation,
+  RegistrationGitHubObservation,
   RegistrationGitHubReadOnlyProbePort,
   ReadOptions,
 } from "../../application/ports/index.js";
@@ -239,9 +241,7 @@ export class GitHubRegistrationReadOnlyProbeAdapter implements GitHubRegistratio
     const at = observedAt(this.#now);
     if (!validRepository(this.#repository) || !validBranch(this.#defaultBranch)) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze(["尚未設定有效的 GitHub Repository 與預設分支。"]),
-        provenance: "github_read_only",
+        evidenceCode: "github_target_unconfigured",
         observedAt: at,
       });
     }
@@ -253,17 +253,12 @@ export class GitHubRegistrationReadOnlyProbeAdapter implements GitHubRegistratio
     );
     if (!read.ok) return read;
     const matchesDefaultBranch = read.value.actualDefaultBranch === this.#defaultBranch;
-    const passed = read.value.readable && matchesDefaultBranch;
+    let evidenceCode: RegistrationGitHubObservation["evidenceCode"];
+    if (!read.value.readable) evidenceCode = "github_repository_unreadable";
+    else if (!matchesDefaultBranch) evidenceCode = "github_default_branch_mismatch";
+    else evidenceCode = "github_repository_readable";
     return ok({
-      state: passed ? "passed" : "failed",
-      evidence: Object.freeze([
-        passed
-          ? "已以 GitHub read-only capability query 確認 Repository 可讀取。"
-          : !read.value.readable
-            ? "GitHub read-only query 已完成，但目前身分沒有 Repository 讀取權限。"
-            : "GitHub read-only query 顯示實際預設分支與設定不一致。",
-      ]),
-      provenance: "github_read_only",
+      evidenceCode,
       observedAt: at,
     });
   }
@@ -274,11 +269,7 @@ export class GitHubRegistrationReadOnlyProbeAdapter implements GitHubRegistratio
     const at = observedAt(this.#now);
     if (!validRepository(this.#repository) || !validBranch(this.#defaultBranch)) {
       return ok({
-        state: "unknown",
-        evidence: Object.freeze([
-          "尚未設定有效的 GitHub Repository 與預設分支，無法讀取 CI 摘要。",
-        ]),
-        provenance: "ci_read_only",
+        evidenceCode: "ci_target_unconfigured",
         observedAt: at,
       });
     }
@@ -290,34 +281,24 @@ export class GitHubRegistrationReadOnlyProbeAdapter implements GitHubRegistratio
     );
     if (!read.ok) return read;
     const snapshot = read.value;
-    let state: "passed" | "failed" | "unknown";
-    let evidence: string;
+    let evidenceCode: RegistrationContinuousIntegrationObservation["evidenceCode"];
     if (snapshot.actualDefaultBranch !== this.#defaultBranch) {
-      state = "failed";
-      evidence = "GitHub Actions read-only query 顯示實際預設分支與設定不一致。";
+      evidenceCode = "ci_default_branch_mismatch";
     } else if (snapshot.activeWorkflowCount === 0) {
-      state = "failed";
-      evidence = "GitHub Actions read-only query 未找到啟用中的 workflow。";
+      evidenceCode = "ci_no_active_workflow";
     } else if (snapshot.latest === null) {
-      state = "unknown";
-      evidence = "GitHub Actions read-only query 尚無預設分支的已完成執行紀錄。";
+      evidenceCode = "ci_no_completed_run";
     } else if (snapshot.latest.headBranch !== this.#defaultBranch) {
-      state = "unknown";
-      evidence = "GitHub Actions 最近執行摘要無法對應設定的預設分支。";
+      evidenceCode = "ci_run_branch_unverified";
     } else if (snapshot.latest.conclusion === "success") {
-      state = "passed";
-      evidence = "已確認啟用中的 workflow，且預設分支最近一次已完成執行成功。";
+      evidenceCode = "ci_run_succeeded";
     } else if (snapshot.latest.conclusion === null) {
-      state = "unknown";
-      evidence = "GitHub Actions 最近執行尚無可驗證的完成結論。";
+      evidenceCode = "ci_run_conclusion_unknown";
     } else {
-      state = "failed";
-      evidence = "GitHub Actions 預設分支最近一次已完成執行未成功。";
+      evidenceCode = "ci_run_unsuccessful";
     }
     return ok({
-      state,
-      evidence: Object.freeze([evidence]),
-      provenance: "ci_read_only",
+      evidenceCode,
       observedAt: at,
     });
   }
