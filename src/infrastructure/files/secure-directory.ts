@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { closeSync, constants, fstatSync, mkdirSync, openSync, type Stats } from "node:fs";
 import { mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 
@@ -35,6 +35,12 @@ export interface SecureDirectoryOpenOptions {
 
 export interface SecureFileReadOptions {
   readonly maxBytes?: number;
+}
+
+interface HeldDirectoryHandle {
+  readonly fd: number;
+  readonly stat: () => Promise<Stats>;
+  readonly close: () => Promise<void>;
 }
 
 function hasCode(error: unknown, code: string): boolean {
@@ -123,14 +129,89 @@ async function openAbsoluteDirectory(
   }
 }
 
+function syncHandle(fd: number): HeldDirectoryHandle {
+  let closed = false;
+  return Object.freeze({
+    fd,
+    stat: () => Promise.resolve(fstatSync(fd)),
+    close: () => {
+      if (!closed) {
+        closeSync(fd);
+        closed = true;
+      }
+      return Promise.resolve();
+    },
+  });
+}
+
+function openAbsoluteDirectorySync(
+  rootPath: string,
+  children: readonly string[],
+  create: boolean,
+): HeldDirectoryHandle {
+  const rootParts = resolve(rootPath)
+    .split(sep)
+    .filter((part) => part.length > 0);
+  let current = openSync(sep, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    for (const [index, part] of rootParts.entries()) {
+      const isPrivateRoot = index === rootParts.length - 1;
+      const path = `/proc/self/fd/${String(current)}/${part}`;
+      if (create && isPrivateRoot) {
+        try {
+          mkdirSync(path, { mode: privateDirectoryMode });
+        } catch (error) {
+          if (!hasCode(error, "EEXIST")) throw error;
+        }
+      }
+      const child = openSync(
+        path,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const info = fstatSync(child);
+      if (!info.isDirectory() || (isPrivateRoot && (info.mode & 0o777) !== privateDirectoryMode)) {
+        closeSync(child);
+        throw Object.assign(new Error("unsafe_private_directory"), { code: "EACCES" });
+      }
+      closeSync(current);
+      current = child;
+    }
+    for (const childName of children) {
+      const path = `/proc/self/fd/${String(current)}/${childName}`;
+      if (create) {
+        try {
+          mkdirSync(path, { mode: privateDirectoryMode });
+        } catch (error) {
+          if (!hasCode(error, "EEXIST")) throw error;
+        }
+      }
+      const child = openSync(
+        path,
+        constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+      );
+      const info = fstatSync(child);
+      if (!info.isDirectory() || (info.mode & 0o777) !== privateDirectoryMode) {
+        closeSync(child);
+        throw Object.assign(new Error("unsafe_private_directory"), { code: "EACCES" });
+      }
+      closeSync(current);
+      current = child;
+    }
+    return syncHandle(current);
+  } catch (error) {
+    closeSync(current);
+    throw error;
+  }
+}
+
 export class HeldSecureDirectory {
-  readonly #handle: FileHandle;
+  readonly #handle: HeldDirectoryHandle;
   readonly #rootPath: string;
   readonly #children: readonly string[];
   readonly identity: SecureDirectoryIdentity;
 
   constructor(
-    handle: FileHandle,
+    handle: HeldDirectoryHandle,
     rootPath: string,
     children: readonly string[],
     identity: SecureDirectoryIdentity,
@@ -139,6 +220,10 @@ export class HeldSecureDirectory {
     this.#rootPath = rootPath;
     this.#children = children;
     this.identity = identity;
+  }
+
+  close(): Promise<void> {
+    return this.#handle.close();
   }
 
   #path(name: string): Result<string, DomainError> {
@@ -205,10 +290,11 @@ export class HeldSecureDirectory {
   async atomicReplace(
     name: string,
     content: Uint8Array,
+    store: AtomicFileStore = new AtomicFileStore(),
   ): Promise<Result<Readonly<{ durability: "confirmed" | "unknown" }>, DomainError>> {
     const path = this.#path(name);
     if (!path.ok) return path;
-    return new AtomicFileStore().write(path.value, Uint8Array.from(content), {
+    return store.write(path.value, Uint8Array.from(content), {
       visibility: "private",
     });
   }
@@ -315,6 +401,33 @@ export class HeldSecureDirectory {
     return isProcessAlive === undefined
       ? reclaimStaleFileLock(path.value, expectedToken)
       : reclaimStaleFileLock(path.value, expectedToken, isProcessAlive);
+  }
+}
+
+export function openHeldSecureDirectory(
+  rootPath: string,
+  children: readonly string[],
+  options: SecureDirectoryOpenOptions,
+): Result<HeldSecureDirectory, DomainError> {
+  if (
+    process.platform !== "linux" ||
+    !isAbsolute(rootPath) ||
+    children.some((child) => !validEntryName(child))
+  ) {
+    return err(domainError(process.platform === "linux" ? "invariant_violation" : "unavailable"));
+  }
+  try {
+    const root = resolve(rootPath);
+    const handle = openAbsoluteDirectorySync(root, children, options.create === true);
+    const info = fstatSync(handle.fd);
+    return ok(
+      new HeldSecureDirectory(handle, root, [...children], {
+        device: info.dev,
+        inode: info.ino,
+      }),
+    );
+  } catch (error) {
+    return err(fileError(error));
   }
 }
 

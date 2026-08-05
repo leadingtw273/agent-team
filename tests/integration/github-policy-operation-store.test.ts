@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +22,11 @@ import {
   type GitHubRegistrationPolicyPort,
 } from "../../src/application/registration/index.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import {
+  acquireFileLock,
+  AtomicFileStore,
+  type AtomicWriteOptions,
+} from "../../src/infrastructure/files/index.js";
 
 const temporaryDirectories: string[] = [];
 const operationId = "a".repeat(64);
@@ -77,6 +92,24 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+class AbaReplacingWriter extends AtomicFileStore {
+  readonly #root: string;
+  replacement: Awaited<ReturnType<typeof acquireFileLock>> | undefined;
+
+  constructor(root: string) {
+    super();
+    this.#root = root;
+  }
+
+  override async write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    const canonical = join(this.#root, `${operationId}.lock`);
+    await rename(canonical, join(this.#root, `${operationId}.lock.displaced`));
+    this.replacement = await acquireFileLock(canonical, "replacement-owner");
+    if (!this.replacement.ok) throw new Error(this.replacement.error.code);
+    return super.write(targetPath, content, options);
+  }
+}
+
 afterEach(async () => {
   await Promise.all(
     temporaryDirectories.splice(0).map((value) => rm(value, { recursive: true, force: true })),
@@ -120,7 +153,7 @@ describe("O004 file GitHub policy operation store", () => {
     expect(await exists(join(targetParent, "journal", `${operationId}.json`))).toBe(false);
   });
 
-  it("holds the constructor directory inode across a pathname replacement", async () => {
+  it("fails closed when the constructor directory pathname is replaced", async () => {
     const base = await directory();
     const root = join(base, "journal");
     const heldOriginal = join(base, "journal-original");
@@ -135,8 +168,8 @@ describe("O004 file GitHub policy operation store", () => {
       next: initial,
     });
 
-    expect(result.ok).toBe(true);
-    expect(await exists(join(heldOriginal, `${operationId}.json`))).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(await exists(join(heldOriginal, `${operationId}.json`))).toBe(false);
     expect(await exists(join(root, `${operationId}.json`))).toBe(false);
     expect(await exists(join(root, `${operationId}.lock`))).toBe(false);
   });
@@ -165,6 +198,33 @@ describe("O004 file GitHub policy operation store", () => {
     ).toBe(false);
     expect(await readFile(outsideJournal, "utf8")).toBe("outside\n");
     expect(await readFile(outsideLock, "utf8")).toBe("outside\n");
+  });
+
+  it("fails the CAS without unlinking a replacement lock owner during release ABA", async () => {
+    const root = await directory();
+    const writer = new AbaReplacingWriter(root);
+    const store = new FileGitHubPolicyOperationStore(root, writer);
+
+    const result = await store.compareAndSwap({
+      operationId,
+      expectedRevision: null,
+      next: initial,
+    });
+
+    expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    const entries = await readdir(root);
+    const quarantined = entries.find((entry) => entry.includes(".release-"));
+    if (quarantined === undefined) throw new Error("replacement lock quarantine missing");
+    expect(
+      JSON.parse(await readFile(join(root, `${operationId}.lock.displaced`), "utf8")),
+    ).toMatchObject({ holderId: `github-policy-operation:${String(process.pid)}` });
+    expect(JSON.parse(await readFile(join(root, quarantined), "utf8"))).toMatchObject({
+      holderId: "replacement-owner",
+    });
+    if (writer.replacement?.ok) {
+      expect(await writer.replacement.value.release()).toMatchObject({ ok: false });
+    }
+    await store.close();
   });
 
   it("persists a strict private schema with store-owned monotonic revisions", async () => {

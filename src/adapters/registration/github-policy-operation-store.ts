@@ -1,4 +1,4 @@
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -15,10 +15,9 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import {
-  acquireFileLock,
   AtomicFileStore,
-  readJsonWithSchema,
-  writeJsonWithSchema,
+  openHeldSecureDirectory,
+  type HeldSecureDirectory,
 } from "../../infrastructure/files/index.js";
 
 const operationIdPattern = /^[a-f0-9]{64}$/u;
@@ -44,6 +43,10 @@ function fileName(operationId: string): string {
   return `${operationId}.json`;
 }
 
+function lockName(operationId: string): string {
+  return `${operationId}.lock`;
+}
+
 function snapshot(
   operationId: string,
   revision: number,
@@ -63,32 +66,75 @@ function snapshot(
   });
 }
 
+async function readHeld(
+  directory: HeldSecureDirectory,
+  operationId: string,
+): Promise<Result<GitHubPolicyOperationSnapshot | undefined, DomainError>> {
+  const content = await directory.readFile(fileName(operationId), { maxBytes: 1024 * 1024 });
+  if (!content.ok) return content.error.code === "not_found" ? ok(undefined) : content;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(content.value).toString("utf8"));
+    const parsed = operationSnapshotSchema.safeParse(value);
+    return parsed.success ? ok(parsed.data) : err(domainError("invariant_violation"));
+  } catch {
+    return err(domainError("invariant_violation"));
+  }
+}
+
+function serialize(value: GitHubPolicyOperationSnapshot): Result<Uint8Array, DomainError> {
+  const parsed = operationSnapshotSchema.safeParse(value);
+  if (!parsed.success) return err(domainError("invariant_violation"));
+  return ok(Buffer.from(`${JSON.stringify(parsed.data, null, 2)}\n`, "utf8"));
+}
+
 /**
- * Private, file-backed operation journal. Each CAS is serialized by an O_EXCL
- * lock and committed through fsync + atomic rename + authoritative read-back.
+ * Private, file-backed operation journal. The constructor holds the exact
+ * Linux directory inode; every lock, read, write, read-back, and CAS stays
+ * relative to that descriptor and fails closed if its pathname is replaced.
  */
 export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStore {
-  readonly #directory: string;
+  readonly #directory: Result<HeldSecureDirectory, DomainError>;
   readonly #files: AtomicFileStore;
 
   constructor(directory: string, files = new AtomicFileStore()) {
-    if (!isAbsolute(directory)) throw new TypeError("GitHub operation directory must be absolute.");
-    this.#directory = resolve(directory);
     this.#files = files;
+    this.#directory =
+      isAbsolute(directory) && process.platform === "linux"
+        ? openHeldSecureDirectory(resolve(directory), [], { create: true })
+        : err(domainError(process.platform === "linux" ? "invariant_violation" : "unavailable"));
   }
 
-  async read(
+  async close(): Promise<void> {
+    if (this.#directory.ok) await this.#directory.value.close();
+  }
+
+  async #run<Value>(
+    action: (directory: HeldSecureDirectory) => Promise<Result<Value, DomainError>>,
+  ): Promise<Result<Value, DomainError>> {
+    if (!this.#directory.ok) return this.#directory;
+    const held = this.#directory.value;
+    const before = await held.verifyIdentity();
+    if (!before.ok) return before;
+    const pathBefore = await held.verifyPathIdentity();
+    if (!pathBefore.ok) return pathBefore;
+    const outcome = await action(held);
+    const after = await held.verifyIdentity();
+    if (!after.ok && outcome.ok) return after;
+    const pathAfter = await held.verifyPathIdentity();
+    if (!pathAfter.ok && outcome.ok) return pathAfter;
+    return outcome;
+  }
+
+  read(
     operationId: string,
   ): Promise<Result<GitHubPolicyOperationSnapshot | undefined, DomainError>> {
-    if (!operationIdPattern.test(operationId)) return err(domainError("invariant_violation"));
-    const result = await readJsonWithSchema(
-      join(this.#directory, fileName(operationId)),
-      operationSnapshotSchema,
-    );
-    return !result.ok && result.error.code === "not_found" ? ok(undefined) : result;
+    if (!operationIdPattern.test(operationId)) {
+      return Promise.resolve(err(domainError("invariant_violation")));
+    }
+    return this.#run((directory) => readHeld(directory, operationId));
   }
 
-  async compareAndSwap(
+  compareAndSwap(
     command: Readonly<{
       operationId: string;
       expectedRevision: number | null;
@@ -100,45 +146,53 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
       (command.expectedRevision !== null &&
         (!Number.isSafeInteger(command.expectedRevision) || command.expectedRevision <= 0))
     ) {
-      return err(domainError("invariant_violation"));
+      return Promise.resolve(err(domainError("invariant_violation")));
     }
-    const lock = await acquireFileLock(
-      join(this.#directory, `${command.operationId}.lock`),
-      `github-policy-operation:${String(process.pid)}`,
-    );
-    if (!lock.ok) return lock;
-    let outcome: Result<GitHubPolicyOperationSnapshot, DomainError>;
-    try {
-      const current = await this.read(command.operationId);
-      if (!current.ok) {
-        outcome = current;
-      } else if ((current.value?.revision ?? null) !== command.expectedRevision) {
-        outcome = err(domainError("conflict"));
-      } else {
-        const next = snapshot(
-          command.operationId,
-          (current.value?.revision ?? 0) + 1,
-          command.next,
-        );
-        const written = await writeJsonWithSchema(
-          this.#files,
-          join(this.#directory, fileName(command.operationId)),
-          operationSnapshotSchema,
-          next,
-          { visibility: "private" },
-        );
-        outcome =
-          written.ok &&
-          written.value.durability === "confirmed" &&
-          written.value.readBack.ok &&
-          written.value.readBack.value.revision === next.revision
-            ? ok(written.value.readBack.value)
-            : err(domainError("external_failure"));
+    return this.#run(async (directory) => {
+      const lock = await directory.acquireLock(
+        lockName(command.operationId),
+        `github-policy-operation:${String(process.pid)}`,
+      );
+      if (!lock.ok) return lock;
+      let outcome: Result<GitHubPolicyOperationSnapshot, DomainError> = err(
+        domainError("external_failure"),
+      );
+      try {
+        const current = await readHeld(directory, command.operationId);
+        if (!current.ok) {
+          outcome = current;
+        } else if ((current.value?.revision ?? null) !== command.expectedRevision) {
+          outcome = err(domainError("conflict"));
+        } else {
+          const next = snapshot(
+            command.operationId,
+            (current.value?.revision ?? 0) + 1,
+            command.next,
+          );
+          const content = serialize(next);
+          if (!content.ok) {
+            outcome = content;
+          } else {
+            const written = await directory.atomicReplace(
+              fileName(command.operationId),
+              content.value,
+              this.#files,
+            );
+            const readBack = written.ok ? await readHeld(directory, command.operationId) : written;
+            outcome =
+              written.ok &&
+              written.value.durability === "confirmed" &&
+              readBack.ok &&
+              readBack.value?.revision === next.revision
+                ? ok(readBack.value)
+                : err(domainError("external_failure"));
+          }
+        }
+      } finally {
+        const released = await lock.value.release();
+        if (!released.ok) outcome = err(domainError("external_failure"));
       }
-    } finally {
-      const released = await lock.value.release();
-      if (!released.ok) outcome = err(domainError("external_failure"));
-    }
-    return outcome;
+      return outcome;
+    });
   }
 }
