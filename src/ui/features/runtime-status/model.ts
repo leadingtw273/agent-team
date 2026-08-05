@@ -143,8 +143,8 @@ const runtimeSummaryPlaceholder = "已隱藏不安全的原始內容";
 const runtimeLabelPlaceholder = "未提供安全摘要";
 const runtimeIdentifierPlaceholder = "已隱藏不安全的識別資訊";
 const runtimeTimestampPlaceholder = "未提供安全時間";
-const rawCommandNames = new Set(["curl", "wget", "rm", "bash", "zsh", "sh", "node", "pnpm", "git"]);
-const prohibitedReasoningPhrases = ["hidden reasoning", "chain of thought"] as const;
+const unsafeRuntimeSummaryPattern =
+  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|(?:^|\s)(?:curl|wget|rm|bash|zsh|sh|node|pnpm|git)\b|hidden\s+reasoning|chain\s+of\s+thought)/iu;
 
 function normalizedRuntimeText(value: unknown, maximumLength: number): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -157,12 +157,7 @@ function normalizedRuntimeText(value: unknown, maximumLength: number): string | 
 }
 
 function containsProhibitedRuntimeSummary(value: string): boolean {
-  const lower = value.toLocaleLowerCase("en-US");
-  const firstWord = lower.split(" ", 1)[0];
-  return (
-    prohibitedReasoningPhrases.some((phrase) => lower.includes(phrase)) ||
-    (firstWord !== undefined && rawCommandNames.has(firstWord))
-  );
+  return unsafeRuntimeSummaryPattern.test(value);
 }
 
 /**

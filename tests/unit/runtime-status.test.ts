@@ -61,6 +61,9 @@ describe("runtime status read model", () => {
     const credentialUrl = "https://user-name:password-value@example.test/runtime";
     const nestedProviderSummary = `巢狀阻塞摘要：${providerToken}`;
     const longSummary = `摘要：${"可讀狀態".repeat(80)}`;
+    const bareBearer = "Bearer opaque-value";
+    const privateKeyMarker = "-----BEGIN PRIVATE KEY----- private-material";
+    const embeddedCommand = "診斷摘要 git reset --hard";
 
     for (const value of [
       providerToken,
@@ -70,6 +73,9 @@ describe("runtime status read model", () => {
       nestedProviderSummary,
       longSummary,
       "git reset --hard",
+      bareBearer,
+      privateKeyMarker,
+      embeddedCommand,
     ]) {
       expect(safeRuntimeSummary(value)).toBe("已隱藏不安全的原始內容");
     }
