@@ -372,7 +372,7 @@ describe("O004 GitHub registration policy", () => {
     const first = policy(port, operationStore);
     expect(await first.apply(await readyCommand(first))).toMatchObject({
       state: "blocked",
-      reason: "provider_unavailable",
+      reason: "mutation_outcome_unknown",
     });
 
     const restarted = policy(port, operationStore);
@@ -390,6 +390,65 @@ describe("O004 GitHub registration policy", () => {
     ).toMatchObject({ state: "configured", changed: true });
     expect(postCount).toBe(1);
     expect(patchCount).toBe(1);
+  });
+
+  it("never repeats auto-merge after an attempted PATCH remains false across restart", async () => {
+    const operationStore = createInMemoryGitHubPolicyOperationStore();
+    let current = inventory();
+    let patchCount = 0;
+    const port: GitHubRegistrationPolicyPort = {
+      inspect: () => Promise.resolve(ok(current)),
+      createManagedRuleset: () => {
+        current = inventory({
+          revision: "b".repeat(64),
+          managedRulesetExact: true,
+          managedRulesetId: "99",
+        });
+        return Promise.resolve(ok({ rulesetId: "99" }));
+      },
+      enableAutoMerge: () => {
+        patchCount += 1;
+        return Promise.resolve(err(domainError("timeout")));
+      },
+    };
+    const first = policy(port, operationStore);
+    const command = await readyCommand(first);
+    expect(await first.apply(command)).toMatchObject({
+      state: "blocked",
+      reason: "mutation_outcome_unknown",
+    });
+
+    const restarted = policy(port, operationStore);
+    expect(await restarted.preview(target)).toMatchObject({
+      state: "blocked",
+      reason: "mutation_outcome_unknown",
+    });
+    expect(await restarted.apply(command)).toMatchObject({
+      state: "blocked",
+      reason: "mutation_outcome_unknown",
+    });
+    expect(patchCount).toBe(1);
+  });
+
+  it("never enters provider mutation after a journal publication has an unknown outcome", async () => {
+    const delegate = createInMemoryGitHubPolicyOperationStore();
+    const unknownPublication: GitHubPolicyOperationStore = {
+      read: (operationId) => delegate.read(operationId),
+      compareAndSwap: async (change) => {
+        const stored = await delegate.compareAndSwap(change);
+        return change.next.phase === "reserved" && stored.ok
+          ? err(domainError("external_failure"))
+          : stored;
+      },
+    };
+    const port = fakePort(inventory());
+    const useCase = policy(port, unknownPublication);
+
+    expect(await useCase.apply(await readyCommand(useCase))).toMatchObject({
+      state: "blocked",
+      reason: "inventory_changed",
+    });
+    expect(port.calls).toEqual([]);
   });
 
   it("maps provider failures without exposing external text", async () => {

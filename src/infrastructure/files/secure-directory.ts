@@ -130,7 +130,10 @@ async function readPermanentLockRecord(
   }
 }
 
-async function acquireKernelLock(fd: number): Promise<Result<void, DomainError>> {
+export async function acquireKernelFileLock(
+  fd: number,
+  flockBinary = "/usr/bin/flock",
+): Promise<Result<void, DomainError>> {
   return new Promise((resolveResult) => {
     let settled = false;
     const settle = (result: Result<void, DomainError>): void => {
@@ -139,7 +142,7 @@ async function acquireKernelLock(fd: number): Promise<Result<void, DomainError>>
       resolveResult(result);
     };
     try {
-      const child = spawn("/usr/bin/flock", ["-E", "75", "-n", "3"], {
+      const child = spawn(flockBinary, ["-E", "75", "-n", "3"], {
         stdio: ["ignore", "ignore", "ignore", fd],
       });
       child.once("error", () => {
@@ -430,7 +433,7 @@ export class HeldSecureDirectory {
         await closeQuietly(ownedHandle);
         return record;
       }
-      const kernelLock = await acquireKernelLock(ownedHandle.fd);
+      const kernelLock = await acquireKernelFileLock(ownedHandle.fd);
       if (!kernelLock.ok) {
         await closeQuietly(ownedHandle);
         return kernelLock;

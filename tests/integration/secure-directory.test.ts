@@ -3,6 +3,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   rename,
   rm,
@@ -15,7 +16,10 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { withSecureDirectory } from "../../src/infrastructure/files/index.js";
+import {
+  acquireKernelFileLock,
+  withSecureDirectory,
+} from "../../src/infrastructure/files/index.js";
 import { ok } from "../../src/domain/foundation/index.js";
 
 const roots: string[] = [];
@@ -31,6 +35,22 @@ afterEach(async () => {
 });
 
 describe("Linux held secure directory", () => {
+  it.each([
+    ["unavailable", "/definitely-missing/o004-flock"],
+    ["unexpected nonbusy exit", "/usr/bin/false"],
+  ] as const)("fails closed when the flock binary is %s", async (_kind, binary) => {
+    const parent = await container();
+    const handle = await open(join(parent, "probe.lock"), "a+", 0o600);
+    try {
+      expect(await acquireKernelFileLock(handle.fd, binary)).toMatchObject({
+        ok: false,
+        error: { code: "external_failure" },
+      });
+    } finally {
+      await handle.close();
+    }
+  });
+
   it("creates only 0700 directories and atomically replaces only 0600 regular files", async () => {
     const parent = await container();
     const root = join(parent, "state");

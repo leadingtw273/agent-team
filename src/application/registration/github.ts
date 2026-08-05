@@ -120,6 +120,7 @@ export type GitHubRegistrationBlockReason =
   | "confirmation_invalid"
   | "inventory_changed"
   | "managed_ruleset_collision"
+  | "mutation_outcome_unknown"
   | "operation_recovery_required"
   | "permission_required"
   | "provider_unavailable"
@@ -450,7 +451,20 @@ export function createGitHubRegistrationPolicy(
       return blocked("operation_recovery_required");
     }
     const result = await options.port.inspect(target, readOptions);
-    if (!result.ok) return blocked(blockReason(result.error));
+    if (!result.ok) {
+      return blocked(
+        operation.value?.phase === "verification_pending" && operation.value.autoMergeAttempted
+          ? "mutation_outcome_unknown"
+          : blockReason(result.error),
+      );
+    }
+    if (
+      operation.value?.phase === "verification_pending" &&
+      operation.value.autoMergeAttempted &&
+      !result.value.autoMergeEnabled
+    ) {
+      return blocked("mutation_outcome_unknown");
+    }
     const policyFailure = policyBlock(result.value);
     const changes = changesFor(result.value);
     if (policyFailure !== undefined) return blocked(policyFailure, changes);
@@ -527,12 +541,25 @@ export function createGitHubRegistrationPolicy(
     ) {
       return blockedApply("operation_recovery_required");
     }
+    const readOptions = command.signal === undefined ? {} : { signal: command.signal };
+    const current = await options.port.inspect(target, readOptions);
+    if (!current.ok) {
+      return blockedApply(
+        stored.value?.phase === "verification_pending" && stored.value.autoMergeAttempted
+          ? "mutation_outcome_unknown"
+          : blockReason(current.error),
+      );
+    }
+    if (
+      stored.value?.phase === "verification_pending" &&
+      stored.value.autoMergeAttempted &&
+      !current.value.autoMergeEnabled
+    ) {
+      return blockedApply("mutation_outcome_unknown");
+    }
     if ((stored.value?.revision ?? 0) !== payload.storeRevision) {
       return blockedApply("inventory_changed");
     }
-    const readOptions = command.signal === undefined ? {} : { signal: command.signal };
-    const current = await options.port.inspect(target, readOptions);
-    if (!current.ok) return blockedApply(blockReason(current.error));
     const policyFailure = policyBlock(current.value);
     if (policyFailure !== undefined) return blockedApply(policyFailure);
     if (current.value.revision !== payload.inventoryRevision) {
@@ -561,6 +588,9 @@ export function createGitHubRegistrationPolicy(
         return blockedApply("read_back_incomplete");
       }
       if (!observed.autoMergeEnabled) {
+        if (journal.autoMergeAttempted) {
+          return blockedApply("mutation_outcome_unknown");
+        }
         const attempting = await store.compareAndSwap({
           operationId: id,
           expectedRevision: journal.revision,
@@ -576,7 +606,7 @@ export function createGitHubRegistrationPolicy(
           idempotencyKey: `github-policy-operation:${id}:auto-merge`,
           ...readOptions,
         });
-        if (!enabled.ok) return blockedApply(blockReason(enabled.error));
+        if (!enabled.ok) return blockedApply("mutation_outcome_unknown");
       }
       const readBack = await options.port.inspect(target, readOptions);
       if (!readBack.ok) return blockedApply(blockReason(readBack.error));

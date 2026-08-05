@@ -206,14 +206,24 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
         lockManifestName(operationId),
         content,
         this.#files,
+        {
+          commitGuard: async () => {
+            const owned = await lock.assertOwnership();
+            if (!owned.ok) return owned;
+            const existing = await readLockManifest(directory, operationId);
+            return existing.ok && existing.value === undefined
+              ? ok(undefined)
+              : err(domainError("conflict"));
+          },
+        },
       );
-      if (!written.ok || written.value.durability !== "confirmed") {
+      if (!written.ok) return written;
+      observed = await readLockManifest(directory, operationId);
+      if (!observed.ok || observed.value === undefined) {
         return err(domainError("external_failure"));
       }
       const ownershipAfterWrite = await lock.assertOwnership();
-      if (!ownershipAfterWrite.ok) return ownershipAfterWrite;
-      observed = await readLockManifest(directory, operationId);
-      if (!observed.ok || observed.value === undefined) {
+      if (written.value.durability !== "confirmed" || !ownershipAfterWrite.ok) {
         return err(domainError("external_failure"));
       }
     }
@@ -222,6 +232,23 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
     return sameLockManifest(observed.value, expected)
       ? ok(undefined)
       : err(domainError("conflict"));
+  }
+
+  async #assertLockBinding(
+    directory: HeldSecureDirectory,
+    operationId: string,
+    lock: SecureFileLockHandle,
+  ): Promise<Result<void, DomainError>> {
+    const ownedBefore = await lock.assertOwnership();
+    if (!ownedBefore.ok) return ownedBefore;
+    const observed = await readLockManifest(directory, operationId);
+    if (!observed.ok || observed.value === undefined) {
+      return observed.ok ? err(domainError("conflict")) : observed;
+    }
+    if (!sameLockManifest(observed.value, lockManifest(operationId, lock.identity))) {
+      return err(domainError("conflict"));
+    }
+    return lock.assertOwnership();
   }
 
   async #withOperationLock<Value>(
@@ -299,18 +326,26 @@ export class FileGitHubPolicyOperationStore implements GitHubPolicyOperationStor
           fileName(command.operationId),
           content.value,
           this.#files,
+          {
+            commitGuard: () => this.#assertLockBinding(directory, command.operationId, lock),
+          },
         );
-        if (!written.ok || written.value.durability !== "confirmed") {
+        if (!written.ok) return written;
+        const readBack = await readHeld(directory, command.operationId);
+        const ownershipAfterReadBack = await this.#assertLockBinding(
+          directory,
+          command.operationId,
+          lock,
+        );
+        if (
+          written.value.durability !== "confirmed" ||
+          !ownershipAfterReadBack.ok ||
+          !readBack.ok ||
+          readBack.value?.revision !== next.revision
+        ) {
           return err(domainError("external_failure"));
         }
-        const ownershipAfterWrite = await lock.assertOwnership();
-        if (!ownershipAfterWrite.ok) return ownershipAfterWrite;
-        const readBack = await readHeld(directory, command.operationId);
-        const ownershipAfterReadBack = await lock.assertOwnership();
-        if (!ownershipAfterReadBack.ok) return ownershipAfterReadBack;
-        return readBack.ok && readBack.value?.revision === next.revision
-          ? ok(readBack.value)
-          : err(domainError("external_failure"));
+        return ok(readBack.value);
       }),
     );
   }

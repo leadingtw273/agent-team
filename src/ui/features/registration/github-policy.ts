@@ -62,6 +62,7 @@ const blockLabels = Object.freeze({
   confirmation_invalid: "確認資料無效，請重新預覽後再確認。",
   inventory_changed: "GitHub 設定已改變，請重新預覽差異。",
   managed_ruleset_collision: "保留名稱已被其他規則占用；系統不會接管或覆寫。",
+  mutation_outcome_unknown: "Auto-merge 變更結果不明；系統不會自動重試，請先確認 GitHub 現況。",
   operation_recovery_required: "GitHub 變更結果尚未安全確認；請人工復原後再繼續設定。",
   permission_required: "目前 GitHub 身分缺少管理權限，設定維持未完成。",
   provider_unavailable: "目前無法安全讀取 GitHub 設定，設定維持未完成。",

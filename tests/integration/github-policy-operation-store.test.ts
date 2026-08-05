@@ -109,12 +109,72 @@ class AbaReplacingWriter extends AtomicFileStore {
     const replacement = await opened.value.acquireLock(`${operationId}.lock`, "replacement-owner");
     if (!replacement.ok) return replacement;
     this.replacement = replacement.value;
-    return err(domainError("external_failure"));
+    return super.write(targetPath, content, options);
   }
 
   async close(): Promise<void> {
     if (this.replacement !== undefined) await this.replacement.release();
     if (this.replacementDirectory !== undefined) await this.replacementDirectory.close();
+  }
+}
+
+class UnknownDurabilityWriter extends AtomicFileStore {
+  override async write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    const written = await super.write(targetPath, content, options);
+    return written.ok && targetPath.endsWith(`/${operationId}.json`)
+      ? ok(Object.freeze({ durability: "unknown" as const }))
+      : written;
+  }
+}
+
+class AfterCommitReplacingWriter extends AtomicFileStore {
+  readonly #root: string;
+  replacement: SecureFileLockHandle | undefined;
+  replacementDirectory: HeldSecureDirectory | undefined;
+
+  constructor(root: string) {
+    super();
+    this.#root = root;
+  }
+
+  override async write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    const written = await super.write(targetPath, content, options);
+    if (!written.ok || !targetPath.endsWith(`/${operationId}.json`)) return written;
+    const canonical = join(this.#root, `${operationId}.lock`);
+    await rename(canonical, join(this.#root, `${operationId}.lock.displaced`));
+    const opened = openHeldSecureDirectory(this.#root, [], { create: false });
+    if (!opened.ok) return opened;
+    this.replacementDirectory = opened.value;
+    const replacement = await opened.value.acquireLock(`${operationId}.lock`, "replacement-owner");
+    if (!replacement.ok) return replacement;
+    this.replacement = replacement.value;
+    return written;
+  }
+
+  async close(): Promise<void> {
+    if (this.replacement !== undefined) await this.replacement.release();
+    if (this.replacementDirectory !== undefined) await this.replacementDirectory.close();
+  }
+}
+
+class TransientRestoringWriter extends AtomicFileStore {
+  readonly #root: string;
+  #restored = false;
+
+  constructor(root: string) {
+    super();
+    this.#root = root;
+  }
+
+  override async write(targetPath: string, content: Uint8Array, options: AtomicWriteOptions = {}) {
+    if (targetPath.endsWith(`/${operationId}.json`) && !this.#restored) {
+      this.#restored = true;
+      const canonical = join(this.#root, `${operationId}.lock`);
+      const displaced = join(this.#root, `${operationId}.lock.transient`);
+      await rename(canonical, displaced);
+      await rename(displaced, canonical);
+    }
+    return super.write(targetPath, content, options);
   }
 }
 
@@ -270,7 +330,7 @@ describe("O004 file GitHub policy operation store", () => {
     await second.close();
   });
 
-  it("rejects lock-path ABA without moving B's lock or changing the journal", async () => {
+  it("uses the commit guard when a real writer replaces the lock before publishing", async () => {
     const root = await directory();
     const initialized = new FileGitHubPolicyOperationStore(root);
     expect(
@@ -291,7 +351,7 @@ describe("O004 file GitHub policy operation store", () => {
       next: Object.freeze({ ...initial, phase: "mutation_started" }),
     });
 
-    expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(result).toMatchObject({ ok: false, error: { code: "conflict" } });
     expect(writer.replacement).toBeDefined();
     expect(await writer.replacement?.assertOwnership()).toEqual({ ok: true, value: undefined });
     const competitor = new FileGitHubPolicyOperationStore(root);
@@ -324,6 +384,176 @@ describe("O004 file GitHub policy operation store", () => {
     expect((await stat(join(root, `${operationId}.lock`))).mode & 0o777).toBe(0o600);
     await store.close();
     await competitor.close();
+  });
+
+  it("forces read-back and reports external failure after an unknown-durability publication", async () => {
+    const root = await directory();
+    const manifestOwner = new FileGitHubPolicyOperationStore(root);
+    expect(await manifestOwner.read(operationId)).toEqual({ ok: true, value: undefined });
+    await manifestOwner.close();
+    const store = new FileGitHubPolicyOperationStore(root, new UnknownDurabilityWriter());
+
+    expect(
+      await store.compareAndSwap({
+        operationId,
+        expectedRevision: null,
+        next: initial,
+      }),
+    ).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
+    });
+    await store.close();
+  });
+
+  it("never reports conflict after publication when ownership is lost after rename", async () => {
+    const root = await directory();
+    const initialized = new FileGitHubPolicyOperationStore(root);
+    expect(
+      await initialized.compareAndSwap({ operationId, expectedRevision: null, next: initial }),
+    ).toMatchObject({ ok: true, value: { revision: 1 } });
+    await initialized.close();
+    const writer = new AfterCommitReplacingWriter(root);
+    const store = new FileGitHubPolicyOperationStore(root, writer);
+
+    expect(
+      await store.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 2,
+      phase: "mutation_started",
+    });
+    expect(await writer.replacement?.assertOwnership()).toEqual({ ok: true, value: undefined });
+    await writer.close();
+    await store.close();
+  });
+
+  it.each([
+    [
+      "strict-schema tamper",
+      "invariant_violation",
+      (value: Record<string, unknown>) => ({ ...value, extra: true }),
+    ],
+    [
+      "identity mismatch",
+      "conflict",
+      (value: Record<string, unknown>) => ({
+        ...value,
+        device: Number(value["device"]) + 1,
+      }),
+    ],
+  ] as const)(
+    "fails closed for lock manifest %s without changing the journal",
+    async (_kind, code, tamper) => {
+      const root = await directory();
+      const initialized = new FileGitHubPolicyOperationStore(root);
+      expect(
+        await initialized.compareAndSwap({ operationId, expectedRevision: null, next: initial }),
+      ).toMatchObject({ ok: true, value: { revision: 1 } });
+      await initialized.close();
+      const manifestPath = join(root, `${operationId}.lock-identity.json`);
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+      await writeFile(manifestPath, `${JSON.stringify(tamper(manifest), null, 2)}\n`, {
+        mode: 0o600,
+      });
+      const store = new FileGitHubPolicyOperationStore(root);
+
+      expect(
+        await store.compareAndSwap({
+          operationId,
+          expectedRevision: 1,
+          next: Object.freeze({ ...initial, phase: "mutation_started" }),
+        }),
+      ).toMatchObject({ ok: false, error: { code } });
+      expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+        revision: 1,
+        phase: "reserved",
+      });
+      await store.close();
+    },
+  );
+
+  it("does not authorize another store while a lock path is replaced and later restored", async () => {
+    const root = await directory();
+    const initialized = new FileGitHubPolicyOperationStore(root);
+    expect(
+      await initialized.compareAndSwap({ operationId, expectedRevision: null, next: initial }),
+    ).toMatchObject({ ok: true, value: { revision: 1 } });
+    await initialized.close();
+    const canonical = join(root, `${operationId}.lock`);
+    const displaced = join(root, `${operationId}.lock.displaced`);
+    const replacementPath = join(root, `${operationId}.lock.replacement`);
+    await rename(canonical, displaced);
+    const replacementDirectory = openHeldSecureDirectory(root, [], { create: false });
+    if (!replacementDirectory.ok) throw new Error(replacementDirectory.error.code);
+    const replacement = await replacementDirectory.value.acquireLock(
+      `${operationId}.lock`,
+      "replacement-owner",
+    );
+    if (!replacement.ok) throw new Error(replacement.error.code);
+    const competitor = new FileGitHubPolicyOperationStore(root);
+
+    expect(
+      await competitor.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 1,
+      phase: "reserved",
+    });
+
+    await replacement.value.release();
+    await replacementDirectory.value.close();
+    await rename(canonical, replacementPath);
+    await rename(displaced, canonical);
+    expect(
+      await competitor.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: true, value: { revision: 2 } });
+    await competitor.close();
+  });
+
+  it("allows one guarded mutation after a transient replace-restore but never a second CAS", async () => {
+    const root = await directory();
+    const initialized = new FileGitHubPolicyOperationStore(root);
+    expect(
+      await initialized.compareAndSwap({ operationId, expectedRevision: null, next: initial }),
+    ).toMatchObject({ ok: true, value: { revision: 1 } });
+    await initialized.close();
+    const first = new FileGitHubPolicyOperationStore(root, new TransientRestoringWriter(root));
+    const second = new FileGitHubPolicyOperationStore(root);
+
+    expect(
+      await first.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: true, value: { revision: 2 } });
+    expect(
+      await second.compareAndSwap({
+        operationId,
+        expectedRevision: 1,
+        next: Object.freeze({ ...initial, phase: "mutation_started" }),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(JSON.parse(await readFile(join(root, `${operationId}.json`), "utf8"))).toMatchObject({
+      revision: 2,
+      phase: "mutation_started",
+    });
+    await first.close();
+    await second.close();
   });
 
   it("persists a strict private schema with store-owned monotonic revisions", async () => {
