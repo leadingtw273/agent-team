@@ -50,5 +50,8 @@ POSIX process-group termination fail closed before spawning a command.
 
 Current activation is deliberately fail-closed: until Runtime composition wires
 `agent-team reconcile --all`, install rejects the unavailable command and leaves no unit behind.
-O008 reports that condition as a degraded wake-up path; this installer does not claim that a timer
-has made the unwired Runtime autonomous.
+`agent-team health` reports that condition using fixed degraded evidence codes; this installer does
+not claim that a timer has made the unwired Runtime autonomous. When health reports a partial or
+missing wake-up path, an operator may run `agent-team reconcile --all` manually. That command uses
+the same Reconcile application contract as the timer and reports completed, degraded, failed, or
+unwired Runtime status rather than manufacturing success.

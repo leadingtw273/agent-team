@@ -35,6 +35,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     run: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
+    health: vi.fn(() => Promise.resolve(outcome)),
     project: vi.fn(() => Promise.resolve(outcome)),
     ui: vi.fn(() => Promise.resolve(outcome)),
     systemd: vi.fn(() => Promise.resolve(outcome)),
@@ -56,6 +57,7 @@ describe("agent-team CLI contract", () => {
         run [project-id]             執行一次派工與 Controller pipeline
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
+        health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑
         project [project-id]         讀取指定專案或列出專案摘要
         ui                           啟動按需 localhost 管理介面
         systemd                      管理 Agent Team 的 systemd user timer
@@ -86,6 +88,7 @@ describe("agent-team CLI contract", () => {
       ),
     ).resolves.toBe(0);
     await expect(runCli(metadata, ["reconcile", "--all"], commands, sink.io)).resolves.toBe(0);
+    await expect(runCli(metadata, ["health"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["ui"], commands, sink.io)).resolves.toBe(0);
     await expect(
@@ -102,12 +105,13 @@ describe("agent-team CLI contract", () => {
       headersFile: "/tmp/headers.json",
     });
     expect(commands.reconcile).toHaveBeenCalledWith({ all: true });
+    expect(commands.health).toHaveBeenCalledOnce();
     expect(commands.project).toHaveBeenCalledWith({});
     expect(commands.ui).toHaveBeenCalledOnce();
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(8));
+    expect(sink.stdout()).toBe("完成\n".repeat(9));
   });
 
   it.each([
