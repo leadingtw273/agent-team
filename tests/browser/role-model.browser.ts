@@ -290,6 +290,30 @@ test.describe("U004 role model configuration", () => {
     await expect(status).toHaveAttribute("data-state", "error");
   });
 
+  test("treats a non-422 response as uncertain even with a validation error code", async ({
+    page,
+  }) => {
+    await visit(page);
+    await page.route("**/api/role-models", async (route) => {
+      if (route.request().method() !== "PUT") {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "invalid_input" }),
+      });
+    });
+
+    await page.locator("[data-role-model-save]").click();
+
+    const status = page.locator("[data-role-model-status]");
+    await expect(status).toHaveText("儲存失敗；無法確認目前設定，請重新載入核對。");
+    await expect(status).toHaveAttribute("data-state", "uncertain");
+    await expect(status).not.toContainText(/未被覆寫|保留舊設定/u);
+  });
+
   test("keeps the sticky save action reachable without horizontal overflow at 390px", async ({
     page,
   }) => {

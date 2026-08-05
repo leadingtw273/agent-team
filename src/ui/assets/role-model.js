@@ -192,7 +192,7 @@
         const error = await responseError(saved);
         if (error === "read_back_mismatch") {
           setStatus("儲存結果無法確認，請重新載入核對。", "uncertain");
-        } else if (validationErrors.has(error)) {
+        } else if (saved.status === 422 && validationErrors.has(error)) {
           setStatus("輸入驗證失敗；原設定未被覆寫。請修正後再試。", "error");
         } else {
           setStatus("儲存失敗；無法確認目前設定，請重新載入核對。", "uncertain");
