@@ -194,6 +194,7 @@ export class TrustedProjectConfigLoader {
     const rawMarker = marker as unknown as Readonly<Record<string, unknown>>;
     const identifier = /^[a-zA-Z0-9][a-zA-Z0-9_.:@+-]{0,220}$/u;
     const expectedMarkerKeys = [
+      "approvalConsumeOperationDigest",
       "approvalReferenceDigest",
       "approvalSource",
       "approvalNonceDigest",
@@ -230,6 +231,7 @@ export class TrustedProjectConfigLoader {
       !identifier.test(marker.linearAuditIssueId) ||
       !digest.test(marker.gateEvidenceDigest) ||
       !digest.test(marker.auditReceiptsDigest) ||
+      !digest.test(marker.approvalConsumeOperationDigest) ||
       !digest.test(marker.approvalReferenceDigest) ||
       !digest.test(marker.authorityDigest) ||
       !digest.test(marker.approvalNonceDigest) ||

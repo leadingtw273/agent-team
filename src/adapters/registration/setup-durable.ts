@@ -366,6 +366,7 @@ const sessionSchema = z
       .optional(),
     evidence: z.array(evidenceSchema),
     approvalReferenceDigest: digestSchema.optional(),
+    approvalConsumeOperationDigest: digestSchema.optional(),
     approvalNonceDigest: digestSchema.optional(),
     approvalAuthorityDigest: digestSchema.optional(),
     approvalSource: z.enum(["local_ui", "current_user_conversation"]).optional(),
@@ -422,6 +423,7 @@ const sessionSchema = z
       ) &&
       (!approvalRequired ||
         (session.approvalReferenceDigest !== undefined &&
+          session.approvalConsumeOperationDigest !== undefined &&
           session.approvalNonceDigest !== undefined &&
           session.approvalAuthorityDigest !== undefined &&
           session.approvalSetupRevision !== undefined &&
@@ -452,6 +454,7 @@ const markerSchema = z
     auditReceiptsDigest: digestSchema,
     approvalSource: z.enum(["local_ui", "current_user_conversation"]),
     approvalReferenceDigest: digestSchema,
+    approvalConsumeOperationDigest: digestSchema,
     authorityDigest: digestSchema,
     approvalNonceDigest: digestSchema,
   })
@@ -1182,6 +1185,7 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
       draft.mergedConfigReceipt === undefined ||
       draft.approvalSource === undefined ||
       draft.approvalReferenceDigest === undefined ||
+      draft.approvalConsumeOperationDigest === undefined ||
       draft.gateEvidenceReceipt === undefined ||
       durableAuditReceiptsDigest({ ...draft, revision: 1 }) === undefined ||
       !sessionSchema.safeParse({ ...draft, revision: 1 }).success
@@ -1222,6 +1226,7 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
           auditReceiptsDigest: durableAuditReceiptsDigest(session),
           approvalSource: session.approvalSource,
           approvalReferenceDigest: session.approvalReferenceDigest,
+          approvalConsumeOperationDigest: session.approvalConsumeOperationDigest,
           authorityDigest: session.approvalAuthorityDigest,
           approvalNonceDigest: session.approvalNonceDigest,
         });

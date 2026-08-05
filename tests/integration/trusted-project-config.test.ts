@@ -133,6 +133,7 @@ describe("default-branch trusted project config", () => {
             auditReceiptsDigest: markerDigest.value,
             approvalSource: "local_ui" as const,
             approvalReferenceDigest: markerDigest.value,
+            approvalConsumeOperationDigest: markerDigest.value,
             authorityDigest: markerDigest.value,
             approvalNonceDigest: markerDigest.value,
           },

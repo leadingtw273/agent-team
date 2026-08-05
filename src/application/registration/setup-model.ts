@@ -159,6 +159,7 @@ export interface RegistrationSetupSession {
   readonly audit?: RegistrationSetupAuditState;
   readonly evidence: readonly RegistrationSetupEvidence[];
   readonly approvalReferenceDigest?: Sha256Digest;
+  readonly approvalConsumeOperationDigest?: Sha256Digest;
   readonly approvalNonceDigest?: string;
   readonly approvalAuthorityDigest?: string;
   readonly approvalSource?: RegistrationSetupApprovalSource;
@@ -218,6 +219,7 @@ export interface RegistrationSetupActivationMarker {
   readonly auditReceiptsDigest: Sha256Digest;
   readonly approvalSource: RegistrationSetupApprovalSource;
   readonly approvalReferenceDigest: Sha256Digest;
+  readonly approvalConsumeOperationDigest: Sha256Digest;
   readonly authorityDigest: string;
   readonly approvalNonceDigest: string;
 }

@@ -474,6 +474,8 @@ export function verifyRegistrationSetupActivatedSession(
     auditReceiptsDigest(session) !== undefined &&
     session.approvalReferenceDigest !== undefined &&
     digestPattern.test(session.approvalReferenceDigest) &&
+    session.approvalConsumeOperationDigest !== undefined &&
+    digestPattern.test(session.approvalConsumeOperationDigest) &&
     session.approvalAuthorityDigest !== undefined &&
     digestPattern.test(session.approvalAuthorityDigest) &&
     session.approvalNonceDigest !== undefined &&
@@ -520,6 +522,7 @@ export function verifyRegistrationSetupActivationBinding(
     marker.auditReceiptsDigest === auditDigest &&
     marker.approvalSource === session.approvalSource &&
     marker.approvalReferenceDigest === session.approvalReferenceDigest &&
+    marker.approvalConsumeOperationDigest === session.approvalConsumeOperationDigest &&
     marker.authorityDigest === session.approvalAuthorityDigest &&
     marker.approvalNonceDigest === session.approvalNonceDigest
   );
@@ -574,6 +577,8 @@ function validSession(session: RegistrationSetupSession): boolean {
       session.phase !== "activated") ||
       (session.approvalReferenceDigest !== undefined &&
         digestPattern.test(session.approvalReferenceDigest) &&
+        session.approvalConsumeOperationDigest !== undefined &&
+        digestPattern.test(session.approvalConsumeOperationDigest) &&
         session.approvalNonceDigest !== undefined &&
         digestPattern.test(session.approvalNonceDigest) &&
         session.approvalAuthorityDigest !== undefined &&
@@ -633,6 +638,14 @@ function approvalReferenceDigest(approvalId: string) {
   });
 }
 
+function expectedApprovalConsumeOperationDigest(
+  request: Pick<RegistrationSetupSessionRequest, "idempotencyKeyPrefix">,
+): Sha256Digest {
+  return createHash("sha256")
+    .update(`${request.idempotencyKeyPrefix}:verify-consume-user-approval`, "utf8")
+    .digest("hex") as Sha256Digest;
+}
+
 function approvalReceiptMatches(
   receipt: RegistrationSetupFinalApprovalReceipt,
   approval: RegistrationSetupFinalApprovalRequest,
@@ -666,10 +679,12 @@ export function verifyRegistrationSetupApprovalLedgerBinding(
   if (
     anchor === undefined ||
     session.approvalReferenceDigest === undefined ||
+    session.approvalConsumeOperationDigest === undefined ||
     session.approvalSetupRevision === undefined ||
     session.approvalSource === undefined ||
     session.approvalAuthorityDigest === undefined ||
     session.approvalNonceDigest === undefined ||
+    !digestPattern.test(session.approvalConsumeOperationDigest) ||
     !digestPattern.test(anchor.consumeOperationDigest)
   ) {
     return false;
@@ -680,6 +695,7 @@ export function verifyRegistrationSetupApprovalLedgerBinding(
   return (
     reference.ok &&
     reference.value === session.approvalReferenceDigest &&
+    anchor.consumeOperationDigest === session.approvalConsumeOperationDigest &&
     binding !== undefined &&
     approvalReceiptMatches(
       receipt,
@@ -758,6 +774,7 @@ export class RegistrationSetupCoordinator {
   async #readApprovalAnchor(
     session: RegistrationSetupSession,
     lease: RegistrationSetupExecutionLease,
+    expectedConsumeOperationDigest?: Sha256Digest,
   ): Promise<Result<RegistrationSetupConsumedApprovalAnchor, DomainError>> {
     const approvalReference = session.approvalReferenceDigest;
     if (approvalReference === undefined) {
@@ -766,7 +783,10 @@ export class RegistrationSetupCoordinator {
     const anchor = await this.#owned(lease, () =>
       this.#ports.finalApproval.readConsumed(approvalReference),
     );
-    return anchor.ok && verifyRegistrationSetupApprovalLedgerBinding(session, anchor.value)
+    return anchor.ok &&
+      (expectedConsumeOperationDigest === undefined ||
+        session.approvalConsumeOperationDigest === expectedConsumeOperationDigest) &&
+      verifyRegistrationSetupApprovalLedgerBinding(session, anchor.value)
       ? Object.freeze({ ok: true, value: anchor.value })
       : Object.freeze({
           ok: false,
@@ -1667,13 +1687,15 @@ export class RegistrationSetupCoordinator {
       return Object.freeze({ state: "blocked", reason: "user_approval_invalid" });
     }
     const approval = request.approval;
+    const expectedConsumeOperationDigest = expectedApprovalConsumeOperationDigest(request);
     if (session.phase === "merge_authorized") {
       const referenceDigest = approvalReferenceDigest(approval.approvalId);
       const expectedBinding = approvalBinding(session, session.revision - 1);
       if (
         !referenceDigest.ok ||
         expectedBinding === undefined ||
-        session.approvalReferenceDigest !== referenceDigest.value
+        session.approvalReferenceDigest !== referenceDigest.value ||
+        session.approvalConsumeOperationDigest !== expectedConsumeOperationDigest
       ) {
         return Object.freeze({ state: "blocked", reason: "approval_replay" });
       }
@@ -1703,6 +1725,12 @@ export class RegistrationSetupCoordinator {
       ) {
         return Object.freeze({ state: "blocked", reason: "user_approval_invalid" });
       }
+      const anchored = await this.#readApprovalAnchor(
+        session,
+        lease,
+        expectedConsumeOperationDigest,
+      );
+      if (!anchored.ok) return portFailure("approval", anchored.error, session);
     } else {
       const expectedBinding = approvalBinding(session);
       if (expectedBinding === undefined) return failed("approval", session);
@@ -1733,6 +1761,7 @@ export class RegistrationSetupCoordinator {
       const authorized = bumped(session, {
         phase: "merge_authorized",
         approvalReferenceDigest: referenceDigest.value,
+        approvalConsumeOperationDigest: expectedConsumeOperationDigest,
         approvalNonceDigest: consumed.value.receipt.approvalNonceDigest,
         approvalAuthorityDigest: consumed.value.receipt.authorityDigest,
         approvalSource: consumed.value.receipt.issuer,
@@ -1751,6 +1780,12 @@ export class RegistrationSetupCoordinator {
           }),
         ]),
       });
+      const anchored = await this.#readApprovalAnchor(
+        authorized,
+        lease,
+        expectedConsumeOperationDigest,
+      );
+      if (!anchored.ok) return portFailure("approval", anchored.error, session);
       const saved = await this.#owned(lease, () =>
         this.#ports.sessions.save(
           session.revision,
@@ -1838,7 +1873,11 @@ export class RegistrationSetupCoordinator {
           Object.freeze({ state: "blocked" as const, reason: "user_approval_invalid" as const })
         );
       }
-      const anchored = await this.#readApprovalAnchor(session, lease);
+      const anchored = await this.#readApprovalAnchor(
+        session,
+        lease,
+        expectedApprovalConsumeOperationDigest(request),
+      );
       if (!anchored.ok) return portFailure("approval", anchored.error, session);
       return this.#continueMergeExclusive(session, request, lease);
     });
@@ -1853,13 +1892,18 @@ export class RegistrationSetupCoordinator {
       !gateEvidenceMatches(session) ||
       auditReceiptsDigest(session) === undefined ||
       session.approvalReferenceDigest === undefined ||
+      session.approvalConsumeOperationDigest === undefined ||
       session.approvalNonceDigest === undefined ||
       session.approvalAuthorityDigest === undefined ||
       session.approvalSource === undefined
     ) {
       return Object.freeze({ ok: false, error: domainError("invariant_violation") });
     }
-    const anchored = await this.#readApprovalAnchor(session, lease);
+    const anchored = await this.#readApprovalAnchor(
+      session,
+      lease,
+      expectedApprovalConsumeOperationDigest(request),
+    );
     if (!anchored.ok) return anchored;
     const reference = { project: session.project, changeRequestId: session.changeRequest.id };
     const current = await this.#owned(lease, () =>
@@ -2107,7 +2151,11 @@ export class RegistrationSetupCoordinator {
         }),
       ]),
     });
-    const activationAnchor = await this.#readApprovalAnchor(session, lease);
+    const activationAnchor = await this.#readApprovalAnchor(
+      session,
+      lease,
+      expectedApprovalConsumeOperationDigest(request),
+    );
     if (!activationAnchor.ok) return portFailure("activation", activationAnchor.error, session);
     const activated = await this.#owned(lease, () =>
       this.#ports.sessions.activate(
@@ -2145,7 +2193,11 @@ export class RegistrationSetupCoordinator {
     lease: RegistrationSetupExecutionLease,
     knownMarker?: RegistrationSetupActivationMarker,
   ): Promise<RegistrationSetupOutcome> {
-    const anchored = await this.#readApprovalAnchor(session, lease);
+    const anchored = await this.#readApprovalAnchor(
+      session,
+      lease,
+      expectedApprovalConsumeOperationDigest(request),
+    );
     if (!anchored.ok) return portFailure("activation", anchored.error, session);
     const readMarker =
       knownMarker === undefined

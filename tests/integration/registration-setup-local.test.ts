@@ -173,6 +173,9 @@ function mustDigest(value: unknown) {
   if (!result.ok) throw new Error(result.error.code);
   return result.value;
 }
+function rawDigest(value: string): typeof testDigest {
+  return createHash("sha256").update(value, "utf8").digest("hex") as typeof testDigest;
+}
 const gateEvidenceBinding = Object.freeze({
   schemaVersion: 1 as const,
   source: "source_control" as const,
@@ -370,6 +373,12 @@ function sessionDraft(
     ...(phase === "activated"
       ? {
           approvalReferenceDigest,
+          approvalConsumeOperationDigest:
+            approvalReceipt === undefined
+              ? testDigest
+              : rawDigest(
+                  `activation-anchor:consume:${String(approvalReceipt.setupSessionRevision)}`,
+                ),
           approvalNonceDigest: approvalReceipt?.approvalNonceDigest ?? testDigest,
           approvalAuthorityDigest: approvalReceipt?.authorityDigest ?? testDigest,
           approvalSource: approvalReceipt?.issuer ?? ("local_ui" as const),
@@ -456,6 +465,7 @@ async function createActivatedFixture(root: string) {
 interface MutableActivationRecord {
   marker: Record<string, unknown>;
   session: {
+    approvalConsumeOperationDigest: string;
     approvalNonceDigest: string;
     mergedConfigReceipt: {
       projectId: string;
@@ -708,6 +718,26 @@ describe("file-backed registration setup state", () => {
     },
   );
 
+  it("rejects another valid consume operation digest from the independent ledger across registry and loader", async () => {
+    const root = await temporaryRoot();
+    const { sessions, registry } = await createActivatedFixture(root);
+    const ledgerPath = join(root, "registration-setup", "approval-authority", "ledger.json");
+    const ledger = JSON.parse(await readFile(ledgerPath, "utf8")) as {
+      grants: Record<string, unknown>[];
+    };
+    const consumed = ledger.grants.find((grant) => grant["state"] === "consumed");
+    if (consumed === undefined) throw new Error("consumed approval missing");
+    consumed["consumeOperationDigest"] = rawDigest("another-legal-consume-operation");
+    await writeFile(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(sessions.load(preview.setupSessionId)).resolves.toMatchObject({ ok: true });
+    await expect(registry.read(project.id)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    await expectLoaderActivationUnavailable(registry);
+  });
+
   it("rejects synchronized valid nonce substitution across session, marker, and project index", async () => {
     const root = await temporaryRoot();
     const { sessions, registry } = await createActivatedFixture(root);
@@ -726,6 +756,38 @@ describe("file-backed registration setup state", () => {
       markerDigest: string;
     };
     index.marker["approvalNonceDigest"] = substitutedNonce;
+    index.markerDigest = mustDigest({
+      kind: "registration_setup_activation_marker",
+      marker: index.marker,
+    });
+    await writeFile(indexPath, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(sessions.load(preview.setupSessionId)).resolves.toMatchObject({ ok: true });
+    await expect(registry.read(project.id)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "conflict" },
+    });
+    await expectLoaderActivationUnavailable(registry);
+  });
+
+  it("rejects synchronized consume operation substitution across session, marker, and project index", async () => {
+    const root = await temporaryRoot();
+    const { sessions, registry } = await createActivatedFixture(root);
+    const substitutedOperation = rawDigest("synchronized-consume-operation-substitution");
+    await tamperActivationRecord(sessions, (record) => {
+      record.session.approvalConsumeOperationDigest = substitutedOperation;
+      record.marker["approvalConsumeOperationDigest"] = substitutedOperation;
+    });
+    const projectKey = mustDigest({
+      kind: "registration_setup_activation_project",
+      projectId: project.id,
+    });
+    const indexPath = join(root, "registration-setup-activation", projectKey, "index.json");
+    const index = JSON.parse(await readFile(indexPath, "utf8")) as {
+      marker: Record<string, unknown>;
+      markerDigest: string;
+    };
+    index.marker["approvalConsumeOperationDigest"] = substitutedOperation;
     index.markerDigest = mustDigest({
       kind: "registration_setup_activation_marker",
       marker: index.marker,

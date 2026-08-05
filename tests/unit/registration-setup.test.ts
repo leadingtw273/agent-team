@@ -25,7 +25,7 @@ import type {
   CommitChecksSnapshot,
   CommitStatusesSnapshot,
 } from "../../src/application/ports/index.js";
-import { sha256Digest } from "../../src/domain/review/index.js";
+import { sha256Digest, type Sha256Digest } from "../../src/domain/review/index.js";
 
 const baseSha = "a".repeat(40);
 const headSha = "b".repeat(40);
@@ -58,6 +58,9 @@ function digest(value: string) {
   const result = sha256Digest(value);
   if (!result.ok) throw new Error(result.error.code);
   return result.value;
+}
+function rawDigest(value: string): Sha256Digest {
+  return createHash("sha256").update(value, "utf8").digest("hex") as Sha256Digest;
 }
 const previewResult = createRegistrationSetupPreview({
   schemaVersion: 1,
@@ -130,6 +133,7 @@ interface HarnessOptions {
   readonly barrierStep?: RegistrationSetupJournalStep;
   readonly mergedReadBack?: boolean;
   readonly approvalAuthority?: "mismatch" | "replay" | "rejected" | "unknown" | "unavailable";
+  readonly approvalLedgerDigest?: "mismatch";
   readonly crashAfter?: RegistrationSetupJournalStep;
   readonly consumeSessionSaveCrash?: boolean;
   readonly unknownJournalDurability?: boolean;
@@ -675,6 +679,8 @@ function harness(options: HarnessOptions = {}) {
           auditReceiptsDigest: auditReceiptsDigest.value,
           approvalSource: session.approvalSource ?? ("local_ui" as const),
           approvalReferenceDigest: session.approvalReferenceDigest ?? digest("missing-approval"),
+          approvalConsumeOperationDigest:
+            session.approvalConsumeOperationDigest ?? digest("missing-consume-operation"),
           authorityDigest: session.approvalAuthorityDigest ?? digest("missing-authority"),
           approvalNonceDigest: session.approvalNonceDigest ?? digest("missing-nonce"),
         };
@@ -756,7 +762,10 @@ function harness(options: HarnessOptions = {}) {
           reference.ok && reference.value === approvalReference
             ? ok({
                 receipt: consumedApprovalReceipt,
-                consumeOperationDigest: digest(consumedApprovalOperation),
+                consumeOperationDigest:
+                  options.approvalLedgerDigest === "mismatch"
+                    ? rawDigest("another-legal-consume-operation")
+                    : rawDigest(consumedApprovalOperation),
               })
             : ok(undefined),
         );
@@ -1307,6 +1316,30 @@ describe("O005 registration Setup PR flow", () => {
     },
   );
 
+  it("fails closed before merge when the approval ledger returns another valid consume operation digest", async () => {
+    const test = await prepared(
+      harness({ approvalLedgerDigest: "mismatch", mergedReadBack: true }),
+    );
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:ledger-operation-mismatch",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    const result = await test.approveAndMerge(
+      {
+        setupSessionId: preview.setupSessionId,
+        approval: approval(ready.session),
+        idempotencyKeyPrefix: "merge:ledger-operation-mismatch",
+      },
+      trustedAuthority,
+    );
+    expect(result).toMatchObject({ state: "failed", stage: "approval" });
+    expect(test.calls.filter((call) => call === "save:merge_authorized")).toHaveLength(0);
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(0);
+    expect(test.calls.filter((call) => call === "activate")).toHaveLength(0);
+    expect(test.calls.filter((call) => call === "publish-activation-index")).toHaveLength(0);
+  });
+
   it("does not activate on merge failure or missing authoritative merged read-back", async () => {
     for (const options of [{ fail: "merge" as const }, {}]) {
       const test = await prepared(harness(options));
@@ -1345,7 +1378,10 @@ describe("O005 registration Setup PR flow", () => {
     );
     expect(result).toMatchObject({
       state: "merge_pending",
-      session: { phase: "merge_authorized" },
+      session: {
+        phase: "merge_authorized",
+        approvalConsumeOperationDigest: rawDigest("merge:success:verify-consume-user-approval"),
+      },
     });
     expect(JSON.stringify(result)).not.toContain("approval-grant-1");
     expect(test.calls).not.toContain("merge");
@@ -1515,7 +1551,7 @@ describe("O005 registration Setup PR flow", () => {
       trustedAuthority,
     );
     expect(replay).toMatchObject({ state: "blocked", reason: "approval_replay" });
-    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(2);
+    expect(test.calls.filter((call) => call === "verify-consume-approval")).toHaveLength(1);
     expect(test.calls).not.toContain("activate");
   });
 

@@ -52,6 +52,7 @@ const markerSchema = z
     auditReceiptsDigest: digestSchema,
     approvalSource: z.enum(["local_ui", "current_user_conversation"]),
     approvalReferenceDigest: digestSchema,
+    approvalConsumeOperationDigest: digestSchema,
     authorityDigest: digestSchema,
     approvalNonceDigest: digestSchema,
   })

@@ -90,6 +90,7 @@ function activationFor(value: TrustedProjectConfig = config()): TrustedProjectAc
           auditReceiptsDigest: digest("audit"),
           approvalSource: "local_ui" as const,
           approvalReferenceDigest: digest("approval"),
+          approvalConsumeOperationDigest: digest("consume-operation"),
           authorityDigest: digest("authority"),
           approvalNonceDigest: digest("nonce"),
         }),
