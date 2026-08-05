@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createDangerApprovalUseCase,
+  createDangerUiFeatureRegistration,
   InMemoryDangerApprovalStore,
   renderDangerPage,
   type DangerApprovalRequest,
@@ -18,6 +19,29 @@ const request: DangerApprovalRequest = Object.freeze({
 });
 
 describe("U006 dangerous operation approval", () => {
+  it("registers content-only security UI with independently owned assets and API", async () => {
+    const useCase = createDangerApprovalUseCase(new InMemoryDangerApprovalStore([request]));
+    const registration = createDangerUiFeatureRegistration(useCase);
+    const content = await registration.page.render();
+
+    expect(registration).toMatchObject({
+      id: "danger",
+      slot: "security",
+      page: {
+        path: "/security",
+        styles: ["/assets/danger.css"],
+        scripts: ["/assets/danger.js"],
+      },
+    });
+    expect(registration.routes.map((route) => route.contract.path)).toEqual([
+      "/assets/danger.css",
+      "/assets/danger.js",
+      "/api/danger",
+    ]);
+    expect(content).toContain('class="danger-page"');
+    expect(content).not.toMatch(/<(?:!doctype|html|head|body|main|aside|nav)\b/iu);
+  });
+
   it("renders unknown requests with reject as their only decision", () => {
     const unknown = { ...request, requestId: "danger-unknown", category: "unknown" as const };
     const html = renderDangerPage(

@@ -1,0 +1,147 @@
+.danger-page button[data-decision="approve_once"] {
+  color: #fff;
+  background: #176b2c;
+  border-color: #176b2c;
+}
+
+.danger-page button[data-decision="reject"],
+.danger-page .badge.bg-danger {
+  color: #fff;
+  background: #a52828;
+  border-color: #a52828;
+}
+
+.danger-page button[data-decision="allow_project_category"] {
+  color: #704d00;
+  background: #fff;
+  border-color: #704d00;
+}
+
+.danger-page .danger-action-button {
+  min-height: 2.75rem;
+  padding: 0.625rem 0.875rem;
+  white-space: normal;
+}
+
+.danger-authority-note {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.danger-action-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.danger-approval-zone,
+.danger-reject-zone,
+.danger-confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.danger-reject-zone {
+  align-items: center;
+  padding-inline-start: 1rem;
+  border-inline-start: 1px solid var(--ui-border);
+}
+
+.danger-action-layout--unknown {
+  grid-template-columns: 1fr;
+}
+
+.danger-action-layout--unknown .danger-reject-zone {
+  padding-inline-start: 0;
+  border-inline-start: 0;
+}
+
+.danger-long-term-trigger {
+  display: inline-flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.danger-confirmation {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: #fff8e6;
+  border: 2px solid #9a6700;
+  border-radius: 0.625rem;
+}
+
+.danger-confirmation h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.danger-confirmation-message {
+  margin: 0.5rem 0 1rem;
+  color: #5c4300;
+  font-weight: 600;
+}
+
+.danger-confirmation-summary {
+  display: grid;
+  gap: 0.625rem;
+  margin-bottom: 1rem;
+}
+
+.danger-confirmation-summary > div {
+  display: grid;
+  grid-template-columns: minmax(4rem, 6rem) minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+.danger-confirmation-summary dt,
+.danger-confirmation-summary dd {
+  margin: 0;
+}
+
+.danger-confirmation-summary dt {
+  color: var(--ui-muted);
+  font-weight: 700;
+}
+
+.danger-unknown-note {
+  display: grid;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+  padding: 0.875rem 1rem;
+  color: #6e1d1d;
+  background: #fff3f3;
+  border: 1px solid #c85a5a;
+  border-radius: 0.625rem;
+}
+
+@media (max-width: 640px) {
+  .danger-action-layout {
+    grid-template-columns: 1fr;
+    gap: 1.25rem;
+  }
+
+  .danger-approval-zone,
+  .danger-confirmation-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .danger-reject-zone {
+    padding-top: 1.25rem;
+    padding-inline-start: 0;
+    border-top: 1px solid var(--ui-border);
+    border-inline-start: 0;
+  }
+
+  .danger-page .danger-action-button {
+    width: 100%;
+    min-height: 3rem;
+  }
+
+  .danger-confirmation-summary > div {
+    grid-template-columns: 1fr;
+    gap: 0.125rem;
+  }
+}

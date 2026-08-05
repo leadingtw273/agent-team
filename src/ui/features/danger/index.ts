@@ -177,4 +177,6 @@ export function createDangerApprovalUseCase(store: InMemoryDangerApprovalStore) 
 export type DangerApprovalUseCase = ReturnType<typeof createDangerApprovalUseCase>;
 
 export * from "./http.js";
+export * from "./registration.js";
+export * from "./routes.js";
 export * from "./view.js";

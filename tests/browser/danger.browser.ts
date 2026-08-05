@@ -5,11 +5,11 @@ import { expect, test, type Page } from "@playwright/test";
 import axe from "axe-core";
 
 import { dangerousOperationCategories } from "../../src/application/safety/index.js";
+import { createRoleModelFeature } from "../../src/ui/features/role-model/index.js";
 import {
   createDangerApprovalUseCase,
-  createDangerUiHandler,
-  createUiSecurityPolicy,
-  dangerUiRouteContract,
+  createDangerUiFeatureRegistration,
+  createUiApplication,
   InMemoryDangerApprovalStore,
   startLocalUiServer,
   type LocalUiServerHandle,
@@ -33,25 +33,13 @@ const waiting = Object.freeze(
 );
 
 test.beforeEach(async () => {
-  const routes = [
-    dangerUiRouteContract,
-    ...[
-      "/security",
-      "/assets/danger.js",
-      "/assets/tabler-1.4.0.min.css",
-      "/assets/ui-shell.css",
-    ].map((path) => ({
-      path,
-      allowedQueryParameters: [],
-      allowedMethods: ["GET"] as const,
-      response: "standard" as const,
-    })),
-  ];
+  const danger = createDangerApprovalUseCase(new InMemoryDangerApprovalStore(waiting));
+  const application = createUiApplication({
+    features: [createRoleModelFeature(), createDangerUiFeatureRegistration(danger)],
+  });
   shell = await startLocalUiServer({
-    securityPolicy: createUiSecurityPolicy({ routes }),
-    handler: createDangerUiHandler(
-      createDangerApprovalUseCase(new InMemoryDangerApprovalStore(waiting)),
-    ),
+    securityPolicy: application.securityPolicy,
+    handler: application.handler,
   });
 });
 
@@ -60,7 +48,7 @@ test.afterEach(async () => {
   shell = undefined;
 });
 
-async function visit(page: Page): Promise<void> {
+async function visit(page: Page, path = "/security"): Promise<void> {
   if (shell === undefined) throw new Error("danger server missing");
   await page.goto(`${shell.baseUrl}/#${shell.sessionToken}`);
   await page.waitForFunction(
@@ -71,15 +59,37 @@ async function visit(page: Page): Promise<void> {
         }
       ).sessionStorage.getItem("agent-team-csrf") !== null,
   );
-  await page.goto(`${shell.baseUrl}/security`, { waitUntil: "networkidle" });
+  await page.goto(`${shell.baseUrl}${path}`, { waitUntil: "networkidle" });
 }
 
 function requestCard(page: Page, requestId: string) {
   return page.locator(`article[data-request-id="${requestId}"]`);
 }
 
-async function capture(page: Page, name: string, width: number, height: number): Promise<void> {
+async function capture(
+  page: Page,
+  name: string,
+  width: number,
+  height: number,
+  fullPage = true,
+): Promise<void> {
   await page.setViewportSize({ width, height });
+  await page.evaluate(() => {
+    const browser = globalThis as typeof globalThis & {
+      readonly document: Readonly<{
+        readonly activeElement: Readonly<{ blur?: () => void }> | null;
+        readonly documentElement: Readonly<{ readonly style: { scrollBehavior: string } }>;
+      }>;
+      readonly scrollTo?: (x: number, y: number) => void;
+    };
+    browser.document.activeElement?.blur?.();
+    browser.document.documentElement.style.scrollBehavior = "auto";
+    browser.scrollTo?.(0, 0);
+  });
+  await page.waitForFunction(() => {
+    const browser = globalThis as typeof globalThis & { readonly scrollY?: number };
+    return browser.scrollY !== undefined && browser.scrollY <= 1;
+  });
   expect(
     await page.evaluate(() => {
       const browser = globalThis as typeof globalThis & {
@@ -89,7 +99,7 @@ async function capture(page: Page, name: string, width: number, height: number):
       return browser.document.documentElement.scrollWidth <= browser.innerWidth;
     }),
   ).toBe(true);
-  await page.screenshot({ path: `${screenshotRoot}/${name}`, fullPage: true });
+  await page.screenshot({ path: `${screenshotRoot}/${name}`, fullPage });
   await copyFile(`${screenshotRoot}/${name}`, join(screenshotWorktree, name));
 }
 
@@ -142,7 +152,7 @@ test("renders explicit warnings and unknown rejection safely at 320 and 390 pixe
   await mkdir(screenshotRoot, { recursive: true });
   await mkdir(screenshotWorktree, { recursive: true });
   await capture(page, "u006-danger-desktop.png", 1440, 900);
-  await capture(page, "u006-danger-mobile.png", 390, 844);
+  await capture(page, "u006-danger-390.png", 390, 844);
   const firstCard = requestCard(page, "danger-1");
   const touchHeights = await visibleButtonHeights(
     page,
@@ -156,7 +166,7 @@ test("renders explicit warnings and unknown rejection safely at 320 and 390 pixe
   expect(await axeViolations(page)).toEqual([]);
   await firstCard.getByRole("button", { name: "核可一次" }).click();
   await expect(firstCard.locator("[data-confirmation]")).toBeVisible();
-  await capture(page, "u006-danger-confirm-mobile.png", 390, 844);
+  await capture(page, "u006-danger-confirm.png", 390, 844);
   expect(
     (
       await visibleButtonHeights(
@@ -167,8 +177,63 @@ test("renders explicit warnings and unknown rejection safely at 320 and 390 pixe
   ).toBe(true);
   expect(await axeViolations(page)).toEqual([]);
   await firstCard.getByRole("button", { name: "取消" }).click();
-  await capture(page, "u006-danger-mobile-320.png", 320, 844);
+  await page.reload({ waitUntil: "networkidle" });
+  await expect(requestCard(page, "danger-1")).toBeVisible();
+  await capture(page, "u006-danger-320.png", 320, 844, false);
   expect(await axeViolations(page)).toEqual([]);
+});
+
+test("keeps Role and Danger in one responsive shell with collapsed active navigation", async ({
+  page,
+}) => {
+  await page.addInitScript({ content: axe.source });
+  let authenticated = false;
+
+  for (const viewport of [
+    { width: 390, height: 844 },
+    { width: 320, height: 720 },
+  ]) {
+    await page.setViewportSize(viewport);
+    for (const route of [
+      { path: "/roles-models", label: "角色與模型" },
+      { path: "/security", label: "安全" },
+    ]) {
+      if (authenticated) {
+        if (shell === undefined) throw new Error("danger server missing");
+        await page.goto(`${shell.baseUrl}${route.path}`, { waitUntil: "networkidle" });
+      } else {
+        await visit(page, route.path);
+        authenticated = true;
+      }
+      const disclosure = page.locator("details.ui-mobile-nav");
+      const mobileNavigation = disclosure.getByRole("navigation", { name: "主要導覽" });
+
+      await expect(page.locator("html")).toHaveCount(1);
+      await expect(page.locator(".ui-brand")).toHaveCount(1);
+      await expect(page.locator('.skip-link[href="#main-content"]')).toHaveCount(1);
+      await expect(disclosure).toBeVisible();
+      await expect(disclosure).not.toHaveAttribute("open", "");
+      await expect(disclosure.locator("summary")).toContainText(`目前頁面：${route.label}`);
+      await expect(mobileNavigation).toBeHidden();
+      await disclosure.locator("summary").click();
+      await expect(
+        mobileNavigation.getByRole("link", { name: route.label, exact: true }),
+      ).toHaveAttribute("aria-current", "page");
+      await disclosure.locator("summary").click();
+      expect(
+        await page.evaluate(() => {
+          const browser = globalThis as typeof globalThis & {
+            readonly document: Readonly<{
+              readonly documentElement: Readonly<{ readonly scrollWidth: number }>;
+            }>;
+            readonly innerWidth: number;
+          };
+          return browser.document.documentElement.scrollWidth <= browser.innerWidth;
+        }),
+      ).toBe(true);
+      expect(await axeViolations(page)).toEqual([]);
+    }
+  }
 });
 
 test("requires an explicit keyboard-confirmed second step for both approval commands", async ({

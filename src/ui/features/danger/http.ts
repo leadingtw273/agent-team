@@ -1,35 +1,31 @@
-import { readFileSync } from "node:fs";
-
-import type { UiRequest, UiRequestHandler, UiResponse } from "../../server/index.js";
-import { createUiShellHandler } from "../../shell/index.js";
+import type { UiRequest, UiResponse } from "../../server/index.js";
 import type {
   DangerApprovalCategory,
   DangerApprovalDecision,
   DangerApprovalUseCase,
 } from "./index.js";
-import { renderDangerPage } from "./view.js";
 
-const script = readFileSync(new URL("../../assets/danger.js", import.meta.url), "utf8");
+export const dangerApiPath = "/api/danger" as const;
+
 const decisions = new Set<DangerApprovalDecision>([
   "approve_once",
   "reject",
   "allow_project_category",
 ]);
 
-export const dangerUiRouteContract = Object.freeze({
-  path: "/api/danger",
-  allowedQueryParameters: Object.freeze([]),
-  allowedMethods: Object.freeze(["GET", "PUT"] as const),
-  response: "standard" as const,
-  mutationBody: "bounded-json" as const,
-});
-
-function json(statusCode: number, value: unknown): UiResponse {
-  return Object.freeze({
-    statusCode,
-    headers: Object.freeze({ "content-type": "application/json; charset=utf-8" }),
-    body: JSON.stringify(value),
-  });
+function jsonResponse(request: UiRequest, statusCode: number, value: unknown): UiResponse {
+  const headers: Record<string, string> = {
+    "cache-control": "no-store",
+    "content-type": "application/json; charset=utf-8",
+  };
+  if (statusCode === 405) headers["allow"] = "GET, HEAD, PUT";
+  return request.method === "HEAD"
+    ? Object.freeze({ statusCode, headers: Object.freeze(headers) })
+    : Object.freeze({
+        statusCode,
+        headers: Object.freeze(headers),
+        body: JSON.stringify(value),
+      });
 }
 
 function command(
@@ -48,8 +44,9 @@ function command(
     typeof expectedRevision !== "string" ||
     typeof decision !== "string" ||
     !decisions.has(decision as DangerApprovalDecision)
-  )
+  ) {
     return undefined;
+  }
   return {
     requestId,
     projectId,
@@ -59,38 +56,25 @@ function command(
   };
 }
 
-export function createDangerUiHandler(useCase: DangerApprovalUseCase): UiRequestHandler {
-  const shell = createUiShellHandler();
-  return async (request: UiRequest): Promise<UiResponse> => {
-    if (request.url === "/api/danger") {
-      if (request.method === "GET") return json(200, useCase.read());
-      if (request.method !== "PUT")
-        return json(405, { state: "error", code: "method_not_allowed" });
-      const parsed = command(request.body);
-      if (parsed === undefined) return json(422, { state: "error", code: "invalid_decision" });
-      const result = useCase.decide(parsed);
-      return result.state === "saved"
-        ? json(200, { state: "saved" })
-        : json(result.state === "conflict" ? 409 : 422, { state: "error", code: result.state });
-    }
-    if (request.url === "/security" && (request.method === "GET" || request.method === "HEAD")) {
-      const body = renderDangerPage(useCase.read());
-      return request.method === "HEAD"
-        ? { statusCode: 200, headers: { "content-type": "text/html; charset=utf-8" } }
-        : { statusCode: 200, headers: { "content-type": "text/html; charset=utf-8" }, body };
-    }
-    if (
-      request.url === "/assets/danger.js" &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
-      return request.method === "HEAD"
-        ? { statusCode: 200, headers: { "content-type": "text/javascript; charset=utf-8" } }
-        : {
-            statusCode: 200,
-            headers: { "content-type": "text/javascript; charset=utf-8" },
-            body: script,
-          };
-    }
-    return shell(request);
-  };
+export function handleDangerApiRequest(
+  useCase: DangerApprovalUseCase,
+  request: UiRequest,
+): UiResponse {
+  if (request.method === "GET" || request.method === "HEAD") {
+    return jsonResponse(request, 200, useCase.read());
+  }
+  if (request.method !== "PUT") {
+    return jsonResponse(request, 405, { state: "error", code: "method_not_allowed" });
+  }
+  const parsed = command(request.body);
+  if (parsed === undefined) {
+    return jsonResponse(request, 422, { state: "error", code: "invalid_decision" });
+  }
+  const result = useCase.decide(parsed);
+  return result.state === "saved"
+    ? jsonResponse(request, 200, { state: "saved" })
+    : jsonResponse(request, result.state === "conflict" ? 409 : 422, {
+        state: "error",
+        code: result.state,
+      });
 }

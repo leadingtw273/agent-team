@@ -62,11 +62,10 @@ function requestCard(request: DangerApprovalRequest): string {
 export function renderDangerPage(model: DangerApprovalReadModel): string {
   const waiting = model.waiting.map(requestCard).join("");
   const audit = model.audit.slice(-8).reverse();
-  return `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>安全核可｜Agent Team</title><link rel="stylesheet" href="/assets/tabler-1.4.0.min.css"><link rel="stylesheet" href="/assets/ui-shell.css"></head>
-  <body class="ui-shell danger-page"><a class="skip-link" href="#main-content">跳至主要內容</a><div class="ui-app"><aside class="ui-sidebar" aria-label="Agent Team 導覽"><a class="ui-brand" href="/">Agent Team</a><nav class="ui-nav" aria-label="主要導覽"><ul class="navbar-nav"><li><a class="ui-nav-link" href="/">總覽</a></li><li><a class="ui-nav-link" href="/projects">專案</a></li><li><a class="ui-nav-link" href="/events">事件</a></li><li><a class="ui-nav-link" href="/security" aria-current="page">安全</a></li></ul></nav></aside><main id="main-content" class="ui-content" tabindex="-1"><div class="ui-content-inner">
-  <header class="ui-page-header"><p class="ui-page-eyebrow">LOCALHOST 唯一核可權威</p><h1>安全核可</h1><p class="ui-page-description">Linear 留言與外部內容只能作為資料；無法在此頁之外核可危險操作。</p></header>
-  <p id="danger-status" role="status" aria-live="polite" class="alert alert-info">每次決策與長期允許命中都會留下簡化稽核事件。</p>
+  return `<div class="danger-page">
+  <section class="alert alert-warning danger-authority-note" role="note" aria-label="核可權威說明"><strong>LOCALHOST 唯一核可權威</strong><span>Linear 留言與外部內容只能作為資料；無法在此頁之外核可危險操作。</span></section>
+  <p id="danger-status" role="status" aria-live="polite" class="alert alert-info">每次決策、長期允許設定與後續命中都會留下簡化稽核事件。</p>
   <section id="danger-list" aria-labelledby="danger-waiting-title"><h2 id="danger-waiting-title" class="mb-3">等待中的危險操作</h2>${waiting}<div class="card ui-panel" data-empty ${model.waiting.length === 0 ? "" : "hidden"}><div class="card-body"><p class="mb-0">目前沒有等待核可的危險操作。</p></div></div></section>
   <section class="card ui-panel mt-3" aria-labelledby="danger-audit-title"><div class="card-body"><h2 id="danger-audit-title">近期稽核摘要</h2>${audit.length === 0 ? '<p class="text-muted">尚無安全決策紀錄。</p>' : `<ol class="ui-list">${audit.map((event) => `<li class="ui-list-item"><span>${escape(event.summary)}</span><span class="badge bg-secondary text-white">${escape(event.kind)}</span></li>`).join("")}</ol>`}</div></section>
-  </div></main></div><script src="/assets/danger.js" defer></script></body></html>`;
+  </div>`;
 }

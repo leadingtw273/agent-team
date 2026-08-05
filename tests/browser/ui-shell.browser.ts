@@ -228,9 +228,10 @@ test.describe("U003 localhost UI shell", () => {
     const beforeFocus = await computedFocusAppearance(projectLink);
 
     for (let index = 0; index < 16; index += 1) {
-      const reachedCta = await projectLink.evaluate(
-        (element) => element === element.ownerDocument.activeElement,
-      );
+      const reachedCta = await projectLink.evaluate((element) => {
+        const focusable = element as unknown as Readonly<{ matches(selector: string): boolean }>;
+        return focusable.matches(":focus");
+      });
       if (reachedCta) break;
       await page.keyboard.press("Tab");
     }
