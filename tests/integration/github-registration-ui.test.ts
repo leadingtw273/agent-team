@@ -72,7 +72,7 @@ async function trustedPreview(
   const response = await fetch(`${handle.baseUrl}/registration`, { headers: { cookie } });
   const html = await response.text();
   const match =
-    /data-github-policy-panel data-expected-revision="([a-f0-9]{64})" data-confirmation-token="([A-Za-z0-9_-]{43})"/u.exec(
+    /data-github-policy-panel data-expected-revision="([a-f0-9]{64})" data-confirmation-token="([A-Za-z0-9_-]{20,4096}\.[A-Za-z0-9_-]{43})"/u.exec(
       html,
     );
   if (response.status !== 200 || match?.[1] === undefined || match[2] === undefined) {
@@ -195,7 +195,7 @@ describe("O004 GitHub registration UI security", () => {
 
     const forgedToken = await apply(handle, firstSession, {
       ...confirmationBody(firstPreview),
-      confirmationToken: "A".repeat(43),
+      confirmationToken: `${"A".repeat(20)}.${"A".repeat(43)}`,
     });
     expect(forgedToken.status).toBe(422);
     expect(await forgedToken.json()).toEqual({

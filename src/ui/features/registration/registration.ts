@@ -77,6 +77,7 @@ export function createRegistrationWizardUiFeatureRegistration(
     context: LinearProvisionConfirmationContext,
   ) => GitHubRegistrationPolicyUseCase = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
   githubTarget: GitHubRegistrationTarget = Object.freeze({
+    projectId: "fixture-agent-team-project",
     repository: "fixture/registered-project",
     defaultBranch: "main",
   }),

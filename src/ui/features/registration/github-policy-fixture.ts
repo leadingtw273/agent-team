@@ -1,4 +1,5 @@
 import {
+  createInMemoryGitHubPolicyOperationStore,
   createGitHubRegistrationPolicy,
   type GitHubRegistrationInventory,
   type GitHubRegistrationPolicyPort,
@@ -17,7 +18,7 @@ export const fixtureGitHubRegistrationPolicyPreview: Extract<
   state: "ready",
   setupState: "configuration_incomplete",
   expectedRevision: "a".repeat(64),
-  confirmationToken: "b".repeat(43),
+  confirmationToken: `${"a".repeat(20)}.${"b".repeat(43)}`,
   changes: Object.freeze(["ensure_required_checks", "enable_auto_merge"] as const),
 });
 
@@ -53,6 +54,7 @@ const initialInventory: GitHubRegistrationInventory = Object.freeze({
   autoMergeEnabled: false,
   activeRequiredChecks: Object.freeze([]),
   managedRulesetCollision: false,
+  managedRulesetExact: false,
 });
 
 /** Per-trusted-session synthetic factory for the combined Registration page. */
@@ -63,19 +65,30 @@ export function createFixtureGitHubRegistrationPolicyUseCaseFactory(): (
     let inventory = initialInventory;
     const port: GitHubRegistrationPolicyPort = Object.freeze({
       inspect: () => Promise.resolve(ok(inventory)),
-      provision: () => {
+      createManagedRuleset: () => {
         inventory = Object.freeze({
           ...initialInventory,
+          revision: "b".repeat(64),
+          activeRequiredChecks: Object.freeze(["CI", "agent-team/review"]),
+          managedRulesetExact: true,
+          managedRulesetId: "99",
+        });
+        return Promise.resolve(ok(Object.freeze({ rulesetId: "99" })));
+      },
+      enableAutoMerge: () => {
+        inventory = Object.freeze({
+          ...inventory,
           revision: "c".repeat(64),
           autoMergeEnabled: true,
-          activeRequiredChecks: Object.freeze(["CI", "agent-team/review"]),
         });
         return Promise.resolve(ok(Object.freeze({ changed: true })));
       },
     });
     return createGitHubRegistrationPolicy({
       port,
+      operationStore: createInMemoryGitHubPolicyOperationStore(),
       confirmationKey: Buffer.from(context.digest, "hex"),
+      confirmationContext: Object.freeze({ authorityDigest: context.digest }),
     });
   };
 }

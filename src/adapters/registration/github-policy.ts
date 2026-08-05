@@ -3,11 +3,13 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import {
+  githubRegistrationDesiredPolicy,
   githubRegistrationManagedRulesetName,
   githubRegistrationRequiredChecks,
+  type GitHubRegistrationCreateRulesetRequest,
+  type GitHubRegistrationEnableAutoMergeRequest,
   type GitHubRegistrationInventory,
   type GitHubRegistrationPolicyPort,
-  type GitHubRegistrationProvisionRequest,
   type GitHubRegistrationTarget,
 } from "../../application/registration/index.js";
 import type { MutationOptions, ReadOptions } from "../../application/ports/index.js";
@@ -20,6 +22,7 @@ import {
 } from "../../domain/foundation/index.js";
 import { GhTransport } from "../github/index.js";
 
+const projectIdPattern = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}$/u;
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/u;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/u;
 const revisionPattern = /^[a-f0-9]{64}$/u;
@@ -40,16 +43,23 @@ const rulesetListSchema = z
       .strict(),
   )
   .max(1_000);
+const requiredStatusCheckRuleSchema = z
+  .object({
+    contexts: z.array(z.string().min(1).max(100)).max(1_000),
+    strictRequiredStatusChecksPolicy: z.boolean(),
+    doNotEnforceOnCreate: z.boolean(),
+  })
+  .strict();
 const rulesetDetailSchema = z
   .object({
     id: z.union([z.number().int().positive(), z.string().regex(ruleIdPattern)]),
     name: z.string().min(1).max(100),
     target: z.string().max(50),
     enforcement: z.string().max(50),
-    includesDefaultBranch: z.boolean(),
-    excludesDefaultBranch: z.boolean(),
-    bypassActorCount: z.number().int().nonnegative(),
-    requiredChecks: z.array(z.string().min(1).max(100)).max(1_000),
+    conditionIncludes: z.array(z.string().min(1).max(255)).max(1_000),
+    conditionExcludes: z.array(z.string().min(1).max(255)).max(1_000),
+    bypassActors: z.array(z.unknown()).max(1_000),
+    requiredStatusCheckRules: z.array(requiredStatusCheckRuleSchema).max(100),
   })
   .strict();
 const createdRulesetSchema = z
@@ -61,7 +71,7 @@ const repositoryProjection =
   "{defaultBranch:.default_branch,allowAutoMerge:.allow_auto_merge,admin:.permissions.admin}";
 const rulesetListProjection = "[add[]|{id}]";
 const rulesetDetailProjection =
-  '{id,name,target,enforcement,includesDefaultBranch:((.conditions.ref_name.include // [])|index("~DEFAULT_BRANCH")!=null),excludesDefaultBranch:((.conditions.ref_name.exclude // [])|index("~DEFAULT_BRANCH")!=null),bypassActorCount:([.bypass_actors[]?]|length),requiredChecks:[.rules[]?|select(.type=="required_status_checks")|.parameters.required_status_checks[]?.context]}';
+  '{id,name,target,enforcement,conditionIncludes:.conditions.ref_name.include,conditionExcludes:.conditions.ref_name.exclude,bypassActors:.bypass_actors,requiredStatusCheckRules:[.rules[]|select(.type=="required_status_checks")|{contexts:[.parameters.required_status_checks[].context],strictRequiredStatusChecksPolicy:.parameters.strict_required_status_checks_policy,doNotEnforceOnCreate:.parameters.do_not_enforce_on_create}]}';
 
 export interface GitHubRegistrationJsonTransport {
   requestJson<Output>(
@@ -73,7 +83,6 @@ export interface GitHubRegistrationJsonTransport {
 
 interface InventoryRead {
   readonly inventory: GitHubRegistrationInventory;
-  readonly missingRequiredChecks: boolean;
 }
 
 function encodedRepository(target: GitHubRegistrationTarget): string {
@@ -86,6 +95,7 @@ function encodedRepository(target: GitHubRegistrationTarget): string {
 function validTarget(target: GitHubRegistrationTarget): boolean {
   const parts = target.repository.split("/");
   return (
+    projectIdPattern.test(target.projectId) &&
     repositoryPattern.test(target.repository) &&
     parts.length === 2 &&
     parts.every((part) => part !== "." && part !== "..") &&
@@ -112,6 +122,7 @@ function asUnsupportedInventory(
     autoMergeEnabled: repository.allowAutoMerge,
     activeRequiredChecks: [] as string[],
     managedRulesetCollision: false,
+    managedRulesetExact: false,
   } as const;
   return Object.freeze({ revision: revision(projected), ...projected });
 }
@@ -122,10 +133,18 @@ function normalizedRule(rule: z.infer<typeof rulesetDetailSchema>) {
     name: rule.name,
     target: rule.target,
     enforcement: rule.enforcement,
-    includesDefaultBranch: rule.includesDefaultBranch,
-    excludesDefaultBranch: rule.excludesDefaultBranch,
-    bypassActorCount: rule.bypassActorCount,
-    requiredChecks: Object.freeze([...new Set(rule.requiredChecks)].sort()),
+    conditionIncludes: Object.freeze([...rule.conditionIncludes]),
+    conditionExcludes: Object.freeze([...rule.conditionExcludes]),
+    bypassActors: Object.freeze([...rule.bypassActors]),
+    requiredStatusCheckRules: Object.freeze(
+      rule.requiredStatusCheckRules.map((entry) =>
+        Object.freeze({
+          contexts: Object.freeze([...entry.contexts]),
+          strictRequiredStatusChecksPolicy: entry.strictRequiredStatusChecksPolicy,
+          doNotEnforceOnCreate: entry.doNotEnforceOnCreate,
+        }),
+      ),
+    ),
   });
 }
 
@@ -133,11 +152,42 @@ function providerFailure<Value>(code: DomainError["code"]): Result<Value, Domain
   return err(domainError(code));
 }
 
-function exactRequiredChecks(value: unknown): boolean {
+function exactStrings(actual: readonly string[], expected: readonly string[]): boolean {
   return (
-    Array.isArray(value) &&
-    value.length === githubRegistrationRequiredChecks.length &&
-    value.every((context, index) => context === githubRegistrationRequiredChecks[index])
+    actual.length === expected.length && actual.every((value, index) => value === expected[index])
+  );
+}
+
+function exactManagedRule(rule: ReturnType<typeof normalizedRule>): boolean {
+  const required = rule.requiredStatusCheckRules[0];
+  return (
+    rule.name === githubRegistrationManagedRulesetName &&
+    rule.target === githubRegistrationDesiredPolicy.ruleset.target &&
+    rule.enforcement === githubRegistrationDesiredPolicy.ruleset.enforcement &&
+    exactStrings(
+      rule.conditionIncludes,
+      githubRegistrationDesiredPolicy.ruleset.conditions.include,
+    ) &&
+    exactStrings(
+      rule.conditionExcludes,
+      githubRegistrationDesiredPolicy.ruleset.conditions.exclude,
+    ) &&
+    rule.bypassActors.length === 0 &&
+    rule.requiredStatusCheckRules.length === 1 &&
+    required !== undefined &&
+    exactStrings(required.contexts, githubRegistrationRequiredChecks) &&
+    required.strictRequiredStatusChecksPolicy &&
+    !required.doNotEnforceOnCreate
+  );
+}
+
+function applicableRule(rule: ReturnType<typeof normalizedRule>): boolean {
+  return (
+    rule.target === "branch" &&
+    rule.enforcement === "active" &&
+    rule.conditionIncludes.includes("~DEFAULT_BRANCH") &&
+    !rule.conditionExcludes.includes("~DEFAULT_BRANCH") &&
+    rule.bypassActors.length === 0
   );
 }
 
@@ -173,11 +223,7 @@ function createRulesetArguments(target: GitHubRegistrationTarget): readonly stri
   ]);
 }
 
-/**
- * Registration-only adapter. Its mutation surface is monotonic by construction:
- * create a dedicated active Ruleset and set allow_auto_merge=true. It has no
- * update/delete/disable operation for existing protections.
- */
+/** Additive-only GitHub adapter; durable idempotency is owned by the application journal. */
 export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicyPort {
   constructor(readonly transport: GitHubRegistrationJsonTransport = new GhTransport()) {}
 
@@ -193,9 +239,7 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
       options,
     );
     if (!repository.ok) return repository;
-    if (repository.value.defaultBranch !== target.defaultBranch) {
-      return providerFailure("conflict");
-    }
+    if (repository.value.defaultBranch !== target.defaultBranch) return providerFailure("conflict");
     const list = await this.transport.requestJson(
       [
         "api",
@@ -211,11 +255,9 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
       options,
     );
     if (!list.ok) {
-      if (list.error.code === "not_found") {
-        const unsupported = asUnsupportedInventory(repository.value);
-        return ok(Object.freeze({ inventory: unsupported, missingRequiredChecks: true }));
-      }
-      return list;
+      return list.error.code === "not_found"
+        ? ok(Object.freeze({ inventory: asUnsupportedInventory(repository.value) }))
+        : list;
     }
     const details: ReturnType<typeof normalizedRule>[] = [];
     for (const item of list.value) {
@@ -236,33 +278,21 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
       details.push(normalizedRule(detail.value));
     }
     details.sort((left, right) => left.id.localeCompare(right.id));
-    const applicable = details.filter(
-      (rule) =>
-        rule.target === "branch" &&
-        rule.enforcement === "active" &&
-        rule.includesDefaultBranch &&
-        !rule.excludesDefaultBranch &&
-        rule.bypassActorCount === 0,
-    );
+    const applicable = details.filter(applicableRule);
     const activeRequiredChecks = Object.freeze(
-      [...new Set(applicable.flatMap((rule) => rule.requiredChecks))].sort(),
-    );
-    const activeSet = new Set(activeRequiredChecks);
-    const missingRequiredChecks = githubRegistrationRequiredChecks.some(
-      (context) => !activeSet.has(context),
-    );
-    const managedRulesetCollision = details.some(
-      (rule) =>
-        rule.name === githubRegistrationManagedRulesetName &&
-        !(
-          rule.target === "branch" &&
-          rule.enforcement === "active" &&
-          rule.includesDefaultBranch &&
-          !rule.excludesDefaultBranch &&
-          rule.bypassActorCount === 0 &&
-          githubRegistrationRequiredChecks.every((context) => rule.requiredChecks.includes(context))
+      [
+        ...new Set(
+          applicable.flatMap((rule) =>
+            rule.requiredStatusCheckRules.flatMap((entry) => entry.contexts),
+          ),
         ),
+      ].sort(),
     );
+    const reserved = details.filter((rule) => rule.name === githubRegistrationManagedRulesetName);
+    const exact = reserved.filter(exactManagedRule);
+    const managedRulesetCollision =
+      reserved.length > 1 || (reserved.length === 1 && exact.length !== 1);
+    const managedRulesetExact = exact.length === 1 && !managedRulesetCollision;
     const projection = Object.freeze({
       repository: Object.freeze({
         defaultBranch: repository.value.defaultBranch,
@@ -271,16 +301,18 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
       }),
       rules: Object.freeze(details),
     });
-    const inventory = Object.freeze({
+    const inventory: GitHubRegistrationInventory = Object.freeze({
       revision: revision(projection),
-      permission: repository.value.admin ? ("admin" as const) : ("read_only" as const),
-      rulesets: "supported" as const,
-      autoMerge: "supported" as const,
+      permission: repository.value.admin ? "admin" : "read_only",
+      rulesets: "supported",
+      autoMerge: "supported",
       autoMergeEnabled: repository.value.allowAutoMerge,
       activeRequiredChecks,
       managedRulesetCollision,
+      managedRulesetExact,
+      ...(managedRulesetExact && exact[0] !== undefined ? { managedRulesetId: exact[0].id } : {}),
     });
-    return ok(Object.freeze({ inventory, missingRequiredChecks }));
+    return ok(Object.freeze({ inventory }));
   }
 
   async inspect(
@@ -291,62 +323,62 @@ export class GitHubRegistrationPolicyAdapter implements GitHubRegistrationPolicy
     return result.ok ? ok(result.value.inventory) : result;
   }
 
-  async provision(
-    request: GitHubRegistrationProvisionRequest,
+  async createManagedRuleset(
+    request: GitHubRegistrationCreateRulesetRequest,
     options: MutationOptions,
-  ): Promise<Result<Readonly<{ changed: boolean }>, DomainError>> {
+  ): Promise<Result<Readonly<{ rulesetId: string }>, DomainError>> {
     if (
       !validTarget(request.target) ||
       !revisionPattern.test(request.expectedRevision) ||
-      options.idempotencyKey.trim().length === 0 ||
-      (request as { readonly enableAutoMerge?: unknown }).enableAutoMerge !== true ||
-      !exactRequiredChecks((request as { readonly requiredChecks?: unknown }).requiredChecks)
+      JSON.stringify(request.desiredPolicy) !==
+        JSON.stringify(githubRegistrationDesiredPolicy.ruleset)
     ) {
       return providerFailure("invariant_violation");
     }
     const current = await this.read(request.target, options);
     if (!current.ok) return current;
-    if (current.value.inventory.revision !== request.expectedRevision) {
+    if (current.value.inventory.revision !== request.expectedRevision)
+      return providerFailure("conflict");
+    if (current.value.inventory.permission !== "admin") return providerFailure("permission_denied");
+    if (
+      current.value.inventory.rulesets !== "supported" ||
+      current.value.inventory.managedRulesetCollision ||
+      current.value.inventory.managedRulesetExact
+    ) {
       return providerFailure("conflict");
     }
-    if (
-      current.value.inventory.permission !== "admin" ||
-      current.value.inventory.rulesets !== "supported" ||
-      current.value.inventory.autoMerge !== "supported"
-    ) {
-      return providerFailure("permission_denied");
-    }
-    if (current.value.inventory.managedRulesetCollision) return providerFailure("conflict");
+    const created = await this.transport.requestJson(
+      createRulesetArguments(request.target),
+      createdRulesetSchema,
+      options,
+    );
+    return created.ok ? ok(Object.freeze({ rulesetId: String(created.value.id) })) : created;
+  }
 
-    let changed = false;
-    if (current.value.missingRequiredChecks) {
-      const created = await this.transport.requestJson(
-        createRulesetArguments(request.target),
-        createdRulesetSchema,
-        options,
-      );
-      if (!created.ok) return created;
-      changed = true;
-    }
-    if (!current.value.inventory.autoMergeEnabled) {
-      const endpoint = `repos/${encodedRepository(request.target)}`;
-      const enabled = await this.transport.requestJson(
-        [
-          "api",
-          endpoint,
-          "--method",
-          "PATCH",
-          "-F",
-          "allow_auto_merge=true",
-          "--jq",
-          "{allowAutoMerge:.allow_auto_merge}",
-        ],
-        autoMergeSchema,
-        options,
-      );
-      if (!enabled.ok) return enabled;
-      changed = true;
-    }
-    return ok(Object.freeze({ changed }));
+  async enableAutoMerge(
+    request: GitHubRegistrationEnableAutoMergeRequest,
+    options: MutationOptions,
+  ): Promise<Result<Readonly<{ changed: boolean }>, DomainError>> {
+    if (!validTarget(request.target)) return providerFailure("invariant_violation");
+    const current = await this.read(request.target, options);
+    if (!current.ok) return current;
+    if (current.value.inventory.permission !== "admin") return providerFailure("permission_denied");
+    if (current.value.inventory.autoMergeEnabled) return ok(Object.freeze({ changed: false }));
+    const endpoint = `repos/${encodedRepository(request.target)}`;
+    const enabled = await this.transport.requestJson(
+      [
+        "api",
+        endpoint,
+        "--method",
+        "PATCH",
+        "-F",
+        "allow_auto_merge=true",
+        "--jq",
+        "{allowAutoMerge:.allow_auto_merge}",
+      ],
+      autoMergeSchema,
+      options,
+    );
+    return enabled.ok ? ok(Object.freeze({ changed: true })) : enabled;
   }
 }

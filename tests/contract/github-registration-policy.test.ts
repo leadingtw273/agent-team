@@ -6,6 +6,7 @@ import {
   type GitHubRegistrationJsonTransport,
 } from "../../src/adapters/registration/index.js";
 import {
+  githubRegistrationDesiredPolicy,
   githubRegistrationManagedRulesetName,
   githubRegistrationRequiredChecks,
 } from "../../src/application/registration/index.js";
@@ -23,10 +24,48 @@ interface Rule {
   readonly name: string;
   readonly target: string;
   readonly enforcement: string;
-  readonly includesDefaultBranch: boolean;
-  readonly excludesDefaultBranch: boolean;
-  readonly bypassActorCount: number;
-  readonly requiredChecks: readonly string[];
+  readonly conditionIncludes: readonly string[];
+  readonly conditionExcludes: readonly string[];
+  readonly bypassActors: readonly unknown[];
+  readonly requiredStatusCheckRules: readonly Readonly<{
+    contexts: readonly string[];
+    strictRequiredStatusChecksPolicy: boolean;
+    doNotEnforceOnCreate: boolean;
+  }>[];
+}
+
+function rule(overrides: Partial<Rule> = {}): Rule {
+  return Object.freeze({
+    id: 1,
+    name: "Existing policy",
+    target: "branch",
+    enforcement: "active",
+    conditionIncludes: Object.freeze(["~DEFAULT_BRANCH"]),
+    conditionExcludes: Object.freeze(["refs/heads/__agent_team_never__"]),
+    bypassActors: Object.freeze([]),
+    requiredStatusCheckRules: Object.freeze([
+      Object.freeze({
+        contexts: Object.freeze(["CI"]),
+        strictRequiredStatusChecksPolicy: true,
+        doNotEnforceOnCreate: false,
+      }),
+    ]),
+    ...overrides,
+  });
+}
+
+function exactManagedRule(id = 99): Rule {
+  return rule({
+    id,
+    name: githubRegistrationManagedRulesetName,
+    requiredStatusCheckRules: Object.freeze([
+      Object.freeze({
+        contexts: githubRegistrationRequiredChecks,
+        strictRequiredStatusChecksPolicy: true,
+        doNotEnforceOnCreate: false,
+      }),
+    ]),
+  });
 }
 
 class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
@@ -34,14 +73,15 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
   autoMerge = false;
   admin = true;
   listError: DomainError | undefined;
+  detailOverride: unknown;
   rules: Rule[] = [];
 
   requestJson<Output>(
     arguments_: readonly string[],
-    _schema: z.ZodType<Output>,
-    _options?: ReadOptions,
+    schema: z.ZodType<Output>,
+    options?: ReadOptions,
   ): Promise<Result<Output, DomainError>> {
-    void _options;
+    void options;
     this.calls.push([...arguments_]);
     const endpoint = arguments_[1] ?? "";
     const methodIndex = arguments_.indexOf("--method");
@@ -49,24 +89,15 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
     let value: unknown;
     if (endpoint.endsWith("?includes_parents=false&per_page=100")) {
       if (this.listError !== undefined) return Promise.resolve(err(this.listError));
-      value = this.rules.map((rule) => ({ id: rule.id }));
+      value = this.rules.map((entry) => ({ id: entry.id }));
     } else if (/\/rulesets\/[1-9][0-9]*$/u.test(endpoint)) {
       const id = Number(endpoint.split("/").at(-1));
-      value = this.rules.find((rule) => rule.id === id);
+      value = this.detailOverride ?? this.rules.find((entry) => entry.id === id);
       if (value === undefined) return Promise.resolve(err(domainError("not_found")));
     } else if (endpoint.endsWith("/rulesets") && method === "POST") {
-      const rule: Rule = {
-        id: 99,
-        name: githubRegistrationManagedRulesetName,
-        target: "branch",
-        enforcement: "active",
-        includesDefaultBranch: true,
-        excludesDefaultBranch: false,
-        bypassActorCount: 0,
-        requiredChecks: [...githubRegistrationRequiredChecks],
-      };
-      this.rules.push(rule);
-      value = { id: rule.id };
+      const created = exactManagedRule(99);
+      this.rules.push(created);
+      value = { id: created.id };
     } else if (method === "PATCH") {
       this.autoMerge = true;
       value = { allowAutoMerge: true };
@@ -77,72 +108,107 @@ class FakeGitHubTransport implements GitHubRegistrationJsonTransport {
         admin: this.admin,
       };
     }
-    const parsed = _schema.safeParse(value);
+    const parsed = schema.safeParse(value);
     return Promise.resolve(parsed.success ? ok(parsed.data) : err(domainError("external_failure")));
   }
 }
 
-const target = Object.freeze({ repository: "owner/repository", defaultBranch: "main" });
+const target = Object.freeze({
+  projectId: "project-o004-contract",
+  repository: "owner/repository",
+  defaultBranch: "main",
+});
 
 describe("O004 GitHub registration adapter", () => {
-  it("reads all applicable active Rulesets and preserves stronger existing checks", async () => {
+  it("fails closed when exact detail is omitted or has weak required-check parameters", async () => {
+    const omitted = new FakeGitHubTransport();
+    omitted.rules = [exactManagedRule(3)];
+    omitted.detailOverride = {
+      id: 3,
+      name: githubRegistrationManagedRulesetName,
+      target: "branch",
+      enforcement: "active",
+    };
+    expect((await new GitHubRegistrationPolicyAdapter(omitted).inspect(target)).ok).toBe(false);
+    omitted.detailOverride = { ...exactManagedRule(3), unknownProviderField: true };
+    expect((await new GitHubRegistrationPolicyAdapter(omitted).inspect(target)).ok).toBe(false);
+
+    for (const requiredStatusCheckRules of [
+      [
+        {
+          contexts: githubRegistrationRequiredChecks,
+          strictRequiredStatusChecksPolicy: false,
+          doNotEnforceOnCreate: false,
+        },
+      ],
+      [
+        {
+          contexts: githubRegistrationRequiredChecks,
+          strictRequiredStatusChecksPolicy: true,
+          doNotEnforceOnCreate: true,
+        },
+      ],
+    ] as const) {
+      const weak = new FakeGitHubTransport();
+      weak.autoMerge = true;
+      weak.rules = [exactManagedRule(4)];
+      weak.detailOverride = { ...exactManagedRule(4), requiredStatusCheckRules };
+      expect(await new GitHubRegistrationPolicyAdapter(weak).inspect(target)).toMatchObject({
+        ok: true,
+        value: { managedRulesetCollision: true, managedRulesetExact: false },
+      });
+    }
+  });
+
+  it("reads all applicable active Rulesets but only one full managed rule is exact", async () => {
     const transport = new FakeGitHubTransport();
     transport.autoMerge = true;
     transport.rules = [
-      {
+      rule({
         id: 1,
         name: "Existing stronger policy",
-        target: "branch",
-        enforcement: "active",
-        includesDefaultBranch: true,
-        excludesDefaultBranch: false,
-        bypassActorCount: 0,
-        requiredChecks: ["CI", "agent-team/review", "security-scan"],
-      },
-      {
-        id: 2,
-        name: "Evaluate only",
-        target: "branch",
-        enforcement: "evaluate",
-        includesDefaultBranch: true,
-        excludesDefaultBranch: false,
-        bypassActorCount: 0,
-        requiredChecks: ["untrusted-evaluate-check"],
-      },
+        requiredStatusCheckRules: Object.freeze([
+          Object.freeze({
+            contexts: Object.freeze(["CI", "agent-team/review", "security-scan"]),
+            strictRequiredStatusChecksPolicy: true,
+            doNotEnforceOnCreate: false,
+          }),
+        ]),
+      }),
+      rule({ id: 2, name: "Evaluate only", enforcement: "evaluate" }),
     ];
 
     const result = await new GitHubRegistrationPolicyAdapter(transport).inspect(target);
 
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.error.code);
-    expect(result.value.revision).toMatch(/^[a-f0-9]{64}$/u);
-    expect(result.value).toMatchObject({
-      permission: "admin",
-      rulesets: "supported",
-      autoMerge: "supported",
-      autoMergeEnabled: true,
-      activeRequiredChecks: ["CI", "agent-team/review", "security-scan"],
-      managedRulesetCollision: false,
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        autoMergeEnabled: true,
+        activeRequiredChecks: ["CI", "agent-team/review", "security-scan"],
+        managedRulesetCollision: false,
+        managedRulesetExact: false,
+      },
     });
-    expect(JSON.stringify(result)).not.toContain("untrusted-evaluate-check");
   });
 
-  it("uses additive POST plus true-only PATCH and is idempotent after read-back", async () => {
+  it("uses additive POST plus true-only PATCH and exact read-back", async () => {
     const transport = new FakeGitHubTransport();
     const adapter = new GitHubRegistrationPolicyAdapter(transport);
     const before = await adapter.inspect(target);
     if (!before.ok) throw new Error(before.error.code);
 
     expect(
-      await adapter.provision(
+      await adapter.createManagedRuleset(
         {
           target,
           expectedRevision: before.value.revision,
-          requiredChecks: githubRegistrationRequiredChecks,
-          enableAutoMerge: true,
+          desiredPolicy: githubRegistrationDesiredPolicy.ruleset,
         },
-        { idempotencyKey: "test:additive" },
+        { idempotencyKey: "journal-owned-operation" },
       ),
+    ).toEqual({ ok: true, value: { rulesetId: "99" } });
+    expect(
+      await adapter.enableAutoMerge({ target }, { idempotencyKey: "journal-owned-auto-merge" }),
     ).toEqual({ ok: true, value: { changed: true } });
 
     const mutationCalls = transport.calls.filter(
@@ -150,97 +216,106 @@ describe("O004 GitHub registration adapter", () => {
     );
     expect(mutationCalls).toHaveLength(2);
     expect(mutationCalls[0]?.join(" ")).toContain(
-      "rules[][parameters][required_status_checks][][context]=CI",
+      "rules[][parameters][strict_required_status_checks_policy]=true",
     );
-    expect(mutationCalls[0]?.join(" ")).toContain("agent-team/review");
+    expect(mutationCalls[0]?.join(" ")).toContain(
+      "rules[][parameters][do_not_enforce_on_create]=false",
+    );
     expect(mutationCalls[1]?.join(" ")).toContain("allow_auto_merge=true");
     expect(mutationCalls.flat()).not.toContain("DELETE");
     expect(mutationCalls.flat()).not.toContain("PUT");
-    expect(mutationCalls.join(" ")).not.toContain("allow_auto_merge=false");
 
-    const after = await adapter.inspect(target);
-    if (!after.ok) throw new Error(after.error.code);
-    const callCount = transport.calls.length;
-    expect(
-      await adapter.provision(
-        {
-          target,
-          expectedRevision: after.value.revision,
-          requiredChecks: githubRegistrationRequiredChecks,
-          enableAutoMerge: true,
-        },
-        { idempotencyKey: "test:idempotent" },
-      ),
-    ).toEqual({ ok: true, value: { changed: false } });
-    expect(
-      transport.calls
-        .slice(callCount)
-        .every((call) => !call.includes("POST") && !call.includes("PATCH")),
-    ).toBe(true);
+    expect(await adapter.inspect(target)).toMatchObject({
+      ok: true,
+      value: {
+        autoMergeEnabled: true,
+        managedRulesetExact: true,
+        managedRulesetId: "99",
+      },
+    });
   });
 
-  it("rejects stale CAS and insufficient permission before any mutation", async () => {
+  it("rejects stale CAS and insufficient permission before any POST", async () => {
     const staleTransport = new FakeGitHubTransport();
     const staleAdapter = new GitHubRegistrationPolicyAdapter(staleTransport);
-    const stale = await staleAdapter.provision(
-      {
-        target,
-        expectedRevision: "0".repeat(64),
-        requiredChecks: githubRegistrationRequiredChecks,
-        enableAutoMerge: true,
-      },
-      { idempotencyKey: "test:stale" },
-    );
-    expect(stale.ok ? "ok" : stale.error.code).toBe("conflict");
     expect(
-      staleTransport.calls.some((call) => call.includes("POST") || call.includes("PATCH")),
-    ).toBe(false);
+      await staleAdapter.createManagedRuleset(
+        {
+          target,
+          expectedRevision: "0".repeat(64),
+          desiredPolicy: githubRegistrationDesiredPolicy.ruleset,
+        },
+        { idempotencyKey: "stale" },
+      ),
+    ).toMatchObject({ ok: false, error: { code: "conflict" } });
 
     const deniedTransport = new FakeGitHubTransport();
     deniedTransport.admin = false;
     const deniedAdapter = new GitHubRegistrationPolicyAdapter(deniedTransport);
     const deniedRead = await deniedAdapter.inspect(target);
     if (!deniedRead.ok) throw new Error(deniedRead.error.code);
-    const denied = await deniedAdapter.provision(
-      {
-        target,
-        expectedRevision: deniedRead.value.revision,
-        requiredChecks: githubRegistrationRequiredChecks,
-        enableAutoMerge: true,
-      },
-      { idempotencyKey: "test:permission" },
-    );
-    expect(denied.ok ? "ok" : denied.error.code).toBe("permission_denied");
     expect(
-      deniedTransport.calls.some((call) => call.includes("POST") || call.includes("PATCH")),
+      await deniedAdapter.createManagedRuleset(
+        {
+          target,
+          expectedRevision: deniedRead.value.revision,
+          desiredPolicy: githubRegistrationDesiredPolicy.ruleset,
+        },
+        { idempotencyKey: "denied" },
+      ),
+    ).toMatchObject({ ok: false, error: { code: "permission_denied" } });
+    expect(
+      [...staleTransport.calls, ...deniedTransport.calls].some((call) => call.includes("POST")),
     ).toBe(false);
   });
 
-  it("reports unsupported Rulesets and a reserved-name collision without taking over", async () => {
+  it("reports unsupported, bypass, and reserved-name collision without takeover", async () => {
     const unsupported = new FakeGitHubTransport();
     unsupported.listError = domainError("not_found");
-    const unsupportedRead = await new GitHubRegistrationPolicyAdapter(unsupported).inspect(target);
-    expect(unsupportedRead).toMatchObject({ ok: true, value: { rulesets: "unsupported" } });
+    expect(await new GitHubRegistrationPolicyAdapter(unsupported).inspect(target)).toMatchObject({
+      ok: true,
+      value: { rulesets: "unsupported" },
+    });
 
-    const collision = new FakeGitHubTransport();
-    collision.rules = [
-      {
+    for (const collisionRule of [
+      rule({
         id: 4,
         name: githubRegistrationManagedRulesetName,
-        target: "branch",
-        enforcement: "active",
-        includesDefaultBranch: true,
-        excludesDefaultBranch: false,
-        bypassActorCount: 1,
-        requiredChecks: [...githubRegistrationRequiredChecks],
-      },
-    ];
-    const collisionRead = await new GitHubRegistrationPolicyAdapter(collision).inspect(target);
-    expect(collisionRead).toMatchObject({
-      ok: true,
-      value: { managedRulesetCollision: true },
-    });
-    if (!collisionRead.ok) throw new Error(collisionRead.error.code);
-    expect(collisionRead.value.activeRequiredChecks).toEqual([]);
+        bypassActors: Object.freeze([{ actor_id: 1 }]),
+      }),
+      rule({
+        id: 5,
+        name: githubRegistrationManagedRulesetName,
+        conditionExcludes: Object.freeze([]),
+      }),
+      rule({
+        id: 6,
+        name: githubRegistrationManagedRulesetName,
+        conditionIncludes: Object.freeze(["~DEFAULT_BRANCH", "refs/heads/release"]),
+      }),
+      rule({
+        id: 7,
+        name: githubRegistrationManagedRulesetName,
+        requiredStatusCheckRules: Object.freeze([
+          Object.freeze({
+            contexts: Object.freeze(["CI"]),
+            strictRequiredStatusChecksPolicy: true,
+            doNotEnforceOnCreate: false,
+          }),
+          Object.freeze({
+            contexts: Object.freeze(["agent-team/review"]),
+            strictRequiredStatusChecksPolicy: true,
+            doNotEnforceOnCreate: false,
+          }),
+        ]),
+      }),
+    ]) {
+      const collision = new FakeGitHubTransport();
+      collision.rules = [collisionRule];
+      expect(await new GitHubRegistrationPolicyAdapter(collision).inspect(target)).toMatchObject({
+        ok: true,
+        value: { managedRulesetCollision: true, managedRulesetExact: false },
+      });
+    }
   });
 });

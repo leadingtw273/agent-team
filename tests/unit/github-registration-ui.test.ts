@@ -54,6 +54,7 @@ describe("O004 GitHub registration UI component", () => {
     );
     const policy: GitHubRegistrationPolicyUseCase = { preview, apply };
     const controller = createGitHubRegistrationUiController(policy, {
+      projectId: "project-o004-ui",
       repository: "owner/repository",
       defaultBranch: "main",
     });
@@ -62,16 +63,21 @@ describe("O004 GitHub registration UI component", () => {
     await contribution.render();
     await controller.apply({
       expectedRevision: "a".repeat(64),
-      confirmationToken: "b".repeat(43),
+      confirmationToken: `${"a".repeat(20)}.${"b".repeat(43)}`,
     });
-    expect(preview).toHaveBeenCalledWith({ repository: "owner/repository", defaultBranch: "main" });
+    expect(preview).toHaveBeenCalledWith({
+      projectId: "project-o004-ui",
+      repository: "owner/repository",
+      defaultBranch: "main",
+    });
     expect(apply).toHaveBeenCalledWith({
+      projectId: "project-o004-ui",
       repository: "owner/repository",
       defaultBranch: "main",
       operation: "apply_github_policy",
       confirmationText: "套用 GitHub 合併保護",
       expectedRevision: "a".repeat(64),
-      confirmationToken: "b".repeat(43),
+      confirmationToken: `${"a".repeat(20)}.${"b".repeat(43)}`,
     });
     expect(contribution.scripts).toEqual([githubRegistrationPolicyScriptPath]);
     expect(contribution.routes.map((route) => route.contract.path)).toEqual([
