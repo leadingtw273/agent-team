@@ -2,6 +2,7 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -160,5 +161,41 @@ describe("Linux held secure directory", () => {
     await expect(stat(join(root, "leases", "operation.lock"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("never unlinks a replacement owner during lock-release ABA", async () => {
+    const parent = await container();
+    const root = join(parent, "state");
+    const lockDirectory = join(root, "leases");
+    const displaced = join(lockDirectory, "operation.lock.displaced");
+    const result = await withSecureDirectory(
+      root,
+      ["leases"],
+      { create: true },
+      async (directory) => {
+        const first = await directory.acquireLock("operation.lock", "owner-a");
+        if (!first.ok) return first;
+        await rename(join(lockDirectory, "operation.lock"), displaced);
+        const replacement = await directory.acquireLock("operation.lock", "owner-b");
+        if (!replacement.ok) return replacement;
+
+        expect(await first.value.release()).toMatchObject({
+          ok: false,
+          error: { code: "conflict" },
+        });
+        const entries = await readdir(lockDirectory);
+        const quarantined = entries.find((entry) => entry.includes(".release-"));
+        if (quarantined === undefined) throw new Error("replacement quarantine missing");
+        expect(JSON.parse(await readFile(displaced, "utf8"))).toMatchObject({
+          holderId: "owner-a",
+        });
+        expect(JSON.parse(await readFile(join(lockDirectory, quarantined), "utf8"))).toMatchObject({
+          holderId: "owner-b",
+        });
+        return ok(undefined);
+      },
+    );
+
+    expect(result).toEqual({ ok: true, value: undefined });
   });
 });

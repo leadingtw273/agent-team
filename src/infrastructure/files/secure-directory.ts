@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, unlink, type FileHandle } from "node:fs/promises";
+import { mkdir, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute, resolve, sep } from "node:path";
 
 import {
   domainError,
+  createClock,
   err,
   ok,
   type Clock,
@@ -13,7 +15,6 @@ import {
 import { AtomicFileStore, privateFileMode, syncDirectory } from "./atomic.js";
 import { privateDirectoryMode } from "./layout.js";
 import {
-  acquireFileLock,
   inspectFileLock,
   reclaimStaleFileLock,
   type FileLockHandle,
@@ -233,9 +234,66 @@ export class HeldSecureDirectory {
   ): Promise<Result<FileLockHandle, DomainError>> {
     const path = this.#path(name);
     if (!path.ok) return path;
-    return clock === undefined
-      ? acquireFileLock(path.value, holderId)
-      : acquireFileLock(path.value, holderId, clock);
+    if (holderId.trim().length === 0) return err(domainError("invariant_violation"));
+    const token = randomUUID();
+    const record: FileLockSnapshot = Object.freeze({
+      schemaVersion: 1,
+      token,
+      holderId,
+      pid: process.pid,
+      acquiredAt: (clock ?? createClock()).now(),
+    });
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(path.value, "wx", privateFileMode);
+      await handle.writeFile(`${JSON.stringify(record)}\n`, "utf8");
+      await handle.chmod(privateFileMode);
+      await handle.sync();
+      await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+    } catch (error) {
+      await closeQuietly(handle);
+      return err(domainError(hasCode(error, "EEXIST") ? "conflict" : fileError(error).code));
+    }
+    const ownedHandle = handle;
+    const ownedInfo = await ownedHandle.stat();
+    let finished = false;
+    return ok(
+      Object.freeze({
+        path: path.value,
+        holderId,
+        release: async (): Promise<Result<void, DomainError>> => {
+          if (finished) return err(domainError("conflict"));
+          finished = true;
+          const quarantineName = `${name}.release-${token}`;
+          const quarantine = this.#path(quarantineName);
+          if (!quarantine.ok) {
+            await closeQuietly(ownedHandle);
+            return quarantine;
+          }
+          let observed: FileHandle | undefined;
+          try {
+            await rename(path.value, quarantine.value);
+            observed = await open(quarantine.value, constants.O_RDONLY | constants.O_NOFOLLOW);
+            const observedInfo = await observed.stat();
+            if (
+              !observedInfo.isFile() ||
+              observedInfo.dev !== ownedInfo.dev ||
+              observedInfo.ino !== ownedInfo.ino
+            ) {
+              return err(domainError("conflict"));
+            }
+            await unlink(quarantine.value);
+            await syncDirectory(`/proc/self/fd/${String(this.#handle.fd)}`);
+            return ok(undefined);
+          } catch (error) {
+            return err(fileError(error));
+          } finally {
+            await closeQuietly(observed);
+            await closeQuietly(ownedHandle);
+          }
+        },
+      }),
+    );
   }
 
   async inspectLock(name: string): Promise<Result<FileLockSnapshot, DomainError>> {
