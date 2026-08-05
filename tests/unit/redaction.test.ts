@@ -22,6 +22,8 @@ describe("text redaction", () => {
     ];
 
     for (const marker of markers) expect(containsSensitiveValue(marker)).toBe(true);
+    expect(containsSensitiveValue("Authorization: Bearer header-value")).toBe(true);
+    expect(containsSensitiveValue("https://user:password@example.test/runtime")).toBe(true);
     expect(containsSensitiveValue("https://hooks.example.test/agent-team")).toBe(false);
   });
 
