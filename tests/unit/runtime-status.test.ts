@@ -6,8 +6,16 @@ import {
   renderRuntimeStatusPage,
   runtimeStatusCssPath,
   runtimeStatusPagePath,
+  safeRuntimeIdentifier,
+  safeRuntimeLabel,
+  safeRuntimeSummary,
+  safeRuntimeTimestamp,
   type RuntimeStatusReadModel,
 } from "../../src/ui/features/runtime-status/index.js";
+
+function joined(...parts: readonly string[]): string {
+  return parts.join("");
+}
 
 describe("runtime status read model", () => {
   it("declares content-only registration in the running slot with a feature-owned stylesheet", () => {
@@ -46,7 +54,39 @@ describe("runtime status read model", () => {
     ]);
   });
 
-  it("renders the operational fields without raw command, secret, or hidden reasoning data", () => {
+  it("uses shared redactor detection for Runtime summaries and labels without hiding normal Chinese", () => {
+    const providerToken = joined("github", "_pat_", "abcdefghijklmnopqrstuvwxyz");
+    const jwt = joined("eyJ", "abcdefghijk", ".", "abcdefghijkl", ".", "abcdefghijkl");
+    const header = "Authorization: Bearer header-secret-value";
+    const credentialUrl = "https://user-name:password-value@example.test/runtime";
+    const nestedProviderSummary = `巢狀阻塞摘要：${providerToken}`;
+    const longSummary = `摘要：${"可讀狀態".repeat(80)}`;
+
+    for (const value of [
+      providerToken,
+      jwt,
+      header,
+      credentialUrl,
+      nestedProviderSummary,
+      longSummary,
+      "git reset --hard",
+    ]) {
+      expect(safeRuntimeSummary(value)).toBe("已隱藏不安全的原始內容");
+    }
+    for (const value of [providerToken, jwt]) {
+      expect(safeRuntimeLabel(value)).toBe("未提供安全摘要");
+    }
+    expect(safeRuntimeIdentifier(providerToken)).toBe("已隱藏不安全的識別資訊");
+    expect(safeRuntimeTimestamp(header)).toBe("未提供安全時間");
+    expect(safeRuntimeSummary("週額度不足，等待 5 小時後再檢查。 ")).toBe(
+      "週額度不足，等待 5 小時後再檢查。",
+    );
+    expect(safeRuntimeLabel("實作者 模型摘要")).toBe("實作者 模型摘要");
+    const longSafeIdentifier = `job_${"safe-identifier-".repeat(40)}`;
+    expect(safeRuntimeIdentifier(longSafeIdentifier)).toBe(longSafeIdentifier);
+  });
+
+  it("fails closed before rendering unsafe external Runtime fields", () => {
     const first = fixtureRuntimeStatusReadModel.listRuntimeStatuses()[0];
     if (first === undefined)
       throw new Error("The runtime status fixture is missing its first entry.");
@@ -54,6 +94,13 @@ describe("runtime status read model", () => {
     if (firstProgress === undefined) {
       throw new Error("The runtime status fixture must show effective progress.");
     }
+    const firstBlock = first.block;
+    if (firstBlock === undefined) throw new Error("The runtime status fixture must show a block.");
+    const providerToken = joined("sk", "-ant-", "abcdefghijklmnopqrstuv");
+    const jwt = joined("eyJ", "abcdefghijk", ".", "abcdefghijkl", ".", "abcdefghijkl");
+    const header = "Authorization: Bearer header-secret-value";
+    const credentialUrl = "https://user-name:password-value@example.test/runtime";
+    const longSummary = `下一步：${"可讀狀態".repeat(80)}`;
 
     const unsafeReadModel: RuntimeStatusReadModel = Object.freeze({
       source: "runtime",
@@ -61,13 +108,35 @@ describe("runtime status read model", () => {
         Object.freeze([
           Object.freeze({
             ...first,
+            job: Object.freeze({
+              ...first.job,
+              issueId: providerToken as typeof first.job.issueId,
+            }),
+            roleModel: Object.freeze({
+              ...first.roleModel,
+              provider: providerToken,
+              model: jwt,
+            }),
             lastEffectiveProgress: Object.freeze({
               ...firstProgress,
-              summary:
-                "curl https://runtime.invalid --header 'Authorization: Bearer fixture-secret'",
+              summary: `巢狀有效進度：${providerToken}`,
             }),
+            block: Object.freeze({
+              ...firstBlock,
+              summary: credentialUrl,
+              nextStep: header,
+            }),
+            ...(first.checkpoint === undefined
+              ? {}
+              : {
+                  checkpoint: Object.freeze({
+                    ...first.checkpoint,
+                    nextStep: longSummary,
+                  }),
+                }),
+            nextStep: `curl https://runtime.invalid --header '${header}'`,
             rawCommand: "rm -rf /dangerous-path",
-            secret: "fixture-secret",
+            secret: "header-secret-value",
             hiddenReasoning: "internal chain of thought",
           }),
         ]),
@@ -83,10 +152,15 @@ describe("runtime status read model", () => {
     expect(html).toContain("60 分鐘硬邊界");
     expect(html).toContain("Checkpoint");
     expect(html).toContain("實作者");
-    expect(html).toContain("Codex");
     expect(html).toContain("已隱藏不安全的原始內容");
+    expect(html).toContain("未提供安全摘要");
+    expect(html).toContain("已隱藏不安全的識別資訊");
     expect(html).not.toContain("curl https://runtime.invalid");
-    expect(html).not.toContain("fixture-secret");
+    expect(html).not.toContain(providerToken);
+    expect(html).not.toContain(jwt);
+    expect(html).not.toContain("header-secret-value");
+    expect(html).not.toContain("user-name");
+    expect(html).not.toContain("password-value");
     expect(html).not.toContain("rm -rf /dangerous-path");
     expect(html).not.toContain("internal chain of thought");
   });

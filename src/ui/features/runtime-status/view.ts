@@ -1,6 +1,8 @@
 import {
+  safeRuntimeIdentifier,
   safeRuntimeLabel,
   safeRuntimeSummary,
+  safeRuntimeTimestamp,
   type RuntimeBlock,
   type RuntimeCheckpointSummary,
   type RuntimeEffectiveProgress,
@@ -33,11 +35,15 @@ function text(value: string): string {
 }
 
 function runtimeIdentifier(value: string): string {
-  return `<code class="ui-runtime-id">${escapeHtml(value)}</code>`;
+  return `<code class="ui-runtime-id">${escapeHtml(safeRuntimeIdentifier(value))}</code>`;
 }
 
 function label(value: string): string {
   return escapeHtml(safeRuntimeLabel(value));
+}
+
+function timestamp(value: string): string {
+  return escapeHtml(safeRuntimeTimestamp(value));
 }
 
 function statusLabel(state: RuntimeStatusItem["state"]): string {
@@ -48,6 +54,8 @@ function statusLabel(state: RuntimeStatusItem["state"]): string {
       return "Checkpoint 已建立";
     case "blocked":
       return "已阻塞";
+    default:
+      return "未知狀態";
   }
 }
 
@@ -58,6 +66,21 @@ function statusVariant(state: RuntimeStatusItem["state"]): "active" | "warning" 
     case "checkpointed":
       return "warning";
     case "blocked":
+      return "blocked";
+    default:
+      return "blocked";
+  }
+}
+
+function statusClass(state: RuntimeStatusItem["state"]): "running" | "checkpointed" | "blocked" {
+  switch (state) {
+    case "running":
+      return "running";
+    case "checkpointed":
+      return "checkpointed";
+    case "blocked":
+      return "blocked";
+    default:
       return "blocked";
   }
 }
@@ -134,6 +157,23 @@ function blockTitle(block: RuntimeBlock): string {
       return "等待危險操作核可";
     case "unknown":
       return "未知錯誤";
+    default:
+      return "未知錯誤";
+  }
+}
+
+function blockClass(kind: RuntimeBlock["kind"]): "crash" | "quota" | "danger_approval" | "unknown" {
+  switch (kind) {
+    case "crash":
+      return "crash";
+    case "quota":
+      return "quota";
+    case "danger_approval":
+      return "danger_approval";
+    case "unknown":
+      return "unknown";
+    default:
+      return "unknown";
   }
 }
 
@@ -155,6 +195,8 @@ function dangerCategoryLabel(
       return "Secret 存取";
     case "paid_action":
       return "付費操作";
+    default:
+      return "未提供安全類別";
   }
 }
 
@@ -172,6 +214,8 @@ function renderBlockDetails(block: RuntimeBlock): string {
       return `<p class="ui-runtime-detail">危險操作類別：${dangerCategoryLabel(block.category)}</p>`;
     case "unknown":
       return `<p class="ui-runtime-detail">狀態：來源尚未可安全對帳，未顯示原始診斷內容。</p>`;
+    default:
+      return `<p class="ui-runtime-detail">狀態：未提供安全阻塞詳情。</p>`;
   }
 }
 
@@ -185,7 +229,7 @@ function renderCheckpoint(checkpoint: RuntimeCheckpointSummary | undefined): str
     <dl class="ui-runtime-facts ui-runtime-facts--compact ui-runtime-facts--mobile-rows">
       <div><dt>ID</dt><dd>${runtimeIdentifier(checkpoint.id)}</dd></div>
       <div><dt>原因</dt><dd>${checkpointReasonLabel(checkpoint.reason)}</dd></div>
-      <div><dt>建立時間</dt><dd>${escapeHtml(checkpoint.createdAt)}</dd></div>
+      <div><dt>建立時間</dt><dd>${timestamp(checkpoint.createdAt)}</dd></div>
       <div><dt>完成／剩餘</dt><dd>${String(checkpoint.completedItemCount)} ／ ${String(checkpoint.remainingItemCount)} 項</dd></div>
       <div><dt>測試摘要</dt><dd>通過 ${String(checkpoint.testCounts.passed)} · 失敗 ${String(checkpoint.testCounts.failed)} · 未執行 ${String(checkpoint.testCounts.notRun)}</dd></div>
     </dl>
@@ -200,7 +244,7 @@ function renderProgress(progress: RuntimeEffectiveProgress | undefined): string 
 
   return `<section class="ui-runtime-section" aria-label="最後有效進度">
     <h3>最後有效進度</h3>
-    <p class="ui-runtime-progress-kind">${progressKindLabel(progress.kind)} · ${escapeHtml(progress.occurredAt)}</p>
+    <p class="ui-runtime-progress-kind">${progressKindLabel(progress.kind)} · ${timestamp(progress.occurredAt)}</p>
     <p class="ui-runtime-summary">${text(progress.summary)}</p>
   </section>`;
 }
@@ -231,7 +275,7 @@ function renderBlock(block: RuntimeBlock | undefined): string {
     return `<section class="ui-runtime-section" aria-label="阻塞原因"><h3>阻塞原因</h3><p class="ui-runtime-empty">目前沒有已知阻塞原因。</p></section>`;
   }
 
-  return `<section class="ui-runtime-section ui-runtime-block ui-runtime-block--${block.kind}" aria-label="阻塞原因">
+  return `<section class="ui-runtime-section ui-runtime-block ui-runtime-block--${blockClass(block.kind)}" aria-label="阻塞原因">
     <h3>阻塞原因</h3>
     <p class="ui-runtime-block-title">${blockTitle(block)}</p>
     <p class="ui-runtime-summary">${text(block.summary)}</p>
@@ -242,21 +286,21 @@ function renderBlock(block: RuntimeBlock | undefined): string {
 
 function renderRuntimeStatus(item: RuntimeStatusItem, index: number): string {
   const headingId = `runtime-status-${String(index + 1)}`;
-  return `<article class="card ui-runtime-card ui-runtime-card--${item.state}" aria-labelledby="${headingId}">
+  return `<article class="card ui-runtime-card ui-runtime-card--${statusClass(item.state)}" aria-labelledby="${headingId}">
     <div class="card-body">
       <div class="ui-runtime-card-header">
         <div>
           <p class="ui-runtime-card-eyebrow">${label(item.roleModel.role)} · ${label(item.roleModel.provider)} / ${label(item.roleModel.model)}</p>
-          <h2 id="${headingId}">${escapeHtml(item.job.issueId)}</h2>
+          <h2 id="${headingId}">${escapeHtml(safeRuntimeIdentifier(item.job.issueId))}</h2>
         </div>
         <span class="badge ui-status-badge ui-status--${statusVariant(item.state)}"><span class="ui-status-dot" aria-hidden="true"></span>${statusLabel(item.state)}</span>
       </div>
       <dl class="ui-runtime-facts ui-runtime-facts--context" aria-label="Job 與 Lease">
         <div><dt>Job ID</dt><dd>${runtimeIdentifier(item.job.id)}</dd></div>
         <div><dt>專案</dt><dd>${runtimeIdentifier(item.job.projectId)}</dd></div>
-        <div><dt>開始時間</dt><dd>${escapeHtml(item.job.startedAt)}</dd></div>
+        <div><dt>開始時間</dt><dd>${timestamp(item.job.startedAt)}</dd></div>
         <div><dt>Lease</dt><dd>${runtimeIdentifier(item.lease.id)} <span class="ui-runtime-inline-status">${leaseStateLabel(item.lease.state)}</span></dd></div>
-        <div><dt>Lease 到期</dt><dd>${escapeHtml(item.lease.expiresAt)}</dd></div>
+        <div><dt>Lease 到期</dt><dd>${timestamp(item.lease.expiresAt)}</dd></div>
       </dl>
       <section class="ui-runtime-section" aria-label="嘗試次數">
         <h3>嘗試次數</h3>

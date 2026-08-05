@@ -1,5 +1,6 @@
 import type { Checkpoint } from "../../../domain/checkpoint/index.js";
 import type { Instant } from "../../../domain/foundation/index.js";
+import { containsSensitiveValue } from "../../../infrastructure/redaction/index.js";
 import type {
   Job,
   JobAttemptCounters,
@@ -134,9 +135,35 @@ export interface RuntimeStatusReadModel {
   readonly listRuntimeStatuses: () => readonly RuntimeStatusItem[];
 }
 
-const unsafeRawContentPattern =
-  /(?:authorization\s*[:=]|bearer\s+[a-z0-9._~+/=-]+|(?:api[_ -]?key|secret|token|password)\s*[:=]|-----begin|(?:^|\s)(?:curl|wget|rm|bash|zsh|sh|node|pnpm|git)\b|hidden\s+reasoning|chain\s+of\s+thought)/iu;
 const safeSummaryMaximumLength = 240;
+const safeLabelMaximumLength = 80;
+const safeIdentifierMaximumLength = 1_024;
+const safeTimestampMaximumLength = 80;
+const runtimeSummaryPlaceholder = "已隱藏不安全的原始內容";
+const runtimeLabelPlaceholder = "未提供安全摘要";
+const runtimeIdentifierPlaceholder = "已隱藏不安全的識別資訊";
+const runtimeTimestampPlaceholder = "未提供安全時間";
+const rawCommandNames = new Set(["curl", "wget", "rm", "bash", "zsh", "sh", "node", "pnpm", "git"]);
+const prohibitedReasoningPhrases = ["hidden reasoning", "chain of thought"] as const;
+
+function normalizedRuntimeText(value: unknown, maximumLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  return normalized.length === 0 ||
+    normalized.length > maximumLength ||
+    containsSensitiveValue(normalized)
+    ? undefined
+    : normalized;
+}
+
+function containsProhibitedRuntimeSummary(value: string): boolean {
+  const lower = value.toLocaleLowerCase("en-US");
+  const firstWord = lower.split(" ", 1)[0];
+  return (
+    prohibitedReasoningPhrases.some((phrase) => lower.includes(phrase)) ||
+    (firstWord !== undefined && rawCommandNames.has(firstWord))
+  );
+}
 
 /**
  * Read models must provide human-readable summaries, not raw diagnostic payloads.
@@ -144,18 +171,23 @@ const safeSummaryMaximumLength = 240;
  * fixed safe placeholder rather than content exposed in the localhost UI.
  */
 export function safeRuntimeSummary(value: string): string {
-  const normalized = value.replace(/\s+/gu, " ").trim();
-  if (
-    normalized.length === 0 ||
-    normalized.length > safeSummaryMaximumLength ||
-    unsafeRawContentPattern.test(normalized)
-  ) {
-    return "已隱藏不安全的原始內容";
-  }
-  return normalized;
+  const normalized = normalizedRuntimeText(value, safeSummaryMaximumLength);
+  return normalized === undefined || containsProhibitedRuntimeSummary(normalized)
+    ? runtimeSummaryPlaceholder
+    : normalized;
 }
 
 export function safeRuntimeLabel(value: string): string {
-  const normalized = value.replace(/\s+/gu, " ").trim();
-  return /^[\p{L}\p{N}][\p{L}\p{N}_. -]{0,79}$/u.test(normalized) ? normalized : "未提供安全摘要";
+  const normalized = normalizedRuntimeText(value, safeLabelMaximumLength);
+  return normalized !== undefined && /^[\p{L}\p{N}][\p{L}\p{N}_. -]{0,79}$/u.test(normalized)
+    ? normalized
+    : runtimeLabelPlaceholder;
+}
+
+export function safeRuntimeIdentifier(value: string): string {
+  return normalizedRuntimeText(value, safeIdentifierMaximumLength) ?? runtimeIdentifierPlaceholder;
+}
+
+export function safeRuntimeTimestamp(value: string): string {
+  return normalizedRuntimeText(value, safeTimestampMaximumLength) ?? runtimeTimestampPlaceholder;
 }

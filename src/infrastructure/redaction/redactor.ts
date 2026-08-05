@@ -58,7 +58,7 @@ const tokenPatternSources = [
 const tokenPatterns = tokenPatternSources.map((source) => new RegExp(source, "gu"));
 
 /** Pure, allocation-bounded recognition for provider credentials and JWT-shaped values. */
-export function containsSensitiveValue(input: string): boolean {
+function containsProviderOrJwtValue(input: string): boolean {
   return tokenPatternSources.some((source) => new RegExp(source, "u").test(input));
 }
 
@@ -133,7 +133,7 @@ export class Redactor {
       (match, boundary: string, quote: string, key: string, separator: string) =>
         this.isSensitiveKey(key) ? `${boundary}${quote}${key}${separator}${redactedValue}` : match,
     );
-    if (containsSensitiveValue(output)) {
+    if (containsProviderOrJwtValue(output)) {
       for (const pattern of tokenPatterns) output = output.replace(pattern, redactedValue);
     }
     return output;
@@ -184,4 +184,16 @@ export class Redactor {
       ancestors.delete(input);
     }
   }
+}
+
+const sharedSensitiveValueRedactor = new Redactor();
+
+/**
+ * Recognizes every credential shape that the shared text redactor would change:
+ * provider/JWT tokens, sensitive headers and query keys, and URL userinfo.
+ */
+export function containsSensitiveValue(input: string): boolean {
+  return (
+    containsProviderOrJwtValue(input) || sharedSensitiveValueRedactor.redactText(input) !== input
+  );
 }
