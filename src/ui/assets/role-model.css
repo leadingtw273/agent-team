@@ -26,6 +26,28 @@
   color: #4b5563 !important;
 }
 
+.ui-role-model-order-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  margin: 0.875rem 0 0.75rem;
+  padding: 0.75rem 0.875rem;
+  border: 1px solid #c4dcf1;
+  border-left: 0.25rem solid #206bc4;
+  border-radius: 0.5rem;
+  background: #f1f7fd;
+}
+
+.ui-role-model-order-note .badge {
+  flex: 0 0 auto;
+  margin-top: 0.0625rem;
+}
+
+.ui-role-model-order-note p {
+  margin: 0;
+  color: #314d69;
+}
+
 .ui-role-model-candidates {
   display: grid;
   gap: 0.625rem;
@@ -79,6 +101,28 @@
   gap: 0.375rem;
 }
 
+.ui-role-model-actions .btn {
+  min-height: 2.25rem;
+  border-color: #85a9c5;
+  background: #fff;
+  color: #174e7a;
+}
+
+.ui-role-model-actions .btn:not(:disabled):hover {
+  border-color: #276fa6;
+  background: #eaf4fc;
+  color: #113f66;
+}
+
+.ui-role-model-actions .btn:disabled,
+.ui-role-model-actions .ui-role-model-action--boundary {
+  border-color: #c4d0dc;
+  background: #e8eef4;
+  color: #526476;
+  cursor: not-allowed;
+  opacity: 1;
+}
+
 .ui-role-model-active {
   padding-top: 1rem;
   border-top: 1px solid #e4eaf0;
@@ -90,7 +134,7 @@
 }
 
 .ui-role-model-save {
-  margin-top: 1rem;
+  margin-bottom: 1rem;
   box-shadow: 0 0.5rem 1.5rem rgb(24 36 51 / 12%);
 }
 
@@ -138,13 +182,8 @@
 }
 
 @media (max-width: 575.98px) {
-  .ui-role-model-candidate,
-  .ui-role-model-save .card-body {
-    align-items: stretch;
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .ui-role-model-candidate {
+    align-items: stretch;
     flex-direction: column;
   }
 
@@ -152,9 +191,43 @@
     width: 100%;
   }
 
-  .ui-role-model-actions .btn,
-  .ui-role-model-save .btn {
+  .ui-role-model-actions .btn {
     flex: 1;
     min-height: 2.75rem;
+  }
+
+  .ui-role-model-save {
+    position: sticky;
+    top: 0.5rem;
+    z-index: 10;
+    border-color: #9bbcd7;
+    box-shadow: 0 0.625rem 1.5rem rgb(24 36 51 / 18%);
+  }
+
+  .ui-role-model-save .card-body {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.5rem 0.75rem;
+    padding: 0.75rem;
+  }
+
+  .ui-role-model-save h2 {
+    margin: 0;
+    font-size: 1rem;
+  }
+
+  .ui-role-model-save-summary p {
+    display: none;
+  }
+
+  .ui-role-model-save .btn {
+    flex: 0 0 auto;
+    min-height: 2.75rem;
+    white-space: nowrap;
+  }
+
+  .ui-role-model-order-note {
+    gap: 0.5rem;
+    padding: 0.625rem 0.75rem;
   }
 }

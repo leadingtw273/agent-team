@@ -15,6 +15,19 @@
 
   const candidates = (list) => Array.from(list.querySelectorAll(":scope > [data-candidate-key]"));
 
+  const updateMoveButton = (button, name, direction, isBoundary) => {
+    if (!(button instanceof HTMLButtonElement)) return;
+    const actionLabel = direction === "up" ? "上移" : "下移";
+    const boundaryLabel = direction === "up" ? "已在最上" : "已在最下";
+    button.disabled = isBoundary;
+    button.classList.toggle("ui-role-model-action--boundary", isBoundary);
+    button.textContent = isBoundary ? boundaryLabel : actionLabel;
+    button.setAttribute(
+      "aria-label",
+      isBoundary ? `${name} ${boundaryLabel}` : `將 ${name} ${actionLabel}`,
+    );
+  };
+
   const updateControls = (list) => {
     const items = candidates(list);
     items.forEach((item, index) => {
@@ -22,8 +35,9 @@
       if (order !== null) order.textContent = String(index + 1);
       const up = item.querySelector('[data-role-model-move="up"]');
       const down = item.querySelector('[data-role-model-move="down"]');
-      if (up instanceof HTMLButtonElement) up.disabled = index === 0;
-      if (down instanceof HTMLButtonElement) down.disabled = index === items.length - 1;
+      const name = item.getAttribute("data-candidate-name") ?? "候選模型";
+      updateMoveButton(up, name, "up", index === 0);
+      updateMoveButton(down, name, "down", index === items.length - 1);
     });
   };
 

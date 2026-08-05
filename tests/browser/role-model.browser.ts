@@ -35,6 +35,19 @@ interface AxeRunner {
   ) => Promise<Readonly<{ readonly violations: readonly AxeViolation[] }>>;
 }
 
+type BrowserScrollEnvironment = typeof globalThis & {
+  readonly document?: {
+    readonly body: Readonly<{ readonly scrollHeight: number }>;
+    readonly documentElement: {
+      readonly scrollHeight: number;
+      readonly style: { scrollBehavior: string };
+    };
+  };
+  readonly innerHeight?: number;
+  readonly scrollTo?: (x: number, y: number) => void;
+  readonly scrollY?: number;
+};
+
 function baseUrl(): string {
   if (shell === undefined) throw new Error("role model UI did not start");
   return shell.baseUrl;
@@ -49,13 +62,13 @@ async function visit(page: Page): Promise<void> {
   await expect(page.locator("[data-role-model-save]")).toBeEnabled();
 }
 
-async function copyReviewScreenshot(page: Page, name: string): Promise<void> {
+async function copyReviewScreenshot(page: Page, name: string, fullPage = true): Promise<void> {
   await Promise.all([
     mkdir(reviewDirectory, { recursive: true }),
     mkdir(worktreeReviewDirectory, { recursive: true }),
   ]);
   const temporaryPath = join(reviewDirectory, name);
-  await page.screenshot({ path: temporaryPath, fullPage: true });
+  await page.screenshot({ path: temporaryPath, fullPage });
   await copyFile(temporaryPath, join(worktreeReviewDirectory, name));
 }
 
@@ -81,6 +94,52 @@ async function candidateKeys(page: Page, role: string): Promise<readonly (string
   return Promise.all(items.map(async (item) => item.getAttribute("data-candidate-key")));
 }
 
+async function expectNoHorizontalOverflow(page: Page): Promise<void> {
+  expect(
+    await page.evaluate(() => {
+      const browser = globalThis as typeof globalThis & {
+        readonly document?: Readonly<{ documentElement: Readonly<{ scrollWidth: number }> }>;
+        readonly innerWidth?: number;
+      };
+      if (browser.document === undefined || browser.innerWidth === undefined) return false;
+      return browser.document.documentElement.scrollWidth <= browser.innerWidth;
+    }),
+  ).toBe(true);
+}
+
+async function scrollInstantly(page: Page, top: number): Promise<void> {
+  await page.evaluate((position) => {
+    const browser = globalThis as BrowserScrollEnvironment;
+    if (browser.document === undefined || browser.scrollTo === undefined) {
+      throw new Error("browser scrolling is unavailable");
+    }
+    const root = browser.document.documentElement;
+    const originalBehavior = root.style.scrollBehavior;
+    root.style.scrollBehavior = "auto";
+    browser.scrollTo(0, position);
+    root.style.scrollBehavior = originalBehavior;
+  }, top);
+  await page.waitForFunction((position) => {
+    const browser = globalThis as BrowserScrollEnvironment;
+    if (browser.scrollY === undefined) return false;
+    return position === 0 ? browser.scrollY <= 1 : browser.scrollY >= position - 1;
+  }, top);
+}
+
+async function scrollToBottom(page: Page): Promise<void> {
+  const bottom = await page.evaluate(() => {
+    const browser = globalThis as BrowserScrollEnvironment;
+    if (browser.document === undefined || browser.innerHeight === undefined) {
+      throw new Error("browser scrolling is unavailable");
+    }
+    return (
+      Math.max(browser.document.body.scrollHeight, browser.document.documentElement.scrollHeight) -
+      browser.innerHeight
+    );
+  });
+  await scrollInstantly(page, bottom);
+}
+
 test.describe("U004 role model configuration", () => {
   test.beforeEach(async () => {
     const feature = createRoleModelFeature();
@@ -102,6 +161,16 @@ test.describe("U004 role model configuration", () => {
     const active = page.locator('[data-active-job-id="job-running-implementer"]');
     await expect(active).toHaveAttribute("data-active-candidate", "claude:sonnet");
     await expect(active).toContainText("啟動時順位 2");
+
+    const teamLeadList = page.locator('[data-role-model-list="team_lead"]');
+    await expect(teamLeadList).toHaveAttribute("aria-describedby", "role-team_lead-order-note");
+    await expect(page.locator("#role-team_lead-order-note")).toContainText("新 Job 順序");
+    const topCandidateMoveUp = teamLeadList
+      .locator('[data-candidate-key="codex:gpt-5.6-sol"]')
+      .getByRole("button", { name: "已在最上" });
+    await expect(topCandidateMoveUp).toBeDisabled();
+    await expect(topCandidateMoveUp).toHaveClass(/ui-role-model-action--boundary/u);
+    await expect(topCandidateMoveUp).toHaveCSS("cursor", "not-allowed");
 
     const implementers = page.locator(
       '[data-role-model-list="implementer"] > [data-candidate-key]',
@@ -178,24 +247,45 @@ test.describe("U004 role model configuration", () => {
     await copyReviewScreenshot(page, "u004-role-model-desktop.png");
   });
 
-  test("keeps controls reachable without horizontal overflow on mobile", async ({ page }) => {
+  test("keeps the sticky save action reachable without horizontal overflow at 390px", async ({
+    page,
+  }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await visit(page);
 
+    const save = page.locator("[data-role-model-action-bar]");
     await expect(page.getByRole("heading", { level: 1, name: "角色與模型" })).toBeVisible();
-    await expect(page.locator("[data-role-model-save]")).toBeVisible();
+    await expect(save).toHaveCSS("position", "sticky");
+    await expect(save.getByRole("button", { name: "儲存模型順序" })).toBeVisible();
     await expect(page.getByRole("button", { name: /下移/u }).first()).toBeVisible();
-    expect(
-      await page.evaluate(() => {
-        const browser = globalThis as typeof globalThis & {
-          readonly document?: Readonly<{ documentElement: Readonly<{ scrollWidth: number }> }>;
-          readonly innerWidth?: number;
-        };
-        if (browser.document === undefined || browser.innerWidth === undefined) return false;
-        return browser.document.documentElement.scrollWidth <= browser.innerWidth;
-      }),
-    ).toBe(true);
+    await expectNoHorizontalOverflow(page);
+    await scrollToBottom(page);
+    await expect(save).toBeVisible();
+    const saveBox = await save.boundingBox();
+    if (saveBox === null) throw new Error("sticky save action is not visible");
+    expect(saveBox.y).toBeGreaterThanOrEqual(0);
+    expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(844);
     await expectNoAxeViolations(page);
-    await copyReviewScreenshot(page, "u004-role-model-mobile.png");
+    await copyReviewScreenshot(page, "u004-role-model-390.png", false);
+  });
+
+  test("keeps the sticky save action reachable without horizontal overflow at 320px", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 320, height: 720 });
+    await visit(page);
+
+    const save = page.locator("[data-role-model-action-bar]");
+    await expect(save).toHaveCSS("position", "sticky");
+    await expectNoHorizontalOverflow(page);
+    await scrollToBottom(page);
+    await expect(save.getByRole("button", { name: "儲存模型順序" })).toBeVisible();
+    const saveBox = await save.boundingBox();
+    if (saveBox === null) throw new Error("sticky save action is not visible");
+    expect(saveBox.y).toBeGreaterThanOrEqual(0);
+    expect(saveBox.y + saveBox.height).toBeLessThanOrEqual(720);
+    await expectNoHorizontalOverflow(page);
+    await expectNoAxeViolations(page);
+    await copyReviewScreenshot(page, "u004-role-model-320.png", false);
   });
 });
