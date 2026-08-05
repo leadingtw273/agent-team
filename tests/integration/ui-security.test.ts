@@ -8,6 +8,7 @@ import {
   startLocalUiServer,
   type LocalUiServerHandle,
   type UiRequest,
+  type UiSecurityRouteContract,
   type UiServerClock,
 } from "../../src/ui/index.js";
 
@@ -384,6 +385,181 @@ describe("localhost UI browser security layer", () => {
     });
     expect(getExchange.status).toBe(405);
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["empty", []],
+    ["duplicate", ["GET", "GET"]],
+    ["non-canonical", ["get"]],
+    ["unsupported OPTIONS", ["OPTIONS"]],
+    ["unsupported CONNECT", ["CONNECT"]],
+  ])("rejects an %s route method allowlist", (_name, allowedMethods) => {
+    const route = {
+      path: "/api/limited",
+      allowedQueryParameters: [],
+      response: "standard",
+      allowedMethods,
+    } as unknown as UiSecurityRouteContract;
+
+    expect(() => createUiSecurityPolicy({ routes: [route] })).toThrow(
+      "Invalid UI security route contract.",
+    );
+  });
+
+  it("normalizes an exact route method allowlist and makes GET imply HEAD", async () => {
+    const methods: string[] = [];
+    const handle = await startSecured({
+      securityPolicy: createUiSecurityPolicy({
+        routes: [
+          {
+            path: "/api/limited",
+            allowedQueryParameters: [],
+            allowedMethods: ["PUT", "GET"],
+            response: "standard",
+          },
+          {
+            path: "/api/head-only",
+            allowedQueryParameters: [],
+            allowedMethods: ["HEAD"],
+            response: "standard",
+          },
+        ],
+      }),
+      handler: (request) => {
+        methods.push(request.method);
+        return { statusCode: 204 };
+      },
+    });
+    const session = await exchange(handle);
+
+    for (const method of ["GET", "HEAD", "PUT"]) {
+      const result = await fetch(`${handle.baseUrl}/api/limited`, {
+        method,
+        headers:
+          method === "GET" || method === "HEAD"
+            ? { cookie: session.cookie }
+            : {
+                cookie: session.cookie,
+                origin: handle.baseUrl,
+                "x-csrf-token": session.csrf,
+              },
+      });
+      expect(result.status).toBe(204);
+    }
+
+    for (const method of ["POST", "PATCH", "DELETE", "OPTIONS"]) {
+      const rejected = await fetch(`${handle.baseUrl}/api/limited`, {
+        method,
+        headers: { cookie: session.cookie },
+      });
+      expect(rejected.status).toBe(405);
+      expect(await rejected.text()).toBe("Method Not Allowed\n");
+      expect(rejected.headers.get("allow")).toBe("GET, HEAD, PUT");
+    }
+    const headOnly = await fetch(`${handle.baseUrl}/api/head-only`, {
+      method: "HEAD",
+      headers: { cookie: session.cookie },
+    });
+    const getHeadOnly = await fetch(`${handle.baseUrl}/api/head-only`, {
+      headers: { cookie: session.cookie },
+    });
+    expect(headOnly.status).toBe(204);
+    expect(getHeadOnly.status).toBe(405);
+    expect(getHeadOnly.headers.get("allow")).toBe("HEAD");
+    expect(methods).toEqual(["GET", "HEAD", "PUT", "HEAD"]);
+  });
+
+  it("keeps the legacy six-method default when allowedMethods is omitted", async () => {
+    const methods: string[] = [];
+    const handle = await startSecured({
+      handler: (request) => {
+        methods.push(request.method);
+        return { statusCode: 204 };
+      },
+    });
+    const session = await exchange(handle);
+
+    for (const method of ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]) {
+      const result = await fetch(`${handle.baseUrl}/api/projects`, {
+        method,
+        headers:
+          method === "GET" || method === "HEAD"
+            ? { cookie: session.cookie }
+            : {
+                cookie: session.cookie,
+                origin: handle.baseUrl,
+                "x-csrf-token": session.csrf,
+              },
+      });
+      expect(result.status).toBe(204);
+    }
+    expect(methods).toEqual(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
+  });
+
+  it("gives authenticated CONNECT requests only the matched route's canonical Allow contract", async () => {
+    const clock = new MutableClock(10_000);
+    const handler = vi.fn(() => ({ statusCode: 204 }));
+    const handle = await startSecured({
+      clock,
+      idleTimeoutMs: 100,
+      securityPolicy: createUiSecurityPolicy({
+        routes: [
+          {
+            path: "/api/limited",
+            allowedQueryParameters: [],
+            allowedMethods: ["PUT", "GET"],
+            response: "standard",
+          },
+          {
+            path: "/api/legacy",
+            allowedQueryParameters: [],
+            response: "standard",
+          },
+        ],
+      }),
+      handler,
+    });
+    const session = await exchange(handle);
+    clock.advance(90);
+    const host = new URL(handle.baseUrl).host;
+    const connect = async (path: string, cookie?: string): Promise<string> =>
+      await rawHttpRequest(
+        handle,
+        [
+          `CONNECT ${path} HTTP/1.1`,
+          `Host: ${host}`,
+          ...(cookie === undefined ? [] : [`Cookie: ${cookie}`]),
+          "Content-Length: 2",
+          "Connection: close",
+          "",
+          "{",
+        ].join("\r\n"),
+      );
+
+    const limited = await connect("/api/limited", session.cookie);
+    const legacy = await connect("/api/legacy", session.cookie);
+    const unknown = await connect("/api/unknown", session.cookie);
+    const unauthenticated = await connect("/api/limited");
+
+    for (const response of [limited, legacy, unknown, unauthenticated]) {
+      expect(response).toContain("HTTP/1.1 405 Method Not Allowed");
+    }
+    expect(limited).toMatch(/allow: GET, HEAD, PUT/iu);
+    expect(legacy).toMatch(/allow: GET, HEAD, POST, PUT, PATCH, DELETE/iu);
+    expect(unknown).not.toMatch(/\r\nallow:/iu);
+    expect(unauthenticated).not.toMatch(/\r\nallow:/iu);
+    expect(handler).not.toHaveBeenCalled();
+    expect(handle.status()).toEqual({ state: "active", idleDeadlineMs: 10_100 });
+
+    clock.advance(11);
+    const expiredConnect = await connect("/api/limited", session.cookie);
+    expect(expiredConnect).toContain("HTTP/1.1 405 Method Not Allowed");
+    expect(expiredConnect).not.toMatch(/\r\nallow:/iu);
+    expect(handle.status()).toEqual({ state: "locked" });
+    const expired = await fetch(`${handle.baseUrl}/api/limited`, {
+      headers: { cookie: session.cookie },
+    });
+    expect(expired.status).toBe(423);
   });
 
   it("does not let public, invalid cookie, Origin, or CSRF requests refresh idle", async () => {

@@ -10,6 +10,9 @@ import {
 } from "node:http";
 
 import { responseLeaksCredentials, untrustedInputIsUnsafe } from "../security/canonical.js";
+import { readBoundedJsonMutation, type UiJsonObject } from "./json.js";
+
+export type { UiJsonArray, UiJsonObject, UiJsonPrimitive, UiJsonValue } from "./json.js";
 
 export const localhostUiHost = "127.0.0.1";
 export const defaultUiIdleTimeoutMs = 15 * 60 * 1_000;
@@ -28,6 +31,7 @@ export interface UiRequest {
   readonly url: string;
   readonly headers: Readonly<IncomingHttpHeaders>;
   readonly auth: Readonly<{ kind: UiAuthKind }>;
+  readonly body?: UiJsonObject;
 }
 
 export interface UiResponse {
@@ -56,6 +60,7 @@ export type UiSecurityDecision =
       authKind: UiAuthKind;
       handlerUrl: string;
       responseContract: UiHandlerResponseContract;
+      mutationBody: "none" | "bounded-json";
       refreshIdle: boolean;
     }>
   | Readonly<{ kind: "respond"; response: UiResponse; refreshIdle: boolean }>;
@@ -86,6 +91,7 @@ export interface StartLocalUiServerOptions {
   readonly host?: string;
   readonly port?: number;
   readonly idleTimeoutMs?: number;
+  readonly maxJsonMutationBodyBytes?: number;
   readonly clock?: UiServerClock;
   readonly tokenSource?: () => Uint8Array;
   readonly handler?: UiRequestHandler;
@@ -213,6 +219,7 @@ function sendFixed(
   body: string,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
+  closeConnection = false,
 ): void {
   if (response.destroyed || response.writableEnded) return;
   if (response.headersSent) {
@@ -228,6 +235,7 @@ function sendFixed(
       ...(Object.keys(secured.headers ?? {}).some((name) => name.toLowerCase() === "content-type")
         ? {}
         : { "content-type": "text/plain; charset=utf-8" }),
+      ...(closeConnection ? { connection: "close" } : {}),
     }),
     ...(secured.body === undefined ? {} : { body: secured.body }),
   });
@@ -235,11 +243,12 @@ function sendFixed(
 }
 
 function rawSocketResponse(
-  statusCode: 400 | 405,
+  source: UiResponse,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
 ): string | undefined {
-  const secured = securityPolicy?.secureResponse({ statusCode }) ?? { statusCode };
+  const secured = securityPolicy?.secureResponse(source) ?? source;
+  if (secured.statusCode !== 400 && secured.statusCode !== 405) return undefined;
   const result: UiResponse = Object.freeze({
     statusCode: secured.statusCode,
     headers: Object.freeze({
@@ -249,8 +258,8 @@ function rawSocketResponse(
     }),
   });
   if (!outboundResponseIsAllowed(result)) return undefined;
-  const reason = statusCode === 400 ? "Bad Request" : "Method Not Allowed";
-  const lines = [`HTTP/1.1 ${String(statusCode)} ${reason}`];
+  const reason = secured.statusCode === 400 ? "Bad Request" : "Method Not Allowed";
+  const lines = [`HTTP/1.1 ${String(secured.statusCode)} ${reason}`];
   if (result.headers !== undefined) {
     for (const [name, value] of Object.entries(result.headers)) {
       const values = typeof value === "string" ? [value] : value;
@@ -262,12 +271,12 @@ function rawSocketResponse(
 
 function endRawSocket(
   socket: NodeJS.WritableStream & Readonly<{ writable: boolean }>,
-  statusCode: 400 | 405,
+  source: UiResponse,
   outboundResponseIsAllowed: OutboundResponseGuard,
   securityPolicy?: UiSecurityPolicy,
 ): void {
   if (!socket.writable) return;
-  const result = rawSocketResponse(statusCode, outboundResponseIsAllowed, securityPolicy);
+  const result = rawSocketResponse(source, outboundResponseIsAllowed, securityPolicy);
   if (result === undefined) {
     socket.end();
     return;
@@ -303,7 +312,11 @@ export async function startLocalUiServer(
   const host = options.host ?? localhostUiHost;
   const port = options.port ?? 0;
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultUiIdleTimeoutMs;
+  const maxJsonMutationBodyBytes = options.maxJsonMutationBodyBytes ?? 16_384;
   validateOptions(host, port, idleTimeoutMs);
+  if (!Number.isSafeInteger(maxJsonMutationBodyBytes) || maxJsonMutationBodyBytes <= 0) {
+    throw new LocalUiServerError("Local UI JSON mutation body limit is invalid.");
+  }
 
   const clock = options.clock ?? systemClock;
   const tokenSource = options.tokenSource ?? (() => randomBytes(minimumTokenBytes));
@@ -324,6 +337,7 @@ export async function startLocalUiServer(
   let idleTimer: NodeJS.Timeout | undefined;
   let closePromise: Promise<void> | undefined;
   let serverOrigin = "";
+  const currentLifecycle = (): "active" | "locked" | "closed" => lifecycle;
 
   const outboundResponseIsAllowed: OutboundResponseGuard = (result) =>
     Number.isInteger(result.statusCode) &&
@@ -332,6 +346,42 @@ export async function startLocalUiServer(
     responseHeadersAreValid(result) &&
     !responseLeaksCredentials(result, [sessionToken]) &&
     securityPolicy?.responseContainsSensitiveData(result) !== true;
+
+  const authorizeRequest = (request: IncomingMessage): UiSecurityDecision => {
+    const bearerAuthenticated = authorized(request, expectedDigest);
+    const incomingHeaders = distinctHeaders(request);
+    const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
+    const rawUrl = request.url ?? "";
+    return untrustedInputIsUnsafe(rawUrl, [sessionToken])
+      ? Object.freeze({
+          kind: "respond",
+          response: fixedResponse(400, "Bad Request\n"),
+          refreshIdle: false,
+        })
+      : (securityPolicy?.authorize(
+          Object.freeze({
+            method: request.method ?? "",
+            url: rawUrl,
+            headers: policyHeaders,
+            bearerAuthenticated,
+            serverOrigin,
+          }),
+        ) ??
+          (bearerAuthenticated
+            ? Object.freeze({
+                kind: "allow",
+                authKind: "bearer",
+                handlerUrl: rawUrl,
+                responseContract: "standard",
+                mutationBody: "none",
+                refreshIdle: true,
+              })
+            : Object.freeze({
+                kind: "respond",
+                response: fixedResponse(401, "Unauthorized\n"),
+                refreshIdle: false,
+              })));
+  };
 
   const lockIfExpired = (): void => {
     if (lifecycle !== "active") return;
@@ -381,38 +431,7 @@ export async function startLocalUiServer(
         return;
       }
 
-      const bearerAuthenticated = authorized(request, expectedDigest);
-      const incomingHeaders = distinctHeaders(request);
-      const policyHeaders = sanitizedHeaders(incomingHeaders, new Set(["authorization"]));
-      const rawUrl = request.url ?? "";
-      const decision: UiSecurityDecision = untrustedInputIsUnsafe(rawUrl, [sessionToken])
-        ? Object.freeze({
-            kind: "respond",
-            response: fixedResponse(400, "Bad Request\n"),
-            refreshIdle: false,
-          })
-        : (securityPolicy?.authorize(
-            Object.freeze({
-              method: request.method ?? "",
-              url: rawUrl,
-              headers: policyHeaders,
-              bearerAuthenticated,
-              serverOrigin,
-            }),
-          ) ??
-          (bearerAuthenticated
-            ? Object.freeze({
-                kind: "allow",
-                authKind: "bearer",
-                handlerUrl: rawUrl,
-                responseContract: "standard",
-                refreshIdle: true,
-              })
-            : Object.freeze({
-                kind: "respond",
-                response: fixedResponse(401, "Unauthorized\n"),
-                refreshIdle: false,
-              })));
+      const decision = authorizeRequest(request);
 
       const refreshIdle = (): boolean => {
         const now = clockMilliseconds(clock);
@@ -434,6 +453,52 @@ export async function startLocalUiServer(
       };
 
       try {
+        let mutationBody: UiJsonObject | undefined;
+        if (
+          decision.kind === "allow" &&
+          decision.mutationBody === "bounded-json" &&
+          request.method !== "GET" &&
+          request.method !== "HEAD"
+        ) {
+          const parsed = await readBoundedJsonMutation(request, maxJsonMutationBodyBytes);
+          lockIfExpired();
+          const postReadLifecycle = currentLifecycle();
+          if (postReadLifecycle === "closed") {
+            sendFixed(
+              response,
+              503,
+              "Service Unavailable\n",
+              outboundResponseIsAllowed,
+              securityPolicy,
+              true,
+            );
+            return;
+          }
+          if (postReadLifecycle === "locked") {
+            sendFixed(response, 423, "Locked\n", outboundResponseIsAllowed, securityPolicy, true);
+            return;
+          }
+          if (!parsed.ok) {
+            const rejected = securityPolicy?.secureResponse({
+              statusCode: parsed.statusCode,
+              headers: Object.freeze({
+                connection: "close",
+                "content-type": "text/plain; charset=utf-8",
+              }),
+              body: parsed.responseBody,
+            }) ?? {
+              statusCode: parsed.statusCode,
+              headers: Object.freeze({
+                connection: "close",
+                "content-type": "text/plain; charset=utf-8",
+              }),
+              body: parsed.responseBody,
+            };
+            send(response, rejected, outboundResponseIsAllowed);
+            return;
+          }
+          mutationBody = parsed.body;
+        }
         const handlerResult =
           decision.kind === "respond"
             ? decision.response
@@ -443,6 +508,7 @@ export async function startLocalUiServer(
                   url: decision.handlerUrl,
                   headers: handlerHeaders,
                   auth: Object.freeze({ kind: decision.authKind }),
+                  ...(mutationBody === undefined ? {} : { body: mutationBody }),
                 }),
               );
         if (
@@ -501,13 +567,35 @@ export async function startLocalUiServer(
   });
 
   server.on("clientError", (_error, socket) => {
-    endRawSocket(socket, 400, outboundResponseIsAllowed, securityPolicy);
+    endRawSocket(
+      socket,
+      fixedResponse(400, "Bad Request\n"),
+      outboundResponseIsAllowed,
+      securityPolicy,
+    );
   });
-  server.on("connect", (_request, socket) => {
-    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
+  server.on("connect", (request, socket) => {
+    let rejected = fixedResponse(405, "Method Not Allowed\n");
+    try {
+      lockIfExpired();
+      if (currentLifecycle() === "active") {
+        const decision = authorizeRequest(request);
+        if (decision.kind === "respond" && decision.response.statusCode === 405) {
+          rejected = decision.response;
+        }
+      }
+    } catch {
+      // A CONNECT request never bypasses the fixed denial if policy evaluation fails.
+    }
+    endRawSocket(socket, rejected, outboundResponseIsAllowed, securityPolicy);
   });
   server.on("upgrade", (_request, socket) => {
-    endRawSocket(socket, 405, outboundResponseIsAllowed, securityPolicy);
+    endRawSocket(
+      socket,
+      fixedResponse(405, "Method Not Allowed\n"),
+      outboundResponseIsAllowed,
+      securityPolicy,
+    );
   });
 
   try {
