@@ -18,6 +18,22 @@ import { z } from "zod";
 
 const maximumProbeConfigFileBytes = 64 * 1024;
 
+/**
+ * O009f: optional host override for the CLI's own production poll defaults (see
+ * `defaultProductionCiPoll`/`defaultProductionStatusPoll`/`defaultProductionProviderEventPoll` in
+ * probe-composition.ts). Bounds are deliberately generous but finite: `maxAttempts` capped at 200
+ * and `intervalMs` at 60s keeps any misconfiguration from hanging a `probe run` invocation for an
+ * unreasonable wall-clock duration (200 * 60s = ~3.3h ceiling, an intentionally loose backstop,
+ * not a recommended value) while still comfortably covering any legitimate CI/webhook latency a
+ * host might need to tune for.
+ */
+const probeConfigPollOverrideSchema = z
+  .object({
+    maxAttempts: z.number().int().min(1).max(200),
+    intervalMs: z.number().int().min(0).max(60_000),
+  })
+  .strict();
+
 const probeConfigSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -29,13 +45,31 @@ const probeConfigSchema = z
         linear: z.string().trim().min(1).max(2_048),
       })
       .strict(),
+    poll: z
+      .object({
+        ciPoll: probeConfigPollOverrideSchema.optional(),
+        statusPoll: probeConfigPollOverrideSchema.optional(),
+        providerEventPoll: probeConfigPollOverrideSchema.optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
+
+export interface RegistrationProbeConfigPollOverride {
+  readonly maxAttempts: number;
+  readonly intervalMs: number;
+}
 
 export interface RegistrationProbeHostConfig {
   readonly linearWorkflowStateId: string;
   readonly gitRemote: string;
   readonly webhookBaseUrls: Readonly<{ github: string; linear: string }>;
+  readonly poll?: Readonly<{
+    ciPoll?: RegistrationProbeConfigPollOverride;
+    statusPoll?: RegistrationProbeConfigPollOverride;
+    providerEventPoll?: RegistrationProbeConfigPollOverride;
+  }>;
 }
 
 export function defaultRegistrationProbeConfigPath(
@@ -72,6 +106,23 @@ export async function loadHostRegistrationProbeConfig(
         linearWorkflowStateId: parsed.data.linearWorkflowStateId,
         gitRemote: parsed.data.gitRemote,
         webhookBaseUrls: Object.freeze({ ...parsed.data.webhookBaseUrls }),
+        ...(parsed.data.poll === undefined
+          ? {}
+          : {
+              poll: Object.freeze({
+                ...(parsed.data.poll.ciPoll === undefined
+                  ? {}
+                  : { ciPoll: Object.freeze({ ...parsed.data.poll.ciPoll }) }),
+                ...(parsed.data.poll.statusPoll === undefined
+                  ? {}
+                  : { statusPoll: Object.freeze({ ...parsed.data.poll.statusPoll }) }),
+                ...(parsed.data.poll.providerEventPoll === undefined
+                  ? {}
+                  : {
+                      providerEventPoll: Object.freeze({ ...parsed.data.poll.providerEventPoll }),
+                    }),
+              }),
+            }),
       }),
     });
   } catch {
