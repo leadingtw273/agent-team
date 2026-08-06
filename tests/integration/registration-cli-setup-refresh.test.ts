@@ -21,7 +21,7 @@
  * - Git itself is REAL (temp bare remote + checkout).
  */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -38,6 +38,7 @@ import {
   linearWorkStatusNames,
 } from "../../src/adapters/linear/model.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import { freshAuthorityDigest } from "../../src/cli/registration/authority.js";
 import { createRegistrationSetupHandlers } from "../../src/cli/registration/setup-handlers.js";
 import { buildRegistrationSetupComposition } from "../../src/cli/registration/setup-composition.js";
 
@@ -208,25 +209,22 @@ class FakeGh implements Pick<
       const number = this.#nextPrNumber;
       this.#nextPrNumber += 1;
       const pr: FakePullRequest = {
-        // Deliberately NOT an opaque node_id-shaped string like "PR_db_<n>" (which is what real
-        // GitHub, and every other FakeGh fixture in this repo, returns for `.id` via
-        // `changeRequestProjection`'s `id:.node_id`). Using a real opaque id here reproduces a
-        // genuine, separately-reported O005 engine defect this task must not fix (out of scope,
-        // "不動引擎"): `setup.ts` stores `session.changeRequest = draft.value` (the *whole*
-        // ChangeRequestSnapshot, `.id` = opaque node_id) and then reuses `session.changeRequest
-        // .id` as `changeRequestId` for every later ChangeRequestRef call (refresh's own
-        // `getChangeRequest`, appendChangeRequestComment, closeChangeRequest, enableAutoMerge...)
-        // -- but `GitHubAdapter`'s own `changeRequestNumber()` requires that value to be a plain
-        // decimal PR number, which an opaque node_id never is. O006's own
-        // `proactive-probe.ts` avoids this exact trap with an explicit comment ("the opaque
-        // `created.value.id` is a separate identifier, not a valid `ChangeRequestRef`") and uses
-        // `String(created.value.number)` instead. No existing O005 test ever caught this because
-        // every one of them fakes `sourceControl` directly and ignores its input entirely (see
-        // tests/unit/registration-setup.test.ts's own `getChangeRequest: () => {...}` fixture).
-        // Reported separately to the decision layer; using a numeric id here keeps this specific
-        // scenario (proving the O009b *CLI wiring* advances a session once evidence is green)
-        // from being blocked by a defect this task has no authority to fix.
-        id: String(number),
+        // O009c fix landed: `.id` is now a genuine opaque node-id-shaped string, exactly like
+        // real GitHub returns via `changeRequestProjection`'s `id:.node_id` (e.g.
+        // "PR_kwDOTvUUF877drQL") and every other FakeGh fixture in this repo already used. Before
+        // O009c, this had to be a decimal-look-alike (`String(number)`) as a workaround: `setup.ts`
+        // stored `session.changeRequest = draft.value` (the *whole* ChangeRequestSnapshot, `.id` =
+        // opaque node_id) and then reused `session.changeRequest.id` as `changeRequestId` for
+        // every later ChangeRequestRef call (refresh's own `getChangeRequest`,
+        // appendChangeRequestComment, `gateEvidence.read`, `squashMerge.enable`, `mergedConfig
+        // .read`...) -- but `GitHubAdapter`'s own `changeRequestNumber()` requires that value to be
+        // a plain decimal PR number, which an opaque node_id never is. O009c fixed every one of
+        // those construction/comparison sites in setup.ts and setup-durable.ts to use
+        // `String(session.changeRequest.number)` instead (matching how O006's `proactive-probe.ts`
+        // already avoided this exact trap). Reverting `.id` here to its pre-fix numeric-lookalike
+        // form reproduces the original E004 dry-run failure (`stage=change_request,
+        // external_failure`) -- see the red-proof capture in this task's report.
+        id: `PR_kwDOTest${String(number).padStart(8, "0")}`,
         number,
         state: "open",
         draft: fields["draft"] === "true",
@@ -721,5 +719,184 @@ describe("O009b registration setup CLI: refresh is the only exit from ci_waiting
     expect(refreshPayload.session.phase).toBe("ci_waiting");
     expect(linear.issues[0]?.comments).toHaveLength(0);
     expect(github.commentsByNumber.size).toBe(0);
+  }, 30_000);
+});
+
+/**
+ * O009c regression guard.
+ *
+ * Root cause: `setup.ts` built every `ChangeRequestRef`/comparison from
+ * `session.changeRequest.id` -- the opaque GitHub GraphQL node id (e.g. `PR_kwDOTvUUF877drQL`)
+ * -- instead of `session.changeRequest.number` (the plain decimal PR number that
+ * `GitHubAdapter.changeRequestNumber()` actually requires). Every FakeGh fixture in this repo
+ * already returns a genuinely opaque `.id` for real PRs *except* this file's, which (before this
+ * fix) had to fake a decimal-looking id as a documented workaround just to get the O009b CLI
+ * wiring scenario past this defect. That workaround is now removed (see the `FakeGh`'s PR-create
+ * branch above): `.id` is a realistic opaque node-id-shaped string again, exactly matching what a
+ * real E004 sandbox registration sees, and every scenario below must still pass.
+ */
+describe("O009c regression guard: opaque ChangeRequestSnapshot.id is never mistaken for the decimal PR number", () => {
+  it("approve's precondition read (controller.read()) succeeds once refresh has advanced to awaiting_user_approval, with a real GitHub node-id-format PR id", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009c-home-approve-read-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+    const buildComposition = (options: Parameters<typeof buildRegistrationSetupComposition>[0]) =>
+      buildRegistrationSetupComposition({
+        ...options,
+        githubTransport: github,
+        linearFetch: linear.fetch,
+      });
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition,
+    });
+    await handlers.setupStart({ projectId });
+
+    // Sanity check: this is a genuinely opaque node id, not a decimal-string lookalike -- if a
+    // future fixture change silently reintroduced the old workaround, this assertion (not just
+    // the ones further down) would be the one to catch it.
+    expect(github.prs[0]?.id).toMatch(/^PR_kwDOTest\d{8}$/u);
+    expect(Number.isNaN(Number(github.prs[0]?.id))).toBe(true);
+
+    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    if (headSha === undefined) throw new Error("expected a pushed setup branch head");
+    github.statusesBySha.set(headSha, [
+      {
+        context: "agent-team/review",
+        state: "success",
+        description: null,
+        targetUrl: "https://review.test/1",
+      },
+    ]);
+    github.ciConclusion = "success";
+    github.reviewState = "success";
+
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition,
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+    expect(refreshResult.state).toBe("success");
+    expect((JSON.parse(refreshResult.message ?? "") as { readonly state: string }).state).toBe(
+      "awaiting_user_approval",
+    );
+
+    // This is the "approve 前置讀取" (approve's precondition read) itself: `setupApprove`'s first
+    // substantive step, before it ever issues an approval intent, is exactly this `controller
+    // .read()` call. Before O009c, this would already fail here (`gateEvidenceMatches`/durable
+    // schema `receiptBound` comparing the just-written receipts' decimal-number-formatted
+    // `changeRequestId` against the still-opaque `session.changeRequest.id`) -- never even
+    // reaching the merge step.
+    const built = await buildComposition({
+      agentTeamHome,
+      projectId,
+      ensureWorktreeDirectories: true,
+      environment,
+    });
+    if (built.state !== "ready") throw new Error(`composition_not_ready:${built.state}`);
+    const read = await built.composition.controller.read({
+      authorityDigest: freshAuthorityDigest(),
+    });
+    expect(read.state).toBe("awaiting_user_approval");
+    expect(read.session).toBeDefined();
+    expect(read.session?.phase).toBe("awaiting_user_approval");
+  }, 30_000);
+
+  it("forward-compatibility: a ci_waiting session file exactly as a pre-O009c run would have written it loads under the fixed code, and refresh() still advances and saves cleanly", async () => {
+    // This reproduces the real, currently-live E004 session sitting in
+    // ~/.agent-team/state/registration-setup/ at the time this fix was written: created by
+    // `setup start` (unaffected by O009c -- session creation for ci_waiting has always stored the
+    // raw ChangeRequestSnapshot untouched) and stuck at ci_waiting with no gate/audit/merged-config
+    // receipts yet (those only get written by the refresh/approve steps this fix touches). O009c
+    // must not require re-running `setup start` for such a session.
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009c-home-forward-compat-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+    const buildComposition = (options: Parameters<typeof buildRegistrationSetupComposition>[0]) =>
+      buildRegistrationSetupComposition({
+        ...options,
+        githubTransport: github,
+        linearFetch: linear.fetch,
+      });
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition,
+    });
+    const startResult = await handlers.setupStart({ projectId });
+    expect(startResult.state).toBe("success");
+
+    // Read the *actual* on-disk session.json this "pre-fix" run produced, and confirm it is
+    // exactly the old shape: opaque changeRequest.id, and none of the receipts O009c's fix
+    // touches exist yet -- i.e. there is nothing here for a schema migration to even act on.
+    const registrationSetupRoot = join(agentTeamHome, "state", "registration-setup");
+    const sessionDirectories = (await readdir(registrationSetupRoot)).filter((name) =>
+      name.startsWith("setup-"),
+    );
+    expect(sessionDirectories).toHaveLength(1);
+    const sessionPath = join(registrationSetupRoot, sessionDirectories[0] ?? "", "session.json");
+    const preFixSession = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      readonly phase: string;
+      readonly changeRequest: { readonly id: string; readonly number: number };
+      readonly gateEvidenceReceipt?: unknown;
+      readonly audit?: unknown;
+      readonly mergedConfigReceipt?: unknown;
+    };
+    expect(preFixSession.phase).toBe("ci_waiting");
+    expect(preFixSession.changeRequest.id).toMatch(/^PR_kwDOTest\d{8}$/u);
+    expect(Number.isNaN(Number(preFixSession.changeRequest.id))).toBe(true);
+    expect(preFixSession.gateEvidenceReceipt).toBeUndefined();
+    expect(preFixSession.audit).toBeUndefined();
+    expect(preFixSession.mergedConfigReceipt).toBeUndefined();
+
+    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    if (headSha === undefined) throw new Error("expected a pushed setup branch head");
+    github.statusesBySha.set(headSha, [
+      {
+        context: "agent-team/review",
+        state: "success",
+        description: null,
+        targetUrl: "https://review.test/1",
+      },
+    ]);
+    github.ciConclusion = "success";
+    github.reviewState = "success";
+
+    // Load this exact pre-existing file with a *fresh* composition (fixed code, same as
+    // production would when the user's real stuck session gets refreshed) and advance it. No
+    // `setup start` re-run, no session file rewritten by hand -- just the fixed code loading what
+    // the (also unchanged, for this phase) old code had already written to disk.
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition,
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+    expect(refreshResult.state).toBe("success");
+    const refreshPayload = JSON.parse(refreshResult.message ?? "") as { readonly state: string };
+    expect(refreshPayload.state).toBe("awaiting_user_approval");
+
+    // And the save that refresh() performs mid-flight must have landed on disk with the *fixed*
+    // (decimal-number) format, proving the migration is clean end-to-end, not just in memory.
+    const postFixSession = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      readonly phase: string;
+      readonly gateEvidenceReceipt?: { readonly changeRequestId: string };
+    };
+    expect(postFixSession.phase).toBe("awaiting_user_approval");
+    expect(postFixSession.gateEvidenceReceipt?.changeRequestId).toBe(
+      String(preFixSession.changeRequest.number),
+    );
   }, 30_000);
 });

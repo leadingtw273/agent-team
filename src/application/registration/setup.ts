@@ -311,7 +311,10 @@ function auditIntent(
     projectId: session.project.id,
     repository: session.project.sourceControl.repository,
     linearAuditIssueId: session.linearAuditIssueId,
-    changeRequestId: session.changeRequest.id,
+    // O009c fix: this must be the provider-visible decimal PR number, never the opaque
+    // ChangeRequestSnapshot.id (GraphQL node id) -- see the identical fix applied to every other
+    // outgoing ChangeRequestRef/binding in this file, and source-control.ts's doc comment.
+    changeRequestId: String(session.changeRequest.number),
     headSha: session.headSha,
     requirementsDigest: session.requirementsDigest,
     diffDigest: session.diffDigest,
@@ -335,7 +338,9 @@ function gateEvidenceMatches(session: RegistrationSetupSession): boolean {
     recomputed.value === evidenceDigest &&
     receipt.projectId === session.project.id &&
     receipt.repository === session.project.sourceControl.repository &&
-    receipt.changeRequestId === session.changeRequest.id &&
+    // O009c fix: receipt.changeRequestId is now stored as String(number) (see auditIntent /
+    // gateEvidence.read call sites); compare against the same representation.
+    receipt.changeRequestId === String(session.changeRequest.number) &&
     sameSha(receipt.headSha, session.headSha) &&
     receipt.requirementsDigest === session.requirementsDigest &&
     receipt.diffDigest === session.diffDigest &&
@@ -405,7 +410,8 @@ function createMergeIntent(
     schemaVersion: 1 as const,
     projectId: session.project.id,
     repository: session.project.sourceControl.repository,
-    changeRequestId: session.changeRequest.id,
+    // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+    changeRequestId: String(session.changeRequest.number),
     expectedHeadSha: session.headSha,
     mergeMethod: "SQUASH" as const,
     idempotencyKey,
@@ -452,7 +458,9 @@ function mergedConfigMatches(
     rawReceipt["source"] === "source_control_default_branch" &&
     receipt.projectId === session.project.id &&
     receipt.repository === session.project.sourceControl.repository &&
-    receipt.changeRequestId === session.changeRequest.id &&
+    // O009c fix: receipt.changeRequestId is now stored as String(number) (see
+    // mergedConfig.read call site); compare against the same representation.
+    receipt.changeRequestId === String(session.changeRequest.number) &&
     sameSha(receipt.setupHeadSha, session.headSha) &&
     receipt.defaultBranch === session.project.defaultBranch &&
     receipt.path === trustedProjectConfigPath &&
@@ -724,7 +732,8 @@ function approvalBinding(
     setupSessionRevision,
     projectId: session.project.id,
     previewDigest: session.previewDigest,
-    changeRequestId: session.changeRequest.id,
+    // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+    changeRequestId: String(session.changeRequest.number),
     headSha: session.headSha,
     requirementsDigest: session.requirementsDigest,
     diffDigest: session.diffDigest,
@@ -1465,7 +1474,11 @@ export class RegistrationSetupCoordinator {
     request: RegistrationSetupSessionRequest,
     lease: RegistrationSetupExecutionLease,
   ): Promise<RegistrationSetupOutcome> {
-    const reference = { project: session.project, changeRequestId: session.changeRequest.id };
+    // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+    const reference = {
+      project: session.project,
+      changeRequestId: String(session.changeRequest.number),
+    };
     const current = await this.#owned(lease, () =>
       this.#ports.sourceControl.getChangeRequest(reference),
     );
@@ -1520,7 +1533,8 @@ export class RegistrationSetupCoordinator {
       const gate = await this.#owned(lease, () =>
         this.#ports.gateEvidence.read({
           project: working.project,
-          changeRequestId: working.changeRequest.id,
+          // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+          changeRequestId: String(working.changeRequest.number),
           expectedHeadSha: working.headSha,
           requirementsDigest: working.requirementsDigest,
           diffDigest: working.diffDigest,
@@ -1562,7 +1576,8 @@ export class RegistrationSetupCoordinator {
           evidence("setup_fresh_review_passed", preview, {
             headSha: working.headSha,
             diffDigest: working.diffDigest,
-            changeRequestId: working.changeRequest.id,
+            // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+            changeRequestId: String(working.changeRequest.number),
           }),
         ]),
       });
@@ -1785,7 +1800,8 @@ export class RegistrationSetupCoordinator {
             requirementsDigest: session.requirementsDigest,
             headSha: session.headSha,
             diffDigest: session.diffDigest,
-            changeRequestId: session.changeRequest.id,
+            // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+            changeRequestId: String(session.changeRequest.number),
           }),
         ]),
       });
@@ -1941,7 +1957,11 @@ export class RegistrationSetupCoordinator {
     }
     const anchored = await this.#readApprovalAnchor(session, lease);
     if (!anchored.ok) return anchored;
-    const reference = { project: session.project, changeRequestId: session.changeRequest.id };
+    // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+    const reference = {
+      project: session.project,
+      changeRequestId: String(session.changeRequest.number),
+    };
     const current = await this.#owned(lease, () =>
       this.#ports.sourceControl.getChangeRequest(reference),
     );
@@ -1977,7 +1997,8 @@ export class RegistrationSetupCoordinator {
     const gate = await this.#owned(lease, () =>
       this.#ports.gateEvidence.read({
         project: session.project,
-        changeRequestId: session.changeRequest.id,
+        // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+        changeRequestId: String(session.changeRequest.number),
         expectedHeadSha: session.headSha,
         requirementsDigest: session.requirementsDigest,
         diffDigest: session.diffDigest,
@@ -2028,7 +2049,8 @@ export class RegistrationSetupCoordinator {
       const observed = await this.#owned(lease, () =>
         this.#ports.sourceControl.getChangeRequest({
           project: session.project,
-          changeRequestId: session.changeRequest.id,
+          // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+          changeRequestId: String(session.changeRequest.number),
         }),
       );
       if (!observed.ok) return portFailure("merge", observed.error, session);
@@ -2070,7 +2092,8 @@ export class RegistrationSetupCoordinator {
           this.#ports.squashMerge.enable(
             {
               project: session.project,
-              changeRequestId: session.changeRequest.id,
+              // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+              changeRequestId: String(session.changeRequest.number),
               expectedHeadSha: session.headSha,
               mergeMethod: "SQUASH",
               mergeIntentDigest: intent.mergeIntentDigest,
@@ -2122,7 +2145,8 @@ export class RegistrationSetupCoordinator {
     const merged = await this.#owned(lease, () =>
       this.#ports.sourceControl.getChangeRequest({
         project: session.project,
-        changeRequestId: session.changeRequest.id,
+        // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+        changeRequestId: String(session.changeRequest.number),
       }),
     );
     if (!merged.ok) return portFailure("merge_readback", merged.error, session);
@@ -2142,7 +2166,8 @@ export class RegistrationSetupCoordinator {
     const authoritative = await this.#owned(lease, () =>
       this.#ports.mergedConfig.read({
         project: session.project,
-        changeRequestId: session.changeRequest.id,
+        // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+        changeRequestId: String(session.changeRequest.number),
         expectedHeadSha: session.headSha,
         defaultBranch: session.project.defaultBranch,
         path: trustedProjectConfigPath,
@@ -2178,12 +2203,14 @@ export class RegistrationSetupCoordinator {
         evidence("setup_merge_verified", preview, {
           headSha: session.headSha,
           diffDigest: session.diffDigest,
-          changeRequestId: session.changeRequest.id,
+          // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+          changeRequestId: String(session.changeRequest.number),
         }),
         evidence("trusted_config_activated", preview, {
           headSha: session.headSha,
           diffDigest: session.diffDigest,
-          changeRequestId: session.changeRequest.id,
+          // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+          changeRequestId: String(session.changeRequest.number),
         }),
       ]),
     });
