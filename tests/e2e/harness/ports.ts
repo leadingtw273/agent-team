@@ -13,41 +13,18 @@ import {
   type GhJsonTransport,
 } from "../../../src/adapters/github/index.js";
 import { LinearGraphqlTransport, LinearReadModel } from "../../../src/adapters/linear/index.js";
-import { parseIdentifier } from "../../../src/domain/foundation/index.js";
-import { projectSchema, type Project } from "../../../src/domain/project/index.js";
 import { createAgentTeamUserLayout } from "../../../src/infrastructure/files/index.js";
 import { DurableInbox, readEventLog } from "../../../src/infrastructure/events/index.js";
 import type { EvidenceCaseDescription } from "./case.js";
 import type { EvidenceCollectorPorts, EvidenceSourceRead } from "./collector.js";
 import { readCheckpointsForIssue } from "./checkpoint-reader.js";
+import { placeholderProjectFor } from "./placeholder-project.js";
 import type {
   CheckpointsEvidenceData,
   GithubEvidenceData,
   LinearEvidenceData,
   LocalEventsEvidenceData,
 } from "./schema.js";
-
-/**
- * `getChangeRequest`/`getCommitChecks`/`getCommitStatuses` (src/application/ports/source-
- * control.ts) all require a full `Project` domain object, but only ever read
- * `project.sourceControl.repository` -- every other field is structurally required by
- * `projectSchema` but functionally irrelevant to these three read calls. This fixed, valid,
- * never-persisted-or-compared placeholder exists purely so `projectSchema.parse` succeeds; its
- * id/displayName/etc. carry no meaning and are never read by anything this harness calls.
- */
-function placeholderProjectFor(repository: string): Project {
-  const projectId = parseIdentifier("project", "project_00000000-0000-4000-8000-000000000000");
-  if (!projectId.ok) throw new Error("unreachable: fixed placeholder project id is well-formed");
-  return projectSchema.parse({
-    schemaVersion: 1,
-    id: projectId.value,
-    displayName: "E005 evidence collector placeholder",
-    localRepositoryPath: "/tmp/e005-evidence-collector-unused",
-    defaultBranch: "main",
-    workManagement: { provider: "linear", containerId: "unused", projectId: "unused" },
-    sourceControl: { provider: "github", repository },
-  });
-}
 
 function readErrorResult<Data>(): EvidenceSourceRead<Data> {
   return { ok: false, reason: "read_error" };
