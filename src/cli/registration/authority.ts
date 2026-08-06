@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 
-import type { RegistrationProbeAuthority } from "../../application/registration/index.js";
+import type {
+  RegistrationProbeAuthority,
+  RegistrationProbeJournalPort,
+} from "../../application/registration/index.js";
+import { ok, type DomainError, type Result } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 
 /**
@@ -27,18 +31,50 @@ export function freshAuthorityDigest(): string {
 export const fixedRegistrationRevision = 1;
 
 /**
- * A stable runId lets a repeated `probe run` for the same project naturally resume the same
- * journal entry (the coordinator's own resume path keys off `journal.load(runId)`) instead of
- * colliding with a still-active prior run's `concurrent_run_exists` guard.
+ * F-1 (2026-08-06 fresh-context acceptance review): a runId *deterministic* in projectId+revision
+ * alone -- as this function used to be -- means every `probe run` for the same project computes
+ * the exact same runId forever. The O006 coordinator persists `verified` (and would persist
+ * `incomplete`) under that runId and, on any later `start()` call for the *same* runId, short-
+ * circuits via `isTerminalCleanPhase` straight to `finalize(existing)` -- touching only
+ * `journal.load`, invoking zero other ports -- before any preflight or revalidation step ever
+ * runs (proactive-probe.ts's own `start()`: `if (... isTerminalCleanPhase(existing.value.phase))
+ * return finalize(existing.value);`). That silently turned every `probe run` after the first into
+ * a zero-mutation replay of a stale result -- exactly the failure mode `RUN FULL REVALIDATION` is
+ * supposed to prevent. `freshRegistrationProbeRunId` must never be memoized/derived from stable
+ * inputs; `resolveRegistrationProbeRunId` below is the only place a runId should come from.
  */
-export function deterministicRegistrationProbeRunId(
-  projectId: string,
-  registrationRevision: number,
-): string {
-  const digest = createHash("sha256")
-    .update(`${projectId}:${String(registrationRevision)}`, "utf8")
-    .digest("hex");
-  return `probe-${digest.slice(0, 32)}`;
+export function freshRegistrationProbeRunId(): string {
+  return `probe-${randomUUID().replace(/-/gu, "")}`;
+}
+
+export interface ResolveRegistrationProbeRunIdResult {
+  readonly runId: string;
+  readonly resumed: boolean;
+}
+
+/**
+ * F-1 fix: decides, from the journal's own `listActiveForProject` (already excludes terminal
+ * `verified`/`incomplete` phases -- see `isTerminalCleanPhase` in proactive-probe-model.ts), which
+ * runId this `probe run` invocation must use:
+ *   - a non-terminal (still active, or `failed` with pending cleanup) run already exists for this
+ *     project -> resume its *exact* runId (`resumed: true`), so the coordinator's own resume path
+ *     picks it back up instead of colliding with `concurrent_run_exists`.
+ *   - otherwise (including "the only prior run for this project is terminal") -> mint a genuinely
+ *     fresh runId (`resumed: false`), guaranteeing the coordinator runs a full revalidation from
+ *     scratch rather than replaying anything.
+ */
+export async function resolveRegistrationProbeRunId(
+  journal: Pick<RegistrationProbeJournalPort, "listActiveForProject">,
+  projectId: Project["id"],
+): Promise<Result<ResolveRegistrationProbeRunIdResult, DomainError>> {
+  const active = await journal.listActiveForProject(projectId);
+  if (!active.ok) return active;
+  const existing = active.value[0];
+  return ok(
+    existing === undefined
+      ? { runId: freshRegistrationProbeRunId(), resumed: false }
+      : { runId: existing.runId, resumed: true },
+  );
 }
 
 /** Decision #2: the probe's human-trigger authority is always `user_conversation` for this CLI. */

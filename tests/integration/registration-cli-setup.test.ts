@@ -14,7 +14,7 @@
  *   `environment` option (never process.env), so nothing here can ever touch a real service.
  */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -319,5 +319,30 @@ describe("O009 registration setup CLI: start -> status (loopback/fake integratio
 
     expect(result.state).toBe("blocked");
     expect(github.prs).toHaveLength(0);
+  });
+
+  it("(minor #5, 2026-08-06 fresh-context review) `setup status` alone never creates state/registration-setup/worktrees, and honestly reports preview_ready for a never-started project", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009-setup-home-status-only-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    const environment = { LINEAR_API_KEY: "unused-in-this-scenario" };
+    const linearFetch = () => {
+      throw new Error("must never be called: status is read-only");
+    };
+    const statusHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition: (options) =>
+        buildRegistrationSetupComposition({ ...options, githubTransport: github, linearFetch }),
+    });
+
+    const statusResult = await statusHandlers.setupStatus({ projectId });
+
+    expect(statusResult.state).toBe("success");
+    const statusPayload = JSON.parse(statusResult.message ?? "") as { readonly state: string };
+    expect(statusPayload.state).toBe("preview_ready");
+    expect(github.prs).toHaveLength(0);
+    await expect(access(join(agentTeamHome, "state"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

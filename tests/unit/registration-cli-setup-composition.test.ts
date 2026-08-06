@@ -3,7 +3,7 @@
  * must short-circuit *before* the next external dependency is even constructed -- these tests
  * prove that with fake counters, not just by inspecting the returned reason code.
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -84,6 +84,7 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
     const result = await buildRegistrationSetupComposition({
       agentTeamHome,
       projectId,
+      ensureWorktreeDirectories: true,
       environment: { LINEAR_API_KEY: "key" },
       githubTransport: github,
       linearFetch,
@@ -104,6 +105,7 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
     const result = await buildRegistrationSetupComposition({
       agentTeamHome,
       projectId,
+      ensureWorktreeDirectories: true,
       environment: {},
       githubTransport: github,
       linearFetch,
@@ -127,6 +129,7 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
     const result = await buildRegistrationSetupComposition({
       agentTeamHome,
       projectId,
+      ensureWorktreeDirectories: true,
       environment: { LINEAR_API_KEY: "key" },
       githubTransport: github,
       linearFetch,
@@ -147,6 +150,7 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
       // createProductionRegistrationSetupComposition itself rejects.
       agentTeamHome: "relative-home",
       projectId,
+      ensureWorktreeDirectories: true,
       environment: { LINEAR_API_KEY: "key" },
       githubTransport: github,
       linearFetch: vi.fn(() => Promise.reject(new Error("must never be called"))),
@@ -163,6 +167,7 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
     const result = await buildRegistrationSetupComposition({
       agentTeamHome,
       projectId,
+      ensureWorktreeDirectories: true,
       environment: { LINEAR_API_KEY: "key" },
       githubTransport: github,
       linearFetch: vi.fn(() => Promise.reject(new Error("must never be called by this test"))),
@@ -173,5 +178,46 @@ describe("buildRegistrationSetupComposition (fail-closed ordering)", () => {
       expect(result.composition.wiring).toMatchObject({ state: "ready" });
     }
     expect(github.inspectAuthentication).toHaveBeenCalledTimes(1);
+  });
+
+  it("(minor #5, 2026-08-06 fresh-context review) a read-only call (ensureWorktreeDirectories: false) never creates state/registration-setup/worktrees", async () => {
+    const agentTeamHome = await root();
+    await writeValidDraft(agentTeamHome);
+    const github = fakeGithubTransport();
+
+    const result = await buildRegistrationSetupComposition({
+      agentTeamHome,
+      projectId,
+      ensureWorktreeDirectories: false,
+      environment: { LINEAR_API_KEY: "key" },
+      githubTransport: github,
+      linearFetch: vi.fn(() => Promise.reject(new Error("must never be called by this test"))),
+    });
+
+    expect(result.state).toBe("ready");
+    await expect(access(join(agentTeamHome, "state"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      access(join(agentTeamHome, "state", "registration-setup", "worktrees")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("a mutation-intent call (ensureWorktreeDirectories: true) does create state/registration-setup/worktrees at 0700", async () => {
+    const agentTeamHome = await root();
+    await writeValidDraft(agentTeamHome);
+    const github = fakeGithubTransport();
+
+    const result = await buildRegistrationSetupComposition({
+      agentTeamHome,
+      projectId,
+      ensureWorktreeDirectories: true,
+      environment: { LINEAR_API_KEY: "key" },
+      githubTransport: github,
+      linearFetch: vi.fn(() => Promise.reject(new Error("must never be called by this test"))),
+    });
+
+    expect(result.state).toBe("ready");
+    await expect(
+      access(join(agentTeamHome, "state", "registration-setup", "worktrees")),
+    ).resolves.toBeUndefined();
   });
 });

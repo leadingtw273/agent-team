@@ -35,6 +35,14 @@ export interface BuildRegistrationSetupCompositionOptions {
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
   /** Injectable for tests; production defaults to real fetch against the Linear GraphQL API. */
   readonly linearFetch?: typeof fetch;
+  /**
+   * Fresh-context acceptance review, minor item #5 (2026-08-06): a read-only `setup status` must
+   * never write to disk. Required (no default) so every call site names its own intent
+   * explicitly: `setup start`/`approve`/`resume` (mutation-ish, may need a real worktree) pass
+   * `true`; `setup status` passes `false` and must report whatever it can read back without ever
+   * creating `state/registration-setup/worktrees`.
+   */
+  readonly ensureWorktreeDirectories: boolean;
 }
 
 /**
@@ -99,7 +107,10 @@ export async function buildRegistrationSetupComposition(
   // target's *parent* directory to already exist -- it does not create it itself. Existing O005
   // fixtures that exercise the real adapter always pre-create this directory the same way (e.g.
   // tests/integration/registration-setup-git-recovery.test.ts's own `mkdir(worktrees, {recursive})`
-  // before calling into the coordinator). This mirrors that same host-side precondition.
+  // before calling into the coordinator). This mirrors that same host-side precondition -- but
+  // only for mutation-ish commands (decision `ensureWorktreeDirectories`): a read-only
+  // `setup status` must never write to disk, and `controller.read()` needs no worktree at all
+  // (a session that was never started simply reads back as absent, which is the correct answer).
   //
   // Every segment must be created at exactly 0700: `withSecureDirectory` (used elsewhere under
   // this same stateRoot for sessions/journal/etc., src/infrastructure/files/secure-directory.ts)
@@ -108,13 +119,15 @@ export async function buildRegistrationSetupComposition(
   // `registration-setup` parent non-0700 and break every later secure-directory read/write under
   // it -- so each segment gets its mode set explicitly, matching privateDirectoryMode's own
   // convention in src/infrastructure/files/layout.ts.
-  for (const directory of [
-    stateRoot,
-    join(stateRoot, "registration-setup"),
-    join(stateRoot, "registration-setup", "worktrees"),
-  ]) {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await chmod(directory, 0o700);
+  if (options.ensureWorktreeDirectories) {
+    for (const directory of [
+      stateRoot,
+      join(stateRoot, "registration-setup"),
+      join(stateRoot, "registration-setup", "worktrees"),
+    ]) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await chmod(directory, 0o700);
+    }
   }
 
   const composition = createProductionRegistrationSetupComposition({

@@ -48,10 +48,12 @@ function readModelOutcome(operation: string, model: RegistrationSetupControllerA
 async function requireReadyComposition(
   options: CreateRegistrationSetupHandlersOptions,
   input: Readonly<{ projectId: string; draftPath?: string }>,
+  ensureWorktreeDirectories: boolean,
 ) {
   const build = await (options.buildComposition ?? buildRegistrationSetupComposition)({
     agentTeamHome: options.agentTeamHome,
     projectId: input.projectId,
+    ensureWorktreeDirectories,
     ...(input.draftPath === undefined ? {} : { draftPath: input.draftPath }),
     ...(options.environment === undefined ? {} : { environment: options.environment }),
   });
@@ -76,7 +78,10 @@ export function createRegistrationSetupHandlers(
 
   return Object.freeze({
     async setupStatus(input) {
-      const built = await requireReadyComposition(options, input);
+      // Minor item #5 (2026-08-06 fresh-context acceptance review): a read-only command must
+      // never create state/registration-setup/worktrees -- it just reports whatever the existing
+      // controller.read() can honestly read back.
+      const built = await requireReadyComposition(options, input, false);
       if (!built.ready) return built.outcome;
       const context = { authorityDigest: freshAuthorityDigest() };
       const model = await built.composition.controller.read(context);
@@ -84,7 +89,7 @@ export function createRegistrationSetupHandlers(
     },
 
     async setupResume(input) {
-      const built = await requireReadyComposition(options, input);
+      const built = await requireReadyComposition(options, input, true);
       if (!built.ready) return built.outcome;
       const context = { authorityDigest: freshAuthorityDigest() };
       const model = await built.composition.controller.resume(
@@ -103,7 +108,7 @@ export function createRegistrationSetupHandlers(
           reason: "confirmation_mismatch",
         });
       }
-      const built = await requireReadyComposition(options, input);
+      const built = await requireReadyComposition(options, input, true);
       if (!built.ready) return built.outcome;
       const controller = built.composition.controller;
       const context = { authorityDigest: freshAuthorityDigest() };
@@ -144,7 +149,7 @@ export function createRegistrationSetupHandlers(
           reason: "confirmation_mismatch",
         });
       }
-      const built = await requireReadyComposition(options, input);
+      const built = await requireReadyComposition(options, input, true);
       if (!built.ready) return built.outcome;
       const controller = built.composition.controller;
       const context = { authorityDigest: freshAuthorityDigest() };

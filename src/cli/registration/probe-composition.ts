@@ -31,8 +31,8 @@ import {
 import type { WebhookRuntimeTransport } from "../probe/index.js";
 import {
   buildRegistrationProbeAuthority,
-  deterministicRegistrationProbeRunId,
   fixedRegistrationRevision,
+  resolveRegistrationProbeRunId,
 } from "./authority.js";
 import { defaultRegistrationDraftPath, loadHostRegistrationSetupDraft } from "./draft-store.js";
 import {
@@ -47,12 +47,16 @@ export type RegistrationProbeCompositionBlockedReason =
   | "linear_api_key_missing"
   | "github_authentication_unavailable"
   | "webhook_secret_unavailable"
-  | "activation_not_found";
+  | "activation_not_found"
+  | "journal_unavailable";
 
 export interface RegistrationProbeCompositionReady {
   readonly coordinator: RegistrationProbeCoordinatorUseCase;
   readonly command: RegistrationProbeStartCommand;
   readonly journal: Pick<FileRegistrationProbeJournalStore, "listActiveForProject" | "load">;
+  /** F-1 fix: true iff this invocation resumed an existing non-terminal run rather than minting
+   * a fresh runId -- see resolveRegistrationProbeRunId in authority.ts. */
+  readonly resumed: boolean;
 }
 
 export type BuildRegistrationProbeCompositionResult =
@@ -183,10 +187,16 @@ export async function buildRegistrationProbeComposition(
     journal,
   };
 
-  const runId = deterministicRegistrationProbeRunId(
-    draft.value.project.id,
-    fixedRegistrationRevision,
-  );
+  // F-1 fix: never derive runId from stable inputs alone (that let the coordinator's own
+  // terminal-phase short-circuit silently replay a cached `verified` result forever after the
+  // first successful run). Resume the exact runId of a non-terminal run if this project already
+  // has one in flight; otherwise mint a genuinely fresh one, so a repeat `probe run` performs a
+  // full revalidation, never a replay.
+  const resolvedRunId = await resolveRegistrationProbeRunId(journal, draft.value.project.id);
+  if (!resolvedRunId.ok) {
+    return Object.freeze({ state: "blocked", reason: "journal_unavailable" });
+  }
+  const { runId, resumed } = resolvedRunId.value;
   const command: RegistrationProbeStartCommand = Object.freeze({
     project: draft.value.project,
     setupSessionId: activation.value.setupSessionId,
@@ -217,5 +227,8 @@ export async function buildRegistrationProbeComposition(
       : { providerEventPoll: options.providerEventPoll }),
   });
 
-  return Object.freeze({ state: "ready", value: Object.freeze({ coordinator, command, journal }) });
+  return Object.freeze({
+    state: "ready",
+    value: Object.freeze({ coordinator, command, journal, resumed }),
+  });
 }

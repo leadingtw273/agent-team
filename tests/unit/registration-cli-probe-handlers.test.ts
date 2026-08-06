@@ -70,7 +70,7 @@ describe("registration probe run/status: fail-closed on missing configuration", 
     });
   });
 
-  it("reports the coordinator's verified outcome on success", async () => {
+  it("reports the coordinator's verified outcome on success, and surfaces resumed:false for a fresh run", async () => {
     const start = vi.fn(() =>
       Promise.resolve({
         state: "verified" as const,
@@ -84,6 +84,7 @@ describe("registration probe run/status: fail-closed on missing configuration", 
           coordinator: { start },
           command: { project: { id: "proj-1" } },
           journal: { listActiveForProject: vi.fn(), load: vi.fn() },
+          resumed: false,
         },
       } as never),
     );
@@ -100,6 +101,39 @@ describe("registration probe run/status: fail-closed on missing configuration", 
       operation: "registration_probe_run",
       state: "verified",
       runId: "probe-run-1",
+      resumed: false,
+    });
+  });
+
+  it("surfaces resumed:true (F-1 fix) when the composition resolved an in-flight run's runId", async () => {
+    const start = vi.fn(() =>
+      Promise.resolve({
+        state: "cleanup_required" as const,
+        run: { runId: "probe-in-flight-run", cleanup: { linearIssue: { state: "failed" } } },
+      } as never),
+    );
+    const buildComposition = vi.fn<typeof buildRegistrationProbeComposition>(() =>
+      Promise.resolve({
+        state: "ready",
+        value: {
+          coordinator: { start },
+          command: { project: { id: "proj-1" } },
+          journal: { listActiveForProject: vi.fn(), load: vi.fn() },
+          resumed: true,
+        },
+      } as never),
+    );
+    const handlers = createRegistrationProbeHandlers({
+      agentTeamHome: "/nonexistent",
+      stdin: stream("RUN FULL REVALIDATION\n"),
+      buildComposition,
+    });
+
+    const result = await handlers.probeRun({ projectId: "proj-1" });
+
+    expect(JSON.parse(result.message ?? "")).toMatchObject({
+      runId: "probe-in-flight-run",
+      resumed: true,
     });
   });
 

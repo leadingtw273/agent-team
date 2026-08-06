@@ -27,6 +27,7 @@ const blockedMessages: Readonly<Record<RegistrationProbeCompositionBlockedReason
     webhook_secret_unavailable:
       "找不到有效的 Webhook secret 檔（${AGENT_TEAM_HOME}/secrets/{github,linear}-webhook-secret），或權限不是 0600。",
     activation_not_found: "此 project 尚未完成 Registration Setup activation，無法執行 Probe。",
+    journal_unavailable: "無法讀取 Probe journal（listActiveForProject 失敗）。",
   });
 
 function outcome(state: "success" | "failed" | "blocked" | "rejected", payload: unknown) {
@@ -74,6 +75,7 @@ export function createRegistrationProbeHandlers(
       const built = await requireReadyComposition(options, input);
       if (!built.ready) return built.outcome;
 
+      const { resumed } = built.value;
       const runOutcome = await built.value.coordinator.start(built.value.command);
       switch (runOutcome.state) {
         case "verified":
@@ -81,12 +83,14 @@ export function createRegistrationProbeHandlers(
             operation: "registration_probe_run",
             state: "verified",
             runId: runOutcome.run.runId,
+            resumed,
           });
         case "incomplete":
           return outcome("blocked", {
             operation: "registration_probe_run",
             state: "incomplete",
             reason: runOutcome.reason,
+            resumed,
           });
         case "cleanup_required":
           return outcome("failed", {
@@ -94,6 +98,7 @@ export function createRegistrationProbeHandlers(
             state: "cleanup_required",
             runId: runOutcome.run.runId,
             cleanup: runOutcome.run.cleanup,
+            resumed,
           });
         case "failed":
           return outcome("failed", {
@@ -102,6 +107,7 @@ export function createRegistrationProbeHandlers(
             stage: runOutcome.stage,
             reason: runOutcome.reason,
             runId: runOutcome.run.runId,
+            resumed,
           });
       }
     },

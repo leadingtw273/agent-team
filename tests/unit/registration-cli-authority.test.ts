@@ -1,11 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   buildRegistrationProbeAuthority,
-  deterministicRegistrationProbeRunId,
   fixedRegistrationRevision,
   freshAuthorityDigest,
+  freshRegistrationProbeRunId,
+  resolveRegistrationProbeRunId,
 } from "../../src/cli/registration/authority.js";
+import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import type { RegistrationProbeJournalPort } from "../../src/application/registration/index.js";
 
 describe("freshAuthorityDigest", () => {
   it("produces a valid, distinct 64-hex-char digest per call", () => {
@@ -18,22 +21,77 @@ describe("freshAuthorityDigest", () => {
   });
 });
 
-describe("deterministicRegistrationProbeRunId", () => {
-  it("is stable for the same project/revision so a re-run naturally resumes it", () => {
-    const first = deterministicRegistrationProbeRunId("project-a", 1);
-    const second = deterministicRegistrationProbeRunId("project-a", 1);
+describe("freshRegistrationProbeRunId", () => {
+  it("produces a valid, bounded probe-<hex> id that differs every call", () => {
+    const first = freshRegistrationProbeRunId();
+    const second = freshRegistrationProbeRunId();
 
-    expect(first).toBe(second);
+    expect(first).toMatch(/^probe-[a-f0-9]+$/u);
     expect(first).toMatch(/^[a-z0-9][a-z0-9-]{0,63}$/u);
+    expect(first.length).toBeLessThanOrEqual(64);
+    expect(first).not.toBe(second);
+  });
+});
+
+describe("resolveRegistrationProbeRunId (F-1 fix)", () => {
+  it("mints a genuinely fresh runId when this project has no active run, and a *different* one on every call", async () => {
+    const listActiveForProject = vi.fn(() => Promise.resolve(ok([])));
+    const journal = { listActiveForProject } as unknown as Pick<
+      RegistrationProbeJournalPort,
+      "listActiveForProject"
+    >;
+
+    const first = await resolveRegistrationProbeRunId(journal, "project-a" as never);
+    const second = await resolveRegistrationProbeRunId(journal, "project-a" as never);
+
+    expect(first.ok && first.value.resumed).toBe(false);
+    expect(second.ok && second.value.resumed).toBe(false);
+    expect(first.ok && second.ok && first.value.runId).not.toBe(second.ok && second.value.runId);
   });
 
-  it("differs across distinct projects or revisions", () => {
-    const a = deterministicRegistrationProbeRunId("project-a", 1);
-    const b = deterministicRegistrationProbeRunId("project-b", 1);
-    const c = deterministicRegistrationProbeRunId("project-a", 2);
+  it("never returns a runId belonging to a terminal (verified/incomplete) journal entry -- listActiveForProject already excludes those", async () => {
+    // isTerminalCleanPhase-filtered runs never appear in listActiveForProject's own result (that
+    // is the O006 journal port's own contract) -- so an empty result here *is* "only terminal
+    // entries exist, if any", and must always mint a fresh id, never replay one.
+    const listActiveForProject = vi.fn(() => Promise.resolve(ok([])));
+    const journal = { listActiveForProject } as unknown as Pick<
+      RegistrationProbeJournalPort,
+      "listActiveForProject"
+    >;
 
-    expect(a).not.toBe(b);
-    expect(a).not.toBe(c);
+    const resolved = await resolveRegistrationProbeRunId(
+      journal,
+      "project-with-old-verified-run" as never,
+    );
+
+    expect(resolved.ok && resolved.value.resumed).toBe(false);
+    expect(resolved.ok && resolved.value.runId).not.toBe("probe-old-verified-run");
+  });
+
+  it("resumes the exact runId of an existing non-terminal (active) run instead of minting a new one", async () => {
+    const listActiveForProject = vi.fn(() =>
+      Promise.resolve(ok([{ runId: "probe-in-flight-run" }])),
+    );
+    const journal = { listActiveForProject } as unknown as Pick<
+      RegistrationProbeJournalPort,
+      "listActiveForProject"
+    >;
+
+    const resolved = await resolveRegistrationProbeRunId(journal, "project-a" as never);
+
+    expect(resolved).toEqual(ok({ runId: "probe-in-flight-run", resumed: true }));
+  });
+
+  it("propagates a journal read failure rather than silently minting a runId", async () => {
+    const listActiveForProject = vi.fn(() => Promise.resolve(err(domainError("unavailable"))));
+    const journal = { listActiveForProject } as unknown as Pick<
+      RegistrationProbeJournalPort,
+      "listActiveForProject"
+    >;
+
+    const resolved = await resolveRegistrationProbeRunId(journal, "project-a" as never);
+
+    expect(resolved).toEqual(err(domainError("unavailable")));
   });
 });
 
