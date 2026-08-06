@@ -6,6 +6,7 @@ import type {
   CreateWorktreeCommand,
   GitCommitCommand,
   GitCommitReceipt,
+  GitCommitSnapshot,
   GitPort,
   GitPushReceipt,
   GitRepositoryRef,
@@ -689,6 +690,64 @@ export class LocalGitAdapter implements GitPort {
     return changes === undefined ? failure("external_failure") : ok(changes);
   }
 
+  async getStagedTreeDiff(
+    worktree: GitWorktree,
+    baseRevision: string,
+    options: ReadOptions = {},
+  ): Promise<Result<readonly EffectiveTreeChange[], DomainError>> {
+    if (!validRevision(baseRevision)) return failure("external_failure");
+    const verified = await this.#inspectVerifiedWorktree(worktree, options);
+    if (!verified.ok) return verified;
+    const base = await this.#resolveCommit(worktree.path, baseRevision, options);
+    if (!base.ok) return base;
+    const output = await this.#run(
+      worktree.path,
+      ["diff", "--cached", "--raw", "--no-abbrev", "-z", "--find-renames=50%", base.value],
+      options,
+    );
+    if (!output.ok) return output;
+    const changes = parseEffectiveTreeDiff(output.value.stdout);
+    return changes === undefined ? failure("external_failure") : ok(changes);
+  }
+
+  async inspectCommit(
+    repository: GitRepositoryRef,
+    revision: string,
+    options: ReadOptions = {},
+  ): Promise<Result<GitCommitSnapshot, DomainError>> {
+    const root = await this.#repositoryRoot(repository, options);
+    if (!root.ok) return root;
+    const resolved = await this.#resolveCommit(root.value, revision, options);
+    if (!resolved.ok) return resolved;
+    const inspected = await this.#run(
+      root.value,
+      ["show", "-s", "--format=%H%x00%T%x00%P%x00%B%x00", resolved.value],
+      options,
+    );
+    if (!inspected.ok) return inspected;
+    const [sha, treeSha, parents, rawMessage, terminator, trailing] =
+      inspected.value.stdout.split("\0");
+    if (
+      sha === undefined ||
+      treeSha === undefined ||
+      parents === undefined ||
+      rawMessage === undefined ||
+      terminator === undefined ||
+      trailing !== undefined ||
+      terminator.trim().length !== 0 ||
+      !shaPattern.test(sha) ||
+      !shaPattern.test(treeSha)
+    ) {
+      return failure("external_failure");
+    }
+    const parentShas = parents.length === 0 ? [] : parents.split(" ");
+    if (parentShas.some((parent) => !shaPattern.test(parent))) {
+      return failure("external_failure");
+    }
+    const message = rawMessage.endsWith("\n") ? rawMessage.slice(0, -1) : rawMessage;
+    return ok({ sha, treeSha, parentShas, message });
+  }
+
   async commit(
     command: GitCommitCommand,
     options: MutationOptions,
@@ -748,6 +807,22 @@ export class LocalGitAdapter implements GitPort {
     );
     if (!remoteCheck.ok) return remoteCheck;
     if (!safeRemoteUrl(remoteCheck.value.stdout.trim())) return failure("external_failure");
+    const existingRemote = await this.#run(
+      worktree.path,
+      [
+        "-c",
+        "protocol.ext.allow=never",
+        "ls-remote",
+        remote,
+        `refs/heads/${snapshot.value.branch}`,
+      ],
+      options,
+    );
+    if (!existingRemote.ok) return existingRemote;
+    const existingRemoteSha = existingRemote.value.stdout.trim().split(/\s+/u)[0];
+    if (existingRemoteSha === snapshot.value.headSha) {
+      return ok({ remote, branch: snapshot.value.branch, sha: snapshot.value.headSha });
+    }
     const pushed = await this.#run(
       worktree.path,
       [

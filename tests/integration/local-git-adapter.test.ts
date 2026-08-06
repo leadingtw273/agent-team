@@ -189,6 +189,9 @@ describe("local Git adapter", () => {
         .trim()
         .split(/\s+/u)[0],
     ).toBe(committed.value.sha);
+    await expect(
+      adapter.push(worktree, "origin", mutation("push:read-back-retry")),
+    ).resolves.toEqual(pushed);
 
     await expect(adapter.removeWorktree(worktree, mutation("remove:lifecycle"))).resolves.toEqual({
       ok: true,

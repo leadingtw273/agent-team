@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createGitHubRegistrationUiContribution,
   createUiApplication,
   fixtureGitHubRegistrationPolicyPreview,
@@ -44,7 +44,7 @@ async function start(): Promise<LocalUiServerHandle> {
 
 async function startRegistration(): Promise<LocalUiServerHandle> {
   const application = createUiApplication({
-    features: [createRegistrationWizardUiFeatureRegistration()],
+    features: [createFixtureRegistrationWizardUiFeatureRegistration()],
   });
   const handle = await startLocalUiServer({
     handler: application.handler,

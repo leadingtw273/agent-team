@@ -1,0 +1,67 @@
+.ui-registration-setup {
+  margin-top: 1.25rem;
+}
+
+.ui-registration-setup-heading,
+.ui-registration-setup-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: space-between;
+}
+
+.ui-registration-setup-state {
+  align-self: flex-start;
+  background: var(--tblr-warning-lt, #fff3cd);
+  border-radius: 999px;
+  font-weight: 700;
+  padding: 0.35rem 0.65rem;
+}
+
+.ui-registration-setup-evidence {
+  padding-left: 1.25rem;
+}
+
+.ui-registration-setup-facts {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ui-registration-setup-facts div {
+  min-width: 0;
+}
+
+.ui-registration-setup-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.ui-registration-setup-controls {
+  align-items: end;
+  justify-content: flex-start;
+}
+
+.ui-registration-setup-controls label {
+  flex-basis: 100%;
+}
+
+.ui-registration-setup-controls input {
+  max-width: 32rem;
+}
+
+@media (max-width: 420px) {
+  .ui-registration-setup > .card-body {
+    padding: 1rem;
+  }
+
+  .ui-registration-setup-heading,
+  .ui-registration-setup-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ui-registration-setup-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

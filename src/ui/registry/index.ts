@@ -4,6 +4,10 @@ import {
   uiShellCoreRouteContracts,
   type UiShellReadModel,
 } from "../shell/index.js";
+import {
+  createProductionRegistrationWizardUiComposition,
+  type CreateProductionRegistrationWizardUiCompositionOptions,
+} from "../features/registration/production.js";
 import { createUiSecurityPolicy, type UiSecurityRouteContract } from "../security/index.js";
 import type { UiRequestHandler, UiSecurityPolicy } from "../server/index.js";
 import {
@@ -17,6 +21,8 @@ export * from "./contracts.js";
 export interface CreateUiApplicationOptions {
   readonly readModel?: UiShellReadModel;
   readonly features?: readonly UiFeatureSource[];
+  /** Actual production host path for the single Registration Wizard slot. */
+  readonly productionRegistrationWizard?: CreateProductionRegistrationWizardUiCompositionOptions;
 }
 
 export interface UiApplication {
@@ -120,7 +126,14 @@ function validateFeatures(sources: readonly UiFeatureSource[]): readonly UiFeatu
 
 /** The only composition point for shell routes, feature routes, handlers, and security policy. */
 export function createUiApplication(options: CreateUiApplicationOptions = {}): UiApplication {
-  const features = validateFeatures(options.features ?? Object.freeze([]));
+  const productionRegistration =
+    options.productionRegistrationWizard === undefined
+      ? undefined
+      : createProductionRegistrationWizardUiComposition(options.productionRegistrationWizard);
+  const features = validateFeatures([
+    ...(options.features ?? Object.freeze([])),
+    ...(productionRegistration === undefined ? [] : [productionRegistration.feature]),
+  ]);
   const routeContracts = Object.freeze([
     ...uiShellCoreRouteContracts,
     ...features.flatMap((feature) => [

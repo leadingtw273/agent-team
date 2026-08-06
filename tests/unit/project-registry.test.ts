@@ -3,12 +3,15 @@ import { describe, expect, it } from "vitest";
 import {
   ProjectRegistry,
   TrustedProjectConfigLoader,
+  serializeTrustedProjectConfig,
   trustedProjectConfigPath,
   type TrustedProjectConfig,
+  type TrustedProjectActivationPort,
   type TrustedProjectGitPort,
 } from "../../src/application/projects/index.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { projectSchema, type Project } from "../../src/domain/project/index.js";
+import { sha256Digest } from "../../src/domain/review/index.js";
 
 const revisionSha = "a".repeat(40);
 
@@ -58,6 +61,43 @@ function gitWith(value: unknown): TrustedProjectGitPort {
   };
 }
 
+function digest(value: string) {
+  const result = sha256Digest(value);
+  if (!result.ok) throw new Error(result.error.code);
+  return result.value;
+}
+
+function activationFor(value: TrustedProjectConfig = config()): TrustedProjectActivationPort {
+  const serialized = serializeTrustedProjectConfig(value);
+  if (!serialized.ok) throw new Error(serialized.error.code);
+  return {
+    read: () =>
+      Promise.resolve(
+        ok({
+          schemaVersion: 1 as const,
+          source: "source_control_default_branch" as const,
+          setupSessionId: "setup-session-1",
+          projectId: value.projectId,
+          repository: value.platforms.sourceControl.repository,
+          changeRequestId: "PR_node_1",
+          setupHeadSha: "b".repeat(40),
+          mergeCommitSha: "c".repeat(40),
+          authoritativeRevision: "c".repeat(40),
+          defaultBranch: value.defaultBranch,
+          configDigest: serialized.value.contentDigest,
+          linearAuditIssueId: "LINEAR-AUDIT-1",
+          gateEvidenceDigest: digest("gate"),
+          auditReceiptsDigest: digest("audit"),
+          approvalSource: "local_ui" as const,
+          approvalReferenceDigest: digest("approval"),
+          approvalConsumeOperationDigest: digest("consume-operation"),
+          authorityDigest: digest("authority"),
+          approvalNonceDigest: digest("nonce"),
+        }),
+      ),
+  };
+}
+
 describe("trusted project config loader", () => {
   it("loads only the configured default-branch path and binds the exact revision", async () => {
     const requests: unknown[] = [];
@@ -75,7 +115,7 @@ describe("trusted project config loader", () => {
         );
       },
     };
-    const result = await new TrustedProjectConfigLoader(git).load(project());
+    const result = await new TrustedProjectConfigLoader(git, activationFor()).load(project());
 
     expect(result).toMatchObject({ state: "ready", revisionSha });
     expect(requests).toEqual([
@@ -201,21 +241,30 @@ describe("project registry", () => {
       localRepositoryPath: "/tmp/second",
       sourceControl: { provider: "github", repository: "owner/second" },
     });
-    const loader = new TrustedProjectConfigLoader({
-      readTextFileAtRevision: (command) => {
-        const selected = command.rootPath === first.localRepositoryPath ? first : second;
-        const value = selected === first ? config(first) : { ...config(second), schemaVersion: 2 };
-        const content = JSON.stringify(value);
-        return Promise.resolve(
-          ok({
-            revisionSha,
-            path: command.path,
-            content,
-            byteLength: Buffer.byteLength(content, "utf8"),
-          }),
-        );
+    const loader = new TrustedProjectConfigLoader(
+      {
+        readTextFileAtRevision: (command) => {
+          const selected = command.rootPath === first.localRepositoryPath ? first : second;
+          const value =
+            selected === first ? config(first) : { ...config(second), schemaVersion: 2 };
+          const content = JSON.stringify(value);
+          return Promise.resolve(
+            ok({
+              revisionSha,
+              path: command.path,
+              content,
+              byteLength: Buffer.byteLength(content, "utf8"),
+            }),
+          );
+        },
       },
-    });
+      {
+        read: (projectId) => {
+          const selected = projectId === first.id ? first : second;
+          return activationFor(config(selected)).read(projectId);
+        },
+      },
+    );
     const registry = await new ProjectRegistry(loader).load([first, second]);
 
     expect(registry.ready.map((entry) => entry.project.id)).toEqual([first.id]);
@@ -241,5 +290,25 @@ describe("project registry", () => {
     expect(registry.rejected).toHaveLength(2);
     expect(registry.rejected.every((entry) => entry.reason === "registry_conflict")).toBe(true);
     expect(reads).toBe(0);
+  });
+
+  it("rejects a valid default-branch config without an activation marker or with digest drift", async () => {
+    await expect(
+      new TrustedProjectConfigLoader(gitWith(config())).load(project()),
+    ).resolves.toMatchObject({
+      state: "rejected",
+      reason: "activation_missing",
+    });
+    const drifted = activationFor();
+    await expect(
+      new TrustedProjectConfigLoader(gitWith(config()), {
+        read: async () => {
+          const marker = await drifted.read(project().id);
+          return marker.ok && marker.value !== undefined
+            ? ok({ ...marker.value, configDigest: digest("drift") })
+            : marker;
+        },
+      }).load(project()),
+    ).resolves.toMatchObject({ state: "rejected", reason: "activation_invalid" });
   });
 });

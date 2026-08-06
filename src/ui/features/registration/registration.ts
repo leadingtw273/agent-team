@@ -1,11 +1,13 @@
 import { readFileSync } from "node:fs";
 
+import { createUnwiredRegistrationSetupController } from "../../../application/registration/index.js";
 import type {
   GitHubRegistrationPolicyUseCase,
   GitHubRegistrationTarget,
   LinearProvisionConfirmationContext,
   LinearProvisionUseCase,
   RegistrationReadOnlyScanUseCase,
+  RegistrationSetupControllerUseCase,
 } from "../../../application/registration/index.js";
 import type { UiFeatureRegistration, UiFeatureRoute } from "../../registry/index.js";
 import type { UiRequest, UiResponse, UiTrustedRequestContext } from "../../server/index.js";
@@ -34,6 +36,19 @@ import {
 } from "./metadata.js";
 import { registrationWizardFeatureSecurityRoutes } from "./routes.js";
 import { renderRegistrationWizard } from "./view.js";
+import {
+  createRegistrationSetupUiContribution,
+  registrationSetupCssPath,
+  registrationSetupScriptPath,
+} from "../registration-setup/index.js";
+
+export type RegistrationLinearUseCaseFactory = (
+  context: LinearProvisionConfirmationContext,
+) => LinearProvisionUseCase;
+
+export type RegistrationGitHubUseCaseFactory = (
+  context: LinearProvisionConfirmationContext,
+) => GitHubRegistrationPolicyUseCase;
 
 const registrationWizardCss = readFileSync(
   new URL("../../assets/registration.css", import.meta.url),
@@ -69,18 +84,11 @@ function assetResponse(request: UiRequest, content: string, contentType: string)
  * preview/provision section into that page without creating another Shell.
  */
 export function createRegistrationWizardUiFeatureRegistration(
-  useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
-  linearUseCaseFactory: (
-    context: LinearProvisionConfirmationContext,
-  ) => LinearProvisionUseCase = createFixtureLinearProvisionUseCaseFactory(),
-  githubUseCaseFactory: (
-    context: LinearProvisionConfirmationContext,
-  ) => GitHubRegistrationPolicyUseCase = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
-  githubTarget: GitHubRegistrationTarget = Object.freeze({
-    projectId: "fixture-agent-team-project",
-    repository: "fixture/registered-project",
-    defaultBranch: "main",
-  }),
+  useCase: RegistrationReadOnlyScanUseCase,
+  linearUseCaseFactory: RegistrationLinearUseCaseFactory,
+  githubUseCaseFactory: RegistrationGitHubUseCaseFactory,
+  githubTarget: GitHubRegistrationTarget,
+  setupController: RegistrationSetupControllerUseCase,
 ): UiFeatureRegistration {
   const sessionUseCase = (
     trustedContext: UiTrustedRequestContext,
@@ -104,6 +112,7 @@ export function createRegistrationWizardUiFeatureRegistration(
   const githubContribution = createGitHubRegistrationUiContribution(
     fixtureGitHubRegistrationUiController,
   );
+  const setupContribution = createRegistrationSetupUiContribution(setupController);
   const contracts = new Map(
     registrationWizardFeatureSecurityRoutes.map((contract) => [contract.path, contract]),
   );
@@ -136,6 +145,7 @@ export function createRegistrationWizardUiFeatureRegistration(
         assetResponse(request, registrationWizardScript, "text/javascript; charset=utf-8"),
     }),
     githubScriptRoute,
+    ...setupContribution.routes,
     Object.freeze({
       contract: apiContract,
       handler: (request: UiRequest, trustedContext: UiTrustedRequestContext) => {
@@ -162,22 +172,48 @@ export function createRegistrationWizardUiFeatureRegistration(
       path: registrationWizardPagePath,
       title: registrationWizardPageTitle,
       description: registrationWizardPageDescription,
-      styles: Object.freeze([registrationWizardCssPath]),
-      scripts: Object.freeze([registrationWizardScriptPath, githubRegistrationPolicyScriptPath]),
+      styles: Object.freeze([registrationWizardCssPath, registrationSetupCssPath]),
+      scripts: Object.freeze([
+        registrationWizardScriptPath,
+        githubRegistrationPolicyScriptPath,
+        registrationSetupScriptPath,
+      ]),
       render: async (trustedContext: UiTrustedRequestContext) => {
         const linearUseCase = sessionUseCase(trustedContext);
         const githubController = sessionGitHubController(trustedContext);
         if (linearUseCase === undefined || githubController === undefined) {
           throw new TypeError("Missing trusted UI session.");
         }
-        const [scan, preview, githubPreview] = await Promise.all([
+        const [scan, preview, githubPreview, setupPanel] = await Promise.all([
           useCase.scan(),
           linearUseCase.preview(),
           githubController.preview(),
+          setupContribution.render(trustedContext),
         ]);
-        return renderRegistrationWizard(scan, preview, githubPreview);
+        return `${renderRegistrationWizard(scan, preview, githubPreview)}${setupPanel}`;
       },
     }),
     routes,
   });
+}
+
+/** Synthetic UI-only assembly; production hosts must use the explicit factory above. */
+export function createFixtureRegistrationWizardUiFeatureRegistration(
+  useCase: RegistrationReadOnlyScanUseCase = fixtureRegistrationReadOnlyScanUseCase,
+  linearUseCaseFactory: RegistrationLinearUseCaseFactory = createFixtureLinearProvisionUseCaseFactory(),
+  githubUseCaseFactory: RegistrationGitHubUseCaseFactory = createFixtureGitHubRegistrationPolicyUseCaseFactory(),
+  githubTarget: GitHubRegistrationTarget = Object.freeze({
+    projectId: "fixture-agent-team-project",
+    repository: "fixture/registered-project",
+    defaultBranch: "main",
+  }),
+  setupController: RegistrationSetupControllerUseCase = createUnwiredRegistrationSetupController(),
+): UiFeatureRegistration {
+  return createRegistrationWizardUiFeatureRegistration(
+    useCase,
+    linearUseCaseFactory,
+    githubUseCaseFactory,
+    githubTarget,
+    setupController,
+  );
 }

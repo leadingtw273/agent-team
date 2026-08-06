@@ -53,6 +53,8 @@ const git = {
   readTextFileAtRevision: unavailable,
   stagePaths: unavailable,
   getEffectiveTreeDiff: unavailable,
+  getStagedTreeDiff: unavailable,
+  inspectCommit: unavailable,
   commit: unavailable,
   push: unavailable,
   removeWorktree: unavailable,

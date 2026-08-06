@@ -8,10 +8,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
 import {
   TrustedProjectConfigLoader,
+  serializeTrustedProjectConfig,
   trustedProjectConfigPath,
   type TrustedProjectConfig,
 } from "../../src/application/projects/index.js";
 import { projectSchema, type Project } from "../../src/domain/project/index.js";
+import { sha256Digest } from "../../src/domain/review/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -106,7 +108,37 @@ describe("default-branch trusted project config", () => {
     );
     if (!committed.ok) throw new Error(committed.error.code);
 
-    const loaded = await new TrustedProjectConfigLoader(adapter).load(project);
+    const trusted = config(project, "default-branch-rule");
+    const serialized = serializeTrustedProjectConfig(trusted);
+    const markerDigest = sha256Digest("marker-binding");
+    if (!serialized.ok || !markerDigest.ok) throw new Error("digest unavailable");
+    const loaded = await new TrustedProjectConfigLoader(adapter, {
+      read: () =>
+        Promise.resolve({
+          ok: true as const,
+          value: {
+            schemaVersion: 1 as const,
+            source: "source_control_default_branch" as const,
+            setupSessionId: "setup-session-1",
+            projectId: project.id,
+            repository: project.sourceControl.repository,
+            changeRequestId: "PR_node_1",
+            setupHeadSha: committed.value.sha,
+            mergeCommitSha: primary.value.headSha,
+            authoritativeRevision: primary.value.headSha,
+            defaultBranch: project.defaultBranch,
+            configDigest: serialized.value.contentDigest,
+            linearAuditIssueId: "LINEAR-AUDIT-1",
+            gateEvidenceDigest: markerDigest.value,
+            auditReceiptsDigest: markerDigest.value,
+            approvalSource: "local_ui" as const,
+            approvalReferenceDigest: markerDigest.value,
+            approvalConsumeOperationDigest: markerDigest.value,
+            authorityDigest: markerDigest.value,
+            approvalNonceDigest: markerDigest.value,
+          },
+        }),
+    }).load(project);
     expect(loaded).toMatchObject({
       state: "ready",
       revisionSha: primary.value.headSha,

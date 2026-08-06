@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createFixtureLinearProvisionUseCaseFactory,
-  createRegistrationWizardUiFeatureRegistration,
+  createFixtureRegistrationWizardUiFeatureRegistration,
   createUiApplication,
   fixtureManualRemoteId,
   fixtureRegistrationReadOnlyScanUseCase,
@@ -16,7 +16,7 @@ async function fixture(
   maxJsonMutationBodyBytes = 16_384,
   linearUseCaseFactory = createFixtureLinearProvisionUseCaseFactory(),
 ) {
-  const feature = createRegistrationWizardUiFeatureRegistration(
+  const feature = createFixtureRegistrationWizardUiFeatureRegistration(
     fixtureRegistrationReadOnlyScanUseCase,
     linearUseCaseFactory,
   );
