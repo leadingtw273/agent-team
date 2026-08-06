@@ -268,10 +268,6 @@ function withCleanupItem(
   return Object.freeze({ ...cleanup, [kind]: item });
 }
 
-function stableDigest(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
-}
-
 class ProbeJournal {
   #run: RegistrationProbeRun;
   readonly #port: RegistrationProbeJournalPort;
@@ -493,7 +489,10 @@ async function ensureGitPush(
 
   const manifestPath = `.agent-team/probes/${run.runId}.json`;
   const content = probeManifestContent(run);
-  const contentDigest = stableDigest(content);
+  // A digest of the raw file bytes the adapter will actually write and read back. `content` is
+  // already a JSON string; re-encoding it through `JSON.stringify` before hashing would digest a
+  // different (quoted, escaped) byte sequence than what actually lands on disk.
+  const contentDigest = createHash("sha256").update(content, "utf8").digest("hex");
   const written = await safely(() =>
     ports.files.writeProbeManifest(
       { worktree: worktree.value, path: manifestPath, content, contentDigest },
@@ -1183,7 +1182,19 @@ export function createRegistrationProbeCoordinator(
       }
 
       await runCleanup(journal, ports, command, activation, options.allowedWorktreeRoot);
-      return finalize(journal.current);
+      const computed = finalize(journal.current);
+      // Persist the terminal "verified" phase so a later `listActiveForProject` (used by this
+      // same preflight's own concurrent-run check) recognizes this run as done rather than
+      // treating it as still in flight forever. Every other outcome intentionally keeps a
+      // non-terminal phase so cleanup/resumption can still be retried.
+      if (computed.state === "verified" && journal.current.phase !== "verified") {
+        const persisted = await journal.persist({
+          ...withoutRevision(journal.current),
+          phase: "verified",
+        });
+        if (persisted.ok) return finalize(persisted.value);
+      }
+      return computed;
     },
   });
 }
