@@ -1,3 +1,4 @@
+import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -80,14 +81,46 @@ export async function buildRegistrationSetupComposition(
       projectId: draft.value.project.workManagement.projectId,
     },
   );
+  // `GitHubRegistrationMergedConfigReadBackAdapter` (constructed inside
+  // createProductionRegistrationSetupComposition below) requires `requestJson` to be an *own*
+  // property of the object it is given (captureOwnRequestJson in merged-config.ts), as a defense
+  // against a proxied/monkey-patched `.bind` lookup. A real `GhTransport` class instance exposes
+  // `requestJson` only on its prototype, so it must be re-wrapped in a plain object here -- a
+  // caller-side (composition-root) adaptation, not an engine change.
+  const requestJsonOnlyTransport: GhJsonTransport = {
+    requestJson: githubTransport.requestJson.bind(githubTransport),
+  };
   const pullRequestAuditWriter = new GitHubPullRequestAuditCommentWriter(
-    new GitHubAdapter(githubTransport),
+    new GitHubAdapter(requestJsonOnlyTransport),
   );
 
+  const stateRoot = join(options.agentTeamHome, "state");
+  // The real LocalGitAdapter.createWorktree (src/adapters/git/local.ts) requires the worktree
+  // target's *parent* directory to already exist -- it does not create it itself. Existing O005
+  // fixtures that exercise the real adapter always pre-create this directory the same way (e.g.
+  // tests/integration/registration-setup-git-recovery.test.ts's own `mkdir(worktrees, {recursive})`
+  // before calling into the coordinator). This mirrors that same host-side precondition.
+  //
+  // Every segment must be created at exactly 0700: `withSecureDirectory` (used elsewhere under
+  // this same stateRoot for sessions/journal/etc., src/infrastructure/files/secure-directory.ts)
+  // treats an already-existing ancestor directory with looser permissions as insecure. Creating
+  // `registration-setup/worktrees` with default (umask-based) permissions would leave the shared
+  // `registration-setup` parent non-0700 and break every later secure-directory read/write under
+  // it -- so each segment gets its mode set explicitly, matching privateDirectoryMode's own
+  // convention in src/infrastructure/files/layout.ts.
+  for (const directory of [
+    stateRoot,
+    join(stateRoot, "registration-setup"),
+    join(stateRoot, "registration-setup", "worktrees"),
+  ]) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await chmod(directory, 0o700);
+  }
+
   const composition = createProductionRegistrationSetupComposition({
-    stateRoot: join(options.agentTeamHome, "state"),
+    stateRoot,
     draft: draft.value,
-    githubTransport,
+    githubTransport: requestJsonOnlyTransport,
     linearAuditWriter,
     pullRequestAuditWriter,
   });

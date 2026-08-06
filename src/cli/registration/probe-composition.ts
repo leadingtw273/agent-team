@@ -153,10 +153,16 @@ export async function buildRegistrationProbeComposition(
   const allowedWorktreeRoot = join(agentTeamHome, "state", "registration-probe", "worktrees");
   const journal = new FileRegistrationProbeJournalStore(journalDirectory);
   const inbox = new DurableInbox(join(agentTeamHome, "state", "inbox"));
+  // See the identical comment in setup-composition.ts: GitHubRegistrationMergedConfigReadBackAdapter
+  // requires `requestJson` as an *own* property, which a real GhTransport class instance does not
+  // expose (it lives only on the prototype) -- re-wrap here at the composition-root boundary.
+  const requestJsonOnlyTransport: GhJsonTransport = {
+    requestJson: githubTransport.requestJson.bind(githubTransport),
+  };
 
   const ports = {
     activation: { readActivation: sessionStore.readActivation.bind(sessionStore) },
-    mergedConfig: new GitHubRegistrationMergedConfigReadBackAdapter(githubTransport),
+    mergedConfig: new GitHubRegistrationMergedConfigReadBackAdapter(requestJsonOnlyTransport),
     linear: new RegistrationProbeLinearAdapter(
       linearReadModel,
       linearMutationClient,
