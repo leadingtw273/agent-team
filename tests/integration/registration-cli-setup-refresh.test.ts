@@ -41,6 +41,13 @@ import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { freshAuthorityDigest } from "../../src/cli/registration/authority.js";
 import { createRegistrationSetupHandlers } from "../../src/cli/registration/setup-handlers.js";
 import { buildRegistrationSetupComposition } from "../../src/cli/registration/setup-composition.js";
+import { FileRegistrationSetupFinalApprovalAuthority } from "../../src/adapters/registration/index.js";
+import {
+  registrationSetupFinalApprovalPhrase,
+  type RegistrationSetupApprovalBinding,
+} from "../../src/application/registration/index.js";
+import type { Sha256Digest } from "../../src/domain/review/index.js";
+import type { Project } from "../../src/domain/project/index.js";
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -91,6 +98,7 @@ interface FakePullRequest {
   number: number;
   state: "open" | "closed" | "merged";
   draft: boolean;
+  autoMergeEnabled: boolean;
   baseBranch: string;
   headBranch: string;
   title: string;
@@ -163,7 +171,7 @@ class FakeGh implements Pick<
       headBranch: pr.headBranch,
       headSha,
       mergeability: "mergeable" as const,
-      autoMergeEnabled: false,
+      autoMergeEnabled: pr.autoMergeEnabled,
       updatedAt: new Date().toISOString(),
     };
   }
@@ -228,6 +236,7 @@ class FakeGh implements Pick<
         number,
         state: "open",
         draft: fields["draft"] === "true",
+        autoMergeEnabled: false,
         baseBranch: fields["base"] ?? this.defaultBranch,
         headBranch: fields["head"] ?? "",
         title: fields["title"] ?? "",
@@ -304,6 +313,20 @@ class FakeGh implements Pick<
       pr.draft = false;
       value = {
         data: { markPullRequestReadyForReview: { pullRequest: { id: pr.id, isDraft: false } } },
+      };
+    } else if (endpoint === "graphql" && fields["query"]?.includes("enablePullRequestAutoMerge")) {
+      // F-2 regression guard: this is required so `setup approve`'s full merge pipeline (squash
+      // merge enablement, driven by the *now-aligned* controller/coordinator approval bindings)
+      // can run end to end against this fixture. Deliberately does NOT simulate an actual GitHub
+      // merge commit landing (state stays "open") -- enabling auto-merge is enough to reach a
+      // legitimate `merge_pending` outcome, which is as far as this regression guard needs to go;
+      // simulating a real squash-merge commit is a separate, unrelated concern already covered by
+      // O005's own directly-faked-port tests.
+      const pr = this.prs.find((candidate) => candidate.id === fields["pullRequestId"]);
+      if (pr === undefined) return err(domainError("not_found"));
+      pr.autoMergeEnabled = true;
+      value = {
+        data: { enablePullRequestAutoMerge: { pullRequest: { id: pr.id } } },
       };
     } else if (/\/issues\/[1-9][0-9]*\/comments(?:\?.*)?$/u.test(endpoint) && method === "GET") {
       const number = Number(/\/issues\/([1-9][0-9]*)\/comments(?:\?.*)?$/u.exec(endpoint)?.[1]);
@@ -899,4 +922,201 @@ describe("O009c regression guard: opaque ChangeRequestSnapshot.id is never mista
       String(preFixSession.changeRequest.number),
     );
   }, 30_000);
+});
+
+/**
+ * F-2 regression guard (2026-08-06 fresh-context acceptance review of O009c's first commit).
+ *
+ * `RegistrationSetupApprovalBinding` has *two* independent production construction sites:
+ * `setup-controller.ts`'s module-local `approvalBinding()` (issue side --
+ * `issueLocalUiApprovalIntent` calls it to build the binding it hands to
+ * `finalApproval.issue(...)`, which the durable ledger persists verbatim as `grant.binding`) and
+ * `setup.ts`'s own `approvalBinding()` (consume side -- `#authorizeMergeExclusive` calls it to
+ * build `expectedBinding` for `finalApproval.verifyAndConsume(...)`, which the ledger compares
+ * field-by-field against `grant.binding` via `sameValue`). O009c's first commit fixed only the
+ * `setup.ts` copy; `setup-controller.ts`'s copy still built `changeRequestId` from the opaque
+ * `session.changeRequest.id`. Because both copies had *always* used the same (buggy) opaque id
+ * before this fix, no existing test could ever have caught two independent construction sites
+ * silently diverging -- least of all `registration-setup-local.test.ts`'s own `binding()` helper,
+ * which feeds the *same* object to both `authority.issue(...)` and `authority.verifyAndConsume(
+ * ...)` and is therefore structurally incapable of detecting drift between two different
+ * *production* construction sites. This describe block is deliberately built to close exactly
+ * that blind spot: the positive test drives the real `RegistrationSetupController` (issue side)
+ * and the real `RegistrationSetupCoordinator` (consume side, reached transitively through
+ * `approveAndMergeLocalUi`) against the same real, file-backed ledger, with a genuinely opaque
+ * node-id-format fixture PR id throughout -- so any future re-introduction of this exact
+ * two-construction-sites drift would fail here even if every other test stays green.
+ */
+describe("F-2 regression guard: approval binding issue-side (controller) and consume-side (coordinator) construction sites must agree", () => {
+  it("full `setup approve` succeeds end to end -- controller issues, coordinator consumes, real ledger accepts -- with a real GitHub node-id-format PR id", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-f2-home-approve-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+    const buildComposition = (options: Parameters<typeof buildRegistrationSetupComposition>[0]) =>
+      buildRegistrationSetupComposition({
+        ...options,
+        githubTransport: github,
+        linearFetch: linear.fetch,
+      });
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition,
+    });
+    await handlers.setupStart({ projectId });
+
+    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    if (headSha === undefined) throw new Error("expected a pushed setup branch head");
+    github.statusesBySha.set(headSha, [
+      {
+        context: "agent-team/review",
+        state: "success",
+        description: null,
+        targetUrl: "https://review.test/1",
+      },
+    ]);
+    github.ciConclusion = "success";
+    github.reviewState = "success";
+
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition,
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+    expect(refreshResult.state).toBe("success");
+    expect((JSON.parse(refreshResult.message ?? "") as { readonly state: string }).state).toBe(
+      "awaiting_user_approval",
+    );
+
+    const approveHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream(`${registrationSetupFinalApprovalPhrase}\n`),
+      buildComposition,
+    });
+    const approveResult = await approveHandlers.setupApprove({ projectId });
+
+    expect(approveResult.state).toBe("success");
+    const approvePayload = JSON.parse(approveResult.message ?? "") as {
+      readonly state: string;
+      readonly reason?: string;
+      readonly session?: { readonly phase: string };
+    };
+    // The F-2 defect's exact symptom: `state:"blocked", reason:"user_approval_invalid"` because
+    // the ledger's `sameValue(grant.binding, expectedBinding)` rejected the two mismatched
+    // `changeRequestId` formats. Pinning the *absence* of this specific outcome, not just "some
+    // success", is the point of this assertion.
+    expect(approvePayload).not.toMatchObject({ state: "blocked", reason: "user_approval_invalid" });
+    // The full pipeline's legitimate stopping point for this fixture: ledger issue-and-consume
+    // succeeded (session advanced past `awaiting_user_approval` into the merge state machine),
+    // merge intent + squash-merge-enable both went through, and the coordinator is now waiting on
+    // GitHub to actually land the squash merge commit -- simulating that commit landing is a
+    // separate, unrelated concern already covered by O005's own directly-faked-port tests.
+    expect(approvePayload.state).toBe("merge_pending");
+    expect(approvePayload.session?.phase).toBe("merge_pending");
+
+    const registrationSetupRoot = join(agentTeamHome, "state", "registration-setup");
+    const sessionDirectories = (await readdir(registrationSetupRoot)).filter((name) =>
+      name.startsWith("setup-"),
+    );
+    expect(sessionDirectories).toHaveLength(1);
+    const sessionPath = join(registrationSetupRoot, sessionDirectories[0] ?? "", "session.json");
+    const persisted = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      readonly phase: string;
+      readonly approvalReferenceDigest?: string;
+      readonly approvalConsumeOperationDigest?: string;
+      readonly mergeIntent?: { readonly changeRequestId: string };
+    };
+    expect(persisted.phase).toBe("merge_pending");
+    // Both populated only on a genuinely successful ledger consume -- proof this ran through
+    // `#authorizeMergeExclusive`'s `verified_and_consumed` branch, not merely returned early.
+    expect(persisted.approvalReferenceDigest).toBeDefined();
+    expect(persisted.approvalConsumeOperationDigest).toBeDefined();
+    expect(persisted.mergeIntent?.changeRequestId).toBe(String(github.prs[0]?.number));
+  }, 30_000);
+
+  it("negative control: the real durable ledger rejects consumption when the issue-side and consume-side bindings differ only in changeRequestId format", async () => {
+    const stateRoot = await temporaryRoot("agent-team-f2-ledger-negative-");
+    const authority = new FileRegistrationSetupFinalApprovalAuthority(stateRoot);
+    const localUiAuthority = Object.freeze({
+      issuer: "local_ui" as const,
+      authorityDigest: freshAuthorityDigest(),
+    });
+
+    function binding(changeRequestId: string): RegistrationSetupApprovalBinding {
+      return {
+        schemaVersion: 1,
+        setupSessionId: "setup-f2-negative-control",
+        setupSessionRevision: 2,
+        projectId: projectId as Project["id"],
+        previewDigest: freshAuthorityDigest() as Sha256Digest,
+        changeRequestId,
+        headSha: "e".repeat(40),
+        requirementsDigest: freshAuthorityDigest() as Sha256Digest,
+        diffDigest: freshAuthorityDigest() as Sha256Digest,
+        linearAuditIssueId: "LINEAR-AUDIT-1",
+        gateEvidenceDigest: freshAuthorityDigest() as Sha256Digest,
+      };
+    }
+    // Same shape as the *real* pre-F-2 defect: issue side (mirroring setup-controller.ts's
+    // then-unfixed `approvalBinding()`) uses the opaque node id; consume side (mirroring the
+    // already-fixed setup.ts `approvalBinding()`) uses the decimal number. Every other field is
+    // identical.
+    const issueSideBinding = binding("PR_kwDOTest00000042");
+    const consumeSideBinding = binding("42");
+
+    const issued = await authority.issue(issueSideBinding, localUiAuthority, {
+      idempotencyKey: "f2-negative-control:issue",
+    });
+    if (!issued.ok || issued.value.state !== "issued") {
+      throw new Error(`expected issue to succeed, got ${JSON.stringify(issued)}`);
+    }
+
+    const consumed = await authority.verifyAndConsume(
+      {
+        approvalId: issued.value.grant.approvalId,
+        userConfirmed: true,
+        expectedSetupRevision: consumeSideBinding.setupSessionRevision,
+      },
+      consumeSideBinding,
+      localUiAuthority,
+      { idempotencyKey: "f2-negative-control:consume" },
+    );
+    expect(consumed).toMatchObject({ ok: true, value: { state: "rejected" } });
+
+    // Control: the *identical* binding on both sides (this is what F-2's fix restores) verifies
+    // and consumes cleanly -- proving the rejection above is specifically about the format
+    // mismatch, not some other malformed field in this hand-built fixture. A fresh authority
+    // digest is required here: re-issuing the exact same binding under the *same* authority the
+    // first `issue()` call above already used would collide with that grant's own
+    // still-unexpired duplicate-binding guard (a different, unrelated ledger invariant), not
+    // exercise the format-mismatch path this control is meant to isolate.
+    const controlAuthority = Object.freeze({
+      issuer: "local_ui" as const,
+      authorityDigest: freshAuthorityDigest(),
+    });
+    const issuedControl = await authority.issue(issueSideBinding, controlAuthority, {
+      idempotencyKey: "f2-negative-control:issue-matched",
+    });
+    if (!issuedControl.ok || issuedControl.value.state !== "issued") {
+      throw new Error(`expected control issue to succeed, got ${JSON.stringify(issuedControl)}`);
+    }
+    const consumedControl = await authority.verifyAndConsume(
+      {
+        approvalId: issuedControl.value.grant.approvalId,
+        userConfirmed: true,
+        expectedSetupRevision: issueSideBinding.setupSessionRevision,
+      },
+      issueSideBinding,
+      controlAuthority,
+      { idempotencyKey: "f2-negative-control:consume-matched" },
+    );
+    expect(consumedControl).toMatchObject({ ok: true, value: { state: "verified_and_consumed" } });
+  });
 });
