@@ -169,7 +169,10 @@ async function runPreflight(
     !mergedConfig.ok ||
     mergedConfig.value.configDigest !== marker.value.configDigest ||
     mergedConfig.value.repository !== command.project.sourceControl.repository ||
-    mergedConfig.value.defaultBranch !== marker.value.defaultBranch
+    mergedConfig.value.repository !== marker.value.repository ||
+    mergedConfig.value.defaultBranch !== marker.value.defaultBranch ||
+    mergedConfig.value.changeRequestId !== marker.value.changeRequestId ||
+    mergedConfig.value.authoritativeRevision !== marker.value.authoritativeRevision
   ) {
     return err("activation_not_ready");
   }
@@ -889,6 +892,7 @@ async function ensureProviderEvents(
   const evidence: RegistrationProbeProviderEventEvidence[] = [];
   for (const criterion of criteria) {
     let matched: RegistrationProbeProviderEventEvidence | undefined;
+    let mismatch = false;
     for (let attempt = 0; attempt < poll.maxAttempts; attempt += 1) {
       if (attempt > 0) await poll.wait(poll.intervalMs);
       const event = await safely(() =>
@@ -900,10 +904,19 @@ async function ensureProviderEvents(
         event.value.remoteObjectId !== criterion.remoteObjectId ||
         (criterion.headSha !== undefined && event.value.headSha !== criterion.headSha)
       ) {
-        continue;
+        // A wrong provider/remote-id/SHA event was actually observed: fail fast rather than
+        // keep polling, since it will never self-correct into the exact expected event.
+        mismatch = true;
+        break;
       }
       matched = event.value;
       break;
+    }
+    if (mismatch) {
+      await journal.persist(
+        withFailure(journal.current, "provider_event", "provider_event_mismatch"),
+      );
+      return { failure: { stage: "provider_event", reason: "provider_event_mismatch" } };
     }
     if (matched === undefined) {
       await journal.persist(
@@ -933,7 +946,7 @@ async function runCleanup(
   let run = journal.current;
 
   // 1. Linear issue cancellation.
-  if (run.linear !== undefined && run.cleanup.linearIssue.state === "pending") {
+  if (run.linear !== undefined && run.cleanup.linearIssue.state !== "confirmed") {
     const linearIssueId = run.linear.issueId;
     const started = await journal.persist({
       ...withoutRevision(run),
@@ -958,7 +971,7 @@ async function runCleanup(
   }
 
   // 2. Draft PR close.
-  if (run.draftPullRequest !== undefined && run.cleanup.draftPullRequest.state === "pending") {
+  if (run.draftPullRequest !== undefined && run.cleanup.draftPullRequest.state !== "confirmed") {
     const changeRequestId = run.draftPullRequest.changeRequestId;
     const started = await journal.persist({
       ...withoutRevision(run),
@@ -983,7 +996,7 @@ async function runCleanup(
   }
 
   // 3. Remote branch deletion — only once the PR is confirmed closed/unmerged.
-  if (run.git !== undefined && run.cleanup.remoteBranch.state === "pending") {
+  if (run.git !== undefined && run.cleanup.remoteBranch.state !== "confirmed") {
     if (run.cleanup.draftPullRequest.state !== "confirmed") {
       const persisted = await journal.persist({
         ...withoutRevision(run),
@@ -1024,7 +1037,7 @@ async function runCleanup(
   }
 
   // 4. Local worktree removal — only under the allowed probe temp root, and only when clean.
-  if (run.git !== undefined && run.cleanup.localWorktree.state === "pending") {
+  if (run.git !== undefined && run.cleanup.localWorktree.state !== "confirmed") {
     if (!run.worktreePath.startsWith(allowedWorktreeRoot)) {
       const persisted = await journal.persist({
         ...withoutRevision(run),
