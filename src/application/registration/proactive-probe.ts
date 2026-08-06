@@ -241,9 +241,7 @@ async function runPreflight(
   const active = await ports.journal.listActiveForProject(command.project.id, readOptions);
   if (
     !active.ok ||
-    active.value.some(
-      (run) => run.runId !== options.excludeRunId && !isTerminalCleanPhase(run.phase),
-    )
+    active.value.some((run) => run.runId !== options.excludeRunId && !isTerminalCleanPhase(run))
   ) {
     return err("concurrent_run_exists");
   }
@@ -995,6 +993,218 @@ const cleanupOutcomeUnknown = cleanupItem("unknown", "cleanup_outcome_unknown");
  * that moment) so that `finalize` on the caller side correctly reports `cleanup_required` instead
  * of treating a never-attempted mutation as clean.
  */
+const confirmedAbsent = cleanupItem("confirmed", "confirmed_absent");
+
+/**
+ * O009e: `run.draftPullRequest === undefined` means this run's own journal evidence never
+ * captured a draft PR -- either the create step never ran (an earlier stage failed first), or it
+ * ran and failed before any evidence was recorded. Neither case proves the PR was never actually
+ * created on GitHub (a create call's *response* can be lost after the mutation itself already
+ * landed), so absence must be proven by the same exact marker+head recovery lookup
+ * `ensureDraftPullRequest`'s own "mutation_started" resume path already uses -- never inferred
+ * from "the journal never recorded one". Genuinely absent -> confirmed. A marker-matching orphan
+ * found -> adopted as this run's own evidence so the caller's ordinary close-and-confirm path
+ * (unchanged) can run against it in the same cleanup pass.
+ */
+async function confirmDraftPullRequestAbsentOrAdopt(
+  journal: ProbeJournal,
+  ports: RegistrationProbePorts,
+  activation: RegistrationProbeActivationContext,
+  run: RegistrationProbeRun,
+  readOptions: ReadOptions,
+): Promise<RegistrationProbeRun> {
+  const recovered = await safely(() =>
+    ports.githubCapability.findDraftPullRequestByHead(
+      { repository: activation.repository, headBranch: run.branch },
+      run.marker,
+      readOptions,
+    ),
+  );
+  if (!recovered.ok) {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "draftPullRequest", cleanupOutcomeUnknown),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "draftPullRequest", cleanupOutcomeUnknown);
+  }
+  if (recovered.value === undefined) {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "draftPullRequest", confirmedAbsent),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "draftPullRequest", confirmedAbsent);
+  }
+  const adopted = await journal.persist({
+    ...withoutRevision(run),
+    draftPullRequest: Object.freeze({
+      changeRequestId: recovered.value.changeRequestId,
+      number: recovered.value.number,
+      baseBranch: activation.defaultBranch,
+      headBranch: run.branch,
+      headSha: recovered.value.headSha,
+    }),
+  });
+  // A CAS failure here must leave `draftPullRequest` unadopted in memory too (not just on disk):
+  // the caller's very next check is `run.draftPullRequest !== undefined` to decide whether to
+  // proceed into the close flow, and this process is not the authoritative writer at this moment.
+  return adopted.ok ? adopted.value : run;
+}
+
+/**
+ * O009e: `run.git === undefined` (draft PR cleanup just confirmed eligible, but this run's own
+ * push evidence was never captured -- branch_push itself may have failed before ever pushing, or
+ * this run failed at an earlier stage and never attempted it at all). Exact-readback the remote
+ * branch directly rather than inferring absence from "the journal never recorded a push". If
+ * present, delegates ownership verification (exact marker + head SHA) and the delete itself to
+ * the existing `deleteOwnedBranch` port, using the SHA just observed (there is no pre-known
+ * expected SHA in this run's own journal to compare against).
+ */
+async function confirmRemoteBranchAbsentOrDelete(
+  journal: ProbeJournal,
+  ports: RegistrationProbePorts,
+  command: RegistrationProbeStartCommand,
+  activation: RegistrationProbeActivationContext,
+  run: RegistrationProbeRun,
+  readOptions: ReadOptions,
+): Promise<RegistrationProbeRun> {
+  const remoteHead = await safely(() =>
+    ports.git.inspectRemoteBranch(
+      { rootPath: command.project.localRepositoryPath },
+      command.gitRemote,
+      run.branch,
+      readOptions,
+    ),
+  );
+  if (!remoteHead.ok) {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "remoteBranch", cleanupOutcomeUnknown),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "remoteBranch", cleanupOutcomeUnknown);
+  }
+  const observedSha = remoteHead.value;
+  if (observedSha === undefined) {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "remoteBranch", confirmedAbsent),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "remoteBranch", confirmedAbsent);
+  }
+  const started = await journal.persist({
+    ...withoutRevision(run),
+    phase: "cleanup_branch_mutation_started",
+  });
+  if (!started.ok) {
+    return withLocalCleanupItem(run, "remoteBranch", cleanupOutcomeUnknown);
+  }
+  const owned = started.value;
+  const deleted = await safely(() =>
+    ports.branchCleanup.deleteOwnedBranch(
+      {
+        repository: activation.repository,
+        branch: owned.branch,
+        marker: owned.marker,
+        expectedHeadSha: observedSha.sha,
+      },
+      mutationOptionsFor(command, `registration-probe:${owned.runId}:branch-delete`),
+    ),
+  );
+  // Present but ownership (exact marker) or head SHA did not match on `deleteOwnedBranch`'s own
+  // independent re-read -> never absent, never this run's own branch to delete: fail closed
+  // rather than silently confirming.
+  const item =
+    deleted.ok && deleted.value.state === "deleted"
+      ? cleanupItem("confirmed", "confirmed_deleted")
+      : deleted.ok && deleted.value.state === "not_found"
+        ? confirmedAbsent
+        : !deleted.ok && deleted.error.code === "conflict"
+          ? cleanupItem("failed", "cleanup_ownership_mismatch")
+          : cleanupItem("failed", "cleanup_failed");
+  const persisted = await journal.persist({
+    ...withoutRevision(owned),
+    cleanup: withCleanupItem(owned.cleanup, "remoteBranch", item),
+  });
+  return persisted.ok ? persisted.value : withLocalCleanupItem(owned, "remoteBranch", item);
+}
+
+/**
+ * O009e: `run.git === undefined` (this run never captured push evidence), but a local worktree
+ * may still exist on disk regardless -- `createWorktree` can succeed and a *later* step (write/
+ * stage/commit/push) can still fail, leaving an orphaned worktree this run's own evidence never
+ * recorded. Exact-readback the path itself (via the same `inspectWorkingTree` existence check
+ * `LocalGitAdapter.createWorktree`'s own idempotent-recovery path already relies on, using an
+ * empty placeholder `headSha` since none is known yet -- the underlying check never validates it
+ * for pure existence) rather than inferring absence from "the journal never recorded one".
+ */
+async function confirmLocalWorktreeAbsentOrRemove(
+  journal: ProbeJournal,
+  ports: RegistrationProbePorts,
+  command: RegistrationProbeStartCommand,
+  run: RegistrationProbeRun,
+  readOptions: ReadOptions,
+): Promise<RegistrationProbeRun> {
+  const probe = Object.freeze({
+    repositoryRoot: command.project.localRepositoryPath,
+    path: run.worktreePath,
+    branch: run.branch,
+    headSha: "",
+  });
+  const inspected = await safely(() => ports.git.inspectWorkingTree(probe, readOptions));
+  if (!inspected.ok && inspected.error.code === "not_found") {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "localWorktree", confirmedAbsent),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "localWorktree", confirmedAbsent);
+  }
+  if (!inspected.ok) {
+    const persisted = await journal.persist({
+      ...withoutRevision(run),
+      cleanup: withCleanupItem(run.cleanup, "localWorktree", cleanupOutcomeUnknown),
+    });
+    return persisted.ok
+      ? persisted.value
+      : withLocalCleanupItem(run, "localWorktree", cleanupOutcomeUnknown);
+  }
+  const started = await journal.persist({
+    ...withoutRevision(run),
+    phase: "cleanup_worktree_mutation_started",
+  });
+  if (!started.ok) {
+    return withLocalCleanupItem(run, "localWorktree", cleanupOutcomeUnknown);
+  }
+  const owned = started.value;
+  const worktree = Object.freeze({ ...probe, headSha: inspected.value.headSha });
+  let removedOk = false;
+  if (inspected.value.changes.length === 0) {
+    const removed = await safely(() =>
+      ports.git.removeWorktree(
+        worktree,
+        mutationOptionsFor(command, `registration-probe:${owned.runId}:worktree-remove`),
+      ),
+    );
+    removedOk = removed.ok;
+  }
+  const item = removedOk
+    ? cleanupItem("confirmed", "confirmed_removed")
+    : cleanupItem("failed", "cleanup_failed");
+  const persisted = await journal.persist({
+    ...withoutRevision(owned),
+    cleanup: withCleanupItem(owned.cleanup, "localWorktree", item),
+  });
+  return persisted.ok ? persisted.value : withLocalCleanupItem(owned, "localWorktree", item);
+}
+
 async function runCleanup(
   journal: ProbeJournal,
   ports: RegistrationProbePorts,
@@ -1034,37 +1244,52 @@ async function runCleanup(
     }
   }
 
-  // 2. Draft PR close.
-  if (run.draftPullRequest !== undefined && run.cleanup.draftPullRequest.state !== "confirmed") {
-    const changeRequestId = run.draftPullRequest.changeRequestId;
-    const started = await journal.persist({
-      ...withoutRevision(run),
-      phase: "cleanup_pr_mutation_started",
-    });
-    if (!started.ok) {
-      run = withLocalCleanupItem(run, "draftPullRequest", cleanupOutcomeUnknown);
-    } else {
-      run = started.value;
-      const closed = await safely(() =>
-        ports.sourceControl.closeChangeRequest(
-          { project: command.project, changeRequestId },
-          mutationOptionsFor(command, `registration-probe:${run.runId}:pr-close`),
-        ),
+  // 2. Draft PR close -- or, if this run's own evidence never captured one (O009e), an
+  //    authoritative absence check/adoption before falling through to the same close logic.
+  if (run.cleanup.draftPullRequest.state !== "confirmed") {
+    if (run.draftPullRequest === undefined) {
+      run = await confirmDraftPullRequestAbsentOrAdopt(
+        journal,
+        ports,
+        activation,
+        run,
+        readOptions,
       );
-      const item =
-        closed.ok && closed.value.state === "closed" && !closed.value.autoMergeEnabled
-          ? cleanupItem("confirmed", "confirmed_closed")
-          : cleanupItem("failed", "cleanup_failed");
-      const persisted = await journal.persist({
+    }
+    if (run.draftPullRequest !== undefined && run.cleanup.draftPullRequest.state !== "confirmed") {
+      const changeRequestId = run.draftPullRequest.changeRequestId;
+      const started = await journal.persist({
         ...withoutRevision(run),
-        cleanup: withCleanupItem(run.cleanup, "draftPullRequest", item),
+        phase: "cleanup_pr_mutation_started",
       });
-      run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "draftPullRequest", item);
+      if (!started.ok) {
+        run = withLocalCleanupItem(run, "draftPullRequest", cleanupOutcomeUnknown);
+      } else {
+        run = started.value;
+        const closed = await safely(() =>
+          ports.sourceControl.closeChangeRequest(
+            { project: command.project, changeRequestId },
+            mutationOptionsFor(command, `registration-probe:${run.runId}:pr-close`),
+          ),
+        );
+        const item =
+          closed.ok && closed.value.state === "closed" && !closed.value.autoMergeEnabled
+            ? cleanupItem("confirmed", "confirmed_closed")
+            : cleanupItem("failed", "cleanup_failed");
+        const persisted = await journal.persist({
+          ...withoutRevision(run),
+          cleanup: withCleanupItem(run.cleanup, "draftPullRequest", item),
+        });
+        run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "draftPullRequest", item);
+      }
     }
   }
 
-  // 3. Remote branch deletion — only once the PR is confirmed closed/unmerged.
-  if (run.git !== undefined && run.cleanup.remoteBranch.state !== "confirmed") {
+  // 3. Remote branch deletion — only once the PR is confirmed closed/unmerged (O009e: any
+  //    "confirmed" reason, including confirmed_absent, satisfies eligibility). If this run's own
+  //    push evidence was never captured, an authoritative absence check/delete (O009e) replaces
+  //    the existing pushedSha-guarded delete below, which is otherwise entirely unchanged.
+  if (run.cleanup.remoteBranch.state !== "confirmed") {
     if (run.cleanup.draftPullRequest.state !== "confirmed") {
       const notEligible = cleanupItem("failed", "cleanup_not_eligible");
       const persisted = await journal.persist({
@@ -1072,6 +1297,15 @@ async function runCleanup(
         cleanup: withCleanupItem(run.cleanup, "remoteBranch", notEligible),
       });
       run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "remoteBranch", notEligible);
+    } else if (run.git === undefined) {
+      run = await confirmRemoteBranchAbsentOrDelete(
+        journal,
+        ports,
+        command,
+        activation,
+        run,
+        readOptions,
+      );
     } else {
       const pushedSha = run.git.pushedSha;
       const started = await journal.persist({
@@ -1105,8 +1339,11 @@ async function runCleanup(
     }
   }
 
-  // 4. Local worktree removal — only under the allowed probe temp root, and only when clean.
-  if (run.git !== undefined && run.cleanup.localWorktree.state !== "confirmed") {
+  // 4. Local worktree removal — only under the allowed probe temp root, and only when clean. If
+  //    this run's own git evidence was never captured, an authoritative absence check/remove
+  //    (O009e) replaces the existing commitSha-based clean-check-then-remove below, which is
+  //    otherwise entirely unchanged.
+  if (run.cleanup.localWorktree.state !== "confirmed") {
     if (!run.worktreePath.startsWith(allowedWorktreeRoot)) {
       const notEligible = cleanupItem("failed", "cleanup_not_eligible");
       const persisted = await journal.persist({
@@ -1116,6 +1353,8 @@ async function runCleanup(
       run = persisted.ok
         ? persisted.value
         : withLocalCleanupItem(run, "localWorktree", notEligible);
+    } else if (run.git === undefined) {
+      run = await confirmLocalWorktreeAbsentOrRemove(journal, ports, command, run, readOptions);
     } else {
       const gitEvidence = run.git;
       const started = await journal.persist({
@@ -1191,11 +1430,7 @@ export function createRegistrationProbeCoordinator(
         return { state: "incomplete", reason: "concurrent_run_exists" };
       }
 
-      if (
-        existing.ok &&
-        existing.value !== undefined &&
-        isTerminalCleanPhase(existing.value.phase)
-      ) {
+      if (existing.ok && existing.value !== undefined && isTerminalCleanPhase(existing.value)) {
         return finalize(existing.value);
       }
 
@@ -1290,6 +1525,27 @@ export function createRegistrationProbeCoordinator(
         const persisted = await journal.persist({
           ...withoutRevision(journal.current),
           phase: "verified",
+        });
+        if (persisted.ok) return finalize(persisted.value);
+      }
+      // O009e: symmetric treatment for a genuine failure whose cleanup has now fully converged
+      // (every kind `confirmed`, by real recovery or by an exact authoritative absence readback --
+      // see `confirmDraftPullRequestAbsentOrAdopt`/`confirmRemoteBranchAbsentOrDelete`/
+      // `confirmLocalWorktreeAbsentOrRemove` above). `phase` was already set to "failed" the
+      // moment the failure itself occurred (`withFailure`), but the cleanup steps that ran
+      // afterward can each leave a *different* `cleanup_*_mutation_started` phase behind as their
+      // own last write (identical to why "verified" above needs its own explicit re-persist) --
+      // so this re-asserts "failed" as the durable, disk-persisted terminal phase precisely once
+      // `finalize` has independently confirmed there is nothing left to retry.
+      // `isTerminalCleanPhase` (proactive-probe-model.ts) is what actually makes this terminal
+      // for `listActiveForProject`/this same `start()`'s own resume short-circuit: it requires
+      // BOTH `phase === "failed"` AND every cleanup kind `confirmed` -- a `phase === "failed"`
+      // run with any cleanup item still `pending`/`unknown`/`failed` remains non-terminal and
+      // resumable, exactly as before this fix.
+      if (computed.state === "failed" && journal.current.phase !== "failed") {
+        const persisted = await journal.persist({
+          ...withoutRevision(journal.current),
+          phase: "failed",
         });
         if (persisted.ok) return finalize(persisted.value);
       }

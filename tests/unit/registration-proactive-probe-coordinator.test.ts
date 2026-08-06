@@ -279,6 +279,14 @@ function createHarness(
   const branch = registrationProbeBranch(runId);
   const marker = registrationProbeMarker(runId);
   let pushedThisCall = false;
+  // O009e: tracks whether a worktree actually exists on disk in this simulated world, so
+  // `inspectWorkingTree` can accurately report `not_found` when `createWorktree` is explicitly
+  // configured to fail for this test -- exactly like the real `LocalGitAdapter` does for a path
+  // that was never created. Defaults `true` to preserve every existing scenario's assumption
+  // (including seeded mid-flight runs that never call `createWorktree` in this test invocation at
+  // all, representing a worktree already created by a simulated prior attempt); only the explicit
+  // `gitCreateWorktree: "fail"` scenario is known, in this fixture, to genuinely have no worktree.
+  let worktreeExists = true;
   let providerEventLinearAttempt = 0;
   let providerEventGithubAttempt = 0;
 
@@ -487,8 +495,11 @@ function createHarness(
     git: {
       createWorktree: (command) => {
         counts.gitCreateWorktree += 1;
-        if (options.gitCreateWorktree === "fail")
+        if (options.gitCreateWorktree === "fail") {
+          worktreeExists = false;
           return Promise.resolve(err(domainError("external_failure")));
+        }
+        worktreeExists = true;
         return Promise.resolve(
           ok({
             repositoryRoot: command.rootPath,
@@ -507,6 +518,7 @@ function createHarness(
         return Promise.resolve(ok({ sha: commitSha, branch: command.worktree.branch }));
       },
       inspectWorkingTree: () => {
+        if (!worktreeExists) return Promise.resolve(err(domainError("not_found")));
         if (options.worktreeClean === "dirty") {
           return Promise.resolve(
             ok({
@@ -533,6 +545,7 @@ function createHarness(
       },
       removeWorktree: () => {
         counts.gitRemoveWorktree += 1;
+        worktreeExists = false;
         return Promise.resolve(ok(undefined));
       },
       inspectRepository: () => {
@@ -1315,7 +1328,22 @@ describe("registration proactive probe coordinator", () => {
       const { ports, counts } = createHarness(runId, { gitPush: "unconfirmed" });
       const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
       const outcome = await coordinator.start(baseCommand(runId));
-      expect(outcome.state).toBe("cleanup_required");
+      // O009e: this run's own `git` evidence never confirmed the push, so it never gets a second
+      // chance to retry it (branch_push already failed closed) -- but every cleanup kind still
+      // independently converges via an authoritative absence/exists readback (this harness's own
+      // `inspectRemoteBranch`/`inspectWorkingTree` fakes report the true state regardless of what
+      // this run's journal captured), so the run reaches genuine terminal "failed", not stuck
+      // forever at "cleanup_required".
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.reason).toBe("branch_push_outcome_unknown");
+        expect(outcome.run.cleanup).toMatchObject({
+          linearIssue: { state: "confirmed" },
+          draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+          remoteBranch: { state: "confirmed", reason: "confirmed_absent" },
+          localWorktree: { state: "confirmed" },
+        });
+      }
       expect(counts.gitPush).toBe(1);
     });
 
@@ -1697,47 +1725,63 @@ describe("registration proactive probe coordinator", () => {
       expect(counts.gitCreateWorktree).toBe(0);
     });
 
-    it("Git worktree creation failure (gitCreateWorktree: fail) still cancels the already-created Linear issue", async () => {
+    it("Git worktree creation failure (gitCreateWorktree: fail) still cancels the already-created Linear issue, and converges the never-created PR/branch/worktree to confirmed_absent (O009e)", async () => {
       const runId = "probe-inject-worktree-fail";
       const { ports, counts } = createHarness(runId, { gitCreateWorktree: "fail" });
       const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
       const outcome = await coordinator.start(baseCommand(runId));
-      expect(outcome.state).toBe("cleanup_required");
-      if (outcome.state === "cleanup_required") {
-        expect(outcome.run.failure).toEqual({
-          stage: "branch_push",
-          reason: "branch_push_failed",
+      // O009e: createWorktree itself failed, so nothing downstream of it (PR/branch/worktree) was
+      // ever created -- each is confirmed absent by an authoritative readback, not left stuck at
+      // "pending"/"failed" forever, so this run reaches genuine terminal "failed".
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.stage).toBe("branch_push");
+        expect(outcome.reason).toBe("branch_push_failed");
+        expect(outcome.run.cleanup).toMatchObject({
+          linearIssue: { state: "confirmed" },
+          draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+          remoteBranch: { state: "confirmed", reason: "confirmed_absent" },
+          localWorktree: { state: "confirmed", reason: "confirmed_absent" },
         });
-        expect(outcome.run.cleanup.linearIssue.state).toBe("confirmed");
       }
       expect(counts.linearCreate).toBe(1);
       expect(counts.linearCancel).toBe(1);
       expect(counts.prCreate).toBe(0);
+      // Never attempted: absence was proven by an exact readback before any mutation, exactly as
+      // for the pre-existing "genuinely absent" recovery paths elsewhere in this suite.
       expect(counts.branchDelete).toBe(0);
       expect(counts.gitRemoveWorktree).toBe(0);
     });
 
-    it("Git push failure (gitPush: fail) still cancels the already-created Linear issue", async () => {
+    it("Git push failure (gitPush: fail) still cancels the already-created Linear issue, and converges via fresh readback discovering the push actually landed remotely (O009e)", async () => {
       const runId = "probe-inject-push-fail";
       const { ports, counts } = createHarness(runId, { gitPush: "fail" });
       const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
       const outcome = await coordinator.start(baseCommand(runId));
-      expect(outcome.state).toBe("cleanup_required");
-      if (outcome.state === "cleanup_required") {
-        expect(outcome.run.failure).toEqual({
-          stage: "branch_push",
-          reason: "branch_push_outcome_unknown",
+      // O009e: this fixture's own `push()` reports failure but the remote branch is nonetheless
+      // genuinely present on a fresh `inspectRemoteBranch` re-read (modelling a lost response,
+      // the same ambiguity class as "unconfirmed") -- cleanup must not stay stuck at "unknown"
+      // forever when an authoritative readback can resolve it; it deletes the branch it just
+      // found (real worktree too) and reaches genuine terminal "failed".
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.stage).toBe("branch_push");
+        expect(outcome.reason).toBe("branch_push_outcome_unknown");
+        expect(outcome.run.cleanup).toMatchObject({
+          linearIssue: { state: "confirmed" },
+          draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+          remoteBranch: { state: "confirmed", reason: "confirmed_deleted" },
+          localWorktree: { state: "confirmed", reason: "confirmed_removed" },
         });
-        expect(outcome.run.cleanup.remoteBranch.state).toBe("unknown");
       }
       expect(counts.gitCreateWorktree).toBe(1);
       expect(counts.linearCancel).toBe(1);
       expect(counts.prCreate).toBe(0);
-      expect(counts.branchDelete).toBe(0);
-      expect(counts.gitRemoveWorktree).toBe(0);
+      expect(counts.branchDelete).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
     });
 
-    it("Draft PR create failure (prCreate: fail) still cancels Linear and removes the local worktree, but never touches the never-created PR's branch", async () => {
+    it("Draft PR create failure (prCreate: fail) still cancels Linear and removes the local worktree, converges the never-created PR to confirmed_absent, and (now eligible) deletes the real pushed branch (O009e)", async () => {
       const runId = "probe-inject-prcreate-fail";
       const { ports, counts } = createHarness(runId, { prCreate: "fail" });
       const coordinator = createRegistrationProbeCoordinator({
@@ -1748,27 +1792,30 @@ describe("registration proactive probe coordinator", () => {
         providerEventPoll: fastPoll(),
       });
       const outcome = await coordinator.start(baseCommand(runId));
-      expect(outcome.state).toBe("cleanup_required");
-      if (outcome.state === "cleanup_required") {
-        expect(outcome.run.failure).toEqual({
-          stage: "draft_pull_request",
-          reason: "draft_pr_create_failed",
+      // O009e: the PR was never created (confirmed absent by exact readback, not left stuck
+      // "failed" forever) -- which now makes remoteBranch *eligible* (any confirmed reason
+      // satisfies eligibility), so the real branch this run genuinely did push earlier is deleted
+      // through the existing pushedSha-guarded path, unchanged. Local worktree removal (which
+      // already ran via the pre-existing `run.git !== undefined` path, since push succeeded
+      // before this failure) is unaffected by this fix.
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.stage).toBe("draft_pull_request");
+        expect(outcome.reason).toBe("draft_pr_create_failed");
+        expect(outcome.run.cleanup).toMatchObject({
+          linearIssue: { state: "confirmed" },
+          draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+          remoteBranch: { state: "confirmed", reason: "confirmed_deleted" },
+          localWorktree: { state: "confirmed" },
         });
-        expect(outcome.run.cleanup.linearIssue.state).toBe("confirmed");
-        expect(outcome.run.cleanup.draftPullRequest.state).toBe("failed");
-        expect(outcome.run.cleanup.remoteBranch).toEqual({
-          state: "failed",
-          reason: "cleanup_not_eligible",
-        });
-        expect(outcome.run.cleanup.localWorktree.state).toBe("confirmed");
       }
       expect(counts.linearCancel).toBe(1);
       expect(counts.gitRemoveWorktree).toBe(1);
       expect(counts.prClose).toBe(0);
-      expect(counts.branchDelete).toBe(0);
+      expect(counts.branchDelete).toBe(1);
     });
 
-    it("a created PR that is not draft=true is an unknown/leaked outcome, never accepted (AC-4, prCreate: not_draft)", async () => {
+    it("a created PR that is not draft=true is an unknown/leaked outcome at the create-validation step (AC-4, prCreate: not_draft) -- and O009e's cleanup-time absence check (per this fixture's own `prRecovery` toggle, decoupled from `prCreate` here exactly like ensureDraftPullRequest's own pre-existing recovery path) reports it absent rather than adopting it", async () => {
       const runId = "probe-inject-pr-not-draft";
       const { ports, counts } = createHarness(runId, { prCreate: "not_draft" });
       const coordinator = createRegistrationProbeCoordinator({
@@ -1779,23 +1826,29 @@ describe("registration proactive probe coordinator", () => {
         providerEventPoll: fastPoll(),
       });
       const outcome = await coordinator.start(baseCommand(runId));
-      expect(outcome.state).toBe("cleanup_required");
-      if (outcome.state === "cleanup_required") {
-        expect(outcome.run.failure).toEqual({
-          stage: "draft_pull_request",
-          reason: "draft_pr_create_outcome_unknown",
-        });
+      // O009e: draft_pull_request still fails exactly as before at the create-validation step
+      // (AC-4's own guarantee -- a leaked non-draft PR is never *accepted* as this run's own
+      // evidence -- is untouched by this fix). What changes is that cleanup no longer stays stuck
+      // "unknown" forever: this fixture's `findDraftPullRequestByHead` reports the PR absent
+      // (this fixture's `prRecovery` toggle is not set here, so it defaults to "absent", the same
+      // decoupling from `prCreate` that `ensureDraftPullRequest`'s own pre-existing
+      // "draft_pr_mutation_started" recovery path already relies on elsewhere in this suite) --
+      // confirming absence, which in turn makes remoteBranch eligible and lets the real pushed
+      // branch be deleted through the existing unchanged path.
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.stage).toBe("draft_pull_request");
+        expect(outcome.reason).toBe("draft_pr_create_outcome_unknown");
         expect(outcome.run.draftPullRequest).toBeUndefined();
-        expect(outcome.run.cleanup.draftPullRequest.state).toBe("unknown");
-        expect(outcome.run.cleanup.remoteBranch).toEqual({
-          state: "failed",
-          reason: "cleanup_not_eligible",
+        expect(outcome.run.cleanup).toMatchObject({
+          draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+          remoteBranch: { state: "confirmed", reason: "confirmed_deleted" },
+          localWorktree: { state: "confirmed" },
         });
-        expect(outcome.run.cleanup.localWorktree.state).toBe("confirmed");
       }
       expect(counts.prCreate).toBe(1);
       expect(counts.prClose).toBe(0);
-      expect(counts.branchDelete).toBe(0);
+      expect(counts.branchDelete).toBe(1);
       expect(counts.linearCancel).toBe(1);
     });
 
@@ -2003,6 +2056,81 @@ describe("registration proactive probe coordinator", () => {
         expect(loser.outcome.reason).toBe("concurrent_run_exists");
         expectZeroMutations(loser.counts);
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // O009e: absence-check adoption must never misjudge a genuinely-present orphan as absent, and
+  // a genuine cleanup failure discovered through that same authoritative readback must still
+  // correctly leave the run non-terminal (cleanup_required) -- never silently confirmed.
+  // ---------------------------------------------------------------------------------------
+  describe("O009e: authoritative absence checks never misjudge an orphan that is genuinely present", () => {
+    it("a marker-matching orphan PR found during cleanup (not merely absent) is adopted and closed, not confirmed_absent", async () => {
+      const runId = "probe-o009e-orphan-pr-found";
+      const { ports, counts } = createHarness(runId, { prCreate: "fail", prRecovery: "found" });
+      const coordinator = createRegistrationProbeCoordinator({
+        ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.run.cleanup.draftPullRequest).toEqual({
+          state: "confirmed",
+          reason: "confirmed_closed",
+        });
+      }
+      // Adopted and closed -- never left "confirmed_absent" despite the create call itself
+      // failing, because the exact marker+head recovery lookup genuinely found it.
+      expect(counts.prClose).toBe(1);
+    });
+
+    it("a marker-matching orphan remote branch found during cleanup (not merely absent) is deleted, not confirmed_absent", async () => {
+      const runId = "probe-o009e-orphan-branch-found";
+      const { ports, counts } = createHarness(runId, {
+        gitCreateWorktree: "fail",
+        branchRecovery: "found",
+      });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.run.cleanup.remoteBranch).toEqual({
+          state: "confirmed",
+          reason: "confirmed_deleted",
+        });
+      }
+      expect(counts.branchDelete).toBe(1);
+    });
+
+    it("a genuine delete failure on an orphan branch that IS present still leaves the run non-terminal (cleanup_required), never silently confirmed", async () => {
+      const runId = "probe-o009e-orphan-branch-delete-fails";
+      const { ports, counts } = createHarness(runId, {
+        gitCreateWorktree: "fail",
+        branchRecovery: "found",
+        branchDelete: "fail",
+      });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+
+      // The orphan branch genuinely exists (branchRecovery: "found") and its delete genuinely
+      // fails -- this must stay "cleanup_required" with a "failed" remoteBranch item, exactly
+      // the pre-existing "cleanup_required" semantics for a real residual artifact, completely
+      // unaffected by O009e's absence-check addition. (This fixture's `deleteOwnedBranch`
+      // reports the failure as a `conflict` domain error, which this fix maps to the more
+      // precise `cleanup_ownership_mismatch` reason rather than the generic `cleanup_failed` --
+      // either way, the state must never become "confirmed".)
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.remoteBranch.state).toBe("failed");
+        expect(outcome.run.cleanup.remoteBranch.reason).toBe("cleanup_ownership_mismatch");
+      }
+      expect(counts.branchDelete).toBe(1);
     });
   });
 

@@ -98,6 +98,11 @@ export const registrationProbeCleanupReasons = [
   "confirmed_closed",
   "confirmed_deleted",
   "confirmed_removed",
+  // O009e: an artifact this run's own journal evidence never captured (never attempted, or the
+  // attempt itself failed before any evidence was recorded) is confirmed clean by an exact,
+  // authoritative provider/filesystem readback proving it genuinely does not exist -- never by
+  // the mere absence of a journal record on its own.
+  "confirmed_absent",
   "cleanup_not_eligible",
   "cleanup_ownership_mismatch",
   "cleanup_failed",
@@ -156,10 +161,27 @@ export type RegistrationProbePhase = (typeof registrationProbePhases)[number];
 
 export const registrationProbeTerminalCleanPhases = ["verified", "incomplete"] as const;
 
-export function isTerminalCleanPhase(phase: RegistrationProbePhase): boolean {
-  return (registrationProbeTerminalCleanPhases as readonly RegistrationProbePhase[]).includes(
-    phase,
-  );
+/**
+ * O009e: `phase === "failed"` alone is never sufficient to prove a run is done -- it is written
+ * immediately at the moment ANY stage fails (`withFailure`, proactive-probe.ts), typically long
+ * before cleanup has even started, and must NOT short-circuit `listActiveForProject`/`start()`'s
+ * resume path while cleanup is still outstanding (that would silently stop retrying a run whose
+ * artifacts were never actually cleaned up). A failed run only becomes genuinely terminal once
+ * every cleanup kind has independently reached `"confirmed"` (by real recovery, or by an exact
+ * authoritative readback proving the artifact was never created -- see
+ * `registrationProbeCleanupReasons`'s `confirmed_absent`) -- i.e. `finalize()` in proactive-
+ * probe.ts would report `state: "failed"`, not `"cleanup_required"`.
+ */
+export function isTerminalCleanPhase(
+  run: Readonly<{ phase: RegistrationProbePhase; cleanup: RegistrationProbeCleanup }>,
+): boolean {
+  if (
+    (registrationProbeTerminalCleanPhases as readonly RegistrationProbePhase[]).includes(run.phase)
+  ) {
+    return true;
+  }
+  if (run.phase !== "failed") return false;
+  return registrationProbeCleanupKinds.every((kind) => run.cleanup[kind].state === "confirmed");
 }
 
 export interface RegistrationProbeLinearEvidence {

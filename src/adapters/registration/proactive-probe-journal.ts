@@ -284,7 +284,7 @@ export class FileRegistrationProbeJournalStore implements RegistrationProbeJourn
       }
       if (`${loaded.value.runId}.json` !== entry) return err(domainError("invariant_violation"));
       if (loaded.value.projectId !== projectId) continue;
-      if (isTerminalCleanPhase(loaded.value.phase)) continue;
+      if (isTerminalCleanPhase(loaded.value)) continue;
       runs.push(loaded.value);
     }
     return ok(Object.freeze(runs));
