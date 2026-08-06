@@ -19,7 +19,7 @@ export const registrationProbeMaximumWebhookAckMs = 2_000;
 
 const runIdPattern = /^[a-z0-9][a-z0-9-]{0,63}$/u;
 const identifierPattern = /^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,254}$/u;
-const shaPattern = /^[0-9a-f]{40}$/u;
+const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const digestPattern = /^[a-f0-9]{64}$/u;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/u;
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/u;
@@ -83,7 +83,12 @@ export const registrationProbeCleanupKinds = [
 ] as const;
 export type RegistrationProbeCleanupKind = (typeof registrationProbeCleanupKinds)[number];
 
-export const registrationProbeCleanupStates = ["pending", "confirmed", "unknown", "failed"] as const;
+export const registrationProbeCleanupStates = [
+  "pending",
+  "confirmed",
+  "unknown",
+  "failed",
+] as const;
 export type RegistrationProbeCleanupState = (typeof registrationProbeCleanupStates)[number];
 
 /** Fixed reason codes only; never a provider raw message. */
@@ -152,7 +157,9 @@ export type RegistrationProbePhase = (typeof registrationProbePhases)[number];
 export const registrationProbeTerminalCleanPhases = ["verified", "incomplete"] as const;
 
 export function isTerminalCleanPhase(phase: RegistrationProbePhase): boolean {
-  return (registrationProbeTerminalCleanPhases as readonly RegistrationProbePhase[]).includes(phase);
+  return (registrationProbeTerminalCleanPhases as readonly RegistrationProbePhase[]).includes(
+    phase,
+  );
 }
 
 export interface RegistrationProbeLinearEvidence {
@@ -366,6 +373,21 @@ export interface RegistrationProbeAuthority {
   readonly registrationRevision: number;
 }
 
+function isValidRegistrationProbeAuthorityShape(
+  value: unknown,
+): value is RegistrationProbeAuthority {
+  if (typeof value !== "object" || value === null) return false;
+  const authority = value as Readonly<Record<string, unknown>>;
+  return (
+    authority["schemaVersion"] === 1 &&
+    typeof authority["source"] === "string" &&
+    (registrationProbeAuthoritySources as readonly string[]).includes(authority["source"]) &&
+    typeof authority["projectId"] === "string" &&
+    typeof authority["setupSessionId"] === "string" &&
+    typeof authority["registrationRevision"] === "number"
+  );
+}
+
 export function registrationProbeAuthorityMatches(
   authority: RegistrationProbeAuthority,
   projectId: Project["id"],
@@ -373,8 +395,7 @@ export function registrationProbeAuthorityMatches(
   registrationRevision: number,
 ): boolean {
   return (
-    authority.schemaVersion === 1 &&
-    (registrationProbeAuthoritySources as readonly string[]).includes(authority.source) &&
+    isValidRegistrationProbeAuthorityShape(authority) &&
     authority.projectId === projectId &&
     authority.setupSessionId === setupSessionId &&
     authority.registrationRevision === registrationRevision

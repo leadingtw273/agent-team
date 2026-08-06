@@ -2,7 +2,7 @@ export * from "./github.js";
 export * from "./model.js";
 export * from "./linear-provision.js";
 export * from "./policy.js";
-export * from "./proactive-probe-model.js";
+export * from "./proactive-probe.js";
 export * from "./probe.js";
 export * from "./schema.js";
 export * from "./setup-model.js";
