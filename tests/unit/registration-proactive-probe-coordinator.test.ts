@@ -974,6 +974,37 @@ describe("registration proactive probe coordinator", () => {
       if (outcome.state === "failed") expect(outcome.reason).toBe("webhook_response_mismatch");
     });
 
+    // O2: uniqueness is ordinarily guaranteed by W004's per-provider Inbox exact readback; this
+    // proves the coordinator itself also fails closed if the two providers' synthetic deliveries
+    // were ever to collide on the same Delivery ID.
+    it("two providers reporting the same synthetic Delivery ID is rejected, not silently accepted", async () => {
+      const runId = "probe-webhook-duplicate-delivery";
+      const { ports } = createHarness(runId);
+      const webhook = {
+        runSyntheticProbe: (request: { readonly provider: "github" | "linear" }) =>
+          Promise.resolve({
+            state: "verified" as const,
+            provider: request.provider,
+            // Same Delivery ID for both providers -- this is exactly what must be rejected.
+            deliveryId: "collided-delivery-id",
+            latencyMs: 120,
+            inboxSha256: hex(`${request.provider}-payload`),
+          }),
+      };
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, webhook },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") {
+        expect(outcome.stage).toBe("webhook_synthetic");
+        expect(outcome.reason).toBe("webhook_response_mismatch");
+      }
+    });
+
     it("a late (but eventually correct) provider-origin event still verifies within the poll budget", async () => {
       const runId = "probe-provider-late";
       const { ports } = createHarness(runId, { providerEventLinear: "late" });
@@ -1091,6 +1122,62 @@ describe("registration proactive probe coordinator", () => {
       const outcome = await coordinator.start(baseCommand(runId));
       expect(outcome.state).toBe("failed");
       if (outcome.state === "failed") expect(outcome.reason).toBe("ci_check_wrong_head");
+    });
+
+    // F3: `find`-first would let an earlier successful "CI" check mask a second same-named
+    // check's failure or incompleteness. Every check named "CI" must be terminal success.
+    it("a second same-named CI check reporting failure is not masked by an earlier successful one", async () => {
+      const runId = "probe-ci-duplicate-failure";
+      const { ports } = createHarness(runId);
+      const sourceControl = {
+        ...ports.sourceControl,
+        getCommitChecks: () =>
+          Promise.resolve(
+            ok({
+              headSha: commitSha,
+              aggregate: "pending" as const,
+              checks: [
+                { name: "CI", status: "completed" as const, conclusion: "success" as const },
+                { name: "CI", status: "completed" as const, conclusion: "failure" as const },
+              ],
+            }),
+          ),
+      };
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, sourceControl },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") expect(outcome.reason).toBe("ci_check_failed");
+    });
+
+    it("a second same-named CI check still in progress keeps polling rather than accepting the first success alone", async () => {
+      const runId = "probe-ci-duplicate-pending";
+      const { ports } = createHarness(runId);
+      const sourceControl = {
+        ...ports.sourceControl,
+        getCommitChecks: () =>
+          Promise.resolve(
+            ok({
+              headSha: commitSha,
+              aggregate: "pending" as const,
+              checks: [
+                { name: "CI", status: "completed" as const, conclusion: "success" as const },
+                { name: "CI", status: "in_progress" as const, conclusion: null },
+              ],
+            }),
+          ),
+      };
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, sourceControl },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("failed");
+      if (outcome.state === "failed") expect(outcome.reason).toBe("ci_check_pending");
     });
 
     it("status set call failure fails as status_set_failed", async () => {
@@ -1309,6 +1396,115 @@ describe("registration proactive probe coordinator", () => {
   });
 
   // ---------------------------------------------------------------------------------------
+  // F2 (AC-5): resuming an in-flight run must re-earn the right to keep mutating -- a stale or
+  // rotated authority, a different setup session, or drifted trusted config must all fail closed
+  // before any further external mutation, exactly as a brand-new run would.
+  // ---------------------------------------------------------------------------------------
+  describe("resumed runs re-validate authority/session/config before further mutation (AC-5)", () => {
+    it("rejects resuming with a setupSessionId that does not match how this run was created", async () => {
+      const runId = "probe-resume-wrong-session";
+      const shared = createMemoryJournal();
+      // Seeded as if this run was originally created under a *different* setup session than the
+      // one the harness's fixed `readActivation`/`mergedConfig` fakes represent as "current"
+      // (the module-level `setupSessionId`); resuming with today's (unchanged, valid-looking)
+      // command must still be rejected because it does not match the run's own origin.
+      seedRunAtPhase(shared.map, runId, "linear_created", {
+        linear: Object.freeze({ issueId: `issue-${runId}`, state: "created" as const }),
+        activation: Object.freeze({
+          setupSessionId: "setup-018f47d2-original-session",
+          authoritativeRevision: mergeCommitSha,
+          defaultBranch: project.defaultBranch,
+          repository: project.sourceControl.repository,
+          configDigest,
+        }),
+      });
+      const { ports, counts } = createHarness(runId, {}, shared);
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome).toEqual({ state: "incomplete", reason: "activation_not_ready" });
+      expectZeroMutations(counts);
+    });
+
+    it("rejects resuming with an authority that no longer matches the command (stale/rotated authority)", async () => {
+      const runId = "probe-resume-bad-authority";
+      const shared = createMemoryJournal();
+      seedRunAtPhase(shared.map, runId, "linear_created", {
+        linear: Object.freeze({ issueId: `issue-${runId}`, state: "created" as const }),
+      });
+      const { ports, counts } = createHarness(runId, {}, shared);
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(
+        baseCommand(runId, {
+          authority: authorityFor({ setupSessionId: "setup-018f47d2-stale-authority" }),
+        }),
+      );
+      expect(outcome).toEqual({ state: "incomplete", reason: "authority_invalid" });
+      expectZeroMutations(counts);
+    });
+
+    it("rejects resuming when trusted config has drifted since the run was created (O005 config drift)", async () => {
+      const runId = "probe-resume-config-drift";
+      const shared = createMemoryJournal();
+      seedRunAtPhase(shared.map, runId, "linear_created", {
+        linear: Object.freeze({ issueId: `issue-${runId}`, state: "created" as const }),
+      });
+      const { ports, counts } = createHarness(runId, { activation: "config_mismatch" }, shared);
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome).toEqual({ state: "incomplete", reason: "activation_not_ready" });
+      expectZeroMutations(counts);
+    });
+
+    it("rejects resuming when a fresh (internally-consistent) activation has rotated to a different authoritativeRevision than this run was created against", async () => {
+      const runId = "probe-resume-rotated-activation";
+      const shared = createMemoryJournal();
+      seedRunAtPhase(shared.map, runId, "linear_created", {
+        linear: Object.freeze({ issueId: `issue-${runId}`, state: "created" as const }),
+      });
+      const { ports, counts } = createHarness(runId, {}, shared);
+      const rotatedRevision = "e".repeat(40);
+      const rotatedMarker = Object.freeze({
+        ...activationMarker,
+        authoritativeRevision: rotatedRevision,
+      });
+      const rotatedConfig = Object.freeze({
+        ...mergedConfigReceipt,
+        authoritativeRevision: rotatedRevision,
+      });
+      const rotatedPorts: RegistrationProbePorts = {
+        ...ports,
+        activation: { readActivation: () => Promise.resolve(ok(rotatedMarker)) },
+        mergedConfig: { read: () => Promise.resolve(ok(rotatedConfig)) },
+      };
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: rotatedPorts,
+        allowedWorktreeRoot,
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome).toEqual({ state: "incomplete", reason: "activation_not_ready" });
+      expectZeroMutations(counts);
+    });
+
+    it("still resumes normally when authority/session/config are unchanged", async () => {
+      const runId = "probe-resume-ok";
+      const shared = createMemoryJournal();
+      seedRunAtPhase(shared.map, runId, "linear_created", {
+        linear: Object.freeze({ issueId: `issue-${runId}`, state: "created" as const }),
+      });
+      const { ports } = createHarness(runId, {}, shared);
+      const coordinator = createRegistrationProbeCoordinator({
+        ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("verified");
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
   // AC-6: cleanup state machine — partial failure, ordering, and safe resume.
   // ---------------------------------------------------------------------------------------
   describe("cleanup state machine (AC-6)", () => {
@@ -1439,6 +1635,374 @@ describe("registration proactive probe coordinator", () => {
       // The previously-failed / not-yet-eligible items are retried exactly once.
       expect(secondAttempt.counts.prClose).toBe(1);
       expect(secondAttempt.counts.branchDelete).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // F4 (AC-4 / AC-6): the harness already declares failure-injection switches for every probe
+  // stage; each one must actually be exercised at least once, proving (a) the outcome's stage/
+  // reason (or cleanup_required), (b) already-created artifacts are still cleaned up, and (c)
+  // never-created artifacts are never mutated.
+  // ---------------------------------------------------------------------------------------
+  describe("every probe-stage failure injection proves exact cleanup (F4, AC-4/AC-6)", () => {
+    it("Linear create failure (linearCreate: fail) leaves nothing else to clean up", async () => {
+      const runId = "probe-inject-linearcreate-fail";
+      const { ports, counts } = createHarness(runId, { linearCreate: "fail" });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "linear_create",
+          reason: "linear_create_failed",
+        });
+        expect(outcome.run.cleanup.linearIssue.state).toBe("failed");
+      }
+      expect(counts.linearCreate).toBe(1);
+      expect(counts.linearCancel).toBe(0);
+      expect(counts.gitCreateWorktree).toBe(0);
+      expect(counts.prCreate).toBe(0);
+    });
+
+    it("Linear create readback mismatch (linearRead: mismatch) is an unknown outcome, not accepted or recreated", async () => {
+      const runId = "probe-inject-linearread-mismatch";
+      const { ports, counts } = createHarness(runId, { linearRead: "mismatch" });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "linear_create",
+          reason: "linear_create_outcome_unknown",
+        });
+        expect(outcome.run.cleanup.linearIssue.state).toBe("unknown");
+      }
+      expect(counts.linearCreate).toBe(1);
+      expect(counts.gitCreateWorktree).toBe(0);
+    });
+
+    it("Linear create readback itself erroring (linearRead: error) is an unknown outcome", async () => {
+      const runId = "probe-inject-linearread-error";
+      const { ports, counts } = createHarness(runId, { linearRead: "error" });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "linear_create",
+          reason: "linear_create_outcome_unknown",
+        });
+      }
+      expect(counts.linearCreate).toBe(1);
+      expect(counts.gitCreateWorktree).toBe(0);
+    });
+
+    it("Git worktree creation failure (gitCreateWorktree: fail) still cancels the already-created Linear issue", async () => {
+      const runId = "probe-inject-worktree-fail";
+      const { ports, counts } = createHarness(runId, { gitCreateWorktree: "fail" });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "branch_push",
+          reason: "branch_push_failed",
+        });
+        expect(outcome.run.cleanup.linearIssue.state).toBe("confirmed");
+      }
+      expect(counts.linearCreate).toBe(1);
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.prCreate).toBe(0);
+      expect(counts.branchDelete).toBe(0);
+      expect(counts.gitRemoveWorktree).toBe(0);
+    });
+
+    it("Git push failure (gitPush: fail) still cancels the already-created Linear issue", async () => {
+      const runId = "probe-inject-push-fail";
+      const { ports, counts } = createHarness(runId, { gitPush: "fail" });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "branch_push",
+          reason: "branch_push_outcome_unknown",
+        });
+        expect(outcome.run.cleanup.remoteBranch.state).toBe("unknown");
+      }
+      expect(counts.gitCreateWorktree).toBe(1);
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.prCreate).toBe(0);
+      expect(counts.branchDelete).toBe(0);
+      expect(counts.gitRemoveWorktree).toBe(0);
+    });
+
+    it("Draft PR create failure (prCreate: fail) still cancels Linear and removes the local worktree, but never touches the never-created PR's branch", async () => {
+      const runId = "probe-inject-prcreate-fail";
+      const { ports, counts } = createHarness(runId, { prCreate: "fail" });
+      const coordinator = createRegistrationProbeCoordinator({
+        ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "draft_pull_request",
+          reason: "draft_pr_create_failed",
+        });
+        expect(outcome.run.cleanup.linearIssue.state).toBe("confirmed");
+        expect(outcome.run.cleanup.draftPullRequest.state).toBe("failed");
+        expect(outcome.run.cleanup.remoteBranch).toEqual({
+          state: "failed",
+          reason: "cleanup_not_eligible",
+        });
+        expect(outcome.run.cleanup.localWorktree.state).toBe("confirmed");
+      }
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
+      expect(counts.prClose).toBe(0);
+      expect(counts.branchDelete).toBe(0);
+    });
+
+    it("a created PR that is not draft=true is an unknown/leaked outcome, never accepted (AC-4, prCreate: not_draft)", async () => {
+      const runId = "probe-inject-pr-not-draft";
+      const { ports, counts } = createHarness(runId, { prCreate: "not_draft" });
+      const coordinator = createRegistrationProbeCoordinator({
+        ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.failure).toEqual({
+          stage: "draft_pull_request",
+          reason: "draft_pr_create_outcome_unknown",
+        });
+        expect(outcome.run.draftPullRequest).toBeUndefined();
+        expect(outcome.run.cleanup.draftPullRequest.state).toBe("unknown");
+        expect(outcome.run.cleanup.remoteBranch).toEqual({
+          state: "failed",
+          reason: "cleanup_not_eligible",
+        });
+        expect(outcome.run.cleanup.localWorktree.state).toBe("confirmed");
+      }
+      expect(counts.prCreate).toBe(1);
+      expect(counts.prClose).toBe(0);
+      expect(counts.branchDelete).toBe(0);
+      expect(counts.linearCancel).toBe(1);
+    });
+
+    it("Linear cancel failure during cleanup (linearCancel: fail) does not block PR close, branch delete, or worktree removal", async () => {
+      const runId = "probe-inject-linearcancel-fail";
+      const { ports, counts } = createHarness(runId, { linearCancel: "fail" });
+      const coordinator = createRegistrationProbeCoordinator({
+        ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.linearIssue.state).toBe("failed");
+        expect(outcome.run.cleanup.draftPullRequest.state).toBe("confirmed");
+        expect(outcome.run.cleanup.remoteBranch.state).toBe("confirmed");
+        expect(outcome.run.cleanup.localWorktree.state).toBe("confirmed");
+      }
+      expect(counts.prClose).toBe(1);
+      expect(counts.branchDelete).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
+    });
+
+    it("preflight fails closed with zero mutation when GitHub capability inspect itself errors (githubCapabilityError)", async () => {
+      const runId = "probe-inject-githubcap-error";
+      const { ports, counts } = createHarness(runId, { githubCapabilityError: true });
+      const coordinator = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome).toEqual({ state: "incomplete", reason: "github_capability_incomplete" });
+      expectZeroMutations(counts);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // F1 (AC-5): a CAS conflict writing a cleanup `*_mutation_started` phase (a concurrent writer,
+  // or a stale revision) must skip that cleanup item's external mutation entirely -- never send
+  // cancel/close/delete/remove on a journal write we know did not durably win -- and must still
+  // surface as `cleanup_required` rather than silently being treated as clean.
+  // ---------------------------------------------------------------------------------------
+  describe("a CAS conflict during cleanup skips the external mutation (F1, AC-5)", () => {
+    function withCasFailureOn(
+      underlying: ReturnType<typeof createMemoryJournal>,
+      failOnPhase: RegistrationProbeRun["phase"],
+    ): RegistrationProbeJournalPort & { readonly map: Map<string, RegistrationProbeRun> } {
+      return {
+        map: underlying.map,
+        load: (runId, options) => underlying.load(runId, options),
+        listActiveForProject: (projectId, options) =>
+          underlying.listActiveForProject(projectId, options),
+        compareAndSwap: (runId, expectedRevision, next, options) => {
+          if (next.phase === failOnPhase) {
+            return Promise.resolve(err(domainError("conflict")));
+          }
+          return underlying.compareAndSwap(runId, expectedRevision, next, options);
+        },
+      };
+    }
+
+    it("a CAS conflict writing cleanup_linear_mutation_started never calls Linear cancel", async () => {
+      const runId = "probe-cas-cleanup-linear";
+      const { ports, counts, journal } = createHarness(runId);
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, journal: withCasFailureOn(journal, "cleanup_linear_mutation_started") },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.linearIssue).toEqual({
+          state: "unknown",
+          reason: "cleanup_outcome_unknown",
+        });
+      }
+      expect(counts.linearCancel).toBe(0);
+      // Other cleanup items, whose own CAS writes were not intercepted, still complete normally.
+      expect(counts.prClose).toBe(1);
+      expect(counts.branchDelete).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
+    });
+
+    it("a CAS conflict writing cleanup_pr_mutation_started never calls Draft PR close", async () => {
+      const runId = "probe-cas-cleanup-pr";
+      const { ports, counts, journal } = createHarness(runId);
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, journal: withCasFailureOn(journal, "cleanup_pr_mutation_started") },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.draftPullRequest).toEqual({
+          state: "unknown",
+          reason: "cleanup_outcome_unknown",
+        });
+        // The branch must not be deleted while the PR's close outcome is unknown.
+        expect(outcome.run.cleanup.remoteBranch.state).not.toBe("confirmed");
+      }
+      expect(counts.prClose).toBe(0);
+      expect(counts.branchDelete).toBe(0);
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
+    });
+
+    it("a CAS conflict writing cleanup_branch_mutation_started never calls branch delete", async () => {
+      const runId = "probe-cas-cleanup-branch";
+      const { ports, counts, journal } = createHarness(runId);
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: { ...ports, journal: withCasFailureOn(journal, "cleanup_branch_mutation_started") },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.remoteBranch).toEqual({
+          state: "unknown",
+          reason: "cleanup_outcome_unknown",
+        });
+      }
+      expect(counts.branchDelete).toBe(0);
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.prClose).toBe(1);
+      expect(counts.gitRemoveWorktree).toBe(1);
+    });
+
+    it("a CAS conflict writing cleanup_worktree_mutation_started never calls worktree removal", async () => {
+      const runId = "probe-cas-cleanup-worktree";
+      const { ports, counts, journal } = createHarness(runId);
+      const coordinator = createRegistrationProbeCoordinator({
+        ports: {
+          ...ports,
+          journal: withCasFailureOn(journal, "cleanup_worktree_mutation_started"),
+        },
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const outcome = await coordinator.start(baseCommand(runId));
+      expect(outcome.state).toBe("cleanup_required");
+      if (outcome.state === "cleanup_required") {
+        expect(outcome.run.cleanup.localWorktree).toEqual({
+          state: "unknown",
+          reason: "cleanup_outcome_unknown",
+        });
+      }
+      expect(counts.gitRemoveWorktree).toBe(0);
+      expect(counts.linearCancel).toBe(1);
+      expect(counts.prClose).toBe(1);
+      expect(counts.branchDelete).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // O4: two coordinators racing the reservation CAS for the very same brand-new run. Only one
+  // may win; the other must back off with zero mutation rather than both proceeding.
+  // ---------------------------------------------------------------------------------------
+  describe("two coordinators racing to start the same brand-new run (O4, AC-5)", () => {
+    it("exactly one coordinator wins the reservation; the other backs off with zero mutation", async () => {
+      const runId = "probe-concurrent-race";
+      const shared = createMemoryJournal();
+      const first = createHarness(runId, {}, shared);
+      const second = createHarness(runId, {}, shared);
+      const coordinator1 = createRegistrationProbeCoordinator({
+        ports: first.ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+      const coordinator2 = createRegistrationProbeCoordinator({
+        ports: second.ports,
+        allowedWorktreeRoot,
+        ciPoll: fastPoll(),
+        statusPoll: fastPoll(),
+        providerEventPoll: fastPoll(),
+      });
+
+      const [outcome1, outcome2] = await Promise.all([
+        coordinator1.start(baseCommand(runId)),
+        coordinator2.start(baseCommand(runId)),
+      ]);
+
+      const outcomes = [
+        { outcome: outcome1, counts: first.counts },
+        { outcome: outcome2, counts: second.counts },
+      ];
+      const winners = outcomes.filter(({ outcome }) => outcome.state === "verified");
+      const losers = outcomes.filter(({ outcome }) => outcome.state === "incomplete");
+      expect(winners).toHaveLength(1);
+      expect(losers).toHaveLength(1);
+      const loser = losers[0];
+      if (loser?.outcome.state === "incomplete") {
+        expect(loser.outcome.reason).toBe("concurrent_run_exists");
+        expectZeroMutations(loser.counts);
+      }
     });
   });
 

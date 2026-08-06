@@ -615,6 +615,20 @@ describe("RegistrationProbeBranchCleanupAdapter", () => {
     const result = await adapter.deleteOwnedBranch(branchCleanupCommand(), mutationOptions);
     expect(result).toEqual(ok({ state: "not_found" }));
   });
+
+  // O3: this class is exported and independently callable; a caller-supplied branch outside the
+  // `agent-team/probe/` prefix must never reach the server-side read/delete calls at all, as a
+  // second line of defense alongside the journal schema's own branch-name restriction.
+  it("refuses a branch outside the agent-team/probe/ prefix before any server call", async () => {
+    const transport = new FakeGhCleanupTransport();
+    const adapter = new RegistrationProbeBranchCleanupAdapter(transport);
+    const result = await adapter.deleteOwnedBranch(
+      branchCleanupCommand({ branch: "main" }),
+      mutationOptions,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+  });
 });
 
 /* -------------------------------------------------------------------------------------------- *
