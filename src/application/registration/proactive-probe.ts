@@ -1280,11 +1280,12 @@ export function createRegistrationProbeCoordinator(
       // Persist the terminal "verified" phase so a later `listActiveForProject` (used by this
       // same preflight's own concurrent-run check) recognizes this run as done rather than
       // treating it as still in flight forever. Every other outcome intentionally keeps a
-      // non-terminal phase so cleanup/resumption can still be retried. Guarded on
-      // `computed.state === "verified"`, which can only hold when every cleanup CAS write in
-      // `runCleanup` actually succeeded (a CAS failure always yields a locally-patched "unknown"
-      // item and therefore "cleanup_required"), so `journal.current` here is never stale relative
-      // to `effectiveRun`.
+      // non-terminal phase so cleanup/resumption can still be retried. `verified` requires every
+      // cleanup item to be `confirmed` by exact readback in `effectiveRun`; a failed
+      // *mutation_started* CAS always yields a locally-patched "unknown" item and therefore
+      // "cleanup_required". However `journal.current` can still lag `effectiveRun` when a cleanup
+      // *result* CAS write failed after the readback already confirmed the item. That lag is
+      // fail-closed: a stale journal can only under-report completed cleanup, never fabricate it.
       if (computed.state === "verified" && journal.current.phase !== "verified") {
         const persisted = await journal.persist({
           ...withoutRevision(journal.current),
