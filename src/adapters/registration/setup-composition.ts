@@ -73,6 +73,84 @@ const incompleteWiring = Object.freeze({
 });
 
 /**
+ * O009d: `enableAutoMerge` (GitHub GraphQL `enablePullRequestAutoMerge`) structurally fails on
+ * real GitHub with "Pull request is in clean status" (UNPROCESSABLE) once the PR is already
+ * fully mergeable -- and the O005 setup flow only ever reaches this call after CI and review are
+ * both green, so this path is *always* hit on real GitHub, never just an occasional edge case
+ * (confirmed by direct repro against a real repository with `allow_auto_merge` already enabled).
+ * `enableAutoMerge`'s failure is opaque here (the shared `GhTransport` masks HTTP-error detail
+ * into a generic domain error code), so this fallback does not try to distinguish "clean status"
+ * from any other failure -- it re-reads current state itself and only proceeds to a direct
+ * squash merge if that state is unambiguously safe to merge (open, non-draft, mergeable, exact
+ * expected head). If either `enableAutoMerge` or the direct-merge fallback path itself is not
+ * attempted (state unsafe) or fails, the *original* `enableAutoMerge` error is returned -- this
+ * fallback never invents a new failure reason of its own.
+ *
+ * Exported (rather than an inline closure) specifically so this decision logic -- distinct from,
+ * and layered on top of, `GitHubAdapter.enableAutoMerge`/`squashMergeChangeRequest`'s own
+ * individually-contract-tested correctness -- can be unit tested directly against a scripted
+ * `GhJsonTransport`, without needing to drive a real git repository or the full O005 session
+ * state machine just to reach this one branch.
+ */
+export function createGitHubSquashMergePort(
+  github: GitHubAdapter,
+): import("../../application/registration/index.js").RegistrationSetupSquashMergePort {
+  return Object.freeze({
+    enable: async (
+      command: Parameters<
+        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
+      >[0],
+      mutation: Parameters<
+        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
+      >[1],
+    ) => {
+      const rawCommand = command as unknown as Readonly<Record<string, unknown>>;
+      if (rawCommand["mergeMethod"] !== "SQUASH") {
+        return err(domainError("invariant_violation"));
+      }
+      const reference = { project: command.project, changeRequestId: command.changeRequestId };
+      const current = await github.getChangeRequest(reference, mutation);
+      if (!current.ok) return current;
+      if (current.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()) {
+        return err(domainError("conflict"));
+      }
+      if (current.value.state === "merged") {
+        return ok({ state: "merged" as const, snapshot: current.value });
+      }
+      if (current.value.state === "open" && current.value.autoMergeEnabled) {
+        return ok({ state: "auto_merge_enabled" as const, snapshot: current.value });
+      }
+      const enabled = await github.enableAutoMerge(reference, command.expectedHeadSha, mutation);
+      if (enabled.ok) {
+        return ok({
+          state:
+            enabled.value.state === "merged"
+              ? ("merged" as const)
+              : ("auto_merge_enabled" as const),
+          snapshot: enabled.value,
+        });
+      }
+      const fallbackCurrent = await github.getChangeRequest(reference, mutation);
+      if (
+        !fallbackCurrent.ok ||
+        fallbackCurrent.value.state !== "open" ||
+        fallbackCurrent.value.draft ||
+        fallbackCurrent.value.mergeability !== "mergeable" ||
+        fallbackCurrent.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()
+      ) {
+        return enabled;
+      }
+      const merged = await github.squashMergeChangeRequest(
+        reference,
+        command.expectedHeadSha,
+        mutation,
+      );
+      return merged.ok ? ok({ state: "merged" as const, snapshot: merged.value }) : enabled;
+    },
+  });
+}
+
+/**
  * Explicit W3A production assembly. The returned controller has no merge method;
  * the full coordinator and SourceControl mutation object remain closure-private.
  */
@@ -127,43 +205,7 @@ export function createProductionRegistrationSetupComposition(
     options.linearAuditWriter,
     options.pullRequestAuditWriter,
   );
-  const squashMerge = Object.freeze({
-    enable: async (
-      command: Parameters<
-        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
-      >[0],
-      mutation: Parameters<
-        import("../../application/registration/index.js").RegistrationSetupSquashMergePort["enable"]
-      >[1],
-    ) => {
-      const rawCommand = command as unknown as Readonly<Record<string, unknown>>;
-      if (rawCommand["mergeMethod"] !== "SQUASH") {
-        return err(domainError("invariant_violation"));
-      }
-      const reference = { project: command.project, changeRequestId: command.changeRequestId };
-      const current = await github.getChangeRequest(reference, mutation);
-      if (!current.ok) return current;
-      if (current.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()) {
-        return err(domainError("conflict"));
-      }
-      if (current.value.state === "merged") {
-        return ok({ state: "merged" as const, snapshot: current.value });
-      }
-      if (current.value.state === "open" && current.value.autoMergeEnabled) {
-        return ok({ state: "auto_merge_enabled" as const, snapshot: current.value });
-      }
-      const enabled = await github.enableAutoMerge(reference, command.expectedHeadSha, mutation);
-      return enabled.ok
-        ? ok({
-            state:
-              enabled.value.state === "merged"
-                ? ("merged" as const)
-                : ("auto_merge_enabled" as const),
-            snapshot: enabled.value,
-          })
-        : enabled;
-    },
-  });
+  const squashMerge = createGitHubSquashMergePort(github);
   const mergedConfig = new GitHubRegistrationMergedConfigReadBackAdapter(options.githubTransport);
   const activationRegistry = new FileRegistrationSetupActivationRegistry(
     options.stateRoot,
