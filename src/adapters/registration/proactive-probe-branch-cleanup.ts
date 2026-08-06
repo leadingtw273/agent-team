@@ -70,16 +70,28 @@ function mutationAllowed(options: MutationOptions): boolean {
  * took, rather than trusting the mutation response alone.
  *
  * This class is exported and may be constructed/called directly, independent of the coordinator;
- * the `agent-team/probe/` prefix check below is a self-contained second line of defense (the
- * primary guarantee is structural: the journal schema only ever admits branches matching this same
- * prefix, and the coordinator only ever passes `run.branch`), not the only thing standing between
- * a caller and an arbitrary branch delete.
+ * the branch-prefix check below is a self-contained second line of defense (the primary guarantee
+ * is structural: the journal schema only ever admits branches matching this same prefix, and the
+ * coordinator only ever passes `run.branch`), not the only thing standing between a caller and an
+ * arbitrary branch delete.
+ *
+ * E006b: `allowedBranchPrefix` is injectable (default unchanged: `agent-team/probe/`, O006's own
+ * namespace) so a second, independent owner -- E006's E2E case seed/reset tool -- can construct
+ * its own instance scoped to its own namespace (`agent-team/e2e/`) without ever being able to
+ * touch a branch in O006's namespace or vice versa. The validation logic itself (exact head-SHA
+ * + marker readback before delete, readback-confirmed delete) is unchanged; only the constant it
+ * is compared against is now a constructor parameter.
  */
 export class RegistrationProbeBranchCleanupAdapter implements RegistrationProbeBranchCleanupPort {
   readonly #transport: Pick<GhTransport, "requestJson" | "requestVoid">;
+  readonly #allowedBranchPrefix: string;
 
-  constructor(transport: Pick<GhTransport, "requestJson" | "requestVoid"> = new GhTransport()) {
+  constructor(
+    transport: Pick<GhTransport, "requestJson" | "requestVoid"> = new GhTransport(),
+    allowedBranchPrefix: string = registrationProbeBranchPrefix,
+  ) {
     this.#transport = transport;
+    this.#allowedBranchPrefix = allowedBranchPrefix;
   }
 
   async deleteOwnedBranch(
@@ -90,7 +102,7 @@ export class RegistrationProbeBranchCleanupAdapter implements RegistrationProbeB
       !mutationAllowed(options) ||
       !validRepository(command.repository) ||
       !validBranch(command.branch) ||
-      !command.branch.startsWith(registrationProbeBranchPrefix) ||
+      !command.branch.startsWith(this.#allowedBranchPrefix) ||
       !shaPattern.test(command.expectedHeadSha) ||
       command.marker.length === 0
     ) {

@@ -86,6 +86,15 @@ async function realRefSha(bareRemote: string, branch: string): Promise<string | 
   }
 }
 
+async function deleteRealRef(bareRemote: string, branch: string): Promise<void> {
+  await execFileAsync("git", ["-C", bareRemote, "update-ref", "-d", `refs/heads/${branch}`]);
+}
+
+async function realCommitMessage(bareRemote: string, sha: string): Promise<string> {
+  const result = await execFileAsync("git", ["-C", bareRemote, "log", "-1", "--format=%B", sha]);
+  return result.stdout;
+}
+
 /* -------------------------------------------------------------------------------------------- *
  * FakeGh -- implements every GhTransport-shaped surface `GitHubAdapter`/
  * `RegistrationProbeGitHubCapabilityAdapter` touch for this test's PR create/find/close flow.
@@ -237,6 +246,10 @@ class FakeGh implements Pick<
       const sha = await realRefSha(this.bareRemote, branch);
       if (sha === undefined) return err(domainError("not_found"));
       value = { object: { sha } };
+    } else if (/\/commits\/[0-9a-f]{40}$/u.test(endpoint) && method === "GET") {
+      // E006b: `deleteOwnedBranch`'s own independent commit-message marker re-check.
+      const sha = /\/commits\/([0-9a-f]{40})$/u.exec(endpoint)?.[1] ?? "";
+      value = { commit: { message: await realCommitMessage(this.bareRemote, sha) } };
     } else {
       value = {};
     }
@@ -244,8 +257,16 @@ class FakeGh implements Pick<
     return parsed.success ? ok(parsed.data) : err(domainError("external_failure"));
   }
 
-  requestVoid() {
-    return Promise.resolve(err(domainError("external_failure")));
+  async requestVoid(arguments_: readonly string[]) {
+    const endpoint = arguments_[1] ?? "";
+    const methodIndex = arguments_.indexOf("--method");
+    const method = methodIndex < 0 ? "GET" : (arguments_[methodIndex + 1] ?? "GET");
+    if (endpoint.includes("/git/refs/heads/") && method === "DELETE") {
+      const branch = decodeURIComponent(endpoint.split("/git/refs/heads/")[1] ?? "");
+      await deleteRealRef(this.bareRemote, branch);
+      return ok(undefined);
+    }
+    return err(domainError("external_failure"));
   }
 }
 
@@ -522,19 +543,19 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
         remote: "origin",
         repository: "owner/sandbox",
         baseBranch: "main",
-        branchName: "agent-team-e2e/e101",
+        branchName: "agent-team/e2e/e101",
       },
       githubDraftPullRequest: {
         repository: "owner/sandbox",
         baseBranch: "main",
-        headBranch: "agent-team-e2e/e101",
+        headBranch: "agent-team/e2e/e101",
         title: "E101 sandbox PR",
         body: "Seeded by the E006 harness for case E101.",
       },
       localWorktree: {
         localRepository: { rootPath: checkout },
         path: join(scratchRoot, "e101-scratch"),
-        branchName: "agent-team-e2e/e101-scratch",
+        branchName: "agent-team/e2e/e101-scratch",
         startPoint: "main",
       },
     };
@@ -545,11 +566,11 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
     expect(seeded.value.entries).toHaveLength(4);
 
     // The branch genuinely landed on the real remote.
-    const branchSha = await realRefSha(bareRemote, "agent-team-e2e/e101");
+    const branchSha = await realRefSha(bareRemote, "agent-team/e2e/e101");
     expect(branchSha).toBeDefined();
     // The draft PR genuinely exists in the fake GitHub state, referencing that real branch.
     expect(gh.prs).toHaveLength(1);
-    expect(gh.prs[0]?.headBranch).toBe("agent-team-e2e/e101");
+    expect(gh.prs[0]?.headBranch).toBe("agent-team/e2e/e101");
     // The Linear issue genuinely exists in the fake Linear state, marker-tagged.
     expect(linear.issues).toHaveLength(1);
     expect(linear.issues[0]?.description).toContain(caseRunId);
@@ -564,7 +585,8 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
     expect(actions.get("linearIssue")).toBe("confirmed_now");
     expect(actions.get("githubDraftPullRequest")).toBe("confirmed_now");
     expect(actions.get("localWorktree")).toBe("confirmed_now");
-    expect(actions.get("githubBranch")).toBe("requires_manual");
+    // E006b: the branch is deleted for real, but only once its sibling PR is confirmed closed.
+    expect(actions.get("githubBranch")).toBe("confirmed_now");
 
     // Real-world verification, independent of the outcome labels above.
     expect(linear.issues[0]?.stateId).toBe(
@@ -580,9 +602,10 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
     await expect(stat(join(scratchRoot, "e101-scratch"))).rejects.toMatchObject({
       code: "ENOENT",
     });
-    // The branch was never deleted -- the disclosed capability gap.
-    const branchShaAfterReset = await realRefSha(bareRemote, "agent-team-e2e/e101");
-    expect(branchShaAfterReset).toBe(branchSha);
+    // The branch was genuinely deleted from the real bare remote.
+    const branchShaAfterReset = await realRefSha(bareRemote, "agent-team/e2e/e101");
+    expect(branchShaAfterReset).toBeUndefined();
+    expect(branchSha).toBeDefined();
 
     // Idempotent re-run: everything already confirmed is reported so, with no further effect.
     const secondReset = await resetCase(ports, manifestStore, caseRunId, clock, {
@@ -596,6 +619,7 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
     expect(secondActions.get("linearIssue")).toBe("already_confirmed");
     expect(secondActions.get("githubDraftPullRequest")).toBe("already_confirmed");
     expect(secondActions.get("localWorktree")).toBe("already_confirmed");
+    expect(secondActions.get("githubBranch")).toBe("already_confirmed");
   }, 30_000);
 
   it("dry-run mutates nothing on the real backing systems", async () => {
@@ -632,7 +656,7 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
           remote: "origin",
           repository: "owner/sandbox",
           baseBranch: "main",
-          branchName: "agent-team-e2e/e102",
+          branchName: "agent-team/e2e/e102",
         },
       },
       clock,
@@ -644,10 +668,13 @@ describe("E006 seed/reset integration (real manifest + real git + fake transport
     if (!dryRun.ok) return;
     const actions = new Map(dryRun.value.entries.map((entry) => [entry.kind, entry.action]));
     expect(actions.get("linearIssue")).toBe("would_clean");
-    expect(actions.get("githubBranch")).toBe("requires_manual");
+    // A standalone branch (no sibling PR in this case) is always eligible.
+    expect(actions.get("githubBranch")).toBe("would_clean");
 
-    // Nothing was actually mutated.
+    // Nothing was actually mutated -- the branch genuinely still exists on the real remote.
     expect(linear.issues[0]?.stateId).toBe(linear.backlogStateId);
+    const stillThere = await realRefSha(bareRemote, "agent-team/e2e/e102");
+    expect(stillThere).toBeDefined();
     const reloaded = await manifestStore.load(caseRunId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok && reloaded.value !== undefined) {

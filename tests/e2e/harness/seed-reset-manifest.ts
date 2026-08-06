@@ -73,6 +73,10 @@ export const e2eManifestEntrySchema = z.discriminatedUnion("kind", [
       ...entryBase,
       repository: z.string().min(1),
       headSha: z.string().regex(shaPattern),
+      // E006b: needed for `inspectRemoteBranch`'s authoritative pre-delete readback (a *local*
+      // git operation, distinct from the GitHub-API-level `repository` slug above).
+      localRepositoryRoot: z.string().min(1),
+      remote: z.string().min(1),
       resolution: resolutionSchema.optional(),
     })
     .strict(),

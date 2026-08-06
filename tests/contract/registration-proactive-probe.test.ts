@@ -629,6 +629,57 @@ describe("RegistrationProbeBranchCleanupAdapter", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("invariant_violation");
   });
+
+  // E006b: `allowedBranchPrefix` is injectable so a second, independent owner (E006's E2E case
+  // seed/reset tool) can scope its own instance to its own namespace. The default (asserted by
+  // every test above, unmodified) must stay `agent-team/probe/`; a custom prefix must accept only
+  // its own namespace and reject every other one, including O006's.
+  describe("allowedBranchPrefix (E006b)", () => {
+    it("accepts a branch in a custom namespace when constructed with a matching prefix", async () => {
+      const transport = new FakeGhCleanupTransport();
+      transport.commitMessage = `agent-team-e2e: ${registrationProbeMarker("contract-run-5")}`;
+      const adapter = new RegistrationProbeBranchCleanupAdapter(transport, "agent-team/e2e/");
+      const result = await adapter.deleteOwnedBranch(
+        branchCleanupCommand({ branch: "agent-team/e2e/contract-run-5" }),
+        mutationOptions,
+      );
+      expect(result).toEqual(ok({ state: "deleted" }));
+    });
+
+    it("refuses a branch outside the custom namespace before any server call", async () => {
+      const transport = new FakeGhCleanupTransport();
+      const adapter = new RegistrationProbeBranchCleanupAdapter(transport, "agent-team/e2e/");
+      const result = await adapter.deleteOwnedBranch(
+        branchCleanupCommand({ branch: "main" }),
+        mutationOptions,
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+    });
+
+    // The critical isolation guarantee: an instance scoped to E006's namespace must never be
+    // able to touch a branch in O006's own `agent-team/probe/` namespace, and vice versa --
+    // proven here by exercising the *other* namespace's exact real branch shape against each
+    // scoped instance.
+    it("refuses a branch in O006's own agent-team/probe/ namespace when scoped to a different prefix", async () => {
+      const transport = new FakeGhCleanupTransport();
+      const adapter = new RegistrationProbeBranchCleanupAdapter(transport, "agent-team/e2e/");
+      const result = await adapter.deleteOwnedBranch(branchCleanupCommand(), mutationOptions);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+    });
+
+    it("refuses a branch in E006's agent-team/e2e/ namespace when scoped to the O006 default", async () => {
+      const transport = new FakeGhCleanupTransport();
+      const adapter = new RegistrationProbeBranchCleanupAdapter(transport);
+      const result = await adapter.deleteOwnedBranch(
+        branchCleanupCommand({ branch: "agent-team/e2e/contract-run-5" }),
+        mutationOptions,
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+    });
+  });
 });
 
 /* -------------------------------------------------------------------------------------------- *

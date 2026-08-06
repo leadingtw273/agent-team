@@ -6,6 +6,7 @@
  * real; every unit/integration test for seed-reset.ts injects a fake `SeedResetPorts` instead.
  */
 import {
+  RegistrationProbeBranchCleanupAdapter,
   RegistrationProbeGitAdapter,
   RegistrationProbeGitHubCapabilityAdapter,
   RegistrationProbeLinearAdapter,
@@ -22,6 +23,7 @@ import {
 } from "../../../src/adapters/linear/index.js";
 import type { MutationOptions } from "../../../src/application/ports/common.js";
 import { placeholderProjectFor } from "./placeholder-project.js";
+import { e2eBranchPrefix } from "./seed-reset.js";
 import type { SeedResetPorts, SeedResetSourceControlPort } from "./seed-reset-ports.js";
 
 function buildSourceControlPort(github: GitHubAdapter): SeedResetSourceControlPort {
@@ -90,5 +92,10 @@ export function buildProductionSeedResetPorts(
     git: new RegistrationProbeGitAdapter(),
     github: new RegistrationProbeGitHubCapabilityAdapter(githubTransport),
     sourceControl: buildSourceControlPort(github),
+    // E006b: an independent instance, scoped to E006's own namespace -- never the O006
+    // production instance (probe-composition.ts constructs its own, unparameterized, default-
+    // scoped instance separately) and structurally unable to touch a branch outside
+    // `agent-team/e2e/`.
+    branchCleanup: new RegistrationProbeBranchCleanupAdapter(githubTransport, e2eBranchPrefix),
   });
 }

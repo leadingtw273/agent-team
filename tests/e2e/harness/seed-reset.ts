@@ -10,20 +10,17 @@
  * Ground rules (plan.md 15.2, quoted verbatim by the task): 僅能清理自身建立且具 Run ID 的
  * Sandbox 物件；Dry-run 列全量；Scope 外物件拒絕；重跑冪等.
  *
- * Known, disclosed capability gap -- `githubBranch`: seeding a branch is fully supported (this
- * module uses the general-purpose `RegistrationProbeGitPort`, which has no branch-prefix
- * restriction). Deleting one is not: the only branch-delete mutation anywhere in `src/**` is
- * `RegistrationProbeBranchCleanupPort.deleteOwnedBranch`
- * (src/adapters/registration/proactive-probe-branch-cleanup.ts), and it hard-rejects
- * (`invariant_violation`) any branch not prefixed `agent-team/probe/` -- the O006 registration
- * probe's own namespace. Reusing it for E2E case branches would mean either laundering E2E
- * branches under O006's probe namespace (a scope/semantics violation of a security-relevant
- * adapter) or adding a new, more general `src/**` capability -- both out of this task's authorized
- * scope (`不動 src/**`) and an exact match for this task's own escalation trigger ("發現必須新增
- * src 層能力才能安全清理某類物件"). Rather than work around this silently, `resetCase()` always
- * classifies a `githubBranch` entry as `requires_manual` (reason
- * `"branch_delete_capability_unavailable"`), never attempts an unauthorized deletion route, and
- * this finding is surfaced verbatim in this task's final report for the coordinator to decide.
+ * `githubBranch` deletion (E006b): `RegistrationProbeBranchCleanupPort.deleteOwnedBranch`
+ * (src/adapters/registration/proactive-probe-branch-cleanup.ts) originally hard-rejected any
+ * branch not prefixed `agent-team/probe/` -- O006's own registration-probe namespace, which made
+ * it unusable for E2E case branches (E006's original finding). E006b parameterized that adapter's
+ * `allowedBranchPrefix` (default unchanged) so this module can construct its own independent
+ * instance scoped to `agent-team/e2e/` (see seed-reset-adapters.ts) -- structurally unable to
+ * touch a branch outside that namespace, and O006's own instance is equally unable to touch one
+ * inside it. `resetGithubBranch` below now performs a real delete, gated exactly the way O006
+ * gates its own branch delete: only once any `githubDraftPullRequest` entry referencing the same
+ * branch is itself resolved (closed or already absent) -- never before, matching O006's own
+ * "Remote branch deletion — only once the PR is confirmed closed/unmerged" rule.
  */
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -53,6 +50,11 @@ export const e2eMarkerPrefix = "agent-team-e2e:";
 export function e2eMarker(caseRunId: string): string {
   return `${e2eMarkerPrefix}${caseRunId}`;
 }
+
+/** E006b: the namespace every E2E case branch must live under, and the exact prefix
+ * `seed-reset-adapters.ts` scopes its own `RegistrationProbeBranchCleanupAdapter` instance to --
+ * disjoint from O006's own `agent-team/probe/` namespace by construction. */
+export const e2eBranchPrefix = "agent-team/e2e/";
 
 const e2eBranchMarkerFilePath = ".agent-team-e2e/manifest.json";
 
@@ -103,6 +105,12 @@ export interface SeedCaseCommand {
 
 function validateSeedCommand(command: SeedCaseCommand): Result<void, DomainError> {
   if (!caseRunIdPattern.test(command.caseRunId)) return err(domainError("invariant_violation"));
+  if (
+    command.githubBranch !== undefined &&
+    !command.githubBranch.branchName.startsWith(e2eBranchPrefix)
+  ) {
+    return err(domainError("invariant_violation"));
+  }
   if (command.githubDraftPullRequest !== undefined) {
     const branch = command.githubBranch;
     if (
@@ -223,6 +231,8 @@ async function seedGithubBranch(
     createdAt: clock.now(),
     repository: request.repository,
     headSha: pushed.value.sha,
+    localRepositoryRoot: request.localRepository.rootPath,
+    remote: request.remote,
   });
   return appended.ok ? ok(undefined) : appended;
 }
@@ -387,8 +397,6 @@ export interface ResetCaseOutcome {
   readonly entries: readonly ResetEntryOutcome[];
 }
 
-const branchDeleteCapabilityUnavailableReason = "branch_delete_capability_unavailable";
-
 async function resetLinearIssue(
   ports: SeedResetPorts,
   entry: E2eManifestEntry & { readonly kind: "linearIssue" },
@@ -465,21 +473,66 @@ async function resetGithubDraftPullRequest(
   return ok({ kind: entry.kind, id: entry.id, action: "confirmed_now" });
 }
 
-function resetGithubBranch(
+/**
+ * E006b: real delete, gated on `eligible` (set by the caller from the sibling-PR check in
+ * `resetCase` below) exactly the way O006 gates its own branch delete -- never before any
+ * `githubDraftPullRequest` entry referencing this same branch is itself resolved. Performs an
+ * authoritative, read-only pre-check (`inspectRemoteBranch`) before ever attempting the mutating
+ * `deleteOwnedBranch` call, so a genuinely-already-absent branch is reported `already_absent`
+ * (idempotent) rather than attempting (and potentially erroring on) a delete of nothing.
+ */
+async function resetGithubBranch(
+  ports: SeedResetPorts,
   entry: E2eManifestEntry & { readonly kind: "githubBranch" },
   dryRun: boolean,
-): ResetEntryOutcome {
-  // See the file-level doc comment: no `src/**` capability exists today to delete an arbitrary
-  // branch this module created (only the O006-scoped `agent-team/probe/`-prefixed one does).
-  // Always fail closed rather than invent a workaround.
-  return {
+  eligible: boolean,
+): Promise<Result<ResetEntryOutcome, DomainError>> {
+  if (!eligible) {
+    return ok({
+      kind: entry.kind,
+      id: entry.id,
+      action: "requires_manual",
+      reason: "branch_not_eligible_pr_unresolved",
+    });
+  }
+  const observed = await ports.git.inspectRemoteBranch(
+    { rootPath: entry.localRepositoryRoot },
+    entry.remote,
+    entry.id,
+  );
+  if (!observed.ok) return observed;
+  if (observed.value === undefined) {
+    return ok({
+      kind: entry.kind,
+      id: entry.id,
+      action: dryRun ? "would_confirm_absent" : "already_absent",
+    });
+  }
+  if (dryRun) return ok({ kind: entry.kind, id: entry.id, action: "would_clean" });
+  const deleted = await ports.branchCleanup.deleteOwnedBranch(
+    {
+      repository: entry.repository,
+      branch: entry.id,
+      marker: entry.marker,
+      expectedHeadSha: observed.value.sha,
+    },
+    { idempotencyKey: `e2e-reset:githubBranch:${entry.id}` },
+  );
+  if (!deleted.ok) {
+    return deleted.error.code === "conflict"
+      ? ok({
+          kind: entry.kind,
+          id: entry.id,
+          action: "requires_manual",
+          reason: "branch_ownership_mismatch",
+        })
+      : deleted;
+  }
+  return ok({
     kind: entry.kind,
     id: entry.id,
-    action: "requires_manual",
-    reason: dryRun
-      ? `${branchDeleteCapabilityUnavailableReason}_dry_run`
-      : branchDeleteCapabilityUnavailableReason,
-  };
+    action: deleted.value.state === "deleted" ? "confirmed_now" : "already_absent",
+  });
 }
 
 async function resetLocalWorktree(
@@ -523,6 +576,7 @@ async function resetEntry(
   ports: SeedResetPorts,
   entry: E2eManifestEntry,
   dryRun: boolean,
+  branchEligible: boolean,
 ): Promise<Result<ResetEntryOutcome, DomainError>> {
   switch (entry.kind) {
     case "linearIssue":
@@ -530,11 +584,48 @@ async function resetEntry(
     case "githubDraftPullRequest":
       return resetGithubDraftPullRequest(ports, entry, dryRun);
     case "githubBranch":
-      return ok(resetGithubBranch(entry, dryRun));
+      return resetGithubBranch(ports, entry, dryRun, branchEligible);
     case "localWorktree":
       return resetLocalWorktree(ports, entry, dryRun);
   }
 }
+
+/** Any outcome meaning "this entry either already is, or -- in this very pass -- would become,
+ * resolved" -- used both to decide what to persist (real run) and, identically, to decide branch-
+ * delete eligibility for a sibling branch even during a dry-run (so dry-run's own eligibility
+ * simulation matches exactly what a real pass would do, without ever mutating anything). */
+const resolvedOrWouldResolveActions: ReadonlySet<ResetEntryAction> = new Set([
+  "confirmed_now",
+  "already_absent",
+  "would_clean",
+  "would_confirm_absent",
+]);
+
+/** E006b: a `githubBranch` entry is only eligible for delete once every `githubDraftPullRequest`
+ * entry referencing the same branch (if any) is itself resolved -- mirrors O006's own gate. A
+ * branch nobody ever opened a PR against is always eligible. */
+function isBranchDeleteEligible(
+  branchEntry: E2eManifestEntry & { readonly kind: "githubBranch" },
+  allEntries: readonly E2eManifestEntry[],
+  resolvedOrWouldResolve: ReadonlySet<string>,
+): boolean {
+  const siblingPullRequest = allEntries.find(
+    (candidate) =>
+      candidate.kind === "githubDraftPullRequest" && candidate.headBranch === branchEntry.id,
+  );
+  if (siblingPullRequest === undefined) return true;
+  return resolvedOrWouldResolve.has(`githubDraftPullRequest:${siblingPullRequest.id}`);
+}
+
+/** Fixed, safe processing order: any `githubDraftPullRequest` must be resolved before the
+ * `githubBranch` it might reference, regardless of the manifest's own (seed-order) storage
+ * order. */
+const resetProcessingOrder: Readonly<Record<E2eManifestKind, number>> = {
+  linearIssue: 0,
+  githubDraftPullRequest: 1,
+  githubBranch: 2,
+  localWorktree: 3,
+};
 
 /**
  * Resets (or, when `dryRun` is true, only reports what it would do to) every entry in this
@@ -555,15 +646,31 @@ export async function resetCase(
   if (!loaded.ok) return loaded;
   if (loaded.value === undefined) return err(domainError("not_found"));
 
+  const allEntries = loaded.value.entries;
+  const orderedEntries = [...allEntries].sort(
+    (a, b) => resetProcessingOrder[a.kind] - resetProcessingOrder[b.kind],
+  );
+  const resolvedOrWouldResolve = new Set<string>(
+    allEntries
+      .filter((entry) => entry.resolution?.state === "confirmed")
+      .map((entry) => `${entry.kind}:${entry.id}`),
+  );
+
   const outcomes: ResetEntryOutcome[] = [];
-  for (const entry of loaded.value.entries) {
+  for (const entry of orderedEntries) {
     if (entry.resolution?.state === "confirmed") {
       outcomes.push({ kind: entry.kind, id: entry.id, action: "already_confirmed" });
       continue;
     }
-    const outcome = await resetEntry(ports, entry, options.dryRun);
+    const branchEligible =
+      entry.kind !== "githubBranch" ||
+      isBranchDeleteEligible(entry, allEntries, resolvedOrWouldResolve);
+    const outcome = await resetEntry(ports, entry, options.dryRun, branchEligible);
     if (!outcome.ok) return outcome;
     outcomes.push(outcome.value);
+    if (resolvedOrWouldResolveActions.has(outcome.value.action)) {
+      resolvedOrWouldResolve.add(`${entry.kind}:${entry.id}`);
+    }
 
     if (options.dryRun) continue;
     if (outcome.value.action === "confirmed_now" || outcome.value.action === "already_absent") {
