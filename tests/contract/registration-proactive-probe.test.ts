@@ -514,7 +514,7 @@ describe("RegistrationProbeGitHubCapabilityAdapter", () => {
     );
     expect(found).toEqual(
       ok({
-        changeRequestId: "PR_kwDOsandbox77",
+        changeRequestId: "77",
         number: 77,
         headSha: "a".repeat(40),
         state: "open",

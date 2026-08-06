@@ -682,7 +682,10 @@ async function ensureDraftPullRequest(
     ...withoutRevision(journal.current),
     phase: "draft_pr_created",
     draftPullRequest: Object.freeze({
-      changeRequestId: created.value.id,
+      // `SourceControlPort.changeRequestId` is the PR number as a string (matching how
+      // `GitHubAdapter` itself round-trips it, e.g. in its own post-create read-back); the
+      // opaque `created.value.id` is a separate identifier, not a valid `ChangeRequestRef`.
+      changeRequestId: String(created.value.number),
       number: created.value.number,
       baseBranch: created.value.baseBranch,
       headBranch: created.value.headBranch,

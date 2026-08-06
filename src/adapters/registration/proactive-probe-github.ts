@@ -192,7 +192,9 @@ export class RegistrationProbeGitHubCapabilityAdapter implements RegistrationPro
     }
     return ok(
       Object.freeze({
-        changeRequestId: candidate.id,
+        // `SourceControlPort.changeRequestId` is the PR number as a string, matching
+        // `GitHubAdapter`'s own convention -- `candidate.id` is a separate opaque identifier.
+        changeRequestId: String(candidate.number),
         number: candidate.number,
         headSha: candidate.headRefOid.toLowerCase(),
         state: candidate.state,
