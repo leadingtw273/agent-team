@@ -34,6 +34,7 @@ export interface RegistrationCliHandlers {
   ) => Promise<CliCommandOutcome>;
   readonly setupStatus: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
   readonly setupResume: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+  readonly setupRefresh: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
   readonly setupApprove: (
     input: Readonly<{ projectId: string; draftPath?: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -74,6 +75,7 @@ const defaultRegistrationHandlers: RegistrationCliHandlers = Object.freeze({
   setupStart: () => blocked("registration setup start"),
   setupStatus: () => blocked("registration setup status"),
   setupResume: () => blocked("registration setup resume"),
+  setupRefresh: () => blocked("registration setup refresh"),
   setupApprove: () => blocked("registration setup approve"),
   probeRun: () => blocked("registration probe run"),
   probeStatus: () => blocked("registration probe status"),
@@ -216,6 +218,15 @@ export function createProgram(
     .requiredOption("--project <project-id>", "專案識別碼")
     .action((options: { readonly project: string }) =>
       action(state, io, () => handlers.registration.setupResume({ projectId: options.project }))(),
+    );
+  setup
+    .command("refresh")
+    .description(
+      "重新讀取 CI／agent-team/review 證據，推進 ci_waiting 等中間階段（唯一能離開 ci_waiting 的命令）",
+    )
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.registration.setupRefresh({ projectId: options.project }))(),
     );
   setup
     .command("approve")

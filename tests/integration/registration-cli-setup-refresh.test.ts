@@ -1,0 +1,725 @@
+/**
+ * O009b integration test for `agent-team registration setup refresh` (E004 dry-run defect fix).
+ *
+ * Reproduces the exact stuck-in-`ci_waiting` scenario a real user hit: `setup start` creates a
+ * real draft PR (as in registration-cli-setup.test.ts), and once CI/review evidence is green,
+ * `controller.refresh()` -- now finally reachable from the CLI -- must read that evidence back,
+ * publish both audit receipts (Linear comment + PR comment), and advance the session all the way
+ * to `awaiting_user_approval`. A second scenario proves a *not yet green* CI leaves the session
+ * exactly at `ci_waiting`, never advancing on a false signal.
+ *
+ * Zero-live-mutation harness, same technique as the other registration-cli integration tests:
+ * - GitHub is faked at the `GhTransport` method boundary (PR create/read, check-runs, commit
+ *   status, and -- new for this test -- issue comments, since `refresh()`'s audit-publish step
+ *   posts a PR comment via the O009 GitHubPullRequestAuditCommentWriter).
+ * - Linear is faked at the `fetch` boundary under the real LinearGraphqlTransport/LinearReadModel/
+ *   LinearMutationClient classes (same technique as the O006 integration test's own fixture),
+ *   extended to track real per-issue comments (O006's own fixture always answered
+ *   AgentTeamReadIssueComments with an empty list, since it never needed comment dedup -- this
+ *   test does, since LinearIssueAuditCommentWriter delegates to the real dedup-checking
+ *   LinearMutationClient.appendComment).
+ * - Git itself is REAL (temp bare remote + checkout).
+ */
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
+
+import type { GhTransport } from "../../src/adapters/github/index.js";
+import {
+  linearAgentRoleNames,
+  linearAgentStatusNames,
+  linearBlockingReasonNames,
+  linearReviewRequirementNames,
+  linearWorkStatusNames,
+} from "../../src/adapters/linear/model.js";
+import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import { createRegistrationSetupHandlers } from "../../src/cli/registration/setup-handlers.js";
+import { buildRegistrationSetupComposition } from "../../src/cli/registration/setup-composition.js";
+
+const execFileAsync = promisify(execFile);
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function temporaryRoot(prefix: string): Promise<string> {
+  const value = await mkdtemp(join(tmpdir(), prefix));
+  roots.push(value);
+  return value;
+}
+
+async function realGitRepository() {
+  const root = await temporaryRoot("agent-team-o009b-git-");
+  const bareRemote = join(root, "remote.git");
+  const checkout = join(root, "checkout");
+  await execFileAsync("git", ["init", "--bare", "-q", "-b", "main", bareRemote]);
+  await execFileAsync("git", ["clone", "-q", bareRemote, checkout]);
+  await execFileAsync("git", ["-C", checkout, "config", "user.email", "setup@example.test"]);
+  await execFileAsync("git", ["-C", checkout, "config", "user.name", "Setup"]);
+  await writeFile(join(checkout, "README.md"), "seed\n", "utf8");
+  await execFileAsync("git", ["-C", checkout, "add", "README.md"]);
+  await execFileAsync("git", ["-C", checkout, "commit", "-q", "-m", "seed"]);
+  await execFileAsync("git", ["-C", checkout, "push", "-q", "origin", "HEAD:refs/heads/main"]);
+  return { checkout, bareRemote };
+}
+
+async function realRefSha(bareRemote: string, branch: string): Promise<string | undefined> {
+  try {
+    const result = await execFileAsync("git", [
+      "-C",
+      bareRemote,
+      "show-ref",
+      "--verify",
+      "--hash",
+      `refs/heads/${branch}`,
+    ]);
+    return result.stdout.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+interface FakePullRequest {
+  id: string;
+  number: number;
+  state: "open" | "closed" | "merged";
+  draft: boolean;
+  baseBranch: string;
+  headBranch: string;
+  title: string;
+  body: string;
+}
+
+interface FakeComment {
+  id: string;
+  url: string;
+  body: string;
+  createdAt: string;
+}
+
+function collectFields(args: readonly string[]): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "-f" || args[index] === "-F") {
+      const pair = args[index + 1] ?? "";
+      const separator = pair.indexOf("=");
+      if (separator > 0) fields[pair.slice(0, separator)] = pair.slice(separator + 1);
+    }
+  }
+  return fields;
+}
+
+/** Extended from registration-cli-setup.test.ts's own FakeGh: adds check-runs, commit status,
+ * and issue-comment endpoints (needed by refresh()'s gate-evidence read and audit-publish step). */
+class FakeGh implements Pick<
+  GhTransport,
+  "inspectAuthentication" | "inspectRepositoryCapabilities" | "requestJson" | "requestVoid"
+> {
+  ciConclusion: "success" | "failure" | null = "success";
+  reviewState: "success" | "failure" | null = "success";
+  statusesBySha = new Map<
+    string,
+    { context: string; state: string; description: string | null; targetUrl: string | null }[]
+  >();
+  commentsByNumber = new Map<number, FakeComment[]>();
+  readonly prs: FakePullRequest[] = [];
+  #nextPrNumber = 100;
+  #nextCommentId = 1;
+
+  constructor(
+    readonly bareRemote: string,
+    readonly defaultBranch: string,
+  ) {}
+
+  inspectAuthentication() {
+    return Promise.resolve(
+      ok({ active: true as const, host: "github.com", accountFingerprint: "fp" }),
+    );
+  }
+
+  inspectRepositoryCapabilities() {
+    return Promise.resolve(err(domainError("unavailable")));
+  }
+
+  requestVoid() {
+    return Promise.resolve(err(domainError("unavailable")));
+  }
+
+  #snapshot(pr: FakePullRequest, headSha: string) {
+    return {
+      id: pr.id,
+      number: pr.number,
+      url: `https://github.test/owner/sandbox/pull/${String(pr.number)}`,
+      state: pr.state,
+      draft: pr.draft,
+      baseBranch: pr.baseBranch,
+      headBranch: pr.headBranch,
+      headSha,
+      mergeability: "mergeable" as const,
+      autoMergeEnabled: false,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  async requestJson<Output>(arguments_: readonly string[], schema: z.ZodType<Output>) {
+    const endpoint = arguments_[1] ?? "";
+    const methodIndex = arguments_.indexOf("--method");
+    const method = methodIndex < 0 ? "GET" : (arguments_[methodIndex + 1] ?? "GET");
+    const jqIndex = arguments_.indexOf("--jq");
+    const jq = jqIndex < 0 ? "" : (arguments_[jqIndex + 1] ?? "");
+    const fields = collectFields(arguments_);
+    let value: unknown;
+
+    if (endpoint.endsWith("/pulls") && method === "GET") {
+      const headBranch = fields["head"]?.split(":")[1];
+      const matches = this.prs.filter(
+        (pr) =>
+          (fields["state"] === undefined || pr.state === fields["state"]) &&
+          (headBranch === undefined || pr.headBranch === headBranch),
+      );
+      const withSha = await Promise.all(
+        matches.map(async (pr) => ({
+          pr,
+          sha: (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40),
+        })),
+      );
+      value = jq.includes("snapshot")
+        ? withSha.map(({ pr, sha }) => ({
+            title: pr.title,
+            body: pr.body,
+            snapshot: this.#snapshot(pr, sha),
+          }))
+        : withSha.map(({ pr, sha }) => ({
+            number: pr.number,
+            id: pr.id,
+            state: pr.state,
+            draft: pr.draft,
+            headRefName: pr.headBranch,
+            headRefOid: sha,
+            body: pr.body,
+          }));
+    } else if (endpoint.endsWith("/pulls") && method === "POST") {
+      const number = this.#nextPrNumber;
+      this.#nextPrNumber += 1;
+      const pr: FakePullRequest = {
+        // Deliberately NOT an opaque node_id-shaped string like "PR_db_<n>" (which is what real
+        // GitHub, and every other FakeGh fixture in this repo, returns for `.id` via
+        // `changeRequestProjection`'s `id:.node_id`). Using a real opaque id here reproduces a
+        // genuine, separately-reported O005 engine defect this task must not fix (out of scope,
+        // "不動引擎"): `setup.ts` stores `session.changeRequest = draft.value` (the *whole*
+        // ChangeRequestSnapshot, `.id` = opaque node_id) and then reuses `session.changeRequest
+        // .id` as `changeRequestId` for every later ChangeRequestRef call (refresh's own
+        // `getChangeRequest`, appendChangeRequestComment, closeChangeRequest, enableAutoMerge...)
+        // -- but `GitHubAdapter`'s own `changeRequestNumber()` requires that value to be a plain
+        // decimal PR number, which an opaque node_id never is. O006's own
+        // `proactive-probe.ts` avoids this exact trap with an explicit comment ("the opaque
+        // `created.value.id` is a separate identifier, not a valid `ChangeRequestRef`") and uses
+        // `String(created.value.number)` instead. No existing O005 test ever caught this because
+        // every one of them fakes `sourceControl` directly and ignores its input entirely (see
+        // tests/unit/registration-setup.test.ts's own `getChangeRequest: () => {...}` fixture).
+        // Reported separately to the decision layer; using a numeric id here keeps this specific
+        // scenario (proving the O009b *CLI wiring* advances a session once evidence is green)
+        // from being blocked by a defect this task has no authority to fix.
+        id: String(number),
+        number,
+        state: "open",
+        draft: fields["draft"] === "true",
+        baseBranch: fields["base"] ?? this.defaultBranch,
+        headBranch: fields["head"] ?? "",
+        title: fields["title"] ?? "",
+        body: fields["body"] ?? "",
+      };
+      this.prs.push(pr);
+      const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
+      value = this.#snapshot(pr, sha);
+    } else if (/\/pulls\/[1-9][0-9]*$/u.test(endpoint) && method === "GET") {
+      const number = Number(endpoint.split("/").pop());
+      const pr = this.prs.find((candidate) => candidate.number === number);
+      if (pr === undefined) return err(domainError("not_found"));
+      const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
+      value = this.#snapshot(pr, sha);
+    } else if (/\/pulls\/[1-9][0-9]*$/u.test(endpoint) && method === "PATCH") {
+      const number = Number(endpoint.split("/").pop());
+      const pr = this.prs.find((candidate) => candidate.number === number);
+      if (pr === undefined) return err(domainError("not_found"));
+      if (fields["state"] === "closed") pr.state = "closed";
+      const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
+      value = this.#snapshot(pr, sha);
+    } else if (endpoint.includes("/check-runs")) {
+      const shaMatch = /\/commits\/([0-9a-f]{40})\/check-runs/u.exec(endpoint);
+      const page = /[?&]page=([0-9]+)/u.exec(endpoint)?.[1] ?? "1";
+      const checks =
+        shaMatch !== null && page === "1"
+          ? [
+              {
+                name: "CI",
+                status:
+                  this.ciConclusion === null ? ("in_progress" as const) : ("completed" as const),
+                conclusion: this.ciConclusion,
+                url: null,
+              },
+            ]
+          : [];
+      value = { totalCount: checks.length, checks };
+    } else if (endpoint.includes("/statuses/") && method === "POST") {
+      const sha = endpoint.split("/statuses/")[1] ?? "";
+      const list = this.statusesBySha.get(sha) ?? [];
+      const entry = {
+        context: fields["context"] ?? "",
+        state: fields["state"] ?? "",
+        description: fields["description"] ?? null,
+        targetUrl: fields["target_url"] ?? null,
+      };
+      const existingIndex = list.findIndex((candidate) => candidate.context === entry.context);
+      if (existingIndex >= 0) list[existingIndex] = entry;
+      else list.push(entry);
+      this.statusesBySha.set(sha, list);
+      value = { context: entry.context, state: entry.state };
+    } else if (/\/commits\/[0-9a-f]{40}\/status$/u.test(endpoint) && method === "GET") {
+      const sha = /\/commits\/([0-9a-f]{40})\/status$/u.exec(endpoint)?.[1] ?? "";
+      // The review status this fixture reports is driven by `this.reviewState`, not just
+      // whatever was POSTed, so tests can simulate a review gate that never went green.
+      const posted = this.statusesBySha.get(sha) ?? [];
+      const reviewContext = posted.find((entry) => entry.context === "agent-team/review");
+      const statuses =
+        this.reviewState === null || reviewContext === undefined
+          ? []
+          : [{ ...reviewContext, state: this.reviewState }];
+      value = { sha, statuses };
+    } else if (endpoint.includes("/git/ref/heads/")) {
+      const branch = decodeURIComponent(endpoint.split("/git/ref/heads/")[1] ?? "");
+      const sha = await realRefSha(this.bareRemote, branch);
+      if (sha === undefined) return err(domainError("not_found"));
+      value = { object: { sha } };
+    } else if (
+      endpoint === "graphql" &&
+      fields["query"]?.includes("markPullRequestReadyForReview")
+    ) {
+      const pr = this.prs.find((candidate) => candidate.id === fields["pullRequestId"]);
+      if (pr === undefined) return err(domainError("not_found"));
+      pr.draft = false;
+      value = {
+        data: { markPullRequestReadyForReview: { pullRequest: { id: pr.id, isDraft: false } } },
+      };
+    } else if (/\/issues\/[1-9][0-9]*\/comments(?:\?.*)?$/u.test(endpoint) && method === "GET") {
+      const number = Number(/\/issues\/([1-9][0-9]*)\/comments(?:\?.*)?$/u.exec(endpoint)?.[1]);
+      const markerMatch = /contains\((".*?")\)/u.exec(jq);
+      const marker = markerMatch !== null ? (JSON.parse(markerMatch[1] ?? '""') as string) : "";
+      const comments = this.commentsByNumber.get(number) ?? [];
+      const matches = comments.filter((comment) => comment.body.includes(marker));
+      value = { count: matches.length, matches };
+    } else if (
+      endpoint.includes("/issues/") &&
+      endpoint.endsWith("/comments") &&
+      method === "POST"
+    ) {
+      const number = Number(/\/issues\/([1-9][0-9]*)\/comments$/u.exec(endpoint)?.[1]);
+      const id = `comment-${String(this.#nextCommentId)}`;
+      this.#nextCommentId += 1;
+      const comment: FakeComment = {
+        id,
+        url: `https://github.test/owner/sandbox/pull/${String(number)}#${id}`,
+        body: fields["body"] ?? "",
+        createdAt: new Date().toISOString(),
+      };
+      const list = this.commentsByNumber.get(number) ?? [];
+      list.push(comment);
+      this.commentsByNumber.set(number, list);
+      value = {
+        id: comment.id,
+        url: comment.url,
+        createdAt: comment.createdAt,
+        body: comment.body,
+      };
+    } else {
+      value = {};
+    }
+    const parsed = schema.safeParse(value);
+    return parsed.success ? ok(parsed.data) : err(domainError("external_failure"));
+  }
+}
+
+/* -------------------------------------------------------------------------------------------- *
+ * Linear fixture, extended from the O006 integration test's own buildLinearFixture: this test
+ * needs a *pre-existing* audit issue (the draft's linearAuditIssueId, never created through this
+ * fixture) and genuine per-issue comment tracking (O006's own fixture always answered
+ * AgentTeamReadIssueComments with an empty list, since it never needed comment dedup).
+ * -------------------------------------------------------------------------------------------- */
+interface FakeLinearIssue {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string;
+  priority: number;
+  updatedAt: string;
+  teamId: string;
+  projectId: string;
+  stateId: string;
+  labelIds: string[];
+  comments: { id: string; body: string; createdAt: string }[];
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * `LinearIssueAuditCommentWriter.appendComment` delegates to `LinearReadModel.readContext`, which
+ * needs a *complete* catalog (buildLinearReadCatalog in model.ts requires one state per
+ * `linearWorkStatusNames` entry and all four label groups populated) -- an empty or partial
+ * label/state set fails closed with zero calls ever reaching the mutation. This mirrors the
+ * O006 integration test's own `buildLinearFixture` catalog construction exactly, extended with a
+ * pre-existing audit issue (never created through this fixture, matching how a real Setup draft
+ * always names an *existing* Linear issue) and genuine per-issue comment tracking (O006's own
+ * fixture always answered AgentTeamReadIssueComments with an empty list, since it never needed
+ * comment dedup).
+ */
+function buildLinearAuditFixture(teamId: string, projectId: string, auditIssueId: string) {
+  const states = Object.entries(linearWorkStatusNames).map(([status, name], index) => ({
+    id: `state-${status}-${String(index)}`,
+    name,
+    type: status,
+  }));
+  const backlogStateId =
+    states.find((state) => state.name === linearWorkStatusNames.backlog)?.id ?? states[0]?.id ?? "";
+
+  interface WireLinearLabel {
+    readonly id: string;
+    readonly name: string;
+    readonly isGroup: boolean;
+    readonly parent: Readonly<{ id: string }> | null;
+  }
+  function group(groupName: string, id: string): WireLinearLabel {
+    return { id, name: groupName, isGroup: true, parent: null };
+  }
+  function child(name: string, parentId: string, id: string): WireLinearLabel {
+    return { id, name, isGroup: false, parent: { id: parentId } };
+  }
+  const groupIds = {
+    agentRole: "label-group-agent-role",
+    reviewRequirement: "label-group-review-requirement",
+    agentStatus: "label-group-agent-status",
+    blockingReason: "label-group-blocking-reason",
+  };
+  const labels: WireLinearLabel[] = [
+    group("Agent 角色", groupIds.agentRole),
+    ...Object.entries(linearAgentRoleNames).map(([key, name], index) =>
+      child(name, groupIds.agentRole, `label-agent-role-${key}-${String(index)}`),
+    ),
+    group("審查需求", groupIds.reviewRequirement),
+    ...Object.entries(linearReviewRequirementNames).map(([key, name], index) =>
+      child(name, groupIds.reviewRequirement, `label-review-requirement-${key}-${String(index)}`),
+    ),
+    group("Agent 狀態", groupIds.agentStatus),
+    ...Object.entries(linearAgentStatusNames).map(([key, name], index) =>
+      child(name, groupIds.agentStatus, `label-agent-status-${key}-${String(index)}`),
+    ),
+    group("阻塞原因", groupIds.blockingReason),
+    ...Object.entries(linearBlockingReasonNames).map(([key, name], index) =>
+      child(name, groupIds.blockingReason, `label-blocking-reason-${key}-${String(index)}`),
+    ),
+  ];
+
+  const issues: FakeLinearIssue[] = [
+    {
+      id: auditIssueId,
+      identifier: "AUDIT-1",
+      title: "Setup audit",
+      description: "",
+      priority: 0,
+      updatedAt: new Date().toISOString(),
+      teamId,
+      projectId,
+      stateId: backlogStateId,
+      labelIds: [],
+      comments: [],
+    },
+  ];
+  let commentSequence = 0;
+
+  async function fakeFetch(
+    _url: string | URL | Request,
+    init: RequestInit = {},
+  ): Promise<Response> {
+    await Promise.resolve();
+    const parsedBody = JSON.parse(init.body as string) as {
+      readonly operationName: string;
+      readonly variables: Readonly<Record<string, unknown>>;
+    };
+    const { operationName, variables } = parsedBody;
+    const emptyPage = { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } };
+    switch (operationName) {
+      case "AgentTeamReadIdentity":
+        return jsonResponse({
+          data: {
+            team:
+              variables["teamId"] === teamId ? { id: teamId, name: "Sandbox", key: "SBX" } : null,
+            project:
+              variables["projectId"] === projectId
+                ? { id: projectId, name: "Sandbox Project" }
+                : null,
+          },
+        });
+      case "AgentTeamReadProjectTeams":
+        return jsonResponse({
+          data: {
+            project: {
+              teams: { nodes: [{ id: teamId }], pageInfo: { hasNextPage: false, endCursor: null } },
+            },
+          },
+        });
+      case "AgentTeamReadStates":
+        return jsonResponse({
+          data: {
+            team: { states: { nodes: states, pageInfo: { hasNextPage: false, endCursor: null } } },
+          },
+        });
+      case "AgentTeamReadLabels":
+        return jsonResponse({
+          data: {
+            issueLabels: { nodes: labels, pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        });
+      case "AgentTeamReadIssue": {
+        const issue = issues.find((candidate) => candidate.id === variables["issueId"]);
+        if (issue === undefined) return jsonResponse({ data: { issue: null } });
+        return jsonResponse({
+          data: {
+            issue: {
+              id: issue.id,
+              identifier: issue.identifier,
+              title: issue.title,
+              description: issue.description,
+              priority: issue.priority,
+              updatedAt: issue.updatedAt,
+              team: { id: issue.teamId },
+              project: { id: issue.projectId },
+              state: { id: issue.stateId },
+            },
+          },
+        });
+      }
+      case "AgentTeamReadIssueLabels":
+        return jsonResponse({ data: { issue: { labels: emptyPage } } });
+      case "AgentTeamReadIssueRelations":
+        return jsonResponse({ data: { issue: { relations: emptyPage } } });
+      case "AgentTeamReadIssueInverseRelations":
+        return jsonResponse({ data: { issue: { inverseRelations: emptyPage } } });
+      case "AgentTeamReadIssueComments": {
+        const issue = issues.find((candidate) => candidate.id === variables["issueId"]);
+        return jsonResponse({
+          data: {
+            issue:
+              issue === undefined
+                ? null
+                : {
+                    comments: {
+                      nodes: issue.comments,
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                    },
+                  },
+          },
+        });
+      }
+      case "AgentTeamCreateComment": {
+        // The real mutation nests `issueId` inside `input`, not as a top-level variable -- see
+        // LinearMutationClient's own call: `variables: { input: { issueId, body, ... } }`.
+        const input = variables["input"] as Readonly<Record<string, unknown>>;
+        const issue = issues.find((candidate) => candidate.id === input["issueId"]);
+        if (issue === undefined) {
+          return jsonResponse({ data: { commentCreate: { success: false, comment: null } } });
+        }
+        commentSequence += 1;
+        const comment = {
+          id: `comment-${String(commentSequence)}`,
+          body: String(input["body"]),
+          createdAt: new Date().toISOString(),
+        };
+        issue.comments.push(comment);
+        return jsonResponse({
+          data: {
+            commentCreate: {
+              success: true,
+              comment: { id: comment.id, body: comment.body, createdAt: comment.createdAt },
+            },
+          },
+        });
+      }
+      default:
+        throw new Error(`fixture does not model operation ${operationName}`);
+    }
+  }
+
+  return { fetch: fakeFetch, backlogStateId, issues };
+}
+
+const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+
+async function writeDraft(agentTeamHome: string, checkout: string): Promise<void> {
+  const directory = join(agentTeamHome, "config", "registration");
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    join(directory, `${projectId}.draft.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      project: {
+        schemaVersion: 1,
+        id: projectId,
+        displayName: "Sandbox",
+        localRepositoryPath: checkout,
+        defaultBranch: "main",
+        workManagement: {
+          provider: "linear",
+          containerId: "team-1",
+          projectId: "linear-project-1",
+        },
+        sourceControl: { provider: "github", repository: "owner/sandbox" },
+      },
+      config: {
+        schemaVersion: 1,
+        projectId,
+        defaultBranch: "main",
+        platforms: {
+          workManagement: {
+            provider: "linear",
+            containerId: "team-1",
+            projectId: "linear-project-1",
+          },
+          sourceControl: { provider: "github", repository: "owner/sandbox" },
+        },
+        projectRules: ["Run quality checks."],
+        roleInstructions: { implementer: ["Stay in scope."] },
+        commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
+      },
+      linearAuditIssueId: "LINEAR-AUDIT-1",
+    }),
+    "utf8",
+  );
+}
+
+async function* stream(chunk: string): AsyncIterable<string> {
+  await Promise.resolve();
+  yield chunk;
+}
+
+describe("O009b registration setup CLI: refresh is the only exit from ci_waiting", () => {
+  it("advances ci_waiting all the way to awaiting_user_approval once CI and review are genuinely green", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009b-home-green-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition: (options) =>
+        buildRegistrationSetupComposition({
+          ...options,
+          githubTransport: github,
+          linearFetch: linear.fetch,
+        }),
+    });
+
+    const startResult = await handlers.setupStart({ projectId });
+    expect(startResult.state).toBe("success");
+    expect((JSON.parse(startResult.message ?? "") as { readonly state: string }).state).toBe(
+      "ci_waiting",
+    );
+
+    // Post the exact commit status the real gate-evidence read requires, exactly as the real
+    // sandbox's own CI/review workflow would (agent-team/review context), so this genuinely
+    // exercises the fixture's read path rather than asserting on an internal flag.
+    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    if (headSha === undefined) throw new Error("expected a pushed setup branch head");
+    github.statusesBySha.set(headSha, [
+      {
+        context: "agent-team/review",
+        state: "success",
+        description: null,
+        targetUrl: "https://review.test/1",
+      },
+    ]);
+    github.ciConclusion = "success";
+    github.reviewState = "success";
+
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition: (options) =>
+        buildRegistrationSetupComposition({
+          ...options,
+          githubTransport: github,
+          linearFetch: linear.fetch,
+        }),
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+
+    expect(refreshResult.state).toBe("success");
+    const refreshPayload = JSON.parse(refreshResult.message ?? "") as { readonly state: string };
+    expect(refreshPayload.state).toBe("awaiting_user_approval");
+    expect(linear.issues[0]?.comments).toHaveLength(1);
+    expect(github.commentsByNumber.get(github.prs[0]?.number ?? -1)).toHaveLength(1);
+  }, 30_000);
+
+  it("leaves the session exactly at ci_waiting -- never advancing -- when CI has not gone green yet", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009b-home-pending-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main");
+    github.ciConclusion = null; // CI still running: no check-run named "CI" observed yet
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition: (options) =>
+        buildRegistrationSetupComposition({
+          ...options,
+          githubTransport: github,
+          linearFetch: linear.fetch,
+        }),
+    });
+    await handlers.setupStart({ projectId });
+
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition: (options) =>
+        buildRegistrationSetupComposition({
+          ...options,
+          githubTransport: github,
+          linearFetch: linear.fetch,
+        }),
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+
+    // The engine's raw refresh() outcome reports "not_ready"/"ci_pending" at the top level for
+    // this case (CI not yet completed) -- the *session*'s own phase is what must stay exactly
+    // "ci_waiting", never falsely advancing.
+    expect(refreshResult.state).toBe("success");
+    const refreshPayload = JSON.parse(refreshResult.message ?? "") as {
+      readonly state: string;
+      readonly reason?: string;
+      readonly session: { readonly phase: string };
+    };
+    expect(refreshPayload.state).toBe("not_ready");
+    expect(refreshPayload.reason).toBe("pending");
+    expect(refreshPayload.session.phase).toBe("ci_waiting");
+    expect(linear.issues[0]?.comments).toHaveLength(0);
+    expect(github.commentsByNumber.size).toBe(0);
+  }, 30_000);
+});

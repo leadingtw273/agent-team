@@ -78,11 +78,14 @@ describe("registration setup status/resume: fail-closed on missing configuration
 
     const status = await handlers.setupStatus({ projectId: "proj-1" });
     const resume = await handlers.setupResume({ projectId: "proj-1" });
+    const refresh = await handlers.setupRefresh({ projectId: "proj-1" });
 
     expect(status.state).toBe("blocked");
     expect(JSON.parse(status.message ?? "")).toMatchObject({ reason: "linear_api_key_missing" });
     expect(resume.state).toBe("blocked");
     expect(JSON.parse(resume.message ?? "")).toMatchObject({ reason: "linear_api_key_missing" });
+    expect(refresh.state).toBe("blocked");
+    expect(JSON.parse(refresh.message ?? "")).toMatchObject({ reason: "linear_api_key_missing" });
   });
 
   it("reports the controller's read model on success", async () => {
@@ -131,5 +134,116 @@ describe("registration setup status/resume: fail-closed on missing configuration
       operation: "registration_setup_status",
       state: "preview_ready",
     });
+  });
+});
+
+describe("registration setup refresh (O009b: the only command that can advance ci_waiting)", () => {
+  it("reads the current setupSessionId first, then calls controller.refresh with it, and reports the advanced state", async () => {
+    const readModel = Object.freeze({
+      state: "ci_waiting" as const,
+      evidence: [],
+      nextStep: "重新讀取同一 Head 的 CI 與 agent-team/review 狀態。",
+      preview: {
+        setupSessionId: "setup-refresh-1",
+        projectId: "proj-1",
+        projectName: "Sandbox",
+        repository: "owner/sandbox",
+        defaultBranch: "main",
+        baseRevision: "a".repeat(40),
+        previewDigest: "b".repeat(64),
+        requirementsDigest: "c".repeat(64),
+        linearAuditIssueId: "LINEAR-AUDIT-1",
+      },
+    });
+    const refreshedModel = Object.freeze({
+      state: "awaiting_user_approval" as const,
+      evidence: [],
+      nextStep: "先簽發本機 UI 核可 intent，再以第二次操作要求 SQUASH merge。",
+      preview: readModel.preview,
+      session: {
+        setupSessionId: "setup-refresh-1",
+        revision: 2,
+        phase: "awaiting_user_approval" as const,
+        pullRequestUrl: "https://github.test/owner/sandbox/pull/1",
+        changeRequestId: "1",
+        headSha: "d".repeat(40),
+        diffDigest: "e".repeat(64),
+        ciPassed: true,
+        freshReviewPassed: true,
+      },
+    });
+    const read = vi.fn(() => Promise.resolve(readModel));
+    const refresh =
+      vi.fn<
+        import("../../src/application/registration/index.js").RegistrationSetupControllerUseCase["refresh"]
+      >();
+    refresh.mockResolvedValue(refreshedModel);
+    const buildComposition = vi.fn<typeof buildRegistrationSetupComposition>(() =>
+      Promise.resolve({
+        state: "ready",
+        composition: { controller: { read, refresh } },
+      } as never),
+    );
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome: "/nonexistent",
+      buildComposition,
+    });
+
+    const result = await handlers.setupRefresh({ projectId: "proj-1" });
+
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    const refreshCommand = refresh.mock.calls[0]?.[0] as unknown;
+    expect(refreshCommand).toMatchObject({ setupSessionId: "setup-refresh-1" });
+    expect(result.state).toBe("success");
+    expect(JSON.parse(result.message ?? "")).toMatchObject({
+      operation: "registration_setup_refresh",
+      state: "awaiting_user_approval",
+    });
+  });
+
+  it("never calls controller.refresh when read() has no preview yet (nothing to refresh)", async () => {
+    const incompleteModel = Object.freeze({
+      state: "configuration_incomplete" as const,
+      evidence: [{ code: "draft_source_unwired", message: "unused" }],
+      nextStep: "unused",
+    });
+    const read = vi.fn(() => Promise.resolve(incompleteModel));
+    const refresh = vi.fn(() => Promise.resolve(incompleteModel));
+    const buildComposition = vi.fn<typeof buildRegistrationSetupComposition>(() =>
+      Promise.resolve({
+        state: "ready",
+        composition: { controller: { read, refresh } },
+      } as never),
+    );
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome: "/nonexistent",
+      buildComposition,
+    });
+
+    const result = await handlers.setupRefresh({ projectId: "proj-1" });
+
+    expect(refresh).not.toHaveBeenCalled();
+    expect(result.state).toBe("blocked");
+    expect(JSON.parse(result.message ?? "")).toMatchObject({
+      operation: "registration_setup_refresh",
+      state: "configuration_incomplete",
+    });
+  });
+
+  it("uses ensureWorktreeDirectories: true, same as start/approve/resume (mutation-capable: writes gate evidence and audit receipts)", async () => {
+    const buildComposition = vi.fn<typeof buildRegistrationSetupComposition>(() =>
+      Promise.resolve({ state: "blocked", reason: "draft_unavailable" }),
+    );
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome: "/nonexistent",
+      buildComposition,
+    });
+
+    await handlers.setupRefresh({ projectId: "proj-1" });
+
+    expect(buildComposition).toHaveBeenCalledWith(
+      expect.objectContaining({ ensureWorktreeDirectories: true }),
+    );
   });
 });
