@@ -8,6 +8,7 @@
  * tests.
  */
 import type {
+  RegistrationProbeBranchCleanupPort,
   RegistrationProbeGitHubCapabilityPort,
   RegistrationProbeGitPort,
   RegistrationProbeLinearPort,
@@ -47,11 +48,18 @@ export type SeedResetGithubReadPort = Pick<
   "findDraftPullRequestByHead"
 >;
 
+/** E006b: the exact same port O006 uses for its own probe-branch delete, injected here with an
+ * independent instance scoped to E006's own `agent-team/e2e/` namespace (see
+ * seed-reset-adapters.ts) -- never the O006 production instance, never able to touch a branch in
+ * O006's `agent-team/probe/` namespace. */
+export type SeedResetBranchCleanupPort = RegistrationProbeBranchCleanupPort;
+
 export interface SeedResetPorts {
   readonly linear: SeedResetLinearPort;
   readonly git: SeedResetGitPort;
   readonly sourceControl: SeedResetSourceControlPort;
   readonly github: SeedResetGithubReadPort;
+  readonly branchCleanup: SeedResetBranchCleanupPort;
 }
 
 export type {

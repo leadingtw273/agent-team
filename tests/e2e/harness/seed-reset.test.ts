@@ -52,8 +52,11 @@ interface FakePullRequest {
 interface FakeWorld {
   readonly linearIssues: Map<string, FakeLinearIssue>;
   nextLinearIssueId: number;
-  readonly worktrees: Map<string, { branch: string; headSha: string }>;
+  readonly worktrees: Map<string, { branch: string; headSha: string; commitMessage?: string }>;
   readonly remoteBranches: Map<string, string>;
+  /** Commit message at each branch's current pushed head -- the fake analogue of the real
+   * adapter's "re-read the commit message and check it contains the marker" step. */
+  readonly remoteBranchMarkers: Map<string, string>;
   readonly pullRequests: Map<number, FakePullRequest>;
   nextPrNumber: number;
   readonly calls: string[];
@@ -65,6 +68,7 @@ function freshWorld(): FakeWorld {
     nextLinearIssueId: 1,
     worktrees: new Map(),
     remoteBranches: new Map(),
+    remoteBranchMarkers: new Map(),
     pullRequests: new Map(),
     nextPrNumber: 100,
     calls: [],
@@ -139,7 +143,10 @@ function fakePorts(world: FakeWorld): SeedResetPorts {
         world.calls.push(`git.commit:${command.worktree.path}`);
         const sha = "c".repeat(40);
         const worktree = world.worktrees.get(command.worktree.path);
-        if (worktree !== undefined) worktree.headSha = sha;
+        if (worktree !== undefined) {
+          worktree.headSha = sha;
+          worktree.commitMessage = command.message;
+        }
         return Promise.resolve(ok({ sha, branch: command.worktree.branch }));
       },
       push: (worktree, remote) => {
@@ -147,6 +154,7 @@ function fakePorts(world: FakeWorld): SeedResetPorts {
         const tracked = world.worktrees.get(worktree.path);
         const sha = tracked?.headSha ?? worktree.headSha;
         world.remoteBranches.set(worktree.branch, sha);
+        world.remoteBranchMarkers.set(worktree.branch, tracked?.commitMessage ?? "");
         return Promise.resolve(ok({ remote, branch: worktree.branch, sha }));
       },
       removeWorktree: (worktree) => {
@@ -162,6 +170,23 @@ function fakePorts(world: FakeWorld): SeedResetPorts {
       inspectRemoteBranch: (_repository, _remote, branch) => {
         const sha = world.remoteBranches.get(branch);
         return Promise.resolve(ok(sha === undefined ? undefined : { sha }));
+      },
+    },
+    branchCleanup: {
+      deleteOwnedBranch: (command) => {
+        world.calls.push(`branchCleanup.deleteOwnedBranch:${command.branch}`);
+        const sha = world.remoteBranches.get(command.branch);
+        if (sha === undefined) return Promise.resolve(ok({ state: "not_found" as const }));
+        if (sha.toLowerCase() !== command.expectedHeadSha.toLowerCase()) {
+          return Promise.resolve(err(domainError("conflict")));
+        }
+        const message = world.remoteBranchMarkers.get(command.branch) ?? "";
+        if (!message.includes(command.marker)) {
+          return Promise.resolve(err(domainError("conflict")));
+        }
+        world.remoteBranches.delete(command.branch);
+        world.remoteBranchMarkers.delete(command.branch);
+        return Promise.resolve(ok({ state: "deleted" as const }));
       },
     },
     github: {
@@ -256,19 +281,19 @@ function fullSeedCommand(): SeedCaseCommand {
       remote: "origin",
       repository: "owner/sandbox",
       baseBranch: "main",
-      branchName: "agent-team-e2e/e101",
+      branchName: "agent-team/e2e/e101",
     },
     githubDraftPullRequest: {
       repository: "owner/sandbox",
       baseBranch: "main",
-      headBranch: "agent-team-e2e/e101",
+      headBranch: "agent-team/e2e/e101",
       title: "E101 sandbox PR",
       body: "Seeded by the E006 harness for case E101.",
     },
     localWorktree: {
       localRepository: { rootPath: "/tmp/e2e-repo" },
       path: "/tmp/e2e-repo-worktrees/e101",
-      branchName: "agent-team-e2e/e101-scratch",
+      branchName: "agent-team/e2e/e101-scratch",
       startPoint: "main",
     },
   };
@@ -313,7 +338,7 @@ describe("seedCase", () => {
       githubDraftPullRequest: {
         repository: "owner/sandbox",
         baseBranch: "main",
-        headBranch: "agent-team-e2e/e101",
+        headBranch: "agent-team/e2e/e101",
         title: "E101 sandbox PR",
         body: "Seeded by the E006 harness for case E101.",
       },
@@ -382,8 +407,10 @@ describe("resetCase", () => {
     expect(actions.get("linearIssue")).toBe("would_clean");
     expect(actions.get("githubDraftPullRequest")).toBe("would_clean");
     expect(actions.get("localWorktree")).toBe("would_clean");
-    // The disclosed capability gap: branch deletion always requires_manual, dry-run or not.
-    expect(actions.get("githubBranch")).toBe("requires_manual");
+    // E006b: the branch is eligible in this same dry-run pass because its sibling PR "would"
+    // resolve first (processing order: PR before branch) -- dry-run simulates exactly what a
+    // real pass would do, without ever mutating anything.
+    expect(actions.get("githubBranch")).toBe("would_clean");
 
     // A dry-run must never write a resolution back into the manifest either.
     const reloaded = await store.load(caseRunId);
@@ -392,7 +419,7 @@ describe("resetCase", () => {
     expect(reloaded.value.entries.every((entry) => entry.resolution === undefined)).toBe(true);
   });
 
-  it("cleans up every real entry it can, and flags the branch as requires_manual", async () => {
+  it("cleans up every real entry, including the branch once its PR is resolved (E006b)", async () => {
     const world = freshWorld();
     const store = await temporaryStore();
     await seedCase(fakePorts(world), store, fullSeedCommand(), clock);
@@ -405,7 +432,7 @@ describe("resetCase", () => {
     expect(actions.get("linearIssue")).toBe("confirmed_now");
     expect(actions.get("githubDraftPullRequest")).toBe("confirmed_now");
     expect(actions.get("localWorktree")).toBe("confirmed_now");
-    expect(actions.get("githubBranch")).toBe("requires_manual");
+    expect(actions.get("githubBranch")).toBe("confirmed_now");
 
     // Real-world effects, all scoped to exactly the manifest's own objects.
     const linearId = [...world.linearIssues.keys()][0];
@@ -415,8 +442,8 @@ describe("resetCase", () => {
     expect(prNumber).toBeDefined();
     if (prNumber !== undefined) expect(world.pullRequests.get(prNumber)?.state).toBe("closed");
     expect(world.worktrees.has("/tmp/e2e-repo-worktrees/e101")).toBe(false);
-    // The branch itself was never touched -- no delete capability exists.
-    expect(world.remoteBranches.has("agent-team-e2e/e101")).toBe(true);
+    // The branch was genuinely deleted, only after its PR closed.
+    expect(world.remoteBranches.has("agent-team/e2e/e101")).toBe(false);
   });
 
   it("is idempotent: an already-confirmed entry is reported confirmed without any further port calls", async () => {
@@ -434,10 +461,126 @@ describe("resetCase", () => {
     expect(actions.get("linearIssue")).toBe("already_confirmed");
     expect(actions.get("githubDraftPullRequest")).toBe("already_confirmed");
     expect(actions.get("localWorktree")).toBe("already_confirmed");
-    // Only linearIssue/PR/worktree became "confirmed" on the first pass (githubBranch never
-    // does), so exactly those three skip every port call on the second pass -- the fourth
-    // (githubBranch) still re-evaluates every time (a no-op read, no mutation either way).
+    expect(actions.get("githubBranch")).toBe("already_confirmed");
+    // Every kind became "confirmed" on the first pass, so all four skip every port call
+    // (including the branch's own read-only pre-check) on the second pass.
     expect(world.calls.length).toBe(callsAfterFirstReset);
+  });
+
+  it("does not delete the branch until its sibling PR is actually resolved (E006b)", async () => {
+    const world = freshWorld();
+    const store = await temporaryStore();
+    await seedCase(fakePorts(world), store, fullSeedCommand(), clock);
+    const [prNumber] = world.pullRequests.keys();
+    expect(prNumber).toBeDefined();
+
+    // Sabotage the PR close so its own readback always reports "open" (a close that never
+    // actually takes), simulating a PR that stays unresolved for this whole pass.
+    const ports = fakePorts(world);
+    const stuckPorts: SeedResetPorts = {
+      ...ports,
+      sourceControl: {
+        ...ports.sourceControl,
+        closeChangeRequest: () =>
+          Promise.resolve(
+            ok({
+              id: "PR_node_stuck",
+              number: prNumber ?? 0,
+              url: "https://github.test/owner/sandbox/pull/stuck",
+              state: "open" as const,
+              draft: true,
+              baseBranch: "main",
+              headBranch: "agent-team/e2e/e101",
+              headSha: "d".repeat(40),
+              mergeability: "unknown" as const,
+              autoMergeEnabled: false,
+              updatedAt: "2026-08-06T12:00:00.000Z" as never,
+            }),
+          ),
+      },
+    };
+
+    const result = await resetCase(stuckPorts, store, caseRunId, clock, { dryRun: false });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const actions = new Map(result.value.entries.map((entry) => [entry.kind, entry.action]));
+    expect(actions.get("githubDraftPullRequest")).toBe("requires_manual");
+    expect(actions.get("githubBranch")).toBe("requires_manual");
+    const branchOutcome = result.value.entries.find((entry) => entry.kind === "githubBranch");
+    expect(branchOutcome?.reason).toBe("branch_not_eligible_pr_unresolved");
+    // The branch itself was never even read, let alone deleted.
+    expect(world.calls.some((call) => call.startsWith("branchCleanup.deleteOwnedBranch:"))).toBe(
+      false,
+    );
+    expect(world.remoteBranches.has("agent-team/e2e/e101")).toBe(true);
+  });
+
+  it("deletes a standalone branch (no sibling PR) directly", async () => {
+    const world = freshWorld();
+    const store = await temporaryStore();
+    const standaloneRunId = "e2e-e103-11112222";
+    const seeded = await seedCase(
+      fakePorts(world),
+      store,
+      {
+        caseId: "E103",
+        caseRunId: standaloneRunId,
+        githubBranch: {
+          localRepository: { rootPath: "/tmp/e2e-repo" },
+          worktreeRoot: "/tmp/e2e-repo-worktrees",
+          remote: "origin",
+          repository: "owner/sandbox",
+          baseBranch: "main",
+          branchName: "agent-team/e2e/e103-standalone",
+        },
+      },
+      clock,
+    );
+    expect(seeded.ok).toBe(true);
+    expect(world.remoteBranches.has("agent-team/e2e/e103-standalone")).toBe(true);
+
+    const result = await resetCase(fakePorts(world), store, standaloneRunId, clock, {
+      dryRun: false,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.entries[0]?.action).toBe("confirmed_now");
+    expect(world.remoteBranches.has("agent-team/e2e/e103-standalone")).toBe(false);
+  });
+
+  it("rejects (requires_manual, never deletes) a branch whose readback marker no longer matches", async () => {
+    const world = freshWorld();
+    const store = await temporaryStore();
+    const standaloneRunId = "e2e-e104-33334444";
+    await seedCase(
+      fakePorts(world),
+      store,
+      {
+        caseId: "E104",
+        caseRunId: standaloneRunId,
+        githubBranch: {
+          localRepository: { rootPath: "/tmp/e2e-repo" },
+          worktreeRoot: "/tmp/e2e-repo-worktrees",
+          remote: "origin",
+          repository: "owner/sandbox",
+          baseBranch: "main",
+          branchName: "agent-team/e2e/e104-hijacked",
+        },
+      },
+      clock,
+    );
+    // Simulate the branch having been reused: its head commit no longer carries this run's
+    // marker (e.g. someone force-pushed unrelated content).
+    world.remoteBranchMarkers.set("agent-team/e2e/e104-hijacked", "an unrelated commit");
+
+    const result = await resetCase(fakePorts(world), store, standaloneRunId, clock, {
+      dryRun: false,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.entries[0]?.action).toBe("requires_manual");
+    expect(result.value.entries[0]?.reason).toBe("branch_ownership_mismatch");
+    expect(world.remoteBranches.has("agent-team/e2e/e104-hijacked")).toBe(true);
   });
 
   it("rejects (requires_manual, never mutates) when the readback marker no longer matches", async () => {
