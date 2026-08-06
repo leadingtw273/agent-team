@@ -703,6 +703,7 @@ async function ensureCiChecked(
   const draftPr = run.draftPullRequest;
   if (draftPr === undefined) return { failure: { stage: "ci_check", reason: "ci_check_missing" } };
   const readOptions = readOptionsFrom(command);
+  let everObservedRequiredCheck = false;
 
   for (let attempt = 0; attempt < poll.maxAttempts; attempt += 1) {
     if (attempt > 0) await poll.wait(poll.intervalMs);
@@ -722,6 +723,7 @@ async function ensureCiChecked(
       (check) => check.name === registrationProbeRequiredCheckName,
     );
     if (required === undefined) continue;
+    everObservedRequiredCheck = true;
     if (required.status !== "completed") continue;
     if (required.conclusion !== "success") {
       await journal.persist(withFailure(journal.current, "ci_check", "ci_check_failed"));
@@ -739,7 +741,9 @@ async function ensureCiChecked(
     return {};
   }
 
-  const reason: RegistrationProbeFailureReason = "ci_check_pending";
+  const reason: RegistrationProbeFailureReason = everObservedRequiredCheck
+    ? "ci_check_pending"
+    : "ci_check_missing";
   await journal.persist(withFailure(journal.current, "ci_check", reason));
   return { failure: { stage: "ci_check", reason } };
 }
@@ -839,7 +843,8 @@ async function ensureWebhookSynthetic(
       !/^[a-f0-9]{64}$/u.test(outcome.inboxSha256)
     ) {
       const reason: RegistrationProbeFailureReason =
-        outcome.state === "failed" && outcome.reason === "response_too_slow"
+        (outcome.state === "failed" && outcome.reason === "response_too_slow") ||
+        (outcome.state === "verified" && outcome.latencyMs > registrationProbeMaximumWebhookAckMs)
           ? "webhook_latency_exceeded"
           : outcome.state === "failed" && outcome.reason === "transport_failed"
             ? "webhook_transport_failed"
