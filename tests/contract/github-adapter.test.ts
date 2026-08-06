@@ -384,6 +384,72 @@ describe("GitHub source-control adapter", () => {
     conflict.expectDone();
   });
 
+  it("O009d: squash-merges directly via REST PUT .../merge with an atomic sha guard, idempotent on already-merged, conflict on stale head or closed PR", async () => {
+    const successTransport = new ScriptedTransport([
+      { value: pull() },
+      {
+        assert: (arguments_) => {
+          expect(arguments_).toContain("PUT");
+          expect(arguments_.some((argument) => argument.includes("/pulls/42/merge"))).toBe(true);
+          expect(arguments_).toContain("merge_method=squash");
+          expect(arguments_).toContain(`sha=${sha}`);
+        },
+        value: { merged: true },
+      },
+      { value: pull({ state: "merged" }) },
+    ]);
+    const merged = await new GitHubAdapter(successTransport).squashMergeChangeRequest(
+      reference,
+      sha,
+      mutation,
+    );
+    expect(merged.ok && merged.value.state).toBe("merged");
+    successTransport.expectDone();
+
+    // Idempotent: already-merged never even issues the PUT.
+    const alreadyMergedTransport = new ScriptedTransport([{ value: pull({ state: "merged" }) }]);
+    const alreadyMerged = await new GitHubAdapter(alreadyMergedTransport).squashMergeChangeRequest(
+      reference,
+      sha,
+      mutation,
+    );
+    expect(alreadyMerged.ok && alreadyMerged.value.state).toBe("merged");
+    alreadyMergedTransport.expectDone();
+
+    // Stale head: conflict, no PUT attempted.
+    const staleHeadTransport = new ScriptedTransport([{ value: pull({ headSha: nextSha }) }]);
+    const staleHead = await new GitHubAdapter(staleHeadTransport).squashMergeChangeRequest(
+      reference,
+      sha,
+      mutation,
+    );
+    expect(staleHead.ok ? "ok" : staleHead.error.code).toBe("conflict");
+    staleHeadTransport.expectDone();
+
+    // Closed (never merged): conflict, no PUT attempted.
+    const closedTransport = new ScriptedTransport([{ value: pull({ state: "closed" }) }]);
+    const closed = await new GitHubAdapter(closedTransport).squashMergeChangeRequest(
+      reference,
+      sha,
+      mutation,
+    );
+    expect(closed.ok ? "ok" : closed.error.code).toBe("conflict");
+    closedTransport.expectDone();
+
+    // GitHub's own response says the merge did not actually happen: fails closed.
+    const notMergedTransport = new ScriptedTransport([
+      { value: pull() },
+      { value: { merged: false } },
+    ]);
+    const notMerged = await new GitHubAdapter(notMergedTransport).squashMergeChangeRequest(
+      reference,
+      sha,
+      mutation,
+    );
+    expect(notMerged.ok).toBe(false);
+    notMergedTransport.expectDone();
+  });
+
   it("closes an open PR with read-back and never closes a merged PR", async () => {
     const transport = new ScriptedTransport([
       { value: pull() },

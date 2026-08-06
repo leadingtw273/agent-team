@@ -120,6 +120,7 @@ const readyForReviewMutationSchema = z
       .strict(),
   })
   .strict();
+const squashMergeResultSchema = z.object({ merged: z.boolean() }).strict();
 
 const changeRequestProjection =
   '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
@@ -623,6 +624,61 @@ export class GitHubAdapter implements SourceControlPort {
     return readBack.ok &&
       readBack.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase() &&
       readBack.value.autoMergeEnabled
+      ? readBack
+      : failure(readBack.ok ? "external_failure" : readBack.error.code);
+  }
+
+  /**
+   * O009d: `enableAutoMerge` structurally fails on GitHub for a PR that is already fully
+   * mergeable ("Pull request is in clean status", UNPROCESSABLE) -- auto-merge exists precisely
+   * to *wait* for checks that haven't finished yet, and the O005 setup flow only ever reaches
+   * this call once CI and review are already green. Callers (setup-composition.ts's
+   * `squashMerge.enable` fallback) must attempt this directly when `enableAutoMerge` fails.
+   * `sha` is passed on the REST merge call so GitHub itself performs an atomic head-sha
+   * comparison (belt-and-suspenders alongside this method's own pre-check below): a head that
+   * moved between the read and the write is rejected server-side, not silently merged.
+   */
+  async squashMergeChangeRequest(
+    reference: ChangeRequestRef,
+    expectedHeadSha: string,
+    options: MutationOptions,
+  ): Promise<Result<ChangeRequestSnapshot, DomainError>> {
+    const number = changeRequestNumber(reference);
+    if (
+      !validRepository(reference) ||
+      number === undefined ||
+      !mutationAllowed(options) ||
+      !shaPattern.test(expectedHeadSha)
+    ) {
+      return failure();
+    }
+    const current = await this.getChangeRequest(reference, options);
+    if (!current.ok) return current;
+    if (current.value.state === "merged") return current;
+    if (current.value.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      return failure("conflict");
+    }
+    if (current.value.state !== "open") return failure("conflict");
+    const merged = await this.transport.requestJson(
+      [
+        "api",
+        `repos/${repositoryPath(reference)}/pulls/${String(number)}/merge`,
+        "--method",
+        "PUT",
+        ...rawField("merge_method", "squash"),
+        ...rawField("sha", expectedHeadSha),
+        "--jq",
+        "{merged}",
+      ],
+      squashMergeResultSchema,
+      options,
+    );
+    if (!merged.ok) return merged;
+    if (!merged.value.merged) return failure();
+    const readBack = await this.getChangeRequest(reference, options);
+    return readBack.ok &&
+      readBack.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase() &&
+      readBack.value.state === "merged"
       ? readBack
       : failure(readBack.ok ? "external_failure" : readBack.error.code);
   }

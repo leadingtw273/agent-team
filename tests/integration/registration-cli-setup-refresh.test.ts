@@ -103,6 +103,7 @@ interface FakePullRequest {
   headBranch: string;
   title: string;
   body: string;
+  mergeCommitSha?: string;
 }
 
 interface FakeComment {
@@ -140,10 +141,21 @@ class FakeGh implements Pick<
   readonly prs: FakePullRequest[] = [];
   #nextPrNumber = 100;
   #nextCommentId = 1;
+  /**
+   * O009d: real GitHub rejects `enablePullRequestAutoMerge` with "Pull request is in clean
+   * status" (UNPROCESSABLE) once a PR is already fully mergeable -- which the O005 setup flow's
+   * own gate (CI + review both green) guarantees is *always* true by the time this call happens.
+   * Set true to reproduce that structural failure and drive the direct-merge fallback.
+   */
+  simulateCleanStatusOnAutoMerge = false;
 
   constructor(
     readonly bareRemote: string,
     readonly defaultBranch: string,
+    /** Only required by the O009d direct-merge fallback test: lets the fixture perform a *real*
+     * git squash merge (via this same clone) so `mergedConfig.read`'s subsequent GitHub Contents
+     * API reads can be served from genuine post-merge repository state, not invented data. */
+    readonly checkout?: string,
   ) {}
 
   inspectAuthentication() {
@@ -245,12 +257,128 @@ class FakeGh implements Pick<
       this.prs.push(pr);
       const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
       value = this.#snapshot(pr, sha);
+    } else if (
+      /\/pulls\/[1-9][0-9]*$/u.test(endpoint) &&
+      method === "GET" &&
+      jq.includes("mergeCommitSha")
+    ) {
+      // Same REST endpoint as the branch below, but `mergedConfig.read`'s own jq projection asks
+      // for a different (also-real, GitHub-defined) shape of the same underlying PR resource.
+      const number = Number(endpoint.split("/").pop());
+      const pr = this.prs.find((candidate) => candidate.number === number);
+      if (pr === undefined) return err(domainError("not_found"));
+      const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
+      value = {
+        id: pr.id,
+        repository: "owner/sandbox",
+        number: pr.number,
+        state: pr.state,
+        merged: pr.state === "merged",
+        baseBranch: pr.baseBranch,
+        headSha: sha,
+        mergeCommitSha: pr.mergeCommitSha ?? null,
+      };
     } else if (/\/pulls\/[1-9][0-9]*$/u.test(endpoint) && method === "GET") {
       const number = Number(endpoint.split("/").pop());
       const pr = this.prs.find((candidate) => candidate.number === number);
       if (pr === undefined) return err(domainError("not_found"));
       const sha = (await realRefSha(this.bareRemote, pr.headBranch)) ?? "0".repeat(40);
       value = this.#snapshot(pr, sha);
+    } else if (/\/pulls\/[1-9][0-9]*\/merge$/u.test(endpoint) && method === "PUT") {
+      // O009d: the direct-merge fallback's own REST endpoint. Performs a *real* git squash merge
+      // through this fixture's own checkout (same technique as every other endpoint here that
+      // derives values from real git state instead of inventing them) so that a subsequent
+      // `mergedConfig.read` -- which the O005 flow calls immediately after a successful merge --
+      // can be served from genuine post-merge repository content.
+      const number = Number(/\/pulls\/([1-9][0-9]*)\/merge$/u.exec(endpoint)?.[1]);
+      const pr = this.prs.find((candidate) => candidate.number === number);
+      if (pr === undefined || this.checkout === undefined) return err(domainError("not_found"));
+      if (pr.state !== "open" || fields["merge_method"] !== "squash") {
+        return err(domainError("conflict"));
+      }
+      const headSha = await realRefSha(this.bareRemote, pr.headBranch);
+      if (headSha === undefined || fields["sha"] !== headSha) {
+        return err(domainError("conflict"));
+      }
+      await execFileAsync("git", ["-C", this.checkout, "fetch", "-q", "origin"]);
+      await execFileAsync("git", [
+        "-C",
+        this.checkout,
+        "checkout",
+        "-q",
+        "-B",
+        "main",
+        "origin/main",
+      ]);
+      await execFileAsync("git", [
+        "-C",
+        this.checkout,
+        "merge",
+        "-q",
+        "--squash",
+        `origin/${pr.headBranch}`,
+      ]);
+      await execFileAsync("git", [
+        "-C",
+        this.checkout,
+        "commit",
+        "-q",
+        "-m",
+        `Squash merge PR #${String(pr.number)}`,
+      ]);
+      await execFileAsync("git", [
+        "-C",
+        this.checkout,
+        "push",
+        "-q",
+        "origin",
+        "HEAD:refs/heads/main",
+      ]);
+      const mergeCommitSha = await realRefSha(this.bareRemote, "main");
+      if (mergeCommitSha === undefined) return err(domainError("external_failure"));
+      pr.state = "merged";
+      pr.mergeCommitSha = mergeCommitSha;
+      value = { merged: true };
+    } else if (endpoint.includes("/commits/") && endpoint.endsWith(`/${this.defaultBranch}`)) {
+      const sha = await realRefSha(this.bareRemote, this.defaultBranch);
+      if (sha === undefined) return err(domainError("not_found"));
+      value = { sha };
+    } else if (endpoint.includes("/compare/")) {
+      const [baseSha, headSha] = (endpoint.split("/compare/")[1] ?? "").split("...");
+      // This fixture only ever needs to prove the "identical" ancestry case (the squash merge
+      // commit this fixture just created *is* the new default-branch tip) -- see
+      // `exactCompareAncestry` in merged-config.ts.
+      value = {
+        status: baseSha === headSha ? ("identical" as const) : ("ahead" as const),
+        aheadBy: 0,
+        behindBy: 0,
+        totalCommits: 0,
+        baseCommitSha: baseSha,
+        mergeBaseSha: baseSha,
+        commits: [],
+      };
+    } else if (endpoint.includes("/contents/") && method === "GET") {
+      if (this.checkout === undefined) return err(domainError("not_found"));
+      const path = decodeURIComponent(endpoint.split("/contents/")[1] ?? "");
+      const ref = fields["ref"];
+      if (ref === undefined) return err(domainError("external_failure"));
+      const [{ stdout: content }, { stdout: gitSha }] = await Promise.all([
+        execFileAsync("git", ["-C", this.checkout, "show", `${ref}:${path}`]),
+        execFileAsync("git", ["-C", this.checkout, "rev-parse", `${ref}:${path}`]),
+      ]);
+      const encoded = Buffer.from(content, "utf8").toString("base64");
+      value = {
+        type: "file",
+        path,
+        sha: gitSha.trim(),
+        size: Buffer.byteLength(content, "utf8"),
+        encoding: "base64",
+        content: encoded,
+        target: null,
+        submoduleGitUrl: null,
+      };
+    } else if (/^repos\/[^/]+\/[^/]+$/u.test(endpoint) && method === "GET") {
+      value = { repository: "owner/sandbox", defaultBranch: this.defaultBranch };
     } else if (/\/pulls\/[1-9][0-9]*$/u.test(endpoint) && method === "PATCH") {
       const number = Number(endpoint.split("/").pop());
       const pr = this.prs.find((candidate) => candidate.number === number);
@@ -315,6 +443,12 @@ class FakeGh implements Pick<
         data: { markPullRequestReadyForReview: { pullRequest: { id: pr.id, isDraft: false } } },
       };
     } else if (endpoint === "graphql" && fields["query"]?.includes("enablePullRequestAutoMerge")) {
+      if (this.simulateCleanStatusOnAutoMerge) {
+        // O009d's exact real-GitHub repro: "Pull request is in clean status" (UNPROCESSABLE).
+        // GhTransport masks HTTP-error detail into a generic domain error code either way, so a
+        // plain external_failure here is the faithful fixture-level equivalent.
+        return err(domainError("external_failure"));
+      }
       // F-2 regression guard: this is required so `setup approve`'s full merge pipeline (squash
       // merge enablement, driven by the *now-aligned* controller/coordinator approval bindings)
       // can run end to end against this fixture. Deliberately does NOT simulate an actual GitHub
@@ -1119,4 +1253,105 @@ describe("F-2 regression guard: approval binding issue-side (controller) and con
     );
     expect(consumedControl).toMatchObject({ ok: true, value: { state: "verified_and_consumed" } });
   });
+});
+
+/**
+ * O009d regression guard.
+ *
+ * Root cause: on real GitHub, `GitHubAdapter.enableAutoMerge` (GraphQL
+ * `enablePullRequestAutoMerge`) fails with "Pull request is in clean status" (UNPROCESSABLE) once
+ * a PR is already fully mergeable -- and the O005 setup flow only ever calls this after CI and
+ * review are both green, so the PR is *always* already clean by the time `setup approve` reaches
+ * the merge step. `setup approve` therefore failed at `stage=merge` on every real registration,
+ * even with the repository's own `allow_auto_merge` setting enabled (confirmed by direct repro).
+ * The fix (`createGitHubSquashMergePort`'s fallback in setup-composition.ts, and
+ * `GitHubAdapter.squashMergeChangeRequest`, the new REST `PUT .../merge` method) is unit/contract
+ * tested in isolation elsewhere; this test proves the fallback also works wired into the real
+ * CLI end to end -- the exact path the user's own stuck-at-`merge_pending` session needs.
+ */
+describe("O009d regression guard: direct-merge fallback lets setup approve finish on a real-GitHub-shaped PR that is already clean", () => {
+  it("full `setup approve` reaches `activated` when enableAutoMerge structurally fails (real GitHub 'clean status') by falling back to a direct squash merge", async () => {
+    const { checkout, bareRemote } = await realGitRepository();
+    const agentTeamHome = await temporaryRoot("agent-team-o009d-home-direct-merge-");
+    await writeDraft(agentTeamHome, checkout);
+    const github = new FakeGh(bareRemote, "main", checkout);
+    github.simulateCleanStatusOnAutoMerge = true;
+    const linear = buildLinearAuditFixture("team-1", "linear-project-1", "LINEAR-AUDIT-1");
+    const environment = { LINEAR_API_KEY: "unused" };
+    const buildComposition = (options: Parameters<typeof buildRegistrationSetupComposition>[0]) =>
+      buildRegistrationSetupComposition({
+        ...options,
+        githubTransport: github,
+        linearFetch: linear.fetch,
+      });
+
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream("CREATE SETUP DRAFT PR\n"),
+      buildComposition,
+    });
+    await handlers.setupStart({ projectId });
+
+    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    if (headSha === undefined) throw new Error("expected a pushed setup branch head");
+    github.statusesBySha.set(headSha, [
+      {
+        context: "agent-team/review",
+        state: "success",
+        description: null,
+        targetUrl: "https://review.test/1",
+      },
+    ]);
+    github.ciConclusion = "success";
+    github.reviewState = "success";
+
+    const refreshHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      buildComposition,
+    });
+    const refreshResult = await refreshHandlers.setupRefresh({ projectId });
+    expect(refreshResult.state).toBe("success");
+    expect((JSON.parse(refreshResult.message ?? "") as { readonly state: string }).state).toBe(
+      "awaiting_user_approval",
+    );
+
+    const approveHandlers = createRegistrationSetupHandlers({
+      agentTeamHome,
+      environment,
+      stdin: stream(`${registrationSetupFinalApprovalPhrase}\n`),
+      buildComposition,
+    });
+    const approveResult = await approveHandlers.setupApprove({ projectId });
+
+    expect(approveResult.state).toBe("success");
+    const approvePayload = JSON.parse(approveResult.message ?? "") as {
+      readonly state: string;
+      readonly reason?: string;
+      readonly stage?: string;
+    };
+    // The O009d defect's exact symptom before this fix: a `failed`/`portFailure` outcome at
+    // `stage: "merge"`, because `enableAutoMerge` failed and there was no fallback.
+    expect(approvePayload.state).not.toBe("failed");
+    expect(approvePayload.state).toBe("activated");
+
+    expect(github.prs[0]?.state).toBe("merged");
+    expect(github.prs[0]?.autoMergeEnabled).toBe(false); // fallback never touched auto-merge at all
+
+    const registrationSetupRoot = join(agentTeamHome, "state", "registration-setup");
+    const sessionDirectories = (await readdir(registrationSetupRoot)).filter((name) =>
+      name.startsWith("setup-"),
+    );
+    expect(sessionDirectories).toHaveLength(1);
+    const sessionPath = join(registrationSetupRoot, sessionDirectories[0] ?? "", "activation.json");
+    const persisted = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      readonly session: {
+        readonly phase: string;
+        readonly mergeReceipt?: { readonly state: string };
+      };
+    };
+    expect(persisted.session.phase).toBe("activated");
+    expect(persisted.session.mergeReceipt?.state).toBe("merged");
+  }, 30_000);
 });
