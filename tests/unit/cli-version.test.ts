@@ -43,6 +43,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
       setupStart: vi.fn(() => Promise.resolve(outcome)),
       setupStatus: vi.fn(() => Promise.resolve(outcome)),
       setupResume: vi.fn(() => Promise.resolve(outcome)),
+      setupRefresh: vi.fn(() => Promise.resolve(outcome)),
       setupApprove: vi.fn(() => Promise.resolve(outcome)),
       probeRun: vi.fn(() => Promise.resolve(outcome)),
       probeStatus: vi.fn(() => Promise.resolve(outcome)),

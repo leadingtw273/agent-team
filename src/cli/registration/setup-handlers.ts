@@ -20,7 +20,7 @@ export interface CreateRegistrationSetupHandlersOptions {
 
 type SetupHandlers = Pick<
   RegistrationCliHandlers,
-  "setupStart" | "setupStatus" | "setupResume" | "setupApprove"
+  "setupStart" | "setupStatus" | "setupResume" | "setupRefresh" | "setupApprove"
 >;
 
 const blockedMessages: Readonly<Record<string, string>> = Object.freeze({
@@ -97,6 +97,41 @@ export function createRegistrationSetupHandlers(
         context,
       );
       return readModelOutcome("registration_setup_resume", model);
+    },
+
+    /**
+     * O009b (2026-08-06 E004 dry-run defect): `controller.refresh()` -- the only operation that
+     * re-reads CI/`agent-team/review` evidence, posts the audit receipts, and advances
+     * `ci_waiting` onward -- had no CLI entry point at all. `resume` cannot substitute: the
+     * engine's own resume port only accepts `merge_authorized`/`merge_pending`/`activated`
+     * (setup.ts's resume-eligibility gate), and `approve`'s own precondition requires
+     * `awaiting_user_approval` already. Without this command, `ci_waiting` was a dead end on the
+     * CLI even after real CI turned green. `refresh()` requires the exact `setupSessionId` the
+     * engine's own preview derivation is currently using (RegistrationSetupRefreshCommand,
+     * setup-controller.ts) -- read() first, exactly mirroring how setupStart already obtains it
+     * before confirmPreview/start.
+     *
+     * No stdin confirmation: refresh is an idempotent, evidence-driven *advance*, not a new
+     * mutation decision -- it never creates anything a human needs to explicitly authorize (the
+     * three phrases remain start/approve/probe-run only, per the O009 packet).
+     */
+    async setupRefresh(input) {
+      const built = await requireReadyComposition(options, input, true);
+      if (!built.ready) return built.outcome;
+      const controller = built.composition.controller;
+      const context = { authorityDigest: freshAuthorityDigest() };
+      const current = await controller.read(context);
+      if (current.preview === undefined) {
+        return readModelOutcome("registration_setup_refresh", current);
+      }
+      const refreshed = await controller.refresh(
+        {
+          setupSessionId: current.preview.setupSessionId,
+          idempotencyKeyPrefix: `cli-setup-refresh:${randomUUID()}`,
+        },
+        context,
+      );
+      return readModelOutcome("registration_setup_refresh", refreshed);
     },
 
     async setupStart(input) {

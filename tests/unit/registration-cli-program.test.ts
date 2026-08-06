@@ -48,6 +48,7 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
       setupStart: vi.fn(() => Promise.resolve(outcome)),
       setupStatus: vi.fn(() => Promise.resolve(outcome)),
       setupResume: vi.fn(() => Promise.resolve(outcome)),
+      setupRefresh: vi.fn(() => Promise.resolve(outcome)),
       setupApprove: vi.fn(() => Promise.resolve(outcome)),
       probeRun: vi.fn(() => Promise.resolve(outcome)),
       probeStatus: vi.fn(() => Promise.resolve(outcome)),
@@ -87,6 +88,14 @@ describe("O009 registration CLI command parsing", () => {
     await expect(
       runCli(
         metadata,
+        ["registration", "setup", "refresh", "--project", "proj-1"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(cliExitCodes.success);
+    await expect(
+      runCli(
+        metadata,
         ["registration", "setup", "approve", "--project", "proj-1"],
         commands,
         sink.io,
@@ -110,6 +119,7 @@ describe("O009 registration CLI command parsing", () => {
     });
     expect(commands.registration.setupStatus).toHaveBeenCalledWith({ projectId: "proj-1" });
     expect(commands.registration.setupResume).toHaveBeenCalledWith({ projectId: "proj-1" });
+    expect(commands.registration.setupRefresh).toHaveBeenCalledWith({ projectId: "proj-1" });
     expect(commands.registration.setupApprove).toHaveBeenCalledWith({
       projectId: "proj-1",
       draftPath: undefined,
@@ -126,6 +136,7 @@ describe("O009 registration CLI command parsing", () => {
       ["registration", "setup", "start"],
       ["registration", "setup", "status"],
       ["registration", "setup", "resume"],
+      ["registration", "setup", "refresh"],
       ["registration", "setup", "approve"],
       ["registration", "probe", "run"],
       ["registration", "probe", "status"],
@@ -136,6 +147,7 @@ describe("O009 registration CLI command parsing", () => {
     expect(commands.registration.setupStart).not.toHaveBeenCalled();
     expect(commands.registration.setupStatus).not.toHaveBeenCalled();
     expect(commands.registration.setupResume).not.toHaveBeenCalled();
+    expect(commands.registration.setupRefresh).not.toHaveBeenCalled();
     expect(commands.registration.setupApprove).not.toHaveBeenCalled();
     expect(commands.registration.probeRun).not.toHaveBeenCalled();
     expect(commands.registration.probeStatus).not.toHaveBeenCalled();
