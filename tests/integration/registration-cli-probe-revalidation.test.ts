@@ -1090,3 +1090,257 @@ describe("O009 F-1 regression: probe run must not replay a cached verified resul
     expect(secondResolved.value).toEqual({ runId, resumed: true });
   }, 30_000);
 });
+
+/**
+ * O009e regression test: the exact real-world deadlock this task fixes (journal evidence:
+ * ~/.agent-team/state/registration-probe/journal/probe-0f7ae61f75df480f89ac7827d1bea156.json).
+ * Linear issue creation succeeds, then `branch_push` fails for real (this test uses a remote name
+ * that does not exist, so the real `RegistrationProbeGitAdapter`'s push genuinely fails) --
+ * exactly the shape of the real incident: `linearIssue` ends up confirmed, but `draftPullRequest`/
+ * `remoteBranch`/`localWorktree` never get journal evidence for this run. Before this fix, that
+ * left the run stuck forever at `cleanup_required` (remoteBranch patched straight to `failed`/
+ * `cleanup_failed` at the moment of failure, draftPullRequest/localWorktree stuck at `pending`
+ * since their own cleanup steps were gated on evidence this run would never produce) --
+ * `resolveRegistrationProbeRunId` would keep resuming the same doomed runId forever, and the
+ * project could never get a fresh probe again.
+ */
+describe("O009e regression: a run whose draft PR/branch/worktree were never created still converges to a genuine terminal state", () => {
+  it("converges to terminal failed via authoritative absence readbacks, and the next probe run gets a genuinely fresh runId that actually re-probes", async () => {
+    const repository = "owner/sandbox";
+    const teamId = "team-o009e";
+    const linearProjectId = "linear-project-o009e";
+    const { checkout, bareRemote } = await realGitRepository();
+    const project = buildProject(repository, checkout, teamId, linearProjectId);
+    const activationMarker: RegistrationSetupActivationMarker = Object.freeze({
+      schemaVersion: 1,
+      source: "source_control_default_branch",
+      setupSessionId: `${setupSessionId}-o009e`,
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      changeRequestId: "PR_setup_o009e_1",
+      setupHeadSha,
+      mergeCommitSha,
+      authoritativeRevision: mergeCommitSha,
+      defaultBranch: project.defaultBranch,
+      configDigest: hex("config-o009e"),
+      linearAuditIssueId: "LINEAR-AUDIT-O009E-1",
+      gateEvidenceDigest: hex("gate-o009e") as never,
+      auditReceiptsDigest: hex("audit-o009e") as never,
+      approvalSource: "local_ui",
+      approvalReferenceDigest: hex("approval-reference-o009e") as never,
+      approvalConsumeOperationDigest: hex("consume-operation-o009e") as never,
+      authorityDigest: hex("authority-o009e"),
+      approvalNonceDigest: hex("nonce-o009e"),
+    });
+    const mergedConfigReceipt: RegistrationSetupMergedConfigReceipt = Object.freeze({
+      schemaVersion: 1,
+      source: "source_control_default_branch",
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      changeRequestId: activationMarker.changeRequestId,
+      setupHeadSha,
+      mergeCommitSha,
+      defaultBranch: project.defaultBranch,
+      authoritativeRevision: mergeCommitSha,
+      path: ".agent-team/project.json",
+      configDigest: activationMarker.configDigest,
+      config: trustedProjectConfigSchema.parse({
+        schemaVersion: 1,
+        projectId: project.id,
+        defaultBranch: project.defaultBranch,
+        platforms: { workManagement: project.workManagement, sourceControl: project.sourceControl },
+        projectRules: ["Run quality checks."],
+        roleInstructions: { implementer: ["Stay in scope."] },
+        commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
+      }),
+    });
+
+    // O009e: rejects every push with a `pre-receive` hook, reproducing "branch_push fails for a
+    // reason unrelated to the remote's own validity" (the real incident's root cause was a
+    // createWorktree conflict; this test achieves the same *shape* -- push genuinely never lands
+    // -- through a mechanism that keeps `origin` itself perfectly valid for reads, so
+    // `inspectRemoteBranch`'s later absence check reports a clean, authoritative "not found" for
+    // the probe branch specifically, not a read error for the whole remote).
+    await writeFile(join(bareRemote, "hooks", "pre-receive"), "#!/bin/sh\nexit 1\n", {
+      mode: 0o755,
+    });
+    await chmod(join(bareRemote, "hooks", "pre-receive"), 0o755);
+
+    const fakeGh = new FakeGh(bareRemote, repository, project.defaultBranch);
+    const linear = buildLinearFixture(teamId, linearProjectId);
+    const journalDirectory = await temporaryRoot("agent-team-o009e-journal-");
+    const journal = new FileRegistrationProbeJournalStore(journalDirectory);
+    const allowedWorktreeRoot = await temporaryRoot("agent-team-o009e-worktrees-");
+    const agentTeamHome = await temporaryRoot("agent-team-o009e-home-");
+    const githubSecret = Buffer.from("o009e-github-secret-0123456789");
+    const linearSecret = Buffer.from("o009e-linear-secret-0123456789");
+    const runtime = await realLoopbackRuntime(agentTeamHome, githubSecret, linearSecret);
+
+    // Counts createWorktree calls (proof of genuine re-probing on the second run) exactly like
+    // the F-1 test above.
+    const createWorktreeCalls: unknown[] = [];
+    const linearCreateCalls: unknown[] = [];
+    const realGitAdapter = new RegistrationProbeGitAdapter();
+    const countedGit: RegistrationProbePorts["git"] = Object.freeze({
+      createWorktree: (
+        command_: Parameters<RegistrationProbePorts["git"]["createWorktree"]>[0],
+        options: Parameters<RegistrationProbePorts["git"]["createWorktree"]>[1],
+      ) => {
+        createWorktreeCalls.push(command_);
+        return realGitAdapter.createWorktree(command_, options);
+      },
+      stagePaths: realGitAdapter.stagePaths.bind(realGitAdapter),
+      commit: realGitAdapter.commit.bind(realGitAdapter),
+      inspectWorkingTree: realGitAdapter.inspectWorkingTree.bind(realGitAdapter),
+      push: realGitAdapter.push.bind(realGitAdapter),
+      removeWorktree: realGitAdapter.removeWorktree.bind(realGitAdapter),
+      inspectRepository: realGitAdapter.inspectRepository.bind(realGitAdapter),
+      inspectRemoteBranch: realGitAdapter.inspectRemoteBranch.bind(realGitAdapter),
+    });
+    const countedLinear = Object.freeze({
+      readCapability: linear.adapter.readCapability.bind(linear.adapter),
+      findByMarker: linear.adapter.findByMarker.bind(linear.adapter),
+      read: linear.adapter.read.bind(linear.adapter),
+      cancel: linear.adapter.cancel.bind(linear.adapter),
+      create: (
+        command_: Parameters<typeof linear.adapter.create>[0],
+        options: Parameters<typeof linear.adapter.create>[1],
+      ) => {
+        linearCreateCalls.push(command_);
+        return linear.adapter.create(command_, options);
+      },
+    });
+
+    const ports: RegistrationProbePorts = {
+      activation: {
+        readActivation: (id) =>
+          Promise.resolve(
+            ok(id === activationMarker.setupSessionId ? activationMarker : undefined),
+          ),
+      },
+      mergedConfig: { read: () => Promise.resolve(ok(mergedConfigReceipt)) },
+      linear: countedLinear,
+      githubCapability: new RegistrationProbeGitHubCapabilityAdapter(fakeGh),
+      sourceControl: new GitHubAdapter(fakeGh),
+      git: countedGit,
+      files: new RegistrationProbeFileAdapter(),
+      webhook: new RegistrationProbeWebhookAdapter({
+        transport: new NodeWebhookRuntimeTransport(),
+        inbox: runtime.inbox,
+        clock: createFixedClock(new Date().toISOString() as never),
+        createDeliveryId: () => `o009e-delivery-${randomUUID()}`,
+      }),
+      providerEvents: new RegistrationProbeProviderEventAdapter(runtime.inbox),
+      branchCleanup: new RegistrationProbeBranchCleanupAdapter(fakeGh),
+      journal,
+    };
+
+    // --- Run 1: branch_push fails for real (nonexistent remote) -- Linear already succeeded,
+    // but draftPullRequest/remoteBranch/localWorktree evidence is never captured for this run. ---
+    const firstResolved = await resolveRegistrationProbeRunId(journal, project.id);
+    if (!firstResolved.ok) throw new Error(firstResolved.error.code);
+    expect(firstResolved.value.resumed).toBe(false);
+    const firstRunId = firstResolved.value.runId;
+    const firstCommand: RegistrationProbeStartCommand = Object.freeze({
+      project,
+      setupSessionId: activationMarker.setupSessionId,
+      registrationRevision: 1,
+      runId: firstRunId,
+      worktreePath: join(allowedWorktreeRoot, firstRunId),
+      gitRemote: "origin",
+      linearWorkflowStateId: linear.backlogStateId,
+      authority: authorityFor({
+        projectId: project.id,
+        setupSessionId: activationMarker.setupSessionId,
+        registrationRevision: 1,
+      }),
+      webhookBaseUrls: Object.freeze({ github: runtime.baseUrl, linear: runtime.baseUrl }),
+      webhookSecrets: Object.freeze({ github: githubSecret, linear: linearSecret }),
+    });
+    const coordinator1 = createRegistrationProbeCoordinator({ ports, allowedWorktreeRoot });
+    const firstOutcome = await coordinator1.start(firstCommand);
+
+    // This is the exact real-incident shape: linearIssue confirmed, everything downstream of the
+    // failed push confirmed *absent* (never "pending"/"failed" forever) -- reaching genuine
+    // terminal "failed", not stuck at "cleanup_required".
+    expect(firstOutcome.state).toBe("failed");
+    if (firstOutcome.state === "failed") {
+      expect(firstOutcome.stage).toBe("branch_push");
+      expect(firstOutcome.run.cleanup).toMatchObject({
+        linearIssue: { state: "confirmed", reason: "confirmed_cancelled" },
+        draftPullRequest: { state: "confirmed", reason: "confirmed_absent" },
+        remoteBranch: { state: "confirmed", reason: "confirmed_absent" },
+        // The worktree genuinely exists on disk (createWorktree succeeded before the real push
+        // failed) -- proving this run's absence-checks correctly distinguish "never created"
+        // (draftPullRequest/remoteBranch) from "exists, must be actually removed" (localWorktree).
+        localWorktree: { state: "confirmed", reason: "confirmed_removed" },
+      });
+    }
+    expect(createWorktreeCalls).toHaveLength(1);
+    expect(linearCreateCalls).toHaveLength(1);
+    expect(fakeGh.prs).toHaveLength(0);
+
+    // --- The now-terminal run must never be resumed again: the next probe for this project
+    // gets a genuinely fresh runId. ---
+    const secondResolved = await resolveRegistrationProbeRunId(journal, project.id);
+    if (!secondResolved.ok) throw new Error(secondResolved.error.code);
+    expect(secondResolved.value.resumed).toBe(false);
+    expect(secondResolved.value.runId).not.toBe(firstRunId);
+    const secondRunId = secondResolved.value.runId;
+
+    // The remote now accepts pushes again -- this run's own doomed push rejection was a one-time
+    // injected condition, not a permanent property of the remote.
+    await rm(join(bareRemote, "hooks", "pre-receive"), { force: true });
+
+    // --- Run 2 (fresh runId, real remote this time): proves it is a genuine new probe, not a
+    // replay -- every fake/real port is actually invoked again from zero. ---
+    let providerEventsSent = false;
+    const coordinator2 = createRegistrationProbeCoordinator({
+      ports,
+      allowedWorktreeRoot,
+      providerEventPoll: {
+        maxAttempts: 2,
+        intervalMs: 0,
+        wait: async () => {
+          if (providerEventsSent) return;
+          providerEventsSent = true;
+          const linearIssue = linear.issues.at(-1);
+          const pr = fakeGh.prs.at(-1);
+          if (linearIssue === undefined || pr === undefined) return;
+          const headSha = await realRefSha(bareRemote, pr.headBranch);
+          await deliverProviderEvent(runtime.baseUrl, "github", githubSecret, {
+            action: "opened",
+            pull_request: { number: pr.number, head: { sha: headSha } },
+          });
+          await deliverProviderEvent(runtime.baseUrl, "linear", linearSecret, {
+            action: "update",
+            type: "Issue",
+            webhookTimestamp: Date.now(),
+            data: { id: linearIssue.id },
+          });
+        },
+      },
+    });
+    const secondCommand: RegistrationProbeStartCommand = Object.freeze({
+      ...firstCommand,
+      runId: secondRunId,
+      worktreePath: join(allowedWorktreeRoot, secondRunId),
+      gitRemote: "origin",
+    });
+    const secondOutcome = await coordinator2.start(secondCommand);
+
+    // A second, genuinely fresh attempt against a *working* remote reaches all the way to
+    // "verified" -- proving the first run's terminal "failed" state was not itself some kind of
+    // poisoning of this project's ability to ever probe again, and that every port genuinely
+    // re-ran from zero rather than replaying anything.
+    if (secondOutcome.state !== "verified") {
+      throw new Error(
+        `expected second run verified, got ${JSON.stringify(secondOutcome, null, 2)}`,
+      );
+    }
+    expect(secondOutcome.run.runId).toBe(secondRunId);
+    expect(createWorktreeCalls).toHaveLength(2);
+    expect(linearCreateCalls).toHaveLength(2);
+    expect(fakeGh.prs).toHaveLength(1);
+  }, 30_000);
+});
