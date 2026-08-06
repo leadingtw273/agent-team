@@ -19,8 +19,27 @@ export type CliCommandOutcome = Readonly<
   | { state: "success"; message?: string }
   | { state: "failed"; message: string }
   | { state: "blocked"; message: string }
+  /**
+   * Usage-level rejection with guaranteed zero side effects (e.g. a wrong stdin confirmation
+   * phrase). Distinct from `blocked` (missing configuration): maps to exit code 2, mirroring how
+   * Commander's own argument-parsing errors are reported.
+   */
+  | { state: "rejected"; message: string }
   | { state: "interrupted"; message: string }
 >;
+
+export interface RegistrationCliHandlers {
+  readonly setupStart: (
+    input: Readonly<{ projectId: string; draftPath?: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly setupStatus: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+  readonly setupResume: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+  readonly setupApprove: (
+    input: Readonly<{ projectId: string; draftPath?: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly probeRun: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+  readonly probeStatus: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+}
 
 export interface CliHandlers {
   readonly run: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
@@ -32,6 +51,7 @@ export interface CliHandlers {
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
   readonly ui: () => Promise<CliCommandOutcome>;
   readonly systemd: (input: SystemdCommandInput) => Promise<CliCommandOutcome>;
+  readonly registration: RegistrationCliHandlers;
 }
 
 export interface CliIo {
@@ -50,6 +70,15 @@ function blocked(command: string): Promise<CliCommandOutcome> {
   });
 }
 
+const defaultRegistrationHandlers: RegistrationCliHandlers = Object.freeze({
+  setupStart: () => blocked("registration setup start"),
+  setupStatus: () => blocked("registration setup status"),
+  setupResume: () => blocked("registration setup resume"),
+  setupApprove: () => blocked("registration setup approve"),
+  probeRun: () => blocked("registration probe run"),
+  probeStatus: () => blocked("registration probe status"),
+});
+
 export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
   ingest: () => blocked("ingest"),
@@ -58,6 +87,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   project: () => blocked("project"),
   ui: () => blocked("ui"),
   systemd: () => blocked("systemd"),
+  registration: defaultRegistrationHandlers,
 });
 
 const defaultIo: CliIo = Object.freeze({
@@ -73,6 +103,8 @@ function outcomeExitCode(outcome: CliCommandOutcome): number {
       return cliExitCodes.failure;
     case "blocked":
       return cliExitCodes.blocked;
+    case "rejected":
+      return cliExitCodes.usage;
     case "interrupted":
       return cliExitCodes.interrupted;
   }
@@ -152,6 +184,68 @@ export function createProgram(
     .command("ui")
     .description("啟動按需 localhost 管理介面")
     .action(action(state, io, handlers.ui));
+
+  const registration = program
+    .command("registration")
+    .description("Registration Setup 與主動 Probe 的最小 CLI 接線");
+
+  const setup = registration.command("setup").description("驅動 Registration Setup 精靈");
+  setup
+    .command("start")
+    .description("以 stdin 確認字串建立 Setup Draft PR")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .option("--draft <path>", "覆寫預設 host draft 檔路徑")
+    .action((options: { readonly project: string; readonly draft?: string }) =>
+      action(state, io, () =>
+        handlers.registration.setupStart({
+          projectId: options.project,
+          ...(options.draft === undefined ? {} : { draftPath: options.draft }),
+        }),
+      )(),
+    );
+  setup
+    .command("status")
+    .description("讀取目前 Setup 狀態（唯讀）")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.registration.setupStatus({ projectId: options.project }))(),
+    );
+  setup
+    .command("resume")
+    .description("重新整理／恢復進行中的 Setup 流程")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.registration.setupResume({ projectId: options.project }))(),
+    );
+  setup
+    .command("approve")
+    .description("以 stdin 確認字串核可並 SQUASH merge Setup PR")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .option("--draft <path>", "覆寫預設 host draft 檔路徑")
+    .action((options: { readonly project: string; readonly draft?: string }) =>
+      action(state, io, () =>
+        handlers.registration.setupApprove({
+          projectId: options.project,
+          ...(options.draft === undefined ? {} : { draftPath: options.draft }),
+        }),
+      )(),
+    );
+
+  const probe = registration.command("probe").description("驅動 O006 主動 Registration Probe");
+  probe
+    .command("run")
+    .description("以 stdin 確認字串觸發一次完整 Full Revalidation")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.registration.probeRun({ projectId: options.project }))(),
+    );
+  probe
+    .command("status")
+    .description("讀取目前 Probe 執行狀態（唯讀）")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.registration.probeStatus({ projectId: options.project }))(),
+    );
 
   const systemd = program.command("systemd").description("管理 Agent Team 的 systemd user timer");
   const dryRunOptions = (command: Command): Command =>

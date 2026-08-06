@@ -39,6 +39,14 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     project: vi.fn(() => Promise.resolve(outcome)),
     ui: vi.fn(() => Promise.resolve(outcome)),
     systemd: vi.fn(() => Promise.resolve(outcome)),
+    registration: {
+      setupStart: vi.fn(() => Promise.resolve(outcome)),
+      setupStatus: vi.fn(() => Promise.resolve(outcome)),
+      setupResume: vi.fn(() => Promise.resolve(outcome)),
+      setupApprove: vi.fn(() => Promise.resolve(outcome)),
+      probeRun: vi.fn(() => Promise.resolve(outcome)),
+      probeStatus: vi.fn(() => Promise.resolve(outcome)),
+    },
   } satisfies CliHandlers;
 }
 
@@ -60,6 +68,7 @@ describe("agent-team CLI contract", () => {
         health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑
         project [project-id]         讀取指定專案或列出專案摘要
         ui                           啟動按需 localhost 管理介面
+        registration                 Registration Setup 與主動 Probe 的最小 CLI 接線
         systemd                      管理 Agent Team 的 systemd user timer
         help [command]               display help for command
       "
@@ -138,7 +147,11 @@ describe("agent-team CLI contract", () => {
     const sink = output();
 
     await expect(runCli(metadata, argv, commands, sink.io)).resolves.toBe(cliExitCodes.usage);
-    expect(Object.values(commands).every((handler) => handler.mock.calls.length === 0)).toBe(true);
+    const { registration, ...topLevel } = commands;
+    expect(Object.values(topLevel).every((handler) => handler.mock.calls.length === 0)).toBe(true);
+    expect(Object.values(registration).every((handler) => handler.mock.calls.length === 0)).toBe(
+      true,
+    );
     expect(sink.stderr()).not.toBe("");
   });
 

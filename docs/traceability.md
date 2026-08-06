@@ -27,7 +27,7 @@
 | SPEC-13 | Node 24、TypeScript、設定分層、檔案式狀態 | B002-B005、F001-F012、C001 | 編譯 CLI、架構 Contract、Crash／Lock／Schema Test | 已規劃 |
 | SPEC-14 | localhost 管理 UI、安全 Session、中文表單 | U001-U008 | Browser、CSRF、Session、axe、視覺 Review | 已規劃 |
 | SPEC-15 | Linear、GitHub、Webhook Runtime Adapters | S004-S006、A001-A010、W001-W005 | Capability Matrix、Contract Fixture、真 Probe | 已規劃 |
-| SPEC-16 | 專案註冊、Setup PR、可信設定、健康狀態 | C001、O001-O008、E004 | Registration State Test、Setup PR、主動 Probe | 已規劃 |
+| SPEC-16 | 專案註冊、Setup PR、可信設定、健康狀態 | C001、O001-O009、E004 | Registration State Test、Setup PR、主動 Probe、`agent-team registration` CLI | 已規劃 |
 | SPEC-17 | 獨立 `agent-team-sandbox` 與完整驗證情境 | E001-E118 | Sandbox CI、代碼／雙重審查、Failure E2E、Soak | 已規劃 |
 | SPEC-18 | 第一版八項驗收出口 | E101-E118、D001-D005 | 本文件「第一版驗收出口」八列證據 | 已規劃 |
 | SPEC-19 | 高階實作順序與核可後可執行 Plan | B001-B006、S001-D005 | Plan SHA、Task DAG、Phase Gate | 已規劃 |
