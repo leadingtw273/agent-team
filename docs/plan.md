@@ -351,7 +351,7 @@ Sandbox 是獨立小型 Node 24 專案，提供一個可觀察功能、一個可
 
 | ID | Task 與輸出 | 依賴 | 修改範圍 | 驗證與證據 | 預估 |
 |---|---|---|---|---|---|
-| E005 | 建立 E2E Harness 與跨四來源 Evidence Collector | E004 | 核心 `tests/e2e/` | 缺任一來源即 Case 不得綠 | 30m |
+| E005 | 建立 E2E Harness 與跨四來源 Evidence Collector（2026-08-06 完成）：`tests/e2e/harness/`——`EvidenceCollectorPorts`＋`collectEvidence()` 對 linear/github/localEvents/checkpoints 四源獨立平行讀取，任一 `missing` 即 `finalizeEvidenceCollection` 判定 `not_green`（固定 `EvidenceMissingReason` enum：read_error/not_found/empty_result/case_incomplete），`EvidenceBundle` 為 zod strict schema（`schemaVersion:1`）。`ports.ts` 唯讀包裝既有 `LinearReadModel`/`GitHubAdapter`/`readEventLog`/`DurableInbox`／`createAgentTeamUserLayout` 佈局；checkpoint 讀取因 src/** 只有 `persist`（無 read-back port）而在 harness 本地新增 `checkpoint-reader.ts`（僅萃取 F008 schema 頂層 scalar 欄位，非通用 YAML parser，非升級觸發——不動 src/**）。`localEvents` 涵蓋既有 `state.events` JSONL 與 `state.inbox`（兩者目前尚無 production 寫入路徑，讀取路徑與 layout 皆為既有定義，屬 forward-compatible）。vitest 無專屬 config，`pnpm test`（裸 `vitest run`）預設 glob 已涵蓋 `tests/e2e/**`（已查證：檔案數從 139→143，`test:contract`/`test:integration` 因 path-scoped 不受影響）。Smoke 測試以 `E005_SMOKE_*`/`LINEAR_API_KEY` 環境變數 gate，未設定即整組 `describe.skipIf` 跳過（local-only，不進 CI／`pnpm test` 預設仍會執行但直接 skip） | E004 | 核心 `tests/e2e/` | 缺任一來源即 Case 不得綠 | 30m |
 | E006 | 建立 Case Seed／Reset 工具，僅能清理自身建立且具 Run ID 的 Sandbox 物件 | E005 | `tests/e2e/harness/` | Dry-run 列全量；Scope 外物件拒絕；重跑冪等 | 30m |
 | E007 | 建立 Evidence Validator：Linear／GitHub／Local Event／Checkpoint 對帳 | E005 | `tests/e2e/evidence/` | 刻意缺一來源、錯 SHA、錯時間線都必紅 | 30m |
 | E008 | 建立 E101-E118 Aggregate Report，不執行模型工作，只彙整各 Case 結果 | E006-E007 | `tests/e2e/report/` | 任何 Case 缺證據時總報告必紅 | 25m |
