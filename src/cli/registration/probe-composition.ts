@@ -26,6 +26,7 @@ import { DurableInbox } from "../../infrastructure/events/index.js";
 import {
   createRegistrationProbeCoordinator,
   type RegistrationProbeCoordinatorUseCase,
+  type RegistrationProbePollOptions,
   type RegistrationProbeStartCommand,
 } from "../../application/registration/index.js";
 import type { WebhookRuntimeTransport } from "../probe/index.js";
@@ -38,6 +39,7 @@ import { defaultRegistrationDraftPath, loadHostRegistrationSetupDraft } from "./
 import {
   defaultRegistrationProbeConfigPath,
   loadHostRegistrationProbeConfig,
+  type RegistrationProbeConfigPollOverride,
 } from "./probe-config-store.js";
 import { readLinearApiKey, readSecretFile } from "./secrets.js";
 
@@ -80,6 +82,64 @@ export interface BuildRegistrationProbeCompositionOptions {
   readonly providerEventPoll?: Parameters<
     typeof createRegistrationProbeCoordinator
   >[0]["providerEventPoll"];
+}
+
+function realWait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * O009f: the O006 engine's own `defaultPoll` (proactive-probe.ts) is
+ * `{maxAttempts: 1, intervalMs: 0}` -- a single, immediate, zero-wait check, deliberately kept
+ * exactly that way because a large share of the engine's own unit tests depend on that
+ * synchronous-immediate default. This composition root previously only forwarded `ciPoll`/
+ * `statusPoll`/`providerEventPoll` to the coordinator when a *caller* (i.e. a test) explicitly
+ * passed one; production's own CLI handler never did, so every real `probe run` silently fell
+ * back to that same single-shot test default -- checking CI/status/webhook-provider-events
+ * exactly once, with no wait at all, then giving up.
+ *
+ * Confirmed live (E004 sandbox dry run, PR #2, GitHub Actions run 31100709913): CI genuinely ran
+ * and genuinely succeeded, and cleanup genuinely converged -- the coordinator had simply already
+ * given up (`ci_check_missing`) long before any of that finished. These are the real production
+ * defaults now always used unless a caller (test) or the host's own probe-config JSON explicitly
+ * overrides them (see `RegistrationProbeConfigPollOverride` in probe-config-store.ts).
+ */
+const defaultProductionCiPoll: RegistrationProbePollOptions = Object.freeze({
+  // 40 * 15s = 10 minutes: comfortably covers the sandbox's own observed ~2 minute CI run plus
+  // realistic GitHub Actions queueing slack.
+  maxAttempts: 40,
+  intervalMs: 15_000,
+  wait: realWait,
+});
+const defaultProductionStatusPoll: RegistrationProbePollOptions = Object.freeze({
+  // 10 * 3s = 30 seconds: the review status write this polls for is this same process's own
+  // just-completed setCommitStatus call settling into readback, not an independent external
+  // system with its own long-tail latency.
+  maxAttempts: 10,
+  intervalMs: 3_000,
+  wait: realWait,
+});
+const defaultProductionProviderEventPoll: RegistrationProbePollOptions = Object.freeze({
+  // 36 * 5s = 3 minutes: webhook delivery is normally seconds-scale; this ceiling is deliberately
+  // generous only to absorb provider-side delivery retries/backoff, not because a healthy
+  // delivery is ever expected to take anywhere near this long.
+  maxAttempts: 36,
+  intervalMs: 5_000,
+  wait: realWait,
+});
+
+function resolvePoll(
+  explicit: RegistrationProbePollOptions | undefined,
+  configOverride: RegistrationProbeConfigPollOverride | undefined,
+  fallback: RegistrationProbePollOptions,
+): RegistrationProbePollOptions {
+  if (explicit !== undefined) return explicit;
+  if (configOverride === undefined) return fallback;
+  return Object.freeze({
+    maxAttempts: configOverride.maxAttempts,
+    intervalMs: configOverride.intervalMs,
+    wait: realWait,
+  });
 }
 
 /**
@@ -220,11 +280,17 @@ export async function buildRegistrationProbeComposition(
   const coordinator = createRegistrationProbeCoordinator({
     ports,
     allowedWorktreeRoot,
-    ...(options.ciPoll === undefined ? {} : { ciPoll: options.ciPoll }),
-    ...(options.statusPoll === undefined ? {} : { statusPoll: options.statusPoll }),
-    ...(options.providerEventPoll === undefined
-      ? {}
-      : { providerEventPoll: options.providerEventPoll }),
+    ciPoll: resolvePoll(options.ciPoll, probeConfig.value.poll?.ciPoll, defaultProductionCiPoll),
+    statusPoll: resolvePoll(
+      options.statusPoll,
+      probeConfig.value.poll?.statusPoll,
+      defaultProductionStatusPoll,
+    ),
+    providerEventPoll: resolvePoll(
+      options.providerEventPoll,
+      probeConfig.value.poll?.providerEventPoll,
+      defaultProductionProviderEventPoll,
+    ),
   });
 
   return Object.freeze({
