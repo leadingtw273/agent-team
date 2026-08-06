@@ -54,6 +54,7 @@ const configDigest = serializedConfig.value.contentDigest;
 const configContent = serializedConfig.value.content;
 const uiSessionDigest = "1".repeat(64);
 const approvalNonceDigest = "2".repeat(64);
+const linearAuditIssueId = "LINEAR-AUDIT-1";
 function digest(value: string) {
   const result = sha256Digest(value);
   if (!result.ok) throw new Error(result.error.code);
@@ -64,14 +65,16 @@ function rawDigest(value: string): Sha256Digest {
 }
 const previewResult = createRegistrationSetupPreview({
   schemaVersion: 1,
-  setupSessionId: "setup-session-1",
+  setupSessionId: `setup-${createHash("sha256")
+    .update([project.id, baseSha, configDigest, linearAuditIssueId].join("\0"), "utf8")
+    .digest("hex")}`,
   project,
   config,
   baseRevision: baseSha,
   worktreePath: "/tmp/setup-worktree",
   branch: "agent-team/setup",
   remote: "origin",
-  linearAuditIssueId: "LINEAR-AUDIT-1",
+  linearAuditIssueId,
 });
 if (!previewResult.ok) throw new Error(previewResult.error.code);
 const preview = previewResult.value;
@@ -853,21 +856,32 @@ function harness(options: HarnessOptions = {}) {
     },
   };
   const coordinator = new RegistrationSetupCoordinator(ports);
-  const application = createRegistrationSetupApplication({
-    coordinatorPorts: ports,
-    controllerPorts: {
-      stateRoot: "/tmp/agent-team-registration-setup-unit",
-      git: {
-        inspectRepository: () => Promise.resolve(err(domainError("unavailable"))),
-      },
-      sessions: ports.sessions,
-      previewConfirmation: {
-        ...ports.previewConfirmation,
-        issue: () => Promise.resolve(ok({ state: "rejected" as const })),
-      },
-      finalApproval: ports.finalApproval,
+  const controllerPorts = {
+    stateRoot: "/tmp/agent-team-registration-setup-unit",
+    draftSource: {
+      load: () => Promise.resolve(ok({ project, config, linearAuditIssueId })),
     },
-  });
+    git: {
+      inspectRepository: () =>
+        Promise.resolve(
+          ok({
+            rootPath: project.localRepositoryPath,
+            headSha: baseSha,
+            branch: project.defaultBranch,
+            clean: true,
+          }),
+        ),
+    },
+    sessions: ports.sessions,
+    previewConfirmation: {
+      ...ports.previewConfirmation,
+      issue: () => Promise.resolve(ok({ state: "rejected" as const })),
+    },
+    finalApproval: ports.finalApproval,
+  };
+  const createApplication = () =>
+    createRegistrationSetupApplication({ coordinatorPorts: ports, controllerPorts });
+  const application = createApplication();
   return {
     coordinator,
     approveAndMerge: (
@@ -883,6 +897,10 @@ function harness(options: HarnessOptions = {}) {
         },
         { authorityDigest: authority.authorityDigest },
       ),
+    reloadController: () => createApplication().controller,
+    markMerged: () => {
+      current = changeRequest({ state: "merged", draft: false, autoMergeEnabled: true });
+    },
     calls,
     sessions,
     journals,
@@ -1660,6 +1678,36 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls).not.toContain("publish-activation-index");
   });
 
+  it("resumes a durable pending merge after process reload with a different transport operation", async () => {
+    const test = await prepared(harness());
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:durable-resume",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    await expect(
+      test.approveAndMerge(
+        {
+          setupSessionId: preview.setupSessionId,
+          approval: approval(ready.session),
+          idempotencyKeyPrefix: "transport-operation-a",
+        },
+        trustedAuthority,
+      ),
+    ).resolves.toMatchObject({ state: "merge_pending" });
+    test.markMerged();
+
+    const reloadedController = test.reloadController();
+    await expect(
+      reloadedController.resume(
+        { idempotencyKeyPrefix: "transport-operation-b" },
+        { authorityDigest: uiSessionDigest },
+      ),
+    ).resolves.toMatchObject({ state: "activated" });
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
+    expect(test.mutationKeys.filter((item) => item.step === "merge")).toHaveLength(1);
+  });
+
   it("reuses the durable merge operation after a pre-response failure", async () => {
     const test = await prepared(harness({ mergeFailOnce: true, mergedReadBack: true }));
     const ready = await test.coordinator.refresh({
@@ -1759,6 +1807,66 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
     expect(test.calls.filter((call) => call === "publish-activation-index")).toHaveLength(2);
   });
+
+  it("repairs only the activation index after reload with a different transport operation", async () => {
+    const test = await prepared(harness({ mergedReadBack: true, activationIndexFailOnce: true }));
+    const ready = await test.coordinator.refresh({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: "refresh:index-reload",
+    });
+    if (ready.state !== "awaiting_user_approval") throw new Error("not ready");
+    await expect(
+      test.approveAndMerge(
+        {
+          setupSessionId: preview.setupSessionId,
+          approval: approval(ready.session),
+          idempotencyKeyPrefix: "transport-index-a",
+        },
+        trustedAuthority,
+      ),
+    ).resolves.toMatchObject({ state: "failed", stage: "activation" });
+
+    await expect(
+      test
+        .reloadController()
+        .resume(
+          { idempotencyKeyPrefix: "transport-index-b" },
+          { authorityDigest: uiSessionDigest },
+        ),
+    ).resolves.toMatchObject({ state: "activated" });
+    expect(test.calls.filter((call) => call === "merge")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "activate")).toHaveLength(1);
+    expect(test.calls.filter((call) => call === "publish-activation-index")).toHaveLength(2);
+  });
+
+  it.each(["awaiting_user_approval", "audit_pending"] as const)(
+    "rejects resume from %s with zero continuation mutation",
+    async (phase) => {
+      const test = await prepared(
+        harness(phase === "audit_pending" ? { auditFailure: "linear" } : {}),
+      );
+      await test.coordinator.refresh({
+        setupSessionId: preview.setupSessionId,
+        idempotencyKeyPrefix: `refresh:resume-rejected:${phase}`,
+      });
+      const continuationCalls = () =>
+        test.calls.filter((call) =>
+          ["verify-consume-approval", "merge", "activate", "publish-activation-index"].includes(
+            call,
+          ),
+        );
+      const before = continuationCalls();
+      await expect(
+        test
+          .reloadController()
+          .resume(
+            { idempotencyKeyPrefix: `transport-resume-rejected:${phase}` },
+            { authorityDigest: uiSessionDigest },
+          ),
+      ).resolves.toMatchObject({ state: "blocked", reason: "resume_not_available" });
+      expect(continuationCalls()).toEqual(before);
+    },
+  );
 
   it.each([
     "unavailable",

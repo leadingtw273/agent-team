@@ -79,6 +79,12 @@ function fixture() {
         Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
       );
     },
+    resume: (command, context) => {
+      calls.push(["resume", command, context]);
+      return Promise.resolve(
+        Object.freeze({ state: "blocked" as const, reason: "not_found" as const }),
+      );
+    },
     issueLocalUiApprovalIntent: (command, context) => {
       calls.push(["approval", command, context]);
       return Promise.resolve(
@@ -199,6 +205,32 @@ describe("O005 Registration Setup Wizard contribution", () => {
         },
         { authorityDigest },
       ],
+    ]);
+  });
+
+  it("accepts resume only as an exact POST without a client-selected target or approval secret", async () => {
+    const { contribution, calls } = fixture();
+    const handler = contribution.routes[2]?.handler;
+    if (handler === undefined) throw new Error("missing setup API handler");
+    const body = { action: "resume", operationId: "operation-resume-1" };
+
+    for (const rejected of [
+      request("PUT", "session", body),
+      request("POST", "session", { ...body, setupSessionId }),
+      request("POST", "session", { ...body, approvalId: "approval-1" }),
+      request("POST", "session", { ...body, authorityDigest }),
+    ]) {
+      await expect(handler(rejected, { session: { authorityDigest } })).resolves.toMatchObject({
+        statusCode: 422,
+      });
+    }
+    expect(calls).toEqual([]);
+
+    await expect(
+      handler(request("POST", "session", body), { session: { authorityDigest } }),
+    ).resolves.toMatchObject({ statusCode: 409 });
+    expect(calls).toEqual([
+      ["resume", { idempotencyKeyPrefix: "ui:operation-resume-1:resume" }, { authorityDigest }],
     ]);
   });
 });

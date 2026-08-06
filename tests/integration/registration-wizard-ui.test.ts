@@ -94,6 +94,30 @@ describe("O002/O003/O004 registration wizard HTTP integration", () => {
         repositoryPath: "/tmp/attacker-controlled",
       }),
     });
+    const setupResume = await fetch(`${handle.baseUrl}/api/registration/setup`, {
+      method: "POST",
+      headers: {
+        cookie,
+        origin: handle.baseUrl,
+        "content-type": "application/json",
+        "x-csrf-token": csrf,
+      },
+      body: JSON.stringify({ action: "resume", operationId: "operation-resume-1" }),
+    });
+    const setupResumeInjectedTarget = await fetch(`${handle.baseUrl}/api/registration/setup`, {
+      method: "POST",
+      headers: {
+        cookie,
+        origin: handle.baseUrl,
+        "content-type": "application/json",
+        "x-csrf-token": csrf,
+      },
+      body: JSON.stringify({
+        action: "resume",
+        operationId: "operation-resume-2",
+        setupSessionId: "setup-attacker-selected",
+      }),
+    });
 
     expect(routePaths).toContain("/registration");
     expect(routePaths).toContain("/assets/registration.css");
@@ -136,6 +160,9 @@ describe("O002/O003/O004 registration wizard HTTP integration", () => {
     expect(rejected.headers.get("allow")).toBe("GET, HEAD");
     expect(setupWithoutCsrf.status).toBe(403);
     expect(setupInjectedSource.status).toBe(422);
+    expect(setupResume.status).toBe(503);
+    expect(await setupResume.json()).toMatchObject({ state: "configuration_incomplete" });
+    expect(setupResumeInjectedTarget.status).toBe(422);
   });
 
   it("requires the local session and never reflects its bootstrap credential", async () => {

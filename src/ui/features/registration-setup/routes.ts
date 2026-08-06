@@ -17,7 +17,7 @@ export const registrationSetupContributionSecurityRoutes: readonly UiSecurityRou
     Object.freeze({
       path: registrationSetupApiPath,
       allowedQueryParameters: Object.freeze([]),
-      allowedMethods: Object.freeze(["GET", "PUT"] as const),
+      allowedMethods: Object.freeze(["GET", "POST", "PUT"] as const),
       response: "standard" as const,
       mutationBody: "bounded-json" as const,
     }),

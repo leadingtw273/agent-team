@@ -51,6 +51,46 @@ const setupPreviewModel: RegistrationSetupControllerReadModel = Object.freeze({
   }),
 });
 
+const setupPendingSession = Object.freeze({
+  setupSessionId,
+  revision: 7,
+  phase: "merge_pending" as const,
+  pullRequestUrl: "https://github.test/owner/sandbox/pull/42",
+  changeRequestId: "PR_node_1",
+  headSha: "f".repeat(40),
+  diffDigest: "a".repeat(64),
+  ciPassed: true,
+  freshReviewPassed: true,
+});
+
+const setupMergePendingModel: RegistrationSetupControllerReadModel = Object.freeze({
+  ...setupPreviewModel,
+  state: "merge_pending",
+  nextStep: "繼續 authoritative merge／activation 驗證。",
+  session: setupPendingSession,
+});
+
+const setupAwaitingApprovalModel: RegistrationSetupControllerReadModel = Object.freeze({
+  ...setupMergePendingModel,
+  state: "awaiting_user_approval",
+  nextStep: "簽發本機核可 intent。",
+  session: Object.freeze({
+    ...setupPendingSession,
+    phase: "awaiting_user_approval",
+  }),
+});
+
+const setupActivatedModel: RegistrationSetupControllerReadModel = Object.freeze({
+  ...setupMergePendingModel,
+  state: "activated",
+  nextStep: "Activation 與 project index 已確認。",
+  session: Object.freeze({
+    ...setupPendingSession,
+    revision: 8,
+    phase: "activated",
+  }),
+});
+
 function setupController(): RegistrationSetupControllerUseCase {
   return Object.freeze({
     read: () => Promise.resolve(setupPreviewModel),
@@ -67,10 +107,50 @@ function setupController(): RegistrationSetupControllerUseCase {
     start: () =>
       Promise.resolve(Object.freeze({ ...setupPreviewModel, state: "ci_waiting" as const })),
     refresh: () => Promise.resolve(setupPreviewModel),
+    resume: () =>
+      Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
     issueLocalUiApprovalIntent: () =>
       Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
     approveAndMergeLocalUi: () =>
       Promise.resolve(Object.freeze({ state: "blocked" as const, reason: "not_found" as const })),
+  });
+}
+
+function resumableSetupController(): Readonly<{
+  controller: RegistrationSetupControllerUseCase;
+  resumeCalls: () => number;
+}> {
+  let resumes = 0;
+  return Object.freeze({
+    controller: Object.freeze({
+      ...setupController(),
+      read: () => Promise.resolve(setupMergePendingModel),
+      resume: () => {
+        resumes += 1;
+        return Promise.resolve(resumes === 1 ? setupMergePendingModel : setupActivatedModel);
+      },
+    }),
+    resumeCalls: () => resumes,
+  });
+}
+
+function pendingTransitionSetupController(): RegistrationSetupControllerUseCase {
+  return Object.freeze({
+    ...setupController(),
+    read: () => Promise.resolve(setupAwaitingApprovalModel),
+    issueLocalUiApprovalIntent: () =>
+      Promise.resolve(
+        Object.freeze({
+          state: "approval_intent_issued" as const,
+          setupSessionId,
+          expectedSetupRevision: 7,
+          approvalId: "approval-browser-1",
+          expiresAt: "2026-08-06T12:05:00.000Z",
+          mergeState: "configuration_incomplete" as const,
+        }),
+      ),
+    approveAndMergeLocalUi: () => Promise.resolve(setupMergePendingModel),
+    resume: () => Promise.resolve(setupActivatedModel),
   });
 }
 
@@ -209,6 +289,7 @@ function longTextUseCase(): RegistrationReadOnlyScanUseCase {
 
 async function startRegistrationShell(
   useCase: RegistrationReadOnlyScanUseCase,
+  controller: RegistrationSetupControllerUseCase = setupController(),
 ): Promise<LocalUiServerHandle> {
   const application = createUiApplication({
     readModel: fixtureUiShellReadModel,
@@ -218,7 +299,7 @@ async function startRegistrationShell(
         undefined,
         undefined,
         undefined,
-        setupController(),
+        controller,
       ),
     ],
   });
@@ -302,6 +383,76 @@ test.describe("O002 registration wizard", () => {
     await expect(start).toBeEnabled();
     await start.click();
     await expect(status).toContainText("Setup Draft PR 已建立");
+  });
+
+  test("renders a durable resume control after reload and keeps pending continuation reachable", async ({
+    page,
+  }) => {
+    const resumable = resumableSetupController();
+    await shell?.close();
+    shell = await startRegistrationShell(
+      fixtureRegistrationReadOnlyScanUseCase,
+      resumable.controller,
+    );
+    await visit(page);
+    await page.reload({ waitUntil: "domcontentloaded" });
+
+    const panel = page.locator("#registration-setup-section");
+    const resume = panel.getByRole("button", { name: "繼續驗證 Merge／Activation" });
+    const status = panel.getByRole("status");
+    const resumeRequests: Readonly<{ method: string; body: unknown }>[] = [];
+    page.on("request", (request) => {
+      if (request.url().endsWith("/api/registration/setup") && request.method() === "POST") {
+        resumeRequests.push({ method: request.method(), body: request.postDataJSON() });
+      }
+    });
+
+    await expect(resume).toBeVisible();
+    await expect(resume).toBeEnabled();
+    await resume.click();
+    await expect(status).toContainText("恢復狀態：merge_pending");
+    await expect(resume).toBeEnabled();
+    await resume.click();
+    await expect(status).toContainText("project index 已確認");
+    await expect(resume).toBeDisabled();
+    expect(resumable.resumeCalls()).toBe(2);
+    expect(resumeRequests).toHaveLength(2);
+    for (const request of resumeRequests) {
+      expect(request.method).toBe("POST");
+      expect(request.body).toEqual({
+        action: "resume",
+        operationId: expect.stringMatching(/^setup-ui-/u),
+      });
+    }
+  });
+
+  test("exposes resume immediately when approval returns durable merge_pending", async ({
+    page,
+  }) => {
+    await shell?.close();
+    shell = await startRegistrationShell(
+      fixtureRegistrationReadOnlyScanUseCase,
+      pendingTransitionSetupController(),
+    );
+    await visit(page);
+
+    const panel = page.locator("#registration-setup-section");
+    const approval = panel.getByLabel("輸入 APPROVE SETUP MERGE");
+    const issue = panel.getByRole("button", { name: "簽發本機核可 Intent" });
+    const merge = panel.getByRole("button", { name: "確認 SQUASH 合併並啟用" });
+    const resume = panel.getByRole("button", { name: "繼續驗證 Merge／Activation" });
+    const status = panel.getByRole("status");
+
+    await expect(resume).toBeHidden();
+    await approval.fill("APPROVE SETUP MERGE");
+    await issue.click();
+    await expect(merge).toBeEnabled();
+    await merge.click();
+    await expect(status).toContainText("合併狀態：merge_pending");
+    await expect(resume).toBeVisible();
+    await expect(resume).toBeEnabled();
+    await resume.click();
+    await expect(status).toContainText("project index 已確認");
   });
 
   test("keeps synthetic Gates readable without horizontal overflow at 390px and 320px", async ({

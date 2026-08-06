@@ -58,7 +58,7 @@ describe("O002/O003/O004 registration wizard UI", () => {
     ]);
     expect(registration.routes[0]?.contract.allowedMethods).toEqual(["GET"]);
     expect(registration.routes[5]?.contract).toMatchObject({
-      allowedMethods: ["GET", "PUT"],
+      allowedMethods: ["GET", "POST", "PUT"],
       mutationBody: "bounded-json",
     });
     expect(registration.routes[6]?.contract).toMatchObject({

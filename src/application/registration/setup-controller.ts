@@ -8,6 +8,7 @@ import type { AsyncPortResult, GitPort, ReadOptions } from "../ports/index.js";
 import {
   createRegistrationSetupPreview,
   type RegistrationSetupControllerMergeOperation,
+  type RegistrationSetupControllerResumeOperation,
   type RegistrationSetupCoordinator,
 } from "./setup.js";
 import {
@@ -137,6 +138,10 @@ export interface RegistrationSetupRefreshCommand {
   readonly idempotencyKeyPrefix: string;
 }
 
+export interface RegistrationSetupResumeCommand {
+  readonly idempotencyKeyPrefix: string;
+}
+
 export interface RegistrationSetupApprovalIntentCommand extends RegistrationSetupRefreshCommand {
   readonly expectedSetupRevision: number;
   readonly confirmation: string;
@@ -165,6 +170,10 @@ export interface RegistrationSetupControllerUseCase {
     command: RegistrationSetupRefreshCommand,
     context: RegistrationSetupControllerContext,
   ): Promise<RegistrationSetupControllerActionResult>;
+  resume(
+    command: RegistrationSetupResumeCommand,
+    context: RegistrationSetupControllerContext,
+  ): Promise<RegistrationSetupControllerActionResult>;
   issueLocalUiApprovalIntent(
     command: RegistrationSetupApprovalIntentCommand,
     context: RegistrationSetupControllerContext,
@@ -181,6 +190,7 @@ export interface RegistrationSetupControllerPorts {
   readonly git: Pick<GitPort, "inspectRepository">;
   readonly coordinator: Pick<RegistrationSetupCoordinator, "begin" | "refresh">;
   readonly approveAndMerge: RegistrationSetupControllerMergeOperation;
+  readonly resume: RegistrationSetupControllerResumeOperation;
   readonly sessions: Pick<RegistrationSetupSessionPort, "load">;
   readonly previewConfirmation: RegistrationSetupPreviewConfirmationAuthorityPort;
   readonly finalApproval: RegistrationSetupFinalApprovalAuthorityPort;
@@ -262,6 +272,7 @@ function previewSummary(preview: RegistrationSetupPreview): RegistrationSetupPre
 function readModel(
   preview: RegistrationSetupPreview,
   session?: RegistrationSetupSession,
+  stateOverride?: "merge_pending",
 ): RegistrationSetupControllerReadModel {
   if (session === undefined) {
     return Object.freeze({
@@ -272,7 +283,8 @@ function readModel(
     });
   }
   const state =
-    session.phase === "activated"
+    stateOverride ??
+    (session.phase === "activated"
       ? "activated"
       : session.phase === "merge_authorized" || session.phase === "merge_pending"
         ? "merge_pending"
@@ -282,7 +294,7 @@ function readModel(
             ? "ci_waiting"
             : session.phase === "audit_pending"
               ? "audit_pending"
-              : "checks_pending";
+              : "checks_pending");
   return Object.freeze({
     state,
     evidence: w3bEvidence,
@@ -290,7 +302,7 @@ function readModel(
       state === "awaiting_user_approval"
         ? "先簽發本機 UI 核可 intent，再以第二次操作要求 SQUASH merge。"
         : state === "merge_pending"
-          ? "等待 authoritative merged read-back；尚未啟用設定。"
+          ? "可繼續 authoritative merge／activation 驗證；尚未確認前不載入設定。"
           : state === "activated"
             ? "Default-branch 設定、activation marker 與 project index 已確認。"
             : "重新讀取同一 Head 的 CI 與 agent-team/review 狀態。",
@@ -434,10 +446,12 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
       if (verified.state !== "activated") {
-        return incomplete({
-          code: "activation_index_required",
-          message: "W1 activation marker 與 project activation index 尚未一致。",
-        });
+        return verified.state === "merge_pending"
+          ? readModel(preview, verified.session, "merge_pending")
+          : incomplete({
+              code: "activation_index_required",
+              message: "W1 activation marker 或 approval ledger binding 無法驗證。",
+            });
       }
       return readModel(preview, verified.session);
     }
@@ -542,6 +556,21 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
     return this.#ports.coordinator.refresh(command);
   }
 
+  async resume(
+    command: RegistrationSetupResumeCommand,
+    context: RegistrationSetupControllerContext,
+  ): Promise<RegistrationSetupControllerActionResult> {
+    if (!operationIsValid(command.idempotencyKeyPrefix) || !validContext(context)) {
+      return incomplete({ code: "draft_invalid", message: "Resume request 無效。" });
+    }
+    const preview = await this.#preview(context);
+    if (!("previewDigest" in preview)) return preview;
+    return this.#ports.resume({
+      setupSessionId: preview.setupSessionId,
+      idempotencyKeyPrefix: command.idempotencyKeyPrefix,
+    });
+  }
+
   async issueLocalUiApprovalIntent(
     command: RegistrationSetupApprovalIntentCommand,
     context: RegistrationSetupControllerContext,
@@ -632,6 +661,7 @@ export function createUnwiredRegistrationSetupController(
     confirmPreview: () => Promise.resolve(model),
     start: () => Promise.resolve(model),
     refresh: () => Promise.resolve(model),
+    resume: () => Promise.resolve(model),
     issueLocalUiApprovalIntent: () => Promise.resolve(model),
     approveAndMergeLocalUi: () => Promise.resolve(model),
   });

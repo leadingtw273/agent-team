@@ -72,6 +72,10 @@ function fixture(
       calls.push(["merge", request, authority]);
       return Promise.resolve({ state: "blocked", reason: "not_found" });
     },
+    resume: (request) => {
+      calls.push(["resume", request]);
+      return Promise.resolve({ state: "blocked", reason: "not_found" });
+    },
     sessions: {
       load: (setupSessionId) => Promise.resolve(ok(sessions.get(setupSessionId))),
     },
@@ -260,6 +264,26 @@ describe("W3A Registration Setup production controller", () => {
     },
   );
 
+  it("renders an activated session with a missing project index as resumable", async () => {
+    const initial = fixture();
+    const model = await initial.controller.read({ authorityDigest });
+    if (model.preview === undefined) throw new Error("missing preview");
+    const session = {
+      ...readySession(model.preview.setupSessionId, model.preview.previewDigest as Sha256Digest),
+      phase: "activated" as const,
+    };
+    const test = fixture({
+      refreshed: Object.freeze({ state: "merge_pending" as const, session }),
+    });
+    test.sessions.set(session.setupSessionId, session);
+
+    await expect(test.controller.read({ authorityDigest })).resolves.toMatchObject({
+      state: "merge_pending",
+      session: { phase: "activated", setupSessionId: session.setupSessionId },
+    });
+    expect(test.calls.map(callName)).toEqual(["refresh"]);
+  });
+
   it("fails closed when the server-side source is missing", async () => {
     const { controller, calls } = fixture({ source: "missing" });
     const result = await controller.read({ authorityDigest });
@@ -335,6 +359,25 @@ describe("W3A Registration Setup production controller", () => {
       trustedAuthority: { authorityDigest },
       confirmation: { tokenId: "preview-token-1" },
     });
+  });
+
+  it("derives the resume target only from the server-owned draft", async () => {
+    const test = fixture();
+    const model = await test.controller.read({ authorityDigest });
+    if (model.preview === undefined) throw new Error("missing preview");
+    await test.controller.resume(
+      { idempotencyKeyPrefix: "controller:resume" },
+      { authorityDigest },
+    );
+    expect(test.calls).toEqual([
+      [
+        "resume",
+        {
+          setupSessionId: model.preview.setupSessionId,
+          idempotencyKeyPrefix: "controller:resume",
+        },
+      ],
+    ]);
   });
 
   it("rejects non-exact confirmation phrases before issuing either durable intent", async () => {

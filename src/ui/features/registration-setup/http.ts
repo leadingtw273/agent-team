@@ -42,10 +42,32 @@ export async function handleRegistrationSetupRequest(
   if (request.method === "GET" || request.method === "HEAD") {
     return response(request, 200, await controller.read(trusted));
   }
+  const body = request.body;
+  if (request.method === "POST") {
+    const action = body?.["action"];
+    const operationId = body?.["operationId"];
+    if (
+      action !== "resume" ||
+      !exactKeys(body, ["action", "operationId"]) ||
+      typeof operationId !== "string" ||
+      !identifierPattern.test(operationId)
+    ) {
+      return response(request, 422, { state: "error", code: "invalid_setup_action" });
+    }
+    const result = await controller.resume(
+      { idempotencyKeyPrefix: `ui:${operationId}:resume` },
+      trusted,
+    );
+    const failure = result.state === "failed" || result.state === "blocked";
+    return response(
+      request,
+      failure ? 409 : result.state === "configuration_incomplete" ? 503 : 202,
+      result,
+    );
+  }
   if (request.method !== "PUT") {
     return response(request, 405, { state: "error", code: "method_not_allowed" });
   }
-  const body = request.body;
   const action = body?.["action"];
   const setupSessionId = body?.["setupSessionId"];
   const operationId = body?.["operationId"];

@@ -636,7 +636,12 @@ export type RegistrationSetupOutcome =
   | Readonly<{ state: "activated"; session: RegistrationSetupSession; revisionSha: string }>
   | Readonly<{
       state: "blocked";
-      reason: "not_found" | "cancelled" | "user_approval_invalid" | "approval_replay";
+      reason:
+        | "not_found"
+        | "cancelled"
+        | "user_approval_invalid"
+        | "approval_replay"
+        | "resume_not_available";
     }>
   | Readonly<{
       state: "cancelled";

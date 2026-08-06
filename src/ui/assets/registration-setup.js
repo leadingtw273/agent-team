@@ -10,11 +10,11 @@
   const operationId = () => `setup-ui-${crypto.randomUUID()}`;
   let previewTokenId;
 
-  const send = async (body) => {
+  const send = async (body, method = "PUT") => {
     const csrf = sessionStorage.getItem("agent-team-csrf");
     if (!csrf) throw new Error("missing_csrf");
     const response = await fetch("/api/registration/setup", {
-      method: "PUT",
+      method,
       credentials: "same-origin",
       headers: { "content-type": "application/json", "x-csrf-token": csrf },
       body: JSON.stringify(body),
@@ -104,6 +104,7 @@
   const approvalInput = section.querySelector(".js-registration-setup-approval");
   const approvalButton = section.querySelector(".js-registration-setup-approval-intent");
   const mergeButton = section.querySelector(".js-registration-setup-merge");
+  const resumeButton = section.querySelector(".js-registration-setup-resume");
   const expectedSetupRevision = Number(section.dataset.setupRevision);
   let approvalId;
   if (
@@ -158,9 +159,37 @@
             ? "SQUASH merge 與 authoritative activation 已確認。"
             : `合併狀態：${String(result.state)}；尚未 activated。`,
         );
+        if (result.state === "merge_pending" && resumeButton instanceof HTMLButtonElement) {
+          resumeButton.hidden = false;
+          resumeButton.disabled = false;
+        }
       } catch {
         setStatus("無法確認 authoritative merge/activation；設定仍不會載入。");
         mergeButton.disabled = false;
+      }
+    });
+  }
+
+  if (resumeButton instanceof HTMLButtonElement) {
+    resumeButton.addEventListener("click", async () => {
+      resumeButton.disabled = true;
+      try {
+        const result = await send(
+          {
+            action: "resume",
+            operationId: operationId(),
+          },
+          "POST",
+        );
+        if (result.state === "activated") {
+          setStatus("SQUASH merge、authoritative activation 與 project index 已確認。");
+        } else {
+          setStatus(`恢復狀態：${String(result.state)}；可稍後再次繼續驗證。`);
+          resumeButton.disabled = false;
+        }
+      } catch {
+        setStatus("無法恢復 authoritative merge/activation；未送出新的核可資料。");
+        resumeButton.disabled = false;
       }
     });
   }

@@ -745,13 +745,21 @@ export type RegistrationSetupControllerMergeOperation = (
   authority: RegistrationSetupFinalApprovalAuthority,
 ) => Promise<RegistrationSetupOutcome>;
 
+export type RegistrationSetupControllerResumeOperation = (
+  request: RegistrationSetupSessionRequest,
+) => Promise<RegistrationSetupOutcome>;
+
 const controllerMergeOperations = new WeakMap<object, RegistrationSetupControllerMergeOperation>();
+const controllerResumeOperations = new WeakMap<
+  object,
+  RegistrationSetupControllerResumeOperation
+>();
 
 export interface RegistrationSetupApplicationAssemblyOptions {
   readonly coordinatorPorts: RegistrationSetupPorts;
   readonly controllerPorts: Omit<
     RegistrationSetupControllerPorts,
-    "coordinator" | "approveAndMerge"
+    "coordinator" | "approveAndMerge" | "resume"
   >;
   readonly conversationApprovalBridge?: RegistrationSetupConversationApprovalBridgePort;
 }
@@ -769,6 +777,7 @@ export class RegistrationSetupCoordinator {
     controllerMergeOperations.set(this, (request, authority) =>
       this.#approveAndMerge(request, authority),
     );
+    controllerResumeOperations.set(this, (request) => this.#resumeAuthorized(request));
   }
 
   async #readApprovalAnchor(
@@ -1873,11 +1882,42 @@ export class RegistrationSetupCoordinator {
           Object.freeze({ state: "blocked" as const, reason: "user_approval_invalid" as const })
         );
       }
-      const anchored = await this.#readApprovalAnchor(
-        session,
-        lease,
-        expectedApprovalConsumeOperationDigest(request),
+      const anchored = await this.#readApprovalAnchor(session, lease);
+      if (!anchored.ok) return portFailure("approval", anchored.error, session);
+      return this.#continueMergeExclusive(session, request, lease);
+    });
+  }
+
+  async #resumeAuthorized(
+    request: RegistrationSetupSessionRequest,
+  ): Promise<RegistrationSetupOutcome> {
+    if (
+      !identifierPattern.test(request.setupSessionId) ||
+      !validPrefix(request.idempotencyKeyPrefix)
+    ) {
+      return failed("request");
+    }
+    return this.#runExclusive(request.setupSessionId, request.signal, async (lease) => {
+      const loaded = await this.#owned(lease, () =>
+        this.#ports.sessions.load(request.setupSessionId),
       );
+      if (!loaded.ok) return portFailure("session", loaded.error);
+      if (loaded.value === undefined) {
+        return Object.freeze({ state: "blocked" as const, reason: "not_found" as const });
+      }
+      const session = loaded.value;
+      if (!validSession(session)) return failed("session", session);
+      if (
+        session.phase !== "merge_authorized" &&
+        session.phase !== "merge_pending" &&
+        session.phase !== "activated"
+      ) {
+        return Object.freeze({
+          state: "blocked" as const,
+          reason: "resume_not_available" as const,
+        });
+      }
+      const anchored = await this.#readApprovalAnchor(session, lease);
       if (!anchored.ok) return portFailure("approval", anchored.error, session);
       return this.#continueMergeExclusive(session, request, lease);
     });
@@ -1899,11 +1939,7 @@ export class RegistrationSetupCoordinator {
     ) {
       return Object.freeze({ ok: false, error: domainError("invariant_violation") });
     }
-    const anchored = await this.#readApprovalAnchor(
-      session,
-      lease,
-      expectedApprovalConsumeOperationDigest(request),
-    );
+    const anchored = await this.#readApprovalAnchor(session, lease);
     if (!anchored.ok) return anchored;
     const reference = { project: session.project, changeRequestId: session.changeRequest.id };
     const current = await this.#owned(lease, () =>
@@ -2151,11 +2187,7 @@ export class RegistrationSetupCoordinator {
         }),
       ]),
     });
-    const activationAnchor = await this.#readApprovalAnchor(
-      session,
-      lease,
-      expectedApprovalConsumeOperationDigest(request),
-    );
+    const activationAnchor = await this.#readApprovalAnchor(session, lease);
     if (!activationAnchor.ok) return portFailure("activation", activationAnchor.error, session);
     const activated = await this.#owned(lease, () =>
       this.#ports.sessions.activate(
@@ -2193,11 +2225,7 @@ export class RegistrationSetupCoordinator {
     lease: RegistrationSetupExecutionLease,
     knownMarker?: RegistrationSetupActivationMarker,
   ): Promise<RegistrationSetupOutcome> {
-    const anchored = await this.#readApprovalAnchor(
-      session,
-      lease,
-      expectedApprovalConsumeOperationDigest(request),
-    );
+    const anchored = await this.#readApprovalAnchor(session, lease);
     if (!anchored.ok) return portFailure("activation", anchored.error, session);
     const readMarker =
       knownMarker === undefined
@@ -2296,11 +2324,15 @@ export function createRegistrationSetupApplication(
 ): RegistrationSetupApplication {
   const coordinator = new RegistrationSetupCoordinator(options.coordinatorPorts);
   const operation = controllerMergeOperations.get(coordinator);
-  if (operation === undefined) throw new TypeError("invalid_registration_setup_coordinator");
+  const resume = controllerResumeOperations.get(coordinator);
+  if (operation === undefined || resume === undefined) {
+    throw new TypeError("invalid_registration_setup_coordinator");
+  }
   const controller = new RegistrationSetupController({
     ...options.controllerPorts,
     coordinator,
     approveAndMerge: operation,
+    resume,
   });
   return Object.freeze({
     controller,
