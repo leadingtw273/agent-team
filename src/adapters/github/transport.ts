@@ -232,6 +232,40 @@ export class GhTransport {
     });
   }
 
+  /**
+   * Like `requestJson`, but for calls (such as a `DELETE` that returns 204 with an empty body)
+   * where there is no JSON response to parse. Only the exit code is the success signal; callers
+   * that need proof of effect must still perform their own read-back afterward.
+   */
+  async requestVoid(
+    arguments_: readonly string[],
+    options: ReadOptions = {},
+  ): Promise<Result<void, DomainError>> {
+    if (!validArguments(arguments_)) return failure("external_failure");
+    if (options.signal?.aborted === true) return failure("interrupted");
+    return new Promise((resolveResult) => {
+      execFile(
+        this.#executable,
+        [...arguments_],
+        {
+          encoding: "utf8",
+          env: this.#environment,
+          maxBuffer: this.#maxOutputBytes,
+          timeout: this.#timeoutMs,
+          windowsHide: true,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        },
+        (error, _stdout, stderr) => {
+          if (error !== null) {
+            resolveResult(err(mapGhError(error, stderr)));
+            return;
+          }
+          resolveResult(ok(undefined));
+        },
+      );
+    });
+  }
+
   async inspectAuthentication(
     host = "github.com",
     options: ReadOptions = {},
