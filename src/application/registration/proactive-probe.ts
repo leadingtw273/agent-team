@@ -133,9 +133,19 @@ interface PreflightSuccess {
   readonly linearTarget: RegistrationProbeLinearTarget;
 }
 
+interface PreflightOptions {
+  /**
+   * Excludes this run's own id from the concurrent-run scan. Set only when re-validating an
+   * in-flight run being resumed -- it is one of the project's own non-terminal runs, not a
+   * genuinely concurrent one.
+   */
+  readonly excludeRunId?: string;
+}
+
 async function runPreflight(
   command: RegistrationProbeStartCommand,
   ports: RegistrationProbePorts,
+  options: PreflightOptions = {},
 ): Promise<Result<PreflightSuccess, RegistrationProbePreflightReason>> {
   const readOptions = readOptionsFrom(command);
 
@@ -229,7 +239,12 @@ async function runPreflight(
   if (!githubCapability.value.ciWorkflowConfirmed) return err("ci_workflow_unconfirmed");
 
   const active = await ports.journal.listActiveForProject(command.project.id, readOptions);
-  if (!active.ok || active.value.some((run) => !isTerminalCleanPhase(run.phase))) {
+  if (
+    !active.ok ||
+    active.value.some(
+      (run) => run.runId !== options.excludeRunId && !isTerminalCleanPhase(run.phase),
+    )
+  ) {
     return err("concurrent_run_exists");
   }
 
@@ -721,13 +736,16 @@ async function ensureCiChecked(
       await journal.persist(withFailure(run, "ci_check", "ci_check_wrong_head"));
       return { failure: { stage: "ci_check", reason: "ci_check_wrong_head" } };
     }
-    const required = checks.value.checks.find(
+    // Every check named "CI" must be considered -- not just the first one found -- so that a
+    // second same-named check run (a matrix job, or a second app registering the same check
+    // name) cannot have its failure/incompleteness masked by an earlier successful one.
+    const matching = checks.value.checks.filter(
       (check) => check.name === registrationProbeRequiredCheckName,
     );
-    if (required === undefined) continue;
+    if (matching.length === 0) continue;
     everObservedRequiredCheck = true;
-    if (required.status !== "completed") continue;
-    if (required.conclusion !== "success") {
+    if (matching.some((check) => check.status !== "completed")) continue;
+    if (matching.some((check) => check.conclusion !== "success")) {
       await journal.persist(withFailure(journal.current, "ci_check", "ci_check_failed"));
       return { failure: { stage: "ci_check", reason: "ci_check_failed" } };
     }
@@ -862,6 +880,15 @@ async function ensureWebhookSynthetic(
     });
   }
 
+  // Each provider's synthetic delivery must be its own distinct Delivery ID; a reused ID across
+  // providers would let one provider's Inbox record stand in for the other's.
+  if (new Set(deliveries.map((delivery) => delivery.deliveryId)).size !== deliveries.length) {
+    await journal.persist(
+      withFailure(journal.current, "webhook_synthetic", "webhook_response_mismatch"),
+    );
+    return { failure: { stage: "webhook_synthetic", reason: "webhook_response_mismatch" } };
+  }
+
   await journal.persist({
     ...withoutRevision(journal.current),
     phase: "webhook_synthetic_verified",
@@ -942,13 +969,39 @@ async function ensureProviderEvents(
   return {};
 }
 
+/**
+ * Applies a cleanup-item patch to an in-memory run view only, without any journal write. Used
+ * exclusively as the fallback when a CAS-guarded journal write itself fails (stale revision /
+ * concurrent writer): the external mutation must not be attempted in that case, but the outcome
+ * returned to this caller still needs to reflect "unknown" rather than silently keeping whatever
+ * state (e.g. "pending") the item had before this attempt -- otherwise `finalize` would treat an
+ * un-attempted cleanup item as clean.
+ */
+function withLocalCleanupItem(
+  run: RegistrationProbeRun,
+  kind: RegistrationProbeCleanupKind,
+  item: RegistrationProbeCleanupItem,
+): RegistrationProbeRun {
+  return { ...run, cleanup: withCleanupItem(run.cleanup, kind, item) };
+}
+
+const cleanupOutcomeUnknown = cleanupItem("unknown", "cleanup_outcome_unknown");
+
+/**
+ * Returns the *effective* final run for outcome computation. This is ordinarily identical to
+ * `journal.current`, but whenever a CAS-guarded write inside this function fails, the returned
+ * run additionally carries the corresponding cleanup item patched to `unknown` in memory (never
+ * durably persisted, since the CAS failure means this process is not the authoritative writer at
+ * that moment) so that `finalize` on the caller side correctly reports `cleanup_required` instead
+ * of treating a never-attempted mutation as clean.
+ */
 async function runCleanup(
   journal: ProbeJournal,
   ports: RegistrationProbePorts,
   command: RegistrationProbeStartCommand,
   activation: RegistrationProbeActivationContext,
   allowedWorktreeRoot: string,
-): Promise<void> {
+): Promise<RegistrationProbeRun> {
   const readOptions = readOptionsFrom(command);
   let run = journal.current;
 
@@ -959,22 +1012,26 @@ async function runCleanup(
       ...withoutRevision(run),
       phase: "cleanup_linear_mutation_started",
     });
-    run = started.ok ? started.value : run;
-    const cancelled = await safely(() =>
-      ports.linear.cancel(
-        linearIssueId,
-        mutationOptionsFor(command, `registration-probe:${run.runId}:linear-cancel`),
-      ),
-    );
-    const item =
-      cancelled.ok && cancelled.value.state === "cancelled"
-        ? cleanupItem("confirmed", "confirmed_cancelled")
-        : cleanupItem("failed", "cleanup_failed");
-    const persisted = await journal.persist({
-      ...withoutRevision(run),
-      cleanup: withCleanupItem(run.cleanup, "linearIssue", item),
-    });
-    run = persisted.ok ? persisted.value : run;
+    if (!started.ok) {
+      run = withLocalCleanupItem(run, "linearIssue", cleanupOutcomeUnknown);
+    } else {
+      run = started.value;
+      const cancelled = await safely(() =>
+        ports.linear.cancel(
+          linearIssueId,
+          mutationOptionsFor(command, `registration-probe:${run.runId}:linear-cancel`),
+        ),
+      );
+      const item =
+        cancelled.ok && cancelled.value.state === "cancelled"
+          ? cleanupItem("confirmed", "confirmed_cancelled")
+          : cleanupItem("failed", "cleanup_failed");
+      const persisted = await journal.persist({
+        ...withoutRevision(run),
+        cleanup: withCleanupItem(run.cleanup, "linearIssue", item),
+      });
+      run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "linearIssue", item);
+    }
   }
 
   // 2. Draft PR close.
@@ -984,111 +1041,121 @@ async function runCleanup(
       ...withoutRevision(run),
       phase: "cleanup_pr_mutation_started",
     });
-    run = started.ok ? started.value : run;
-    const closed = await safely(() =>
-      ports.sourceControl.closeChangeRequest(
-        { project: command.project, changeRequestId },
-        mutationOptionsFor(command, `registration-probe:${run.runId}:pr-close`),
-      ),
-    );
-    const item =
-      closed.ok && closed.value.state === "closed" && !closed.value.autoMergeEnabled
-        ? cleanupItem("confirmed", "confirmed_closed")
-        : cleanupItem("failed", "cleanup_failed");
-    const persisted = await journal.persist({
-      ...withoutRevision(run),
-      cleanup: withCleanupItem(run.cleanup, "draftPullRequest", item),
-    });
-    run = persisted.ok ? persisted.value : run;
+    if (!started.ok) {
+      run = withLocalCleanupItem(run, "draftPullRequest", cleanupOutcomeUnknown);
+    } else {
+      run = started.value;
+      const closed = await safely(() =>
+        ports.sourceControl.closeChangeRequest(
+          { project: command.project, changeRequestId },
+          mutationOptionsFor(command, `registration-probe:${run.runId}:pr-close`),
+        ),
+      );
+      const item =
+        closed.ok && closed.value.state === "closed" && !closed.value.autoMergeEnabled
+          ? cleanupItem("confirmed", "confirmed_closed")
+          : cleanupItem("failed", "cleanup_failed");
+      const persisted = await journal.persist({
+        ...withoutRevision(run),
+        cleanup: withCleanupItem(run.cleanup, "draftPullRequest", item),
+      });
+      run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "draftPullRequest", item);
+    }
   }
 
   // 3. Remote branch deletion — only once the PR is confirmed closed/unmerged.
   if (run.git !== undefined && run.cleanup.remoteBranch.state !== "confirmed") {
     if (run.cleanup.draftPullRequest.state !== "confirmed") {
+      const notEligible = cleanupItem("failed", "cleanup_not_eligible");
       const persisted = await journal.persist({
         ...withoutRevision(run),
-        cleanup: withCleanupItem(
-          run.cleanup,
-          "remoteBranch",
-          cleanupItem("failed", "cleanup_not_eligible"),
-        ),
+        cleanup: withCleanupItem(run.cleanup, "remoteBranch", notEligible),
       });
-      run = persisted.ok ? persisted.value : run;
+      run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "remoteBranch", notEligible);
     } else {
       const pushedSha = run.git.pushedSha;
       const started = await journal.persist({
         ...withoutRevision(run),
         phase: "cleanup_branch_mutation_started",
       });
-      run = started.ok ? started.value : run;
-      const deleted = await safely(() =>
-        ports.branchCleanup.deleteOwnedBranch(
-          {
-            repository: activation.repository,
-            branch: run.branch,
-            marker: run.marker,
-            expectedHeadSha: pushedSha,
-          },
-          mutationOptionsFor(command, `registration-probe:${run.runId}:branch-delete`),
-        ),
-      );
-      const item = deleted.ok
-        ? cleanupItem("confirmed", "confirmed_deleted")
-        : cleanupItem("failed", "cleanup_failed");
-      const persisted = await journal.persist({
-        ...withoutRevision(run),
-        cleanup: withCleanupItem(run.cleanup, "remoteBranch", item),
-      });
-      run = persisted.ok ? persisted.value : run;
+      if (!started.ok) {
+        run = withLocalCleanupItem(run, "remoteBranch", cleanupOutcomeUnknown);
+      } else {
+        run = started.value;
+        const deleted = await safely(() =>
+          ports.branchCleanup.deleteOwnedBranch(
+            {
+              repository: activation.repository,
+              branch: run.branch,
+              marker: run.marker,
+              expectedHeadSha: pushedSha,
+            },
+            mutationOptionsFor(command, `registration-probe:${run.runId}:branch-delete`),
+          ),
+        );
+        const item = deleted.ok
+          ? cleanupItem("confirmed", "confirmed_deleted")
+          : cleanupItem("failed", "cleanup_failed");
+        const persisted = await journal.persist({
+          ...withoutRevision(run),
+          cleanup: withCleanupItem(run.cleanup, "remoteBranch", item),
+        });
+        run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "remoteBranch", item);
+      }
     }
   }
 
   // 4. Local worktree removal — only under the allowed probe temp root, and only when clean.
   if (run.git !== undefined && run.cleanup.localWorktree.state !== "confirmed") {
     if (!run.worktreePath.startsWith(allowedWorktreeRoot)) {
+      const notEligible = cleanupItem("failed", "cleanup_not_eligible");
       const persisted = await journal.persist({
         ...withoutRevision(run),
-        cleanup: withCleanupItem(
-          run.cleanup,
-          "localWorktree",
-          cleanupItem("failed", "cleanup_not_eligible"),
-        ),
+        cleanup: withCleanupItem(run.cleanup, "localWorktree", notEligible),
       });
-      run = persisted.ok ? persisted.value : run;
+      run = persisted.ok
+        ? persisted.value
+        : withLocalCleanupItem(run, "localWorktree", notEligible);
     } else {
       const gitEvidence = run.git;
       const started = await journal.persist({
         ...withoutRevision(run),
         phase: "cleanup_worktree_mutation_started",
       });
-      run = started.ok ? started.value : run;
-      const worktree = Object.freeze({
-        repositoryRoot: command.project.localRepositoryPath,
-        path: run.worktreePath,
-        branch: run.branch,
-        headSha: gitEvidence.commitSha,
-      });
-      const inspected = await safely(() => ports.git.inspectWorkingTree(worktree, readOptions));
-      let removedOk = false;
-      if (inspected.ok && inspected.value.changes.length === 0) {
-        const removed = await safely(() =>
-          ports.git.removeWorktree(
-            worktree,
-            mutationOptionsFor(command, `registration-probe:${run.runId}:worktree-remove`),
-          ),
-        );
-        removedOk = removed.ok;
+      if (!started.ok) {
+        run = withLocalCleanupItem(run, "localWorktree", cleanupOutcomeUnknown);
+      } else {
+        run = started.value;
+        const worktree = Object.freeze({
+          repositoryRoot: command.project.localRepositoryPath,
+          path: run.worktreePath,
+          branch: run.branch,
+          headSha: gitEvidence.commitSha,
+        });
+        const inspected = await safely(() => ports.git.inspectWorkingTree(worktree, readOptions));
+        let removedOk = false;
+        if (inspected.ok && inspected.value.changes.length === 0) {
+          const removed = await safely(() =>
+            ports.git.removeWorktree(
+              worktree,
+              mutationOptionsFor(command, `registration-probe:${run.runId}:worktree-remove`),
+            ),
+          );
+          removedOk = removed.ok;
+        }
+        const item = removedOk
+          ? cleanupItem("confirmed", "confirmed_removed")
+          : cleanupItem("failed", "cleanup_failed");
+        const persisted = await journal.persist({
+          ...withoutRevision(run),
+          cleanup: withCleanupItem(run.cleanup, "localWorktree", item),
+        });
+        run = persisted.ok ? persisted.value : withLocalCleanupItem(run, "localWorktree", item);
       }
-      const item = removedOk
-        ? cleanupItem("confirmed", "confirmed_removed")
-        : cleanupItem("failed", "cleanup_failed");
-      const persisted = await journal.persist({
-        ...withoutRevision(run),
-        cleanup: withCleanupItem(run.cleanup, "localWorktree", item),
-      });
-      run = persisted.ok ? persisted.value : run;
     }
   }
+
+  return run;
 }
 
 function finalize(run: RegistrationProbeRun): RegistrationProbeOutcome {
@@ -1135,6 +1202,27 @@ export function createRegistrationProbeCoordinator(
       let run: RegistrationProbeRun;
       let activation: RegistrationProbeActivationContext;
       if (existing.ok && existing.value !== undefined) {
+        // Resuming an in-flight run must re-earn the right to keep mutating: re-validate
+        // `command.authority` and re-read merged config exactly as a fresh run would (excluding
+        // this run's own non-terminal journal entry from the concurrent-run scan, since it is not
+        // a genuinely concurrent run). Any drift versus what this run was originally activated
+        // against -- a different setup session, a stale/rotated authority, or trusted config
+        // having moved on -- fails closed before any further external mutation, exactly like a
+        // brand-new run would. A caller without current authority gets zero further mutation, not
+        // even cleanup; cleanup resumes once a validly-authorized resume succeeds.
+        const preflight = await runPreflight(command, ports, { excludeRunId: command.runId });
+        if (!preflight.ok) return { state: "incomplete", reason: preflight.error };
+        const original = existing.value.activation;
+        const revalidated = preflight.value.activation;
+        if (
+          revalidated.setupSessionId !== original.setupSessionId ||
+          revalidated.authoritativeRevision !== original.authoritativeRevision ||
+          revalidated.defaultBranch !== original.defaultBranch ||
+          revalidated.repository !== original.repository ||
+          revalidated.configDigest !== original.configDigest
+        ) {
+          return { state: "incomplete", reason: "activation_not_ready" };
+        }
         run = existing.value;
         activation = run.activation;
       } else {
@@ -1181,12 +1269,22 @@ export function createRegistrationProbeCoordinator(
         if (outcome.failure !== undefined) break;
       }
 
-      await runCleanup(journal, ports, command, activation, options.allowedWorktreeRoot);
-      const computed = finalize(journal.current);
+      const effectiveRun = await runCleanup(
+        journal,
+        ports,
+        command,
+        activation,
+        options.allowedWorktreeRoot,
+      );
+      const computed = finalize(effectiveRun);
       // Persist the terminal "verified" phase so a later `listActiveForProject` (used by this
       // same preflight's own concurrent-run check) recognizes this run as done rather than
       // treating it as still in flight forever. Every other outcome intentionally keeps a
-      // non-terminal phase so cleanup/resumption can still be retried.
+      // non-terminal phase so cleanup/resumption can still be retried. Guarded on
+      // `computed.state === "verified"`, which can only hold when every cleanup CAS write in
+      // `runCleanup` actually succeeded (a CAS failure always yields a locally-patched "unknown"
+      // item and therefore "cleanup_required"), so `journal.current` here is never stale relative
+      // to `effectiveRun`.
       if (computed.state === "verified" && journal.current.phase !== "verified") {
         const persisted = await journal.persist({
           ...withoutRevision(journal.current),

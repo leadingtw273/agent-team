@@ -5,6 +5,7 @@ import type {
   RegistrationProbeBranchCleanupCommand,
   RegistrationProbeBranchCleanupPort,
 } from "../../application/ports/index.js";
+import { registrationProbeBranchPrefix } from "../../application/registration/proactive-probe-model.js";
 import {
   domainError,
   err,
@@ -67,6 +68,12 @@ function mutationAllowed(options: MutationOptions): boolean {
  * the coordinator's own journal says -- and only deletes when every one of repository, exact head
  * SHA, and marker match. It then reads the ref back once more to confirm the deletion actually
  * took, rather than trusting the mutation response alone.
+ *
+ * This class is exported and may be constructed/called directly, independent of the coordinator;
+ * the `agent-team/probe/` prefix check below is a self-contained second line of defense (the
+ * primary guarantee is structural: the journal schema only ever admits branches matching this same
+ * prefix, and the coordinator only ever passes `run.branch`), not the only thing standing between
+ * a caller and an arbitrary branch delete.
  */
 export class RegistrationProbeBranchCleanupAdapter implements RegistrationProbeBranchCleanupPort {
   readonly #transport: Pick<GhTransport, "requestJson" | "requestVoid">;
@@ -83,6 +90,7 @@ export class RegistrationProbeBranchCleanupAdapter implements RegistrationProbeB
       !mutationAllowed(options) ||
       !validRepository(command.repository) ||
       !validBranch(command.branch) ||
+      !command.branch.startsWith(registrationProbeBranchPrefix) ||
       !shaPattern.test(command.expectedHeadSha) ||
       command.marker.length === 0
     ) {
