@@ -245,7 +245,11 @@ function sessionSummary(session: RegistrationSetupSession) {
     revision: session.revision,
     phase: session.phase,
     pullRequestUrl: session.changeRequest.url,
-    changeRequestId: session.changeRequest.id,
+    // O009c/F-2 fix: decimal PR number, not the opaque ChangeRequestSnapshot.id -- this is a
+    // display-only read-model field (never fed into a ChangeRequestRef/binding comparison), but
+    // it shares a name with the engine's now-decimal-number changeRequestId fields, so reporting
+    // the opaque id here was confusing for diagnostics even though it was functionally harmless.
+    changeRequestId: String(session.changeRequest.number),
     headSha: session.headSha,
     diffDigest: session.diffDigest,
     linearAuditIssueId: session.linearAuditIssueId,
@@ -326,7 +330,14 @@ function approvalBinding(
     setupSessionRevision: session.revision,
     projectId: session.project.id,
     previewDigest: session.previewDigest,
-    changeRequestId: session.changeRequest.id,
+    // F-2 fix: this independent `approvalBinding()` (issue-side, in setup-controller.ts) had not
+    // been updated by O009c's original fix, which only touched setup.ts's `approvalBinding()`
+    // (consume-side). The durable approval ledger compares the two bindings field-by-field
+    // (`sameValue`, setup-durable.ts's `verifyAndConsume`), so a mismatched changeRequestId format
+    // between issue and consume silently rejected every `setup approve` post-fix. Both sides must
+    // use the identical representation: decimal PR number, never the opaque
+    // ChangeRequestSnapshot.id.
+    changeRequestId: String(session.changeRequest.number),
     headSha: session.headSha,
     requirementsDigest: session.requirementsDigest,
     diffDigest: session.diffDigest,

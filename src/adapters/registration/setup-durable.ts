@@ -387,7 +387,8 @@ const sessionSchema = z
     const gateBound =
       gate?.projectId === session.project.id &&
       gate.repository === session.project.sourceControl.repository &&
-      gate.changeRequestId === session.changeRequest.id &&
+      // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+      gate.changeRequestId === String(session.changeRequest.number) &&
       gate.headSha.toLowerCase() === session.headSha.toLowerCase() &&
       gate.requirementsDigest === session.requirementsDigest &&
       gate.diffDigest === session.diffDigest;
@@ -396,7 +397,8 @@ const sessionSchema = z
       receipt.projectId === session.project.id &&
       receipt.repository === session.project.sourceControl.repository &&
       receipt.linearAuditIssueId === session.linearAuditIssueId &&
-      receipt.changeRequestId === session.changeRequest.id &&
+      // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+      receipt.changeRequestId === String(session.changeRequest.number) &&
       receipt.headSha.toLowerCase() === session.headSha.toLowerCase() &&
       receipt.requirementsDigest === session.requirementsDigest &&
       receipt.diffDigest === session.diffDigest &&

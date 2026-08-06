@@ -181,7 +181,7 @@ const gateEvidenceBinding = Object.freeze({
   source: "source_control" as const,
   projectId: project.id,
   repository: project.sourceControl.repository,
-  changeRequestId: "PR_node_1",
+  changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
   headSha,
   requirementsDigest: preview.requirementsDigest,
   diffDigest: testDigest,
@@ -225,7 +225,7 @@ function testAuditReceipt(destination: "linear" | "pull_request") {
     projectId: project.id,
     repository: project.sourceControl.repository,
     linearAuditIssueId: preview.linearAuditIssueId,
-    changeRequestId: "PR_node_1",
+    changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
     headSha,
     requirementsDigest: preview.requirementsDigest,
     diffDigest: testDigest,
@@ -252,7 +252,7 @@ function testMergeState(approvalReferenceDigest = testDigest) {
     schemaVersion: 1 as const,
     projectId: project.id,
     repository: project.sourceControl.repository,
-    changeRequestId: "PR_node_1",
+    changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
     expectedHeadSha: headSha,
     mergeMethod: "SQUASH" as const,
     idempotencyKey: mergeIdempotencyKey,
@@ -346,7 +346,7 @@ function sessionDraft(
               requirementsDigest: preview.requirementsDigest,
               headSha,
               diffDigest: testDigest,
-              changeRequestId: "PR_node_1",
+              changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
             },
             {
               code: "setup_merge_verified",
@@ -356,7 +356,7 @@ function sessionDraft(
               requirementsDigest: preview.requirementsDigest,
               headSha,
               diffDigest: testDigest,
-              changeRequestId: "PR_node_1",
+              changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
             },
             {
               code: "trusted_config_activated",
@@ -366,7 +366,7 @@ function sessionDraft(
               requirementsDigest: preview.requirementsDigest,
               headSha,
               diffDigest: testDigest,
-              changeRequestId: "PR_node_1",
+              changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
             },
           ] as const)
         : [],
@@ -390,7 +390,7 @@ function sessionDraft(
             source: "source_control_default_branch" as const,
             projectId: project.id,
             repository: project.sourceControl.repository,
-            changeRequestId: "PR_node_1",
+            changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
             setupHeadSha: headSha,
             mergeCommitSha: mergedSha,
             defaultBranch: project.defaultBranch,
@@ -516,7 +516,7 @@ function binding(revision = 2): RegistrationSetupApprovalBinding {
     setupSessionRevision: revision,
     projectId: project.id,
     previewDigest: preview.previewDigest,
-    changeRequestId: "PR_node_1",
+    changeRequestId: "42", // O009c fix: decimal PR number, not the opaque node id.
     headSha,
     requirementsDigest: preview.requirementsDigest,
     diffDigest: testDigest,

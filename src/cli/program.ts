@@ -222,7 +222,8 @@ export function createProgram(
   setup
     .command("refresh")
     .description(
-      "重新讀取 CI／agent-team/review 證據，推進 ci_waiting 等中間階段（唯一能離開 ci_waiting 的命令）",
+      "重新讀取 CI／agent-team/review 證據；條件達成時發布 Linear／PR 稽核留言並推進到待核可狀態" +
+        "（唯一能離開 ci_waiting 的命令；不合併、不啟用可信設定，合併仍須 approve 的 stdin 確認字串把關）",
     )
     .requiredOption("--project <project-id>", "專案識別碼")
     .action((options: { readonly project: string }) =>

@@ -7,10 +7,24 @@ export interface SourceControlRepositoryRef {
 }
 
 export interface ChangeRequestRef extends SourceControlRepositoryRef {
+  /**
+   * Provider-visible change request number, as a decimal string (GitHub: PR
+   * number). This is NOT the same value as {@link ChangeRequestSnapshot.id},
+   * which is an opaque provider-internal identifier (GitHub: GraphQL node
+   * id). Adapters that parse this field into a number (e.g. GitHub's
+   * `changeRequestNumber()`) require the decimal-number form; passing the
+   * opaque id here fails parsing. See O009c.
+   */
   readonly changeRequestId: string;
 }
 
 export interface ChangeRequestSnapshot {
+  /**
+   * Opaque provider-internal identifier (GitHub: GraphQL node id, e.g.
+   * `PR_kwDOTvUUF877drQL`). Not a decimal string — do not use this to
+   * populate {@link ChangeRequestRef.changeRequestId}; use {@link number}
+   * instead. See O009c.
+   */
   readonly id: string;
   readonly number: number;
   readonly url: string;

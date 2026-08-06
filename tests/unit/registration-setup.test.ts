@@ -804,7 +804,9 @@ function harness(options: HarnessOptions = {}) {
           source: "source_control_default_branch" as const,
           projectId: project.id,
           repository: project.sourceControl.repository,
-          changeRequestId: current.id,
+          // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id
+          // (must match session.changeRequest.number, as production now compares).
+          changeRequestId: String(current.number),
           setupHeadSha: headSha,
           mergeCommitSha,
           defaultBranch: project.defaultBranch,
