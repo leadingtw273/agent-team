@@ -507,8 +507,8 @@ describe("runResumeCycle", () => {
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
   });
 
-  it("fails closed to requires_manual on an exact-readback branch mismatch", async () => {
-    const { deps, progress } = await harness({
+  it("fails closed to requires_manual on an exact-readback branch mismatch, with zero downstream mutation", async () => {
+    const { deps, progress, calls } = await harness({
       changeRequestState: { headBranch: "someone-else/branch" },
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
@@ -522,6 +522,47 @@ describe("runResumeCycle", () => {
     }
     const reloaded = await progress.load(jobId);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    // Zero mutation: the mismatch is caught before CiRecovery/Reviewer/ReviewStatus/AutoMerge/
+    // Lifecycle are ever reached -- only the read-back getChangeRequest call happens.
+    expect(calls).toEqual(["getChangeRequest"]);
+  });
+
+  it("fails closed to requires_manual on an exact-readback head SHA drift, with zero downstream mutation", async () => {
+    const { deps, progress, calls } = await harness({
+      changeRequestState: { headSha: "b".repeat(40) },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "change_request_state_mismatch" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    expect(calls).toEqual(["getChangeRequest"]);
+  });
+
+  it("fails closed to requires_manual when the PR was closed without merging, with zero downstream mutation", async () => {
+    const { deps, progress, calls } = await harness({
+      changeRequestState: { state: "closed" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "change_request_closed" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    // Closed-not-merged must never reach Lifecycle (that path is reserved for state === "merged",
+    // checked strictly before this branch) -- only the read-back getChangeRequest call happens.
+    expect(calls).toEqual(["getChangeRequest"]);
   });
 
   it('a "merging"-staged job re-checks merge status without re-running CI/Review', async () => {

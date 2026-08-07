@@ -12,6 +12,7 @@ import {
 import type { Clock } from "../../domain/foundation/index.js";
 import { GitPreflight, LocalGitAdapter } from "../git/index.js";
 import { GitHubAdapter, type GhJsonTransport } from "../github/adapter.js";
+import { isSafeToSquashMergeDirectly } from "../github/squash-merge-fallback.js";
 import {
   FileLocalUiPreviewConfirmationAuthority,
   FileRegistrationSetupExecutionStore,
@@ -91,6 +92,14 @@ const incompleteWiring = Object.freeze({
  * individually-contract-tested correctness -- can be unit tested directly against a scripted
  * `GhJsonTransport`, without needing to drive a real git repository or the full O005 session
  * state machine just to reach this one branch.
+ *
+ * C015c acceptance review (observation 2): the "is this state unambiguously safe to merge"
+ * predicate itself is shared with `buildMergeGateSourceControl`
+ * (src/cli/dispatch/status-merge-composition.ts) via `isSafeToSquashMergeDirectly`
+ * (src/adapters/github/squash-merge-fallback.ts) -- the outer wrapper here still differs (this
+ * one returns `RegistrationSetupSquashMergePort`'s own state union), but the actual safety
+ * decision can no longer drift between the two independently. See
+ * tests/unit/squash-merge-fallback-parity.test.ts.
  */
 export function createGitHubSquashMergePort(
   github: GitHubAdapter,
@@ -131,13 +140,7 @@ export function createGitHubSquashMergePort(
         });
       }
       const fallbackCurrent = await github.getChangeRequest(reference, mutation);
-      if (
-        !fallbackCurrent.ok ||
-        fallbackCurrent.value.state !== "open" ||
-        fallbackCurrent.value.draft ||
-        fallbackCurrent.value.mergeability !== "mergeable" ||
-        fallbackCurrent.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()
-      ) {
+      if (!isSafeToSquashMergeDirectly(fallbackCurrent, command.expectedHeadSha)) {
         return enabled;
       }
       const merged = await github.squashMergeChangeRequest(

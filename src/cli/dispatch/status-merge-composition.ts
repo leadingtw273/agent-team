@@ -8,7 +8,12 @@
  * itself needs the O009d squash-merge fallback (see `buildMergeGateSourceControl` below), so it is
  * not a bare pass-through of `GitHubAdapter.enableAutoMerge`.
  */
-import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
+import {
+  GhTransport,
+  GitHubAdapter,
+  isSafeToSquashMergeDirectly,
+  type GhJsonTransport,
+} from "../../adapters/github/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import {
   AutoMergeGate,
@@ -41,11 +46,15 @@ export type BuildStatusMergePipelinesResult =
  * always hit on real GitHub, never an occasional edge case. This mirrors
  * `createGitHubSquashMergePort`'s exact fallback (src/adapters/registration/setup-composition.ts):
  * try `enableAutoMerge` first; on failure, re-read the change request; only if that re-read state
- * is unambiguously safe (open, non-draft, mergeable, exact expected head) attempt a direct
- * `squashMergeChangeRequest`; on any other outcome, return the *original* `enableAutoMerge` error
- * untouched -- this fallback never invents a new failure reason of its own. Built fresh here
- * (rather than reused) because it targets `SourceControlPort.enableAutoMerge`'s own return shape
- * (`ChangeRequestSnapshot`), not `RegistrationSetupSquashMergePort`'s custom state union.
+ * is unambiguously safe attempt a direct `squashMergeChangeRequest`; on any other outcome, return
+ * the *original* `enableAutoMerge` error untouched -- this fallback never invents a new failure
+ * reason of its own. The outer wrapper is built fresh here (rather than reused) because it targets
+ * `SourceControlPort.enableAutoMerge`'s own return shape (`ChangeRequestSnapshot`), not
+ * `RegistrationSetupSquashMergePort`'s custom state union -- but the actual "is this safe" decision
+ * is the one piece that must never be allowed to drift between the two implementations, so it is
+ * imported from `isSafeToSquashMergeDirectly` (src/adapters/github/squash-merge-fallback.ts)
+ * rather than re-expressed here. See tests/unit/squash-merge-fallback-parity.test.ts for the
+ * cross-implementation behavioral-parity test the acceptance review asked for.
  */
 export function buildMergeGateSourceControl(
   github: GitHubAdapter,
@@ -65,13 +74,7 @@ export function buildMergeGateSourceControl(
       if (enabled.ok) return enabled;
 
       const current = await github.getChangeRequest(reference, options);
-      if (
-        !current.ok ||
-        current.value.state !== "open" ||
-        current.value.draft ||
-        current.value.mergeability !== "mergeable" ||
-        current.value.headSha.toLowerCase() !== expectedHeadSha.toLowerCase()
-      ) {
+      if (!isSafeToSquashMergeDirectly(current, expectedHeadSha)) {
         return enabled;
       }
       const merged = await github.squashMergeChangeRequest(reference, expectedHeadSha, options);
