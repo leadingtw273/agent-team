@@ -129,9 +129,26 @@ export class Redactor {
         this.isSensitiveKey(decodeQueryKey(key)) ? `${separator}${key}=${redactedValue}` : match,
     );
     output = output.replace(
-      /(^|[\s,{;])(["']?)([a-z][a-z0-9_-]*)(\2\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gimu,
-      (match, boundary: string, quote: string, key: string, separator: string) =>
-        this.isSensitiveKey(key) ? `${boundary}${quote}${key}${separator}${redactedValue}` : match,
+      /(^|[\s,{;])(["']?)([a-z][a-z0-9_-]*)(\2\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gimu,
+      (match, boundary: string, quote: string, key: string, separator: string, value: string) => {
+        if (!this.isSensitiveKey(key)) return match;
+        // C015f: the value must still be fully replaced -- never leaked, no partial retention --
+        // but a JSON string value (double- or single-quoted) must come back *quoted*, or the
+        // substitution corrupts the surrounding JSON syntax. Claude Code's own stream-json output
+        // always carries a `"signature"` field on every "thinking" content block (a real
+        // Anthropic API integrity-verification value, not a secret) -- redacting it bare
+        // (`"signature":[REDACTED]`, no quotes) breaks `JSON.parse` on that line even though the
+        // rest of the event stream, including the final `result` event, is perfectly valid. An
+        // unquoted/bare value (the existing log-line/URL style this function was originally
+        // written for, e.g. `key=value`) keeps its prior bare-replacement behavior unchanged.
+        if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+          return `${boundary}${quote}${key}${separator}"${redactedValue}"`;
+        }
+        if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+          return `${boundary}${quote}${key}${separator}'${redactedValue}'`;
+        }
+        return `${boundary}${quote}${key}${separator}${redactedValue}`;
+      },
     );
     if (containsProviderOrJwtValue(output)) {
       for (const pattern of tokenPatterns) output = output.replace(pattern, redactedValue);

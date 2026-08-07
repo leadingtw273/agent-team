@@ -101,6 +101,74 @@ describe("text redaction", () => {
       "sk-short https://example.test/path?mode=safe X-Session-Secretive: visible ordinary-value";
     expect(new Redactor().redactText(input)).toBe(input);
   });
+
+  describe("JSON-safe redaction of sensitive keys (C015f)", () => {
+    /** The exact shape that broke real Claude Code `stream-json` output: every "thinking"
+     * content block carries a `signature` field (a real Anthropic API integrity value, not a
+     * secret) alongside the sensitive-by-default key `signature`. Redacting a double-quoted JSON
+     * string value into a *bare* `[REDACTED]` (no quotes) corrupts the line -- `JSON.parse` then
+     * throws on an otherwise entirely valid, successful event. */
+    function thinkingBlockLine(signatureValue: string): string {
+      return JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [{ type: "thinking", thinking: "", signature: signatureValue }],
+        },
+      });
+    }
+
+    it("redacts a double-quoted JSON string value while keeping the line valid JSON", () => {
+      const signatureValue = "abcXYZ123-real-looking-base64-signature-value==";
+      const line = thinkingBlockLine(signatureValue);
+
+      const output = new Redactor().redactText(line);
+
+      // Safety red line: the original value must never survive, in whole or in part.
+      expect(output).not.toContain(signatureValue);
+      // The whole point of this fix: still valid JSON after redaction.
+      const parsed = JSON.parse(output) as {
+        message: { content: readonly { signature: unknown }[] };
+      };
+      // And the masking is genuinely complete, not just "doesn't crash" -- the field's value is
+      // exactly the redacted marker, not a mangled fragment of the original.
+      expect(parsed.message.content[0]?.signature).toBe(redactedValue);
+    });
+
+    it("redacts a single-quoted value while keeping the surrounding quote style intact", () => {
+      const secretValue = "single-quoted-secret-value";
+      const input = `{token: '${secretValue}', safe: 'visible'}`;
+
+      const output = new Redactor().redactText(input);
+
+      expect(output).not.toContain(secretValue);
+      expect(output).toBe(`{token: '${redactedValue}', safe: 'visible'}`);
+    });
+
+    it("keeps the existing bare-value behavior unchanged for non-JSON log-line style input", () => {
+      const secretValue = "bare-secret-value";
+      const input = `X-Auth-Token: ${secretValue}`;
+
+      const output = new Redactor().redactText(input);
+
+      expect(output).not.toContain(secretValue);
+      expect(output).toBe(`X-Auth-Token: ${redactedValue}`);
+    });
+
+    it("fully masks a long real-looking base64 signature with no prefix/suffix fragment surviving", () => {
+      const signatureValue = "EqQBCkYIBRgCKkC3f9J4l2mQ8xR7pV1nK5zT6wY0hL3eD9sU2iM4oB8qA1rC7nW==";
+      const line = thinkingBlockLine(signatureValue);
+
+      const output = new Redactor().redactText(line);
+
+      expect(output).not.toContain(signatureValue);
+      // No fragment of the original value (prefix or suffix) leaks either.
+      expect(output).not.toContain(signatureValue.slice(0, 16));
+      expect(output).not.toContain(signatureValue.slice(-16));
+      expect(() => {
+        JSON.parse(output);
+      }).not.toThrow();
+    });
+  });
 });
 
 describe("structured redaction", () => {
