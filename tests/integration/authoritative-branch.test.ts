@@ -29,7 +29,9 @@ const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -170,7 +172,12 @@ describe("LocalGitAdapter.resolveAuthoritativeBranch (C015x decision 1)", () => 
 
   it("fails closed (conflict) when the remote is genuinely github.com-shaped but for a different owner/repo", async () => {
     const fixture = await createFixture();
-    await runGit(fixture.repository, ["remote", "set-url", "origin", "https://github.com/someone-else/other-repo.git"]);
+    await runGit(fixture.repository, [
+      "remote",
+      "set-url",
+      "origin",
+      "https://github.com/someone-else/other-repo.git",
+    ]);
     const adapter = new LocalGitAdapter();
 
     const result = await adapter.resolveAuthoritativeBranch(

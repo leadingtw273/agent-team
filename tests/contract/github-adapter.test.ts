@@ -525,9 +525,14 @@ describe("GitHub source-control adapter", () => {
   });
 
   it("fails closed for a non-GitHub provider before ever calling the transport", async () => {
-    const gitlabProject = { ...project, sourceControl: { ...project.sourceControl, provider: "gitlab" } };
+    const gitlabProject = {
+      ...project,
+      sourceControl: { ...project.sourceControl, provider: "gitlab" },
+    };
     const transport = new ScriptedTransport([]);
-    const result = await new GitHubAdapter(transport).getRepositoryMetadata({ project: gitlabProject });
+    const result = await new GitHubAdapter(transport).getRepositoryMetadata({
+      project: gitlabProject,
+    });
 
     expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
     transport.expectDone();

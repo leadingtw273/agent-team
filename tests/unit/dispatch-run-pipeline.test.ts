@@ -19,7 +19,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
-import { issueSchema, projectSchema, type Issue, type Project } from "../../src/domain/project/index.js";
+import {
+  issueSchema,
+  projectSchema,
+  type Issue,
+  type Project,
+} from "../../src/domain/project/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
@@ -227,7 +232,9 @@ function buildHandlers(
   buildImplementerPipeline: Parameters<
     typeof createDispatchCliHandlers
   >[0]["buildImplementerPipeline"],
-  resolveAuthoritativeBase?: Parameters<typeof createDispatchCliHandlers>[0]["resolveAuthoritativeBase"],
+  resolveAuthoritativeBase?: Parameters<
+    typeof createDispatchCliHandlers
+  >[0]["resolveAuthoritativeBase"],
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -261,7 +268,8 @@ function buildHandlers(
   return createDispatchCliHandlers({
     agentTeamHome: stateRoot,
     buildComposition,
-    resolveAuthoritativeBase: resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
+    resolveAuthoritativeBase:
+      resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
     ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
   });
 }

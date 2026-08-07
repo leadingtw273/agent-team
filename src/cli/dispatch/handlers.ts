@@ -125,7 +125,9 @@ function outcome(state: "success" | "failed" | "blocked", payload: unknown) {
  * (`default_branch_mismatch` has no `DomainError` at all -- it is a live cross-check disagreement,
  * not an external-call failure) -- this normalizes them into a single serializable shape for the
  * CLI's own JSON output, never dropping whichever evidence that specific reason actually has. */
-function authoritativeBaseErrorDetail(error: AuthoritativeBaseFailure): Readonly<Record<string, unknown>> {
+function authoritativeBaseErrorDetail(
+  error: AuthoritativeBaseFailure,
+): Readonly<Record<string, unknown>> {
   switch (error.reason) {
     case "default_branch_metadata_unavailable":
     case "authoritative_branch_unavailable":
@@ -449,8 +451,9 @@ export function createDispatchCliHandlers(
           // (missing both `inspectRepository` and the new `resolveAuthoritativeBranch`), and both
           // adapters are stateless CLI wrappers -- constructing fresh instances is cheap and does
           // not duplicate any state.
-          const authoritativeBase = await (options.resolveAuthoritativeBase ??
-            resolveAuthoritativeBaseRevision)(
+          const authoritativeBase = await (
+            options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision
+          )(
             build.value.project,
             { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
             { idempotencyKey: `cli-dispatch:${result.job.id}:authoritative-base` },

@@ -1715,12 +1715,17 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
   it("escalates immediately to requires_manual(change_request_behind_base) the instant mergeStateStatus is behind, with no prior history", async () => {
     const base = await harness();
     await seedProgressRecord(base.progress, { kind: "merging" });
-    const deps = readbackDeps(base, () => ({ mergeStateStatus: "behind", baseSha: "b".repeat(40) }));
+    const deps = readbackDeps(base, () => ({
+      mergeStateStatus: "behind",
+      baseSha: "b".repeat(40),
+    }));
 
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.value).toEqual([{ jobId, outcome: "requires_manual", reason: "change_request_behind_base" }]);
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "change_request_behind_base" },
+      ]);
     }
 
     const reloaded = await base.progress.load(jobId);
@@ -1828,7 +1833,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     }
   });
 
-  it("migrates a pre-C015x bare {kind:\"merging\"} record on its first resume, seeding a fresh baseline rather than treating absent history as zero progress", async () => {
+  it('migrates a pre-C015x bare {kind:"merging"} record on its first resume, seeding a fresh baseline rather than treating absent history as zero progress', async () => {
     const base = await harness();
     // Exactly the shape a real, un-migrated `~/.agent-team/state` record has today -- this ticket
     // is forbidden from editing or migrating any existing file under that directory, so

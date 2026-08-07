@@ -991,7 +991,13 @@ export class LocalGitAdapter implements GitPort {
     const trackingRef = `refs/remotes/${request.remote}/${request.branch}`;
     const fetched = await this.#run(
       root.value,
-      ["fetch", "--no-tags", "--quiet", request.remote, `+refs/heads/${request.branch}:${trackingRef}`],
+      [
+        "fetch",
+        "--no-tags",
+        "--quiet",
+        request.remote,
+        `+refs/heads/${request.branch}:${trackingRef}`,
+      ],
       options,
     );
     if (!fetched.ok) return fetched;

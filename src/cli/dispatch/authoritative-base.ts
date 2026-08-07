@@ -84,7 +84,10 @@ export async function resolveAuthoritativeBaseRevision(
       branch: project.defaultBranch,
       expectedRepository: project.sourceControl.repository,
     },
-    { idempotencyKey: options.idempotencyKey, ...(options.signal === undefined ? {} : { signal: options.signal }) },
+    {
+      idempotencyKey: options.idempotencyKey,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    },
   );
   if (!resolved.ok) {
     return err({ reason: "authoritative_branch_unavailable", error: resolved.error });

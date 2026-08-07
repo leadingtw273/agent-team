@@ -49,13 +49,7 @@ export interface ChangeRequestSnapshot {
    * required, zod-validated projection; only test fakes may ever legitimately omit them.
    */
   readonly mergeStateStatus?:
-    | "clean"
-    | "behind"
-    | "blocked"
-    | "dirty"
-    | "draft"
-    | "unstable"
-    | "unknown";
+    "clean" | "behind" | "blocked" | "dirty" | "draft" | "unstable" | "unknown";
   /** C015x decision 3: GitHub's own current base-branch tip (`.base.sha`) -- needed to build the
    * "has the base moved further since this job last observed it" fingerprint
    * `resumeMergingStage` persists. Same optionality rationale as {@link mergeStateStatus} above. */

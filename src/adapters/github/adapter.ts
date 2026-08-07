@@ -45,7 +45,15 @@ const projectedChangeRequestSchema = z
     // C015x decision 2: GitHub's own `mergeable_state` -- see `ChangeRequestSnapshot.mergeStateStatus`'s
     // own header (application/ports/source-control.ts) for why this is required here (the real
     // adapter always populates it) despite being optional on that port-level type.
-    mergeStateStatus: z.enum(["clean", "behind", "blocked", "dirty", "draft", "unstable", "unknown"]),
+    mergeStateStatus: z.enum([
+      "clean",
+      "behind",
+      "blocked",
+      "dirty",
+      "draft",
+      "unstable",
+      "unknown",
+    ]),
     // C015x decision 3: GitHub's own current base-branch tip (`.base.sha`).
     baseSha: z.string().regex(shaPattern),
     autoMergeEnabled: z.boolean(),
