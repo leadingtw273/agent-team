@@ -170,13 +170,28 @@ describe("FileJobProgressStore", () => {
       { kind: "completed" as const },
       { kind: "failed" as const },
       { kind: "paused" as const, checkpointId },
+      // C015r decision 1: `cause` stays optional -- a bare pre-C015r record must still parse.
       { kind: "requires_manual" as const },
+      {
+        kind: "requires_manual" as const,
+        cause: {
+          stage: "review" as const,
+          reasonCode: "review_report_contract" as const,
+          attempts: { count: 2, lastCategory: "enum_mismatch" as const },
+        },
+      },
       // C015o decision 2: retryable-provider-failure resumable stages.
       { kind: "review_pending_retry" as const, retries: 1, lastErrorCode: "timeout" },
       { kind: "ci_pending_retry" as const, retries: 0, lastErrorCode: "unavailable" },
       // C015o decision 4: explicit, human-issued terminal verdicts.
       { kind: "superseded" as const, supersededByJobId: otherJobId },
       { kind: "cancelled" as const },
+      // C015r decision 4: dedicated, separately-capped report-contract retry stage.
+      {
+        kind: "review_report_pending_retry" as const,
+        retries: 1,
+        lastCategory: "preamble_or_trailing_content" as const,
+      },
     ];
     for (const stage of stages) {
       // Deliberately not routed through `baseRecord()` here: this test exercises runtime schema

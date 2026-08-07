@@ -41,6 +41,7 @@ import {
 import {
   buildIssueAdmissionStore,
   buildJobProgressStore,
+  buildReviewReportDiagnosticsSidecar,
   resumableStageKinds,
   runResumeCycle,
   type ResumeJobOutcome,
@@ -281,6 +282,7 @@ export function createDispatchCliHandlers(
             lifecycle: resumeComposition.value.lifecycle,
             clock,
             holderId,
+            reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
           });
           if (!cycle.ok) {
             return outcome("failed", {

@@ -38,6 +38,7 @@ import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type {
   CiRecoveryPipeline,
   ReviewerPipeline,
+  ReviewerPipelineOutcome,
   ReviewStatusCoordinator,
   AutoMergeGate,
   LifecyclePipeline,
@@ -65,8 +66,18 @@ import {
   FileJobProgressStore,
   type JobProgressRecord,
   type JobProgressRecordMutation,
+  type RequiresManualCause,
+  type RequiresManualReasonCode,
+  type RequiresManualStage,
 } from "../../adapters/dispatch/job-progress-store.js";
 import { FileIssueAdmissionStore } from "../../adapters/dispatch/issue-admission-store.js";
+import {
+  FileReviewReportDiagnosticsSidecar,
+  defaultReviewReportSidecarDirectory,
+  type ReviewReportDiagnosticsSidecarPort,
+} from "../../adapters/dispatch/review-report-diagnostics-sidecar.js";
+import type { ReportContractFailureCategory } from "../../application/pipelines/reviewer-model.js";
+import { Redactor } from "../../infrastructure/redaction/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 
@@ -96,6 +107,9 @@ export const resumableStageKinds: ReadonlySet<string> = new Set([
   "merging",
   "review_pending_retry",
   "ci_pending_retry",
+  // C015r decision 4: symmetric to the two above, for a `report`-stage contract failure that has
+  // not yet exhausted its own, separately-capped retry limit.
+  "review_report_pending_retry",
 ]);
 
 /**
@@ -136,6 +150,36 @@ const resumeProviderDeadlineMs = watchdogHardStopMs;
  * Living in `JobProgressStage` (adapter layer) rather than `Job.attempts` (domain layer) is what
  * keeps this fix entirely inside CLI/adapter authority -- see this file's own module header. */
 const providerRetryLimit = 2;
+
+/** C015r decision 4: a `report`-stage contract failure (the provider ran to completion, but its
+ * output failed decision 3's tolerant parse/schema/context checks) gets its *own*, separately
+ * capped retry -- deliberately never `providerRetryLimit`/`review_pending_retry` above, which is for
+ * the provider failing to run *at all*. codex's C015q review named these as distinct failure
+ * semantics that must not share a counter or a limit. The cap is 1 (coordinator's explicit "自動重試
+ * 上限 1"), not 2 -- a single, prompt-guided retry, not the same budget as an infrastructure hiccup. */
+const reportContractRetryLimit = 1;
+
+function currentReportContractRetries(record: JobProgressRecord): number {
+  return record.stage.kind === "review_report_pending_retry" ? record.stage.retries : 0;
+}
+
+/** C015r decision 1: builds the closed-enum `cause` every `requiresManual(...)` call site must now
+ * supply -- see `requiresManualCauseSchema`'s own header (job-progress-store.ts) for the full
+ * rationale. `count` defaults to 1 (a single-shot failure, no retry loop tracked for that call site);
+ * only the `review_report_contract` reasonCode's own call site passes a real, larger count (the
+ * report-contract retry counter's value at exhaustion) and a `lastCategory`. */
+function requiresManualCause(
+  stage: RequiresManualStage,
+  reasonCode: RequiresManualReasonCode,
+  count = 1,
+  lastCategory?: ReportContractFailureCategory,
+): RequiresManualCause {
+  return Object.freeze({
+    stage,
+    reasonCode,
+    attempts: Object.freeze({ count, ...(lastCategory === undefined ? {} : { lastCategory }) }),
+  });
+}
 
 function computeProviderDeadline(clock: Clock): Instant | undefined {
   const computed = instantFromDate(new Date(Date.parse(clock.now()) + resumeProviderDeadlineMs));
@@ -181,6 +225,10 @@ export interface ResumeCycleDependencies {
   readonly holderId: string;
   /** Injectable for tests; production defaults to a real `LocalGitAdapter`. */
   readonly gitForBaseRevision?: Pick<LocalGitAdapter, "inspectRepository">;
+  /** C015r decision 5: the observability sidecar -- see its own file header
+   * (review-report-diagnostics-sidecar.ts) for the full rule set. Only ever called from within this
+   * module's own `report`-stage failure handling; never anywhere else. */
+  readonly reviewReportSidecar: ReviewReportDiagnosticsSidecarPort;
 }
 
 export type ResumeJobOutcome =
@@ -316,8 +364,9 @@ async function requiresManual(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
   reason: string,
+  cause: RequiresManualCause,
 ): Promise<ResumeJobOutcome> {
-  return transitionOrReport(deps, record, { stage: { kind: "requires_manual" } }, () => ({
+  return transitionOrReport(deps, record, { stage: { kind: "requires_manual", cause } }, () => ({
     jobId: record.jobId,
     outcome: "requires_manual",
     reason,
@@ -342,11 +391,12 @@ async function requiresManualUnlessRetryable(
   deps: ResumeCycleDependencies,
   reason: string,
   error: DomainError | undefined,
+  cause: RequiresManualCause,
 ): Promise<ResumeJobOutcome> {
   if (error !== undefined && isRetryableError(error)) {
     return { jobId: record.jobId, outcome: "transient_failure", reason, error };
   }
-  return requiresManual(record, deps, reason);
+  return requiresManual(record, deps, reason, cause);
 }
 
 async function resumeUnderLease(
@@ -354,7 +404,12 @@ async function resumeUnderLease(
   deps: ResumeCycleDependencies,
 ): Promise<ResumeJobOutcome> {
   if (record.changeRequestId === undefined) {
-    return requiresManual(record, deps, "missing_change_request_id");
+    return requiresManual(
+      record,
+      deps,
+      "missing_change_request_id",
+      requiresManualCause("setup", "change_request_unavailable"),
+    );
   }
   const changeRequestId = record.changeRequestId;
   const changeRequestReference = { project: deps.project, changeRequestId };
@@ -365,6 +420,7 @@ async function resumeUnderLease(
       deps,
       "change_request_read_failed",
       currentChangeRequest.error,
+      requiresManualCause("setup", "change_request_unavailable"),
     );
   }
   // Exact-readback: the recorded branch/headSha must still match live GitHub, unless the PR has
@@ -377,10 +433,20 @@ async function resumeUnderLease(
     currentChangeRequest.value.headBranch !== record.branch ||
     (record.headSha !== undefined && currentChangeRequest.value.headSha !== record.headSha)
   ) {
-    return requiresManual(record, deps, "change_request_state_mismatch");
+    return requiresManual(
+      record,
+      deps,
+      "change_request_state_mismatch",
+      requiresManualCause("setup", "change_request_unavailable"),
+    );
   }
   if (currentChangeRequest.value.state === "closed") {
-    return requiresManual(record, deps, "change_request_closed");
+    return requiresManual(
+      record,
+      deps,
+      "change_request_closed",
+      requiresManualCause("setup", "change_request_unavailable"),
+    );
   }
 
   if (record.stage.kind === "merging") {
@@ -391,9 +457,24 @@ async function resumeUnderLease(
   }
 
   const jobs = await deps.jobRepository.readAll();
-  if (!jobs.ok) return requiresManualUnlessRetryable(record, deps, "job_read_failed", jobs.error);
+  if (!jobs.ok) {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "job_read_failed",
+      jobs.error,
+      requiresManualCause("setup", "job_unavailable"),
+    );
+  }
   const job = jobs.value.find((candidate) => candidate.id === record.jobId);
-  if (job === undefined) return requiresManual(record, deps, "job_not_found");
+  if (job === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "job_not_found",
+      requiresManualCause("setup", "job_unavailable"),
+    );
+  }
 
   const issue = await projectIssueByExternalId(
     deps.project,
@@ -403,7 +484,13 @@ async function resumeUnderLease(
     record.externalIssueId,
   );
   if (!issue.ok) {
-    return requiresManualUnlessRetryable(record, deps, "issue_projection_failed", issue.error);
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "issue_projection_failed",
+      issue.error,
+      requiresManualCause("setup", "requirement_snapshot_unavailable"),
+    );
   }
   const requirementSnapshot = createRequirementSnapshot(issue.value, deps.clock.now());
   if (!requirementSnapshot.ok) {
@@ -412,6 +499,7 @@ async function resumeUnderLease(
       deps,
       "requirement_snapshot_invalid",
       requirementSnapshot.error,
+      requiresManualCause("setup", "requirement_snapshot_unavailable"),
     );
   }
 
@@ -423,6 +511,7 @@ async function resumeUnderLease(
       deps,
       "base_revision_unavailable",
       repository.error,
+      requiresManualCause("setup", "base_revision_unavailable"),
     );
   }
 
@@ -435,7 +524,14 @@ async function resumeUnderLease(
   const idempotencyKeyPrefix = `cli-dispatch-resume:${record.jobId}:${String(record.revision)}`;
 
   const ciDeadline = computeProviderDeadline(deps.clock);
-  if (ciDeadline === undefined) return requiresManual(record, deps, "invalid_deadline");
+  if (ciDeadline === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "invalid_deadline",
+      requiresManualCause("ci_recovery", "invalid_deadline"),
+    );
+  }
 
   const ciOutcome = await deps.ciRecovery.run({
     trigger: { kind: "polling" },
@@ -457,7 +553,14 @@ async function resumeUnderLease(
   switch (ciOutcome.state) {
     case "ci_waiting": {
       const headSha = parsedHeadSha(ciOutcome.checks.headSha);
-      if (headSha === undefined) return requiresManual(record, deps, "invalid_head_sha");
+      if (headSha === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "invalid_head_sha",
+          requiresManualCause("ci_recovery", "invalid_head_sha"),
+        );
+      }
       return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" }, headSha }, () => ({
         jobId: record.jobId,
         outcome: "still_ci_waiting",
@@ -465,7 +568,14 @@ async function resumeUnderLease(
     }
     case "repair_pushed": {
       const headSha = parsedHeadSha(ciOutcome.commit.sha);
-      if (headSha === undefined) return requiresManual(record, deps, "invalid_head_sha");
+      if (headSha === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "invalid_head_sha",
+          requiresManualCause("ci_recovery", "invalid_head_sha"),
+        );
+      }
       return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" }, headSha }, () => ({
         jobId: record.jobId,
         outcome: "repair_pushed",
@@ -473,7 +583,14 @@ async function resumeUnderLease(
     }
     case "checkpointed": {
       const checkpointId = parsedCheckpointId(ciOutcome.checkpointId);
-      if (checkpointId === undefined) return requiresManual(record, deps, "invalid_checkpoint_id");
+      if (checkpointId === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "invalid_checkpoint_id",
+          requiresManualCause("ci_recovery", "invalid_checkpoint_id"),
+        );
+      }
       return transitionOrReport(deps, record, { stage: { kind: "paused", checkpointId } }, () => ({
         jobId: record.jobId,
         outcome: "checkpointed",
@@ -481,7 +598,12 @@ async function resumeUnderLease(
       }));
     }
     case "paused":
-      return requiresManual(record, deps, `ci_recovery_paused:${ciOutcome.reason}`);
+      return requiresManual(
+        record,
+        deps,
+        `ci_recovery_paused:${ciOutcome.reason}`,
+        requiresManualCause("ci_recovery", "ci_recovery_paused"),
+      );
     case "failed": {
       // C015o decision 2: retryable CI-recovery provider failures get the same treatment as
       // reviewer ones (`ci_pending_retry`, symmetric to `review_pending_retry`) -- see this
@@ -514,6 +636,7 @@ async function resumeUnderLease(
         record,
         deps,
         `ci_recovery_failed:${ciOutcome.stage}:${ciOutcome.error.code}`,
+        requiresManualCause("ci_recovery", "ci_recovery_failed"),
       );
     }
     case "ready_for_review":
@@ -529,6 +652,61 @@ async function resumeUnderLease(
     baseRevision: repository.value.headSha,
     idempotencyKeyPrefix,
   });
+}
+
+/**
+ * C015r decisions 4 + 5: the single place a `report`-stage reviewer failure is ever handled.
+ *
+ * Decision 5 (observability sidecar) happens first and unconditionally, right here where the raw
+ * rejected text still exists: it is written to `deps.reviewReportSidecar`, Redactor-scrubbed and
+ * size-capped by that adapter itself, and then this function never touches the raw text again --
+ * it never appears in the `ResumeJobOutcome` this function returns, nor in the `cause` a
+ * `requires_manual` transition may write. A sidecar write failure is deliberately never surfaced or
+ * retried here -- it is a best-effort diagnostic aid (decision 5's own words), not a gate on the
+ * resume outcome itself.
+ *
+ * Decision 4 (bounded, dedicated retry) happens second: `reportContractRetryLimit` (1) is tracked by
+ * `review_report_pending_retry`'s own `retries` field -- never `providerRetryLimit`/
+ * `review_pending_retry` (that counter is for the provider failing to run at all, a different
+ * failure semantics per codex's C015q review). Once exhausted, `requires_manual` is written with
+ * `reasonCode: "review_report_contract"` and `attempts: {count, lastCategory}` -- decision 1's
+ * closed-enum cause, still never the raw provider text.
+ */
+async function handleReportContractFailure(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  reviewOutcome: Extract<ReviewerPipelineOutcome, { state: "failed" }>,
+): Promise<ResumeJobOutcome> {
+  const category: ReportContractFailureCategory =
+    reviewOutcome.reportFailureCategory ?? "schema_invalid";
+  if (reviewOutcome.rejectedOutput !== undefined) {
+    await deps.reviewReportSidecar.record({
+      jobId: record.jobId,
+      category,
+      rejectedOutput: reviewOutcome.rejectedOutput,
+    });
+  }
+  const retries = currentReportContractRetries(record) + 1;
+  if (retries <= reportContractRetryLimit) {
+    return transitionOrReport(
+      deps,
+      record,
+      { stage: { kind: "review_report_pending_retry", retries, lastCategory: category } },
+      () => ({
+        jobId: record.jobId,
+        outcome: "pending_retry",
+        stage: "report",
+        error: reviewOutcome.error,
+        retries,
+      }),
+    );
+  }
+  return requiresManual(
+    record,
+    deps,
+    `review_report_contract:${category}`,
+    requiresManualCause("review", "review_report_contract", retries, category),
+  );
 }
 
 async function resumeReview(
@@ -554,7 +732,13 @@ async function resumeReview(
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
   });
   if (begin.state === "failed") {
-    return requiresManualUnlessRetryable(record, deps, "review_begin_failed", begin.error);
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "review_begin_failed",
+      begin.error,
+      requiresManualCause("review", "review_begin_failed"),
+    );
   }
   if (begin.state === "not_ready") {
     return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" } }, () => ({
@@ -566,11 +750,31 @@ async function resumeReview(
     // Disclosed limitation (see file header): this resume path never leaves a job in a state
     // that should reach commit-only-change reuse -- fail closed rather than guess at an approval
     // this code has no fresh evidence for.
-    return requiresManual(record, deps, "already_approved_reuse_unimplemented");
+    return requiresManual(
+      record,
+      deps,
+      "already_approved_reuse_unimplemented",
+      requiresManualCause("review", "review_reuse_unimplemented"),
+    );
   }
 
   const reviewDeadline = computeProviderDeadline(deps.clock);
-  if (reviewDeadline === undefined) return requiresManual(record, deps, "invalid_deadline");
+  if (reviewDeadline === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "invalid_deadline",
+      requiresManualCause("review", "invalid_deadline"),
+    );
+  }
+
+  // C015r decision 4: only set when this resume attempt is itself the one, bounded report-contract
+  // retry -- carries a fixed failure-category enum into the directive, never the previous attempt's
+  // raw invalid output (see `ReviewerPipelineRequest.reportRetryFeedback`'s own header).
+  const reportRetryFeedback =
+    record.stage.kind === "review_report_pending_retry"
+      ? Object.freeze({ category: record.stage.lastCategory })
+      : undefined;
 
   const reviewOutcome = await deps.reviewer.run({
     job: context.job,
@@ -585,6 +789,7 @@ async function resumeReview(
     evidence: Object.freeze([]),
     deadlineAt: reviewDeadline,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
+    ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
   });
 
   switch (reviewOutcome.state) {
@@ -596,7 +801,14 @@ async function resumeReview(
     }
     case "checkpointed": {
       const checkpointId = parsedCheckpointId(reviewOutcome.checkpointId);
-      if (checkpointId === undefined) return requiresManual(record, deps, "invalid_checkpoint_id");
+      if (checkpointId === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "invalid_checkpoint_id",
+          requiresManualCause("review", "invalid_checkpoint_id"),
+        );
+      }
       return transitionOrReport(deps, record, { stage: { kind: "paused", checkpointId } }, () => ({
         jobId: record.jobId,
         outcome: "checkpointed",
@@ -604,8 +816,21 @@ async function resumeReview(
       }));
     }
     case "paused":
-      return requiresManual(record, deps, `review_paused:${reviewOutcome.reason}`);
+      return requiresManual(
+        record,
+        deps,
+        `review_paused:${reviewOutcome.reason}`,
+        requiresManualCause("review", "review_paused"),
+      );
     case "failed": {
+      // C015r decision 4: a `report`-stage failure (the provider ran to completion, but its output
+      // failed decision 3's tolerant parse/schema/context checks) is handled entirely separately
+      // from the retryable-provider-start/run path below -- its own dedicated, 1-capped retry
+      // counter, its own sidecar write, its own requires_manual reasonCode. See
+      // `handleReportContractFailure`'s own header for the full rationale.
+      if (reviewOutcome.stage === "report") {
+        return handleReportContractFailure(record, deps, reviewOutcome);
+      }
       // C015o decision 2 (D1's confirmed root cause): a retryable reviewer provider-start/
       // provider-run failure gets a bounded, dedicated `review_pending_retry` state instead of
       // being forced straight to `requires_manual` -- see `providerRetryLimit`'s own comment for
@@ -637,6 +862,7 @@ async function resumeReview(
         record,
         deps,
         `review_failed:${reviewOutcome.stage}:${reviewOutcome.error.code}`,
+        requiresManualCause("review", "review_provider_failed"),
       );
     }
     case "changes_requested":
@@ -649,7 +875,13 @@ async function resumeReview(
         decision: reviewOutcome,
       });
       if (record$.state === "failed") {
-        return requiresManualUnlessRetryable(record, deps, "review_record_failed", record$.error);
+        return requiresManualUnlessRetryable(
+          record,
+          deps,
+          "review_record_failed",
+          record$.error,
+          requiresManualCause("review", "review_record_failed"),
+        );
       }
       return transitionOrReport(deps, record, { stage: { kind: "fix_round" } }, () => ({
         jobId: record.jobId,
@@ -670,8 +902,19 @@ async function resumeReview(
   });
   if (recorded.state !== "approved") {
     return recorded.state === "failed"
-      ? requiresManualUnlessRetryable(record, deps, "review_record_did_not_approve", recorded.error)
-      : requiresManual(record, deps, "review_record_did_not_approve");
+      ? requiresManualUnlessRetryable(
+          record,
+          deps,
+          "review_record_did_not_approve",
+          recorded.error,
+          requiresManualCause("review", "review_not_approved"),
+        )
+      : requiresManual(
+          record,
+          deps,
+          "review_record_did_not_approve",
+          requiresManualCause("review", "review_not_approved"),
+        );
   }
 
   const enabled = await deps.autoMerge.enable({
@@ -690,8 +933,14 @@ async function resumeReview(
           deps,
           `auto_merge_not_enabled:${enabled.state}`,
           enabled.error,
+          requiresManualCause("review", "auto_merge_not_enabled"),
         )
-      : requiresManual(record, deps, `auto_merge_not_enabled:${enabled.state}`);
+      : requiresManual(
+          record,
+          deps,
+          `auto_merge_not_enabled:${enabled.state}`,
+          requiresManualCause("review", "auto_merge_not_enabled"),
+        );
   }
   if (enabled.changeRequest.state === "merged") {
     return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
@@ -722,8 +971,14 @@ async function finishMerged(
           deps,
           `lifecycle_not_completed:${outcome.state}`,
           outcome.error,
+          requiresManualCause("merge", "lifecycle_not_completed"),
         )
-      : requiresManual(record, deps, `lifecycle_not_completed:${outcome.state}`);
+      : requiresManual(
+          record,
+          deps,
+          `lifecycle_not_completed:${outcome.state}`,
+          requiresManualCause("merge", "lifecycle_not_completed"),
+        );
   }
   return transitionOrReport(deps, record, { stage: { kind: "completed" } }, () => ({
     jobId: record.jobId,
@@ -746,4 +1001,17 @@ export function defaultIssueAdmissionDirectory(agentTeamHome: string): string {
 
 export function buildIssueAdmissionStore(agentTeamHome: string): FileIssueAdmissionStore {
   return new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(agentTeamHome));
+}
+
+/** C015r decision 5: production default -- a fresh `Redactor()` with no seeded secrets, exactly the
+ * same construction `buildClaudeRunner` (claude-factory.ts) already uses for the real provider
+ * transcript path, so the sidecar's own scrubbing has the same coverage as everything else a
+ * provider's raw text already flows through. */
+export function buildReviewReportDiagnosticsSidecar(
+  agentTeamHome: string,
+): FileReviewReportDiagnosticsSidecar {
+  return new FileReviewReportDiagnosticsSidecar(
+    defaultReviewReportSidecarDirectory(agentTeamHome),
+    new Redactor(),
+  );
 }

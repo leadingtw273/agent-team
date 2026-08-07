@@ -713,3 +713,147 @@ describe("ReviewerPipeline", () => {
     expect(setup.calls).toEqual([]);
   });
 });
+
+/**
+ * C015r decisions 2/3/4/5: the directive's controller-generated JSON skeleton, decision 3's
+ * exactly-two-step deterministic syntax tolerance, and the resulting `reportFailureCategory`/
+ * `rejectedOutput` propagation. `runReviewerProvider`/`tolerantParseCandidate`/
+ * `classifyReportFailure` are not exported (private to reviewer-provider.ts) -- every case here goes
+ * through the real, public `ReviewerPipeline.run()`, exactly as production does.
+ */
+describe("ReviewerPipeline report contract (C015r decisions 2/3/4/5)", () => {
+  it("directive contains a JSON skeleton with the exact identity digests, the approved AC, every quality dimension for the role, and the real evidence source list", async () => {
+    const input = request("code_review");
+    const setup = fixture(input);
+    await setup.pipeline.run(input.value);
+
+    const directive = setup.providerRequests[0]?.controllerDirective ?? "";
+    expect(directive).toContain(input.review.identity.requirementsDigest);
+    expect(directive).toContain(input.review.identity.headSha);
+    expect(directive).toContain(input.review.identity.diffDigest);
+    expect(directive).toContain(acceptanceCriterion);
+    for (const dimension of codeQualityDimensions) {
+      expect(directive).toContain(dimension);
+    }
+    expect(directive).toContain("agent-team:review-identity");
+    expect(directive).toContain("agent-team:diff");
+    expect(directive).toContain("agent-team:ci");
+    expect(directive).toContain("known:compatibility");
+    // Decision 2's whole point: every enum's legal values spelled out inline, not just verdict's.
+    expect(directive).toContain("passed | failed | clarification_required");
+    expect(directive).toContain("passed | failed | not_applicable");
+    expect(directive).toContain("blocking | advisory | clarification");
+    // Decision 3's counterpart instruction: no framing at all, not even a Markdown fence.
+    expect(directive).toContain(
+      "no leading sentence, no trailing sentence, no Markdown code fence",
+    );
+    // Real-CLI acceptance run 1 (c015r-repro-run1) produced a finding with both acceptanceCriteria
+    // and evidenceSources empty, which reviewFindingSchema's own superRefine rejects -- the
+    // skeleton's findings placeholder now spells this cross-field constraint out explicitly.
+    expect(directive).toContain(
+      "every individual finding object inside it must have at least one entry in acceptanceCriteria OR at least one entry in evidenceSources",
+    );
+  });
+
+  it("decision 3 step 2 tolerates a leading preamble sentence before an otherwise-valid JSON report", async () => {
+    const input = request("code_review");
+    const clean = report("code_reviewer", input.review.identity);
+    const withPreamble = `Confirmed CI is green. Now producing the final review.\n\n${JSON.stringify(clean)}`;
+    const setup = fixture(input, { reports: { code_reviewer: withPreamble } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "approved" });
+  });
+
+  it("decision 3 step 1 tolerates a single Markdown fence layer wrapping an otherwise-valid JSON report", async () => {
+    const input = request("code_review");
+    const clean = report("code_reviewer", input.review.identity);
+    const fenced = `\`\`\`json\n${JSON.stringify(clean)}\n\`\`\``;
+    const setup = fixture(input, { reports: { code_reviewer: fenced } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "approved" });
+  });
+
+  it("classifies a completely empty final message as empty_output, with no rejectedOutput to propagate", async () => {
+    const input = request("code_review");
+    const setup = fixture(input, { reports: { code_reviewer: "" } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "report",
+      reportFailureCategory: "empty_output",
+    });
+    expect((outcome as { rejectedOutput?: string }).rejectedOutput).toBeUndefined();
+  });
+
+  it("classifies genuinely malformed JSON (even after both tolerance steps) as invalid_json and propagates the exact rejected text", async () => {
+    const input = request("code_review");
+    const garbage = "not json at all {{{";
+    const setup = fixture(input, { reports: { code_reviewer: garbage } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "report",
+      reportFailureCategory: "invalid_json",
+      rejectedOutput: garbage,
+    });
+  });
+
+  it("classifies an enum violation with no preamble/trailing content as enum_mismatch", async () => {
+    const input = request("code_review");
+    const clean = report("code_reviewer", input.review.identity);
+    const badVerdict = { ...clean, verdict: "met" } as unknown as ReviewerReport;
+    const setup = fixture(input, { reports: { code_reviewer: badVerdict } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "report",
+      reportFailureCategory: "enum_mismatch",
+    });
+    expect((outcome as { rejectedOutput?: string }).rejectedOutput).toContain('"met"');
+  });
+
+  it("prioritizes preamble_or_trailing_content over the underlying enum issue when both are present", async () => {
+    const input = request("code_review");
+    const clean = report("code_reviewer", input.review.identity);
+    const badVerdict = { ...clean, verdict: "met" } as unknown as ReviewerReport;
+    const withPreamble = `Here is my review.\n\n${JSON.stringify(badVerdict)}`;
+    const setup = fixture(input, { reports: { code_reviewer: withPreamble } });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "report",
+      reportFailureCategory: "preamble_or_trailing_content",
+    });
+  });
+
+  it("classifies an evidence-whitelist violation (schema-valid, context-invalid) as context_mismatch", async () => {
+    const input = request("code_review");
+    const blocking = {
+      severity: "blocking" as const,
+      title: "Untrusted handoff claim",
+      description: "This improperly cites implementer conversation.",
+      acceptanceCriteria: [],
+      evidenceSources: ["implementer-handoff"],
+    };
+    const setup = fixture(input, {
+      reports: {
+        code_reviewer: report("code_reviewer", input.review.identity, "changes_requested", [
+          blocking,
+        ]),
+      },
+    });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "report",
+      reportFailureCategory: "context_mismatch",
+    });
+  });
+});

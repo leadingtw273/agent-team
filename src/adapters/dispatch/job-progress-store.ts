@@ -50,6 +50,7 @@ import {
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import { jobIdSchema, projectIdSchema, issueIdSchema } from "../../domain/jobs/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
+import { reportContractFailureCategorySchema } from "../../application/pipelines/reviewer-model.js";
 import {
   AtomicFileStore,
   acquireRecoverableFileLock,
@@ -77,6 +78,75 @@ const providerRetryCountSchema = z.number().int().min(0).max(100);
  * `retryable` before ever reaching this stage at all. */
 const lastErrorCodeSchema = z.string().trim().min(1).max(64);
 
+/**
+ * C015r decision 1: `requires_manual` used to be the bare `{kind:"requires_manual"}` below --
+ * C015q's diagnosis (`/home/markchou/.claude/jobs/6152588f/tmp/c015q-diagnose.md`, item 5) proved
+ * this loses every diagnostic signal the instant a job lands there: the only place the *reason* ever
+ * existed was one `agent-team run` invocation's own ephemeral stdout JSON, gone the moment that
+ * process exits. `cause` closes that gap with a small, closed classification -- `stage` (which part
+ * of the resume pipeline failed) + `reasonCode` (a fixed enum covering every `requiresManual(...)`
+ * call site in resume-composition.ts) + `attempts` (how many tries happened before landing here, and
+ * -- only when relevant -- the last report-contract failure category). This is the prerequisite
+ * codex's C015q review named for ever safely requeuing a `requires_manual` job: without it, an
+ * operator (or a future `dispatch requeue`, deferred to its own ticket) has no durable way to tell
+ * "this was a report-contract hiccup, safe to retry" apart from "the PR state itself diverged,
+ * retrying would be dangerous."
+ *
+ * `cause` is deliberately **optional** on the schema (not a breaking migration): job-progress
+ * records written before this ticket (bare `{kind:"requires_manual"}`, no `cause` at all) must keep
+ * reading back successfully -- this ticket is explicitly forbidden from editing or migrating any
+ * existing file under `~/.agent-team/state`. Every *new* write from resume-composition.ts always
+ * populates it; only pre-existing, un-migrated records will ever have it absent.
+ *
+ * `cause` never carries the provider's raw output text anywhere, on any field -- every value here is
+ * one of this file's own closed enums or a bounded integer, by construction (see decision 1's own
+ * explicit "不得存 provider 原始文字" requirement).
+ */
+export const requiresManualStageSchema = z.enum(["setup", "ci_recovery", "review", "merge"]);
+export type RequiresManualStage = z.infer<typeof requiresManualStageSchema>;
+
+export const requiresManualReasonCodeSchema = z.enum([
+  // setup: shared pre-dispatch reads/validation before either CI-recovery or review begins.
+  "change_request_unavailable",
+  "job_unavailable",
+  "requirement_snapshot_unavailable",
+  "base_revision_unavailable",
+  "invalid_deadline",
+  "invalid_head_sha",
+  "invalid_checkpoint_id",
+  // ci_recovery
+  "ci_recovery_paused",
+  "ci_recovery_failed",
+  // review
+  "review_begin_failed",
+  "review_reuse_unimplemented",
+  "review_paused",
+  "review_provider_failed",
+  // C015r decision 4: the one reasonCode that always pairs with `attempts.lastCategory` -- a
+  // `report`-stage failure that exhausted the dedicated, capped report-contract retry.
+  "review_report_contract",
+  "review_record_failed",
+  "review_not_approved",
+  "auto_merge_not_enabled",
+  // merge
+  "lifecycle_not_completed",
+]);
+export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
+
+export const requiresManualCauseSchema = z
+  .object({
+    stage: requiresManualStageSchema,
+    reasonCode: requiresManualReasonCodeSchema,
+    attempts: z
+      .object({
+        count: z.number().int().min(1).max(1_000),
+        lastCategory: reportContractFailureCategorySchema.optional(),
+      })
+      .strict(),
+  })
+  .strict();
+export type RequiresManualCause = z.infer<typeof requiresManualCauseSchema>;
+
 export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("implementing") }).strict(),
   z.object({ kind: z.literal("ci_waiting") }).strict(),
@@ -91,7 +161,11 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("paused"), checkpointId: checkpointIdSchema }).strict(),
   // A resume attempt found the recorded state did not match live reality (branch/head SHA/open
   // status mismatch) -- fail-closed: never guessed at, never auto-corrected, left for a human.
-  z.object({ kind: z.literal("requires_manual") }).strict(),
+  // C015r decision 1: `cause` is optional -- see this file's own comment right above
+  // `requiresManualCauseSchema` for exactly why (backward compatibility with un-migrated records).
+  z
+    .object({ kind: z.literal("requires_manual"), cause: requiresManualCauseSchema.optional() })
+    .strict(),
   // C015o decision 2: `ReviewerPipeline.run()`/`CiRecoveryPipeline.run()` returned `state:"failed"`
   // with a *retryable* `DomainError` (timeout/unavailable/rate_limited/quota_unknown/interrupted)
   // at a provider-invocation stage -- not a state mismatch, not a permission/invariant/conflict
@@ -121,6 +195,22 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   // C015o decision 4: an explicit, human-issued terminal verdict via `agent-team dispatch resolve`
   // -- this job's work is abandoned outright, no successor job. Never written automatically.
   z.object({ kind: z.literal("cancelled") }).strict(),
+  // C015r decision 4: a `report`-stage failure (reviewer output didn't satisfy the report contract
+  // even after decision 3's deterministic syntax tolerance) that has not yet exhausted the
+  // *dedicated*, separately-capped report-contract retry limit (1, see resume-composition.ts's
+  // `reportContractRetryLimit`) -- deliberately never shares C015o's `review_pending_retry`/
+  // `providerRetryLimit` (that counter is for the provider failing to *run at all*; this one is for
+  // the provider running to completion but the output failing the contract -- codex's C015q review
+  // named these as distinct failure semantics that must not share a counter). `lastCategory` is the
+  // fixed classification fed back into the next attempt's directive as a sentence -- never the
+  // provider's raw invalid text (see reviewer-model.ts's `ReportContractFailureCategory`).
+  z
+    .object({
+      kind: z.literal("review_report_pending_retry"),
+      retries: providerRetryCountSchema,
+      lastCategory: reportContractFailureCategorySchema,
+    })
+    .strict(),
 ]);
 
 export type JobProgressStage = z.infer<typeof jobProgressStageSchema>;

@@ -258,6 +258,13 @@ interface Harness {
   readonly jobRepository: FileJobRepository;
   readonly calls: string[];
   readonly repositoryPath: string;
+  /** C015r decision 5: every call this test run made to the fake `reviewReportSidecar`, in order --
+   * lets tests assert *only* a `report`-stage failure ever writes to it, and that the raw rejected
+   * text reaches it (this fake, never any durable `JobProgressRecord`/`ResumeJobOutcome`). */
+  readonly sidecarRecords: Readonly<{ jobId: string; category: string; rejectedOutput: string }>[];
+  /** C015r decision 4: every request this test run's fake `reviewer.run` received, in order -- lets
+   * a test assert `reportRetryFeedback` was (or was not) threaded in. */
+  readonly reviewerRequests: unknown[];
 }
 
 async function harness(
@@ -290,6 +297,9 @@ async function harness(
   }
 
   const calls: string[] = [];
+  const sidecarRecords: Readonly<{ jobId: string; category: string; rejectedOutput: string }>[] =
+    [];
+  const reviewerRequests: unknown[] = [];
   const deps: ResumeCycleDependencies = {
     progress,
     jobRepository,
@@ -318,8 +328,9 @@ async function harness(
       },
     },
     reviewer: {
-      run: () => {
+      run: (reviewerRequest) => {
         calls.push("reviewer.run");
+        reviewerRequests.push(reviewerRequest);
         return Promise.resolve(
           overrides.reviewerOutcome ??
             ({ state: "approved", job: job(), changeRequest: changeRequest() } as never),
@@ -369,8 +380,15 @@ async function harness(
     },
     clock: createFixedClock(now),
     holderId: "resume-holder",
+    reviewReportSidecar: {
+      record: (input) => {
+        calls.push("reviewReportSidecar.record");
+        sidecarRecords.push(input);
+        return Promise.resolve(ok({ path: `/fake/${input.jobId}.json` }));
+      },
+    },
   };
-  return { deps, progress, jobRepository, calls, repositoryPath };
+  return { deps, progress, jobRepository, calls, repositoryPath, sidecarRecords, reviewerRequests };
 }
 
 async function seedProgressRecord(
@@ -527,7 +545,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "change_request_unavailable" },
+      });
     // Zero mutation: the mismatch is caught before CiRecovery/Reviewer/ReviewStatus/AutoMerge/
     // Lifecycle are ever reached -- only the read-back getChangeRequest call happens.
     expect(calls).toEqual(["getChangeRequest"]);
@@ -547,7 +569,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "change_request_unavailable" },
+      });
     expect(calls).toEqual(["getChangeRequest"]);
   });
 
@@ -565,7 +591,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "change_request_unavailable" },
+      });
     // Closed-not-merged must never reach Lifecycle (that path is reserved for state === "merged",
     // checked strictly before this branch) -- only the read-back getChangeRequest call happens.
     expect(calls).toEqual(["getChangeRequest"]);
@@ -724,7 +754,130 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "review", reasonCode: "review_provider_failed" },
+      });
+  });
+
+  describe("C015r decisions 4/5: report-contract failures (separate from provider-start/run retries)", () => {
+    it("a report-contract failure becomes review_report_pending_retry (never review_pending_retry) and writes the sidecar", async () => {
+      const { deps, progress, sidecarRecords } = await harness({
+        reviewerOutcome: {
+          state: "failed",
+          stage: "report",
+          error: domainError("external_failure"),
+          job: job(),
+          reportFailureCategory: "enum_mismatch",
+          rejectedOutput: '{"verdict":"met"}',
+        },
+      });
+      await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+      const result = await runResumeCycle(deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toEqual([
+          {
+            jobId,
+            outcome: "pending_retry",
+            stage: "report",
+            error: domainError("external_failure"),
+            retries: 1,
+          },
+        ]);
+      }
+      const reloaded = await progress.load(jobId);
+      if (reloaded.ok) {
+        expect(reloaded.value?.stage).toEqual({
+          kind: "review_report_pending_retry",
+          retries: 1,
+          lastCategory: "enum_mismatch",
+        });
+        // Decision 1/5: the raw rejected text must never land in the durable progress record.
+        expect(JSON.stringify(reloaded.value?.stage)).not.toContain("met");
+      }
+      expect(sidecarRecords).toEqual([
+        { jobId, category: "enum_mismatch", rejectedOutput: '{"verdict":"met"}' },
+      ]);
+    });
+
+    it("exhausts reportContractRetryLimit (1) on the second consecutive report-contract failure -> requires_manual with the closed-enum cause, no raw text in it", async () => {
+      const { deps, progress, sidecarRecords } = await harness({
+        reviewerOutcome: {
+          state: "failed",
+          stage: "report",
+          error: domainError("external_failure"),
+          job: job(),
+          reportFailureCategory: "preamble_or_trailing_content",
+          rejectedOutput: "Confirmed. {}",
+        },
+      });
+      await seedProgressRecord(progress, {
+        kind: "review_report_pending_retry",
+        retries: 1,
+        lastCategory: "enum_mismatch",
+      });
+
+      const result = await runResumeCycle(deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toEqual([
+          {
+            jobId,
+            outcome: "requires_manual",
+            reason: "review_report_contract:preamble_or_trailing_content",
+          },
+        ]);
+      }
+      const reloaded = await progress.load(jobId);
+      if (reloaded.ok) {
+        expect(reloaded.value?.stage).toEqual({
+          kind: "requires_manual",
+          cause: {
+            stage: "review",
+            reasonCode: "review_report_contract",
+            attempts: { count: 2, lastCategory: "preamble_or_trailing_content" },
+          },
+        });
+        expect(JSON.stringify(reloaded.value?.stage)).not.toContain("Confirmed");
+      }
+      // Decision 5 still fires on the exhausting attempt too -- every report-contract failure gets
+      // a sidecar write, not just the ones that stay resumable.
+      expect(sidecarRecords).toHaveLength(1);
+      expect(sidecarRecords[0]).toMatchObject({ category: "preamble_or_trailing_content" });
+    });
+
+    it("threads the last report-contract failure category into the reviewer request as reportRetryFeedback when resuming review_report_pending_retry", async () => {
+      const { deps, progress, reviewerRequests } = await harness({
+        reviewerOutcome: { state: "approved", job: job(), changeRequest: changeRequest() } as never,
+      });
+      await seedProgressRecord(progress, {
+        kind: "review_report_pending_retry",
+        retries: 1,
+        lastCategory: "missing_field",
+      });
+
+      await runResumeCycle(deps);
+
+      expect(reviewerRequests).toHaveLength(1);
+      expect(reviewerRequests[0]).toMatchObject({
+        reportRetryFeedback: { category: "missing_field" },
+      });
+    });
+
+    it("never sets reportRetryFeedback when resuming a plain ci_waiting record (first attempt, nothing to feed back)", async () => {
+      const { deps, progress, reviewerRequests } = await harness({
+        reviewerOutcome: { state: "approved", job: job(), changeRequest: changeRequest() } as never,
+      });
+      await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+      await runResumeCycle(deps);
+
+      expect(reviewerRequests).toHaveLength(1);
+      expect(reviewerRequests[0]).not.toHaveProperty("reportRetryFeedback");
+    });
   });
 
   it("a non-retryable reviewer failure goes straight to requires_manual, never review_pending_retry", async () => {
@@ -751,7 +904,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "review", reasonCode: "review_provider_failed" },
+      });
   });
 
   /** Symmetric to the reviewer scenarios above -- `CiRecoveryPipeline.run()`'s own retryable
@@ -816,7 +973,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "ci_recovery", reasonCode: "ci_recovery_failed" },
+      });
   });
 
   /**
@@ -918,7 +1079,11 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok)
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "change_request_unavailable" },
+      });
   });
 
   /**
