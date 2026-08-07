@@ -53,6 +53,8 @@ import { projectSchema } from "../../src/domain/project/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
+import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
+import { headShaSchema } from "../../src/domain/review/index.js";
 
 const run = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -441,5 +443,37 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     const persistedJobs = await jobs.readAll();
     expect(persistedJobs.ok).toBe(true);
     if (persistedJobs.ok) expect(persistedJobs.value).toHaveLength(1);
+
+    // === C015c item 2's own backport: the real ci_waiting outcome's fields (changeRequest.number,
+    // commit.sha) round-trip through the real FileJobProgressStore exactly the way
+    // handlers.ts's own backport write uses them (same schema, same required fields). This proves
+    // the *data contract* a genuine ImplementerPipeline outcome offers is actually compatible with
+    // what the job-progress schema requires -- handlers.ts's own field mapping is a few lines of
+    // straight-line code covered by the type checker; what could genuinely surprise us is whether
+    // a real `commit.sha`/`changeRequest.number` shape ever fails to satisfy the schema, which this
+    // proves it does not. ===
+    const progressDirectory = join(root, "state", "dispatch", "progress");
+    const progress = new FileJobProgressStore(progressDirectory);
+    const headSha = headShaSchema.parse(outcome.commit.sha);
+    const recorded = await progress.compareAndSwap(dispatchResult.job.id, null, {
+      jobId: dispatchResult.job.id,
+      projectId: project.id,
+      issueId: dispatchResult.job.issueId,
+      externalIssueId: issue.externalId,
+      model: "opus",
+      stage: { kind: "ci_waiting" },
+      branch: pipelineRequest.branch,
+      worktreePath: pipelineRequest.worktreePath,
+      changeRequestId: String(outcome.changeRequest.number),
+      headSha,
+    });
+    expect(recorded.ok).toBe(true);
+    const reloaded = await progress.load(dispatchResult.job.id);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      expect(reloaded.value?.changeRequestId).toBe("1");
+      expect(reloaded.value?.headSha).toBe(outcome.commit.sha);
+    }
   });
 });

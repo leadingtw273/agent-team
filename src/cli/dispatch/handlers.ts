@@ -21,6 +21,7 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
 import { createClock, type Clock } from "../../domain/foundation/index.js";
+import { headShaSchema } from "../../domain/review/index.js";
 import {
   buildDispatchComposition,
   dispatchOnce,
@@ -159,6 +160,9 @@ export function createDispatchCliHandlers(
 
       const holderId = generateHolderId();
       const dryRun = input.dryRun === true;
+      // Constructing this is cheap (no I/O) and safe in `--dry-run` too; only *using* it (the
+      // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
+      const progress = buildJobProgressStore(options.agentTeamHome);
 
       // C015c item 2: resume any of this project's own ci_waiting-or-later jobs *before*
       // considering a fresh dispatch -- never in `--dry-run`, which must stay zero-mutation/
@@ -166,7 +170,6 @@ export function createDispatchCliHandlers(
       // `runResumeCycle`). A single `run` invocation either resumes existing work or dispatches
       // new work, never both -- the next invocation picks up whichever is still outstanding.
       if (!dryRun) {
-        const progress = buildJobProgressStore(options.agentTeamHome);
         const existingProgress = await progress.listForProject(build.value.project.id);
         if (!existingProgress.ok) {
           return outcome("failed", {
@@ -371,6 +374,43 @@ export function createDispatchCliHandlers(
           }
 
           const pipelineOutcome = await pipelineComposition.value.run(request.value);
+          // C015c item 2's own backport (small, disclosed addition to C015b's scope): the instant
+          // a real Draft PR exists, record it in the job-progress index -- this is the *only*
+          // place a job's `changeRequestId`/`headSha` are ever first learned, and a later
+          // `agent-team run` (item 2's resume path) has no other way to find this job again.
+          // Written before returning, not best-effort afterward: a `ci_waiting` outcome with no
+          // corresponding progress record would be silently unresumable forever.
+          if (pipelineOutcome.state === "ci_waiting") {
+            const headSha = headShaSchema.safeParse(pipelineOutcome.commit.sha);
+            if (!headSha.success) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: { code: "invariant_violation" },
+              });
+            }
+            const recorded = await progress.compareAndSwap(result.job.id, null, {
+              jobId: result.job.id,
+              projectId: build.value.project.id,
+              issueId: result.job.issueId,
+              externalIssueId: issue.externalId,
+              model,
+              stage: { kind: "ci_waiting" },
+              branch: request.value.branch,
+              worktreePath: request.value.worktreePath,
+              changeRequestId: String(pipelineOutcome.changeRequest.number),
+              headSha: headSha.data,
+            });
+            if (!recorded.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: recorded.error,
+              });
+            }
+          }
           return outcome(pipelineOutcome.state === "failed" ? "failed" : "success", {
             ...dispatchedPayload,
             ...pipelineOutcomePayload(pipelineOutcome),
