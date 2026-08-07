@@ -277,7 +277,8 @@ describe("Claude stream-json runner", () => {
       "--tools",
       "Read",
       "--allowedTools",
-      "Read",
+      "Read(./*)",
+      "Read(./**)",
       "--no-session-persistence",
       "--model",
       "opus",
@@ -442,6 +443,16 @@ describe("Claude stream-json runner", () => {
    *    OS permits, not just inside the worktree `--workingDirectory` points at).
    * 3. Read-only roles (`team_lead`/`code_reviewer`/`visual_reviewer`) get no `Write`/`Edit`
    *    grant of any kind -- their zero-mutation guarantee is unchanged from before this ticket.
+   * 4. (C015h-1 acceptance review, round 1) `Read` is scoped exactly like `Write`/`Edit`
+   *    (`Read(./*)`, `Read(./**)`), for *every* role including read-only ones -- never a bare
+   *    `Read`. A bare `Read` grant was proven, with a real Claude CLI 2.1.223 run against a
+   *    canary file placed outside the worktree, to read arbitrary files anywhere the OS permits
+   *    with zero `permission_denials` signal. On this host that is a real exfiltration path:
+   *    same-uid, 0600 secrets live under `~/.agent-team/secrets/` and
+   *    `~/.agent-team/config/dispatch/providers.json`, the task's own Linear issue description is
+   *    untrusted external data (a prompt-injection surface), and `Redactor` only scrubs
+   *    known-shaped secrets (`sk-ant-*`, `lin_api_*`, JWTs, ...) -- never a random-byte webhook
+   *    secret. Removing Bash does not close this path; only scoping `Read` does.
    */
   describe("tool authorization shape (C015h-1)", () => {
     const writeCapableRoles = ["implementer", "integration_engineer"] as const;
@@ -470,7 +481,8 @@ describe("Claude stream-json runner", () => {
           "--tools",
           "Read,Write,Edit",
           "--allowedTools",
-          "Read",
+          "Read(./*)",
+          "Read(./**)",
           "Write(./*)",
           "Write(./**)",
           "Edit(./*)",
@@ -483,11 +495,12 @@ describe("Claude stream-json runner", () => {
         expect(arguments_.join(" ")).not.toMatch(/\bBash\b/u);
         expect(arguments_).not.toContain("Write");
         expect(arguments_).not.toContain("Edit");
+        expect(arguments_).not.toContain("Read");
       },
     );
 
     it.each(readOnlyRoles)(
-      "grants %s only Read -- no Write/Edit/Bash tool, no Write/Edit/Bash grant",
+      "grants %s only directory-scoped Read -- no Write/Edit/Bash tool, no bare Read/Write/Edit/Bash grant",
       async (role) => {
         const process = new FakeProcessPort([
           { type: "result", is_error: false, result: "ok", permission_denials: [] },
@@ -507,7 +520,8 @@ describe("Claude stream-json runner", () => {
           "--tools",
           "Read",
           "--allowedTools",
-          "Read",
+          "Read(./*)",
+          "Read(./**)",
           "--no-session-persistence",
           "--model",
           "opus",
@@ -515,7 +529,7 @@ describe("Claude stream-json runner", () => {
       },
     );
 
-    it("never emits a bare Write/Edit/Bash token in --allowedTools for any role", async () => {
+    it("never emits a bare Read/Write/Edit/Bash token in --allowedTools for any role", async () => {
       for (const role of agentRoleSchema.options) {
         const process = new FakeProcessPort([
           { type: "result", is_error: false, result: "ok", permission_denials: [] },
@@ -532,7 +546,7 @@ describe("Claude stream-json runner", () => {
         const grants = arguments_.slice(allowedToolsIndex + 1, noSessionIndex);
         expect(grants.length).toBeGreaterThan(0);
         for (const grant of grants) {
-          expect(["Write", "Edit", "Bash"]).not.toContain(grant);
+          expect(["Read", "Write", "Edit", "Bash"]).not.toContain(grant);
         }
       }
     });
