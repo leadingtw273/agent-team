@@ -116,6 +116,7 @@ describe("buildImplementerPipelineRequest", () => {
       model: "opus",
       agentTeamHome: "/tmp/agent-team-home",
       clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -131,7 +132,7 @@ describe("buildImplementerPipelineRequest", () => {
     expect(request.role).toBe("implementer");
     expect(request.model).toBe("opus");
     expect(request.repositoryRoot).toBe("/tmp/sandbox");
-    expect(request.baseRevision).toBe("main");
+    expect(request.baseRevision).toBe("a".repeat(40));
     expect(request.worktreePath).toBe(`/tmp/agent-team-home/state/dispatch/worktrees/${jobId}`);
     expect(request.branch).toBe(`agent-team/${jobId}`);
     expect(request.remote).toBe("origin");
@@ -147,6 +148,7 @@ describe("buildImplementerPipelineRequest", () => {
       model: "opus",
       agentTeamHome: "/tmp/agent-team-home",
       clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -163,6 +165,7 @@ describe("buildImplementerPipelineRequest", () => {
       model: "opus",
       agentTeamHome: "/tmp/agent-team-home",
       clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -195,6 +198,7 @@ describe("buildImplementerPipelineRequest", () => {
       model: "opus",
       agentTeamHome: "/tmp/agent-team-home",
       clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;

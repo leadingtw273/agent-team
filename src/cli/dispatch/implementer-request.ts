@@ -62,6 +62,15 @@ export interface BuildImplementerPipelineRequestOptions {
   readonly model: string;
   readonly agentTeamHome: string;
   readonly clock: Clock;
+  /**
+   * The real, resolved commit SHA to branch the worktree from -- **not** a branch name.
+   * `git worktree add` happens to tolerate a branch name as a start-point too, which could hide
+   * this being wrong; the caller must resolve the project's default branch to its current
+   * `headSha` (e.g. via `GitPort.inspectRepository`) immediately before calling this, so the
+   * worktree is pinned to a known revision rather than "whatever the branch tip happens to be by
+   * the time `createWorktree` actually runs."
+   */
+  readonly baseRevision: string;
 }
 
 export function buildImplementerPipelineRequest(
@@ -94,7 +103,7 @@ export function buildImplementerPipelineRequest(
       role: "implementer" as const,
       model: options.model,
       repositoryRoot: options.project.localRepositoryPath,
-      baseRevision: options.project.defaultBranch,
+      baseRevision: options.baseRevision,
       worktreePath,
       branch,
       remote: "origin",

@@ -137,7 +137,12 @@ function registry(): ProjectRegistrySnapshot {
 }
 
 /** Every field `evaluateEligibility` checks for is present -- unlike anything the real Linear
- * discovery bridge can currently produce (see file header). */
+ * discovery bridge can currently produce (see file header). `agentRole:"code_reviewer"`
+ * (deliberately *not* `"implementer"`): C015b's run-flow only drives the `ImplementerPipeline`
+ * for `role:"implementer"` candidates (see handlers.ts's `case "dispatched"`), and this file's
+ * job is strictly the dry-run/real-mode port-isolation question, not pipeline behavior (that has
+ * its own dedicated test files) -- using a non-implementer role keeps this test hermetic without
+ * needing to fake the pipeline composition too. */
 function eligibleIssue(): Issue {
   return issueSchema.parse({
     schemaVersion: 1,
@@ -152,7 +157,7 @@ function eligibleIssue(): Issue {
     outOfScope: ["Process execution"],
     dependencies: { kind: "none" },
     priority: "high",
-    agentRole: "implementer",
+    agentRole: "code_reviewer",
     reviewRequirement: "code_review",
     estimatedMinutes: 30,
   });
