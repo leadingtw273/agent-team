@@ -44,6 +44,7 @@ import {
   buildResumeComposition,
   type BuildResumeCompositionResult,
 } from "./resume-full-composition.js";
+import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -206,6 +207,26 @@ export function createDispatchCliHandlers(
               message: implementerCompositionBlockedMessages[resumeComposition.reason],
             });
           }
+
+          // C015e: a resumed job's worktree lives under the exact same
+          // `${agentTeamHome}/state/dispatch/worktrees` tree a fresh dispatch does -- ensure it
+          // still exists before handing a worktree reference to CiRecoveryPipeline/
+          // ReviewerPipeline, for the same reason a fresh dispatch must (see
+          // worktree-directories.ts's own header).
+          const resumeWorktreeDirectory = await ensureDispatchWorktreesDirectory(
+            options.agentTeamHome,
+          );
+          if (!resumeWorktreeDirectory.ok) {
+            return outcome("failed", {
+              operation: "dispatch_run",
+              state: "blocked",
+              projectId: input.projectId,
+              reason: "worktree_directory_unavailable",
+              message: "無法確保 dispatch worktree 目錄存在（檔案系統故障，非設定缺失，可重試）。",
+              error: resumeWorktreeDirectory.error,
+            });
+          }
+
           const cycle = await runResumeCycle({
             progress,
             jobRepository: build.value.jobs,
@@ -351,6 +372,22 @@ export function createDispatchCliHandlers(
               pipeline: "failed",
               pipelineReason: "base_revision_unavailable",
               error: repository.error,
+            });
+          }
+
+          // C015e: `LocalGitAdapter.createWorktree` requires its target's *parent* directory to
+          // already exist -- nothing in this composition ever created
+          // `${agentTeamHome}/state/dispatch/worktrees` (E101's second real run died here,
+          // `stage:"worktree"`, on a genuinely fresh `${AGENT_TEAM_HOME}`). Never run in
+          // `--dry-run` (this whole switch-case is unreachable there -- see the `if (dryRun)`
+          // short-circuit above).
+          const worktreeDirectory = await ensureDispatchWorktreesDirectory(options.agentTeamHome);
+          if (!worktreeDirectory.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "worktree_directory_unavailable",
+              error: worktreeDirectory.error,
             });
           }
 

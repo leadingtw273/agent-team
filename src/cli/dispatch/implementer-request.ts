@@ -4,6 +4,20 @@
  * assembled from the same structured `Issue` fields `requirement-template.ts` just parsed out of
  * the Linear description, closing the loop: the fields that made the candidate eligible are the
  * same fields Claude is actually told to work from.
+ *
+ * BACKLOG (C015e, E101 first real run, not fixed by this ticket): `evaluateEligibility`
+ * (src/domain/eligibility/decision.ts) never checks `changeRegions`, but
+ * `ImplementerPipeline.run()`'s own `requestShapeValid` (src/application/pipelines/
+ * implementer.ts) hard-requires it non-empty and fails the whole request with a generic
+ * `state:"failed", stage:"request", error:{code:"invariant_violation"}` if it is missing -- an
+ * eligibility/pipeline-request gap: a candidate can clear eligibility and get dispatched, then
+ * hard-fail deterministically on its very first pipeline invocation with no field-specific
+ * message pointing at `changeRegions`. E101's first real Linear issue hit exactly this (a human
+ * filled in every other Ready Gate field but left "預期變更區域" empty). Fixing this is a
+ * separate, not-yet-filed ticket -- it would need either `evaluateEligibility` gaining a
+ * `changeRegions`-aware blocker (an eligibility-layer change, out of this ticket's "only
+ * cli/dispatch layer" scope) or a friendlier pre-flight check here that turns the same condition
+ * into an actionable CLI-level rejection before ever reaching the pipeline.
  */
 import { join } from "node:path";
 
