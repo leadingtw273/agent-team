@@ -30,11 +30,21 @@
  *   whole candidate up front (see `discoverReadyDispatchCandidates`'s `dependencies_unparsed`
  *   skip reason), because "the template was followed but we can't safely interpret one required
  *   answer" is a materially different situation from "the template was not followed at all."
- * - `estimatedMinutes` takes the first integer found in the section's text. No unit words
- *   ("分鐘"/"小時") are parsed -- the template's own guidance ("目標 15～30 分鐘") only ever
- *   asks for a minutes figure, so the first bare integer is the minutes count. Text with no
- *   integer at all is left absent, letting `evaluateEligibility`'s `missing_estimate` blocker
- *   catch it.
+ * - `estimatedMinutes` accepts **only** text that, once trimmed, is composed entirely of ASCII
+ *   digits (`/^\d+$/u`) -- no unit words ("分鐘"/"小時"/"hour"/"h"), no sign, no decimal point, no
+ *   scientific notation, no surrounding annotation. This was tightened after an acceptance review
+ *   found the original "first integer found anywhere in the text" rule silently misparsed
+ *   completely ordinary input in the *unsafe* direction: "2小時" (2 hours) parsed as `2` (minutes),
+ *   letting a genuinely 2-hour task slip past `evaluateEligibility`'s `task_too_large` gate
+ *   (>45 minutes); "-5" parsed as `5` (the sign silently dropped); "1e9" parsed as `1` (scientific
+ *   notation silently truncated). Every one of those must now be `undefined` (-> the ordinary
+ *   `missing_estimate` blocker), matching this file's own rule for every other field: uncertain
+ *   input is never silently coerced into a small, harmless-looking number -- it is refused and
+ *   handed to the existing missing-field path. This is deliberately conservative: a genuinely
+ *   well-formed answer like "約 2 小時（120 分鐘）" is *also* rejected (multi-number,
+ *   free-text-annotated input is exactly the ambiguous shape this rule refuses to guess at) --
+ *   the template's own instruction asks for a bare minutes figure, and only a bare minutes figure
+ *   is accepted.
  * - `changeRegions` uses the same bullet-list extraction as acceptance criteria/scope: each
  *   `- <path>` line under "預期變更區域" becomes one `{path, coverage:"exact"}` entry. This was
  *   revised after discovering `ImplementerPipeline.run()` (src/application/pipelines/
@@ -77,34 +87,75 @@ export interface ReadyGateTemplateFields {
 }
 
 const headingLinePattern = /^##\s+(.+?)\s*$/u;
+const fenceLinePattern = /^\s*```/u;
 
-/** Splits a description into a map of heading text -> the raw body text beneath it (up to the
- * next `##` heading or end of text). A heading that appears more than once keeps only its last
- * occurrence's body -- the template never repeats a heading, so this is a defensive default, not
- * a feature. */
-function splitSections(description: string): ReadonlyMap<string, string> {
-  const sections = new Map<string, string>();
+export interface ParsedSections {
+  readonly bodies: ReadonlyMap<string, string>;
+  /** Headings that appeared more than once. A repeated heading is never safely resolvable --
+   * see `splitSections`'s own header comment (FAIL-B) for why last-wins is the *unsafe*
+   * direction here, not merely undefined behavior. */
+  readonly duplicated: ReadonlySet<string>;
+}
+
+/**
+ * Splits a description into a map of heading text -> the raw body text beneath it (up to the
+ * next `##` heading or end of text), while tracking two hazards found by acceptance review:
+ *
+ * - **Repeated headings.** The original implementation kept only the *last* occurrence's body
+ *   ("a defensive default, not a feature"). For most fields last-wins is harmless, but for
+ *   `dependencies` it is actively unsafe: a real dependency declared first, then silently
+ *   overwritten by a later, unrelated "## 依賴關係\n無" section, flips a fail-closed `unparsed`
+ *   into a dispatchable `none`. This function now records every heading that occurs more than
+ *   once in `duplicated`; callers (`parseDependencies` especially) must treat a duplicated
+ *   heading as unsafe to use at all, regardless of which occurrence's text looks fine.
+ * - **Fenced code blocks.** A `## 依賴關係`-looking line inside a ``` fence is markdown sample
+ *   text, not a real section boundary -- this was letting a code block that merely *illustrates*
+ *   the template's own syntax hijack real section parsing (the same underlying hazard as the
+ *   duplicate-heading issue: something that looks like the real heading is not the real answer).
+ *   Fence state is tracked per line (any line whose trimmed content starts with ``` toggles it);
+ *   while inside a fence, `##`-looking lines are treated as ordinary body text, not headings.
+ */
+function splitSections(description: string): ParsedSections {
+  const bodies = new Map<string, string>();
+  const seenHeadings = new Set<string>();
+  const duplicated = new Set<string>();
   let currentHeading: string | undefined;
   let buffer: string[] = [];
+  let inFence = false;
 
   function flush(): void {
     if (currentHeading !== undefined) {
-      sections.set(currentHeading, buffer.join("\n"));
+      bodies.set(currentHeading, buffer.join("\n"));
     }
   }
 
   for (const line of description.split(/\r\n|\r|\n/u)) {
-    const match = headingLinePattern.exec(line);
+    if (fenceLinePattern.test(line)) {
+      inFence = !inFence;
+      if (currentHeading !== undefined) buffer.push(line);
+      continue;
+    }
+    const match = inFence ? null : headingLinePattern.exec(line);
     if (match?.[1] !== undefined) {
       flush();
-      currentHeading = match[1];
+      const heading = match[1];
+      if (seenHeadings.has(heading)) duplicated.add(heading);
+      seenHeadings.add(heading);
+      currentHeading = heading;
       buffer = [];
     } else if (currentHeading !== undefined) {
       buffer.push(line);
     }
   }
   flush();
-  return sections;
+  return Object.freeze({ bodies: Object.freeze(bodies), duplicated: Object.freeze(duplicated) });
+}
+
+/** Every field except `dependencies` treats a duplicated heading exactly like a heading that was
+ * never found at all -- both end up `undefined`, both fall through to the ordinary `missing_X`
+ * blocker. Only `dependencies` needs to distinguish the two (see `parseDependencies`). */
+function bodyIfUnique(sections: ParsedSections, heading: string): string | undefined {
+  return sections.duplicated.has(heading) ? undefined : sections.bodies.get(heading);
 }
 
 function nonEmptyText(body: string | undefined): string | undefined {
@@ -124,12 +175,13 @@ function parseBulletList(body: string | undefined): readonly string[] | undefine
   return items.length === 0 ? undefined : Object.freeze(items);
 }
 
+const pureDigitsPattern = /^\d+$/u;
+
 function parseEstimatedMinutes(body: string | undefined): number | undefined {
   const text = nonEmptyText(body);
   if (text === undefined) return undefined;
-  const match = /\d+/u.exec(text);
-  if (match === null) return undefined;
-  const value = Number.parseInt(match[0], 10);
+  if (!pureDigitsPattern.test(text)) return undefined;
+  const value = Number.parseInt(text, 10);
   return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
@@ -141,7 +193,18 @@ function parseChangeRegions(
   return Object.freeze(paths.map((path) => Object.freeze({ path, coverage: "exact" as const })));
 }
 
-function parseDependencies(body: string | undefined): ReadyGateDependenciesField {
+/** `duplicated` is checked *before* looking at any body text: a repeated 依賴關係 heading is
+ * unsafe to resolve regardless of what the (ambiguous, which-occurrence-even) text says --
+ * see `splitSections`'s header comment (FAIL-B). This is deliberately the same `"unparsed"`
+ * outcome as "one heading, ambiguous free text" -- both are "the template was followed but this
+ * answer cannot be safely trusted," which is exactly the situation `dependencies_unparsed`
+ * (src/adapters/dispatch/linear-discovery.ts) exists to make visible rather than silently
+ * resolving into a guess. */
+function parseDependencies(
+  body: string | undefined,
+  duplicated: boolean,
+): ReadyGateDependenciesField {
+  if (duplicated) return Object.freeze({ kind: "unparsed" as const });
   if (body === undefined) return Object.freeze({ kind: "absent" as const });
   const trimmed = body.trim();
   if (trimmed.length === 0 || trimmed === "無") return Object.freeze({ kind: "none" as const });
@@ -154,20 +217,27 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
   }
 
   const sections = splitSections(description);
-  const goal = nonEmptyText(sections.get(readyGateTemplateHeadings.goal));
-  const background = nonEmptyText(sections.get(readyGateTemplateHeadings.background));
+  const goal = nonEmptyText(bodyIfUnique(sections, readyGateTemplateHeadings.goal));
+  const background = nonEmptyText(bodyIfUnique(sections, readyGateTemplateHeadings.background));
   const acceptanceCriteria = parseBulletList(
-    sections.get(readyGateTemplateHeadings.acceptanceCriteria),
+    bodyIfUnique(sections, readyGateTemplateHeadings.acceptanceCriteria),
   );
-  const inScope = parseBulletList(sections.get(readyGateTemplateHeadings.inScope));
-  const outOfScope = parseBulletList(sections.get(readyGateTemplateHeadings.outOfScope));
+  const inScope = parseBulletList(bodyIfUnique(sections, readyGateTemplateHeadings.inScope));
+  const outOfScope = parseBulletList(bodyIfUnique(sections, readyGateTemplateHeadings.outOfScope));
   const estimatedMinutes = parseEstimatedMinutes(
-    sections.get(readyGateTemplateHeadings.estimatedMinutes),
+    bodyIfUnique(sections, readyGateTemplateHeadings.estimatedMinutes),
   );
-  const constraints = parseBulletList(sections.get(readyGateTemplateHeadings.constraints));
-  const risks = parseBulletList(sections.get(readyGateTemplateHeadings.risks));
-  const changeRegions = parseChangeRegions(sections.get(readyGateTemplateHeadings.changeRegions));
-  const dependencies = parseDependencies(sections.get(readyGateTemplateHeadings.dependencies));
+  const constraints = parseBulletList(
+    bodyIfUnique(sections, readyGateTemplateHeadings.constraints),
+  );
+  const risks = parseBulletList(bodyIfUnique(sections, readyGateTemplateHeadings.risks));
+  const changeRegions = parseChangeRegions(
+    bodyIfUnique(sections, readyGateTemplateHeadings.changeRegions),
+  );
+  const dependencies = parseDependencies(
+    sections.bodies.get(readyGateTemplateHeadings.dependencies),
+    sections.duplicated.has(readyGateTemplateHeadings.dependencies),
+  );
 
   return Object.freeze({
     ...(goal === undefined ? {} : { goal }),

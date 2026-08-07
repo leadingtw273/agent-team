@@ -4,8 +4,12 @@
  * (every field extractable, including `changeRegions`), a partially-filled template
  * (only-required-fields), a description that never used the template at all (everything absent,
  * no crash), untouched placeholder text treated as not-filled, the three-way `dependencies`
- * outcome (none/unparsed/absent), and estimatedMinutes extraction robustness (first integer wins,
- * no digits leaves it absent).
+ * outcome (none/unparsed/absent), `estimatedMinutes`'s pure-digits-only rule (an acceptance
+ * review found the original "first integer anywhere" rule silently misparsed ordinary Chinese
+ * input like "2小時" in the unsafe direction -- every adversarial case that review found is
+ * pinned down here), duplicate-heading fail-closed handling (FAIL-B), and fenced-code-block
+ * awareness (the same review's FAIL-B same-source finding: a `##`-looking line inside a ```
+ * fence must never be treated as a real section boundary).
  */
 import { describe, expect, it } from "vitest";
 
@@ -35,7 +39,7 @@ C015a 發現沒有解析器，C015b 補上。
 ${dependencies}
 
 ## ${readyGateTemplateHeadings.estimatedMinutes}
-目標 30 分鐘
+30
 
 ## ${readyGateTemplateHeadings.constraints}
 - 不得修改引擎
@@ -171,17 +175,134 @@ describe("parseReadyGateTemplate", () => {
     });
   });
 
-  describe("estimatedMinutes extraction", () => {
-    it("takes the first integer found in the section text", () => {
-      const description = `## ${readyGateTemplateHeadings.estimatedMinutes}
-大約 30 到 45 分鐘`;
-      expect(parseReadyGateTemplate(description).estimatedMinutes).toBe(30);
+  describe("estimatedMinutes extraction (FAIL-A: pure-digits-only, never guess through units/signs/notation)", () => {
+    function estimatedMinutesFor(text: string): number | undefined {
+      const description = `## ${readyGateTemplateHeadings.estimatedMinutes}\n${text}`;
+      return parseReadyGateTemplate(description).estimatedMinutes;
+    }
+
+    it("accepts a bare integer", () => {
+      expect(estimatedMinutesFor("30")).toBe(30);
+    });
+
+    it.each([
+      ["2小時", "unit word directly appended with no space"],
+      ["3 小時", "unit word with a preceding space"],
+      ["約 2 小時（120 分鐘）", "annotated multi-number text -- the real review case"],
+      ["約2小時", "unit word with a leading qualifier and no space"],
+      ["-5", "a leading minus sign must not be silently dropped"],
+      ["1e9", "scientific notation must not be silently truncated"],
+      ["0", "zero is not a positive estimate"],
+      ["abc", "no digits at all"],
+    ])("leaves estimatedMinutes undefined for %s (%s)", (text) => {
+      expect(estimatedMinutesFor(text)).toBeUndefined();
     });
 
     it("leaves estimatedMinutes absent when no digit is present", () => {
+      expect(estimatedMinutesFor("很快")).toBeUndefined();
+    });
+  });
+
+  describe("duplicate headings (FAIL-B: repeated section must never resolve via last-wins)", () => {
+    it("flips dependencies to unparsed (fail-closed) when the heading appears twice, even if the later occurrence says 無", () => {
+      // The exact adversarial shape from the acceptance review: a real dependency declared
+      // first, silently "overwritten" by a later, unrelated 無 section.
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+需要 ISSUE-1 先完成
+
+## ${readyGateTemplateHeadings.risks}
+- r
+
+## ${readyGateTemplateHeadings.dependencies}
+無`;
+      expect(parseReadyGateTemplate(description).dependencies).toEqual({ kind: "unparsed" });
+    });
+
+    it("flips dependencies to unparsed even when the first occurrence already says 無 and the second repeats it", () => {
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.dependencies}
+無`;
+      expect(parseReadyGateTemplate(description).dependencies).toEqual({ kind: "unparsed" });
+    });
+
+    it("leaves a duplicated non-dependencies field undefined (missing_X blocker), not the last occurrence's text", () => {
+      const description = `## ${readyGateTemplateHeadings.goal}
+第一次目標
+
+## ${readyGateTemplateHeadings.goal}
+第二次目標`;
+      expect(parseReadyGateTemplate(description).goal).toBeUndefined();
+    });
+
+    it("leaves a duplicated estimatedMinutes undefined even when both occurrences are individually valid", () => {
       const description = `## ${readyGateTemplateHeadings.estimatedMinutes}
-很快`;
+20
+
+## ${readyGateTemplateHeadings.estimatedMinutes}
+30`;
       expect(parseReadyGateTemplate(description).estimatedMinutes).toBeUndefined();
+    });
+
+    it("does not flag a heading that genuinely appears only once", () => {
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.risks}
+- only one risks section`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.dependencies).toEqual({ kind: "none" });
+      expect(result.risks).toEqual(["only one risks section"]);
+    });
+  });
+
+  describe("fenced code blocks (FAIL-B same-source: a heading-looking line inside ``` is never a real section boundary)", () => {
+    it("ignores a fake dependencies heading inside a fenced code block", () => {
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.risks}
+以下是範本格式範例：
+\`\`\`
+## ${readyGateTemplateHeadings.dependencies}
+需要 ISSUE-1 先完成
+\`\`\`
+- 真正的風險項目`;
+      const result = parseReadyGateTemplate(description);
+      // The load-bearing assertion: dependencies stays "none" -- the fake heading inside the
+      // fence never created a second (real) 依賴關係 section, so FAIL-B's duplicate-heading
+      // rule never even triggers here.
+      expect(result.dependencies).toEqual({ kind: "none" });
+      // The fenced lines are ordinary body text within "risks" (not bullet lines, so
+      // parseBulletList's own filter drops them) -- only the genuine bullet survives.
+      expect(result.risks).toEqual(["真正的風險項目"]);
+    });
+
+    it("does not let an unclosed fence's trailing fake heading leak into the real dependencies section", () => {
+      // Even with no closing ``` at all, the fake heading inside the (permanently open) fence
+      // must never be treated as a real section boundary.
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.risks}
+\`\`\`
+## ${readyGateTemplateHeadings.dependencies}
+需要 ISSUE-1 先完成`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.dependencies).toEqual({ kind: "none" });
+    });
+
+    it("still recognizes a real heading that follows a properly closed fence", () => {
+      const description = `## ${readyGateTemplateHeadings.risks}
+\`\`\`
+## fake heading inside fence
+\`\`\`
+
+## ${readyGateTemplateHeadings.dependencies}
+無`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.dependencies).toEqual({ kind: "none" });
     });
   });
 });
