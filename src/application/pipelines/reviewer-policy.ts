@@ -12,6 +12,7 @@ import {
 import { trustedProjectConfigSchema } from "../projects/index.js";
 import type { CommitChecksSnapshot, ExternalDataBlock } from "../ports/index.js";
 import type {
+  ReportContractFailureCategory,
   ReviewerPipelineRequest,
   ReviewerReport,
   ReviewQualityDimension,
@@ -196,24 +197,104 @@ export function evidenceForReviewerRole(
   return Object.freeze(external);
 }
 
+/**
+ * C015r decision 4: one fixed sentence per `ReportContractFailureCategory`, appended to a retry
+ * attempt's directive -- never the previous attempt's raw invalid output (coordinator's explicit
+ * requirement, and the reason this is a `switch` over a closed enum rather than a template that
+ * could ever be handed free-form text). Each sentence names the *mechanical* fix, not the specific
+ * value that was wrong (this function has no access to that, and must not be given it).
+ */
+function reportRetryFeedbackSentence(category: ReportContractFailureCategory): string {
+  switch (category) {
+    case "empty_output":
+      return "Your previous attempt ended without producing the JSON report at all -- your final message this time must end with the completed skeleton below.";
+    case "invalid_json":
+      return "Your previous attempt's final message was not syntactically valid JSON -- copy the skeleton below exactly, including every brace, bracket, comma, and quote, and only replace the <...> placeholders.";
+    case "preamble_or_trailing_content":
+      return "Your previous attempt added a sentence before or after the JSON object -- this time your final message must contain nothing else at all, not even a short acknowledgement.";
+    case "missing_field":
+      return "Your previous attempt was missing one or more of the skeleton's required keys -- your final message must include every key that appears in the skeleton below, none renamed or removed.";
+    case "enum_mismatch":
+      return "Your previous attempt used a value for an enum field (verdict, status, or severity) that is not one of the exact values listed inside that field's own <...> placeholder -- use one of those exact values, not a synonym.";
+    case "context_mismatch":
+      return "Your previous attempt's requirementsDigest, headSha, diffDigest, acceptance criteria, quality dimensions, or evidenceSources did not match this run's own skeleton -- copy those values from the skeleton below exactly rather than restating them from memory.";
+    case "schema_invalid":
+      return "Your previous attempt did not match the required report structure -- follow the skeleton below exactly, key for key.";
+  }
+}
+
+/**
+ * C015r decision 2 (the core fix, replacing the coordinator's own earlier "just list the fields in
+ * prose" Option A once C015q's real-CLI repro proved that alone is not reliable enough): builds a
+ * literal, ready-to-copy JSON skeleton for this exact run -- every deterministic value (schemaVersion,
+ * role, the three digests, every approved AC's `criterion` text, every required quality dimension for
+ * this role) is *already filled in*; the only things left for the model to write are free text
+ * (summary fields) and closed-enum choices, and every closed-enum placeholder spells out its own
+ * complete, exact legal value list inline (mirroring what C015q's real repro proved *does* reliably
+ * work for `verdict`, whose legal values were already spelled out this way before this ticket).
+ * `evidenceSources` placeholders list every currently-allowed source verbatim, so the model never has
+ * to invent or guess one. This function builds *only* the directive's text -- it does not change what
+ * `reviewerReportSchema`/`reviewerReportMatchesContext` accept, and a skeleton copied byte-for-byte
+ * with placeholders left unfilled would still, correctly, fail that unmodified validation.
+ */
+function reportSkeleton(
+  role: RequiredReviewerRole,
+  request: ReviewerPipelineRequest,
+  identity: ReviewIdentity,
+  evidenceSourceList: readonly string[],
+): Readonly<Record<string, unknown>> {
+  const qualityDimensions =
+    role === "code_reviewer" ? codeQualityDimensions : visualQualityDimensions;
+  const acceptanceCriteria = request.requirementSnapshot.issue.acceptanceCriteria ?? [];
+  const evidenceSourcesPlaceholder = `<zero or more of, each copied exactly: ${evidenceSourceList.join(" | ")}>`;
+  return Object.freeze({
+    schemaVersion: 1,
+    role,
+    verdict: "<exactly one of: passed | changes_requested | clarification_required>",
+    requirementsDigest: identity.requirementsDigest,
+    headSha: identity.headSha,
+    diffDigest: identity.diffDigest,
+    summary: "<replace with your own free-text summary of this review>",
+    acceptanceCriteria: acceptanceCriteria.map((criterion) => ({
+      criterion,
+      status: "<exactly one of: passed | failed | clarification_required>",
+      summary: "<replace with your own free-text summary for this criterion>",
+      evidenceSources: [evidenceSourcesPlaceholder],
+    })),
+    qualityChecks: qualityDimensions.map((dimension) => ({
+      dimension,
+      status: "<exactly one of: passed | failed | not_applicable>",
+      summary: "<replace with your own free-text summary for this dimension>",
+      evidenceSources: [evidenceSourcesPlaceholder],
+    })),
+    findings:
+      '<replace with your own JSON array of zero or more objects, each shaped exactly like: {"severity": "<exactly one of: blocking | advisory | clarification>", "title": "<short text>", "description": "<free text>", "acceptanceCriteria": ["<zero or more of the exact criterion strings above>"], "evidenceSources": [' +
+      evidenceSourcesPlaceholder +
+      '], "path": "<optional repository-relative path, or omit this key>", "line": "<optional positive integer, or omit this key>"} -- an empty top-level array [] is a complete, valid answer if there is nothing to report, but every individual finding object inside it must have at least one entry in acceptanceCriteria OR at least one entry in evidenceSources -- never both empty at the same time>',
+  });
+}
+
 export function reviewerDirective(
   role: RequiredReviewerRole,
   request: ReviewerPipelineRequest,
   identity: ReviewIdentity,
+  evidenceSourceList: readonly string[],
+  retryFeedback?: Readonly<{ category: ReportContractFailureCategory }>,
 ): string {
-  const qualityDimensions =
-    role === "code_reviewer" ? codeQualityDimensions : visualQualityDimensions;
-  return [
+  const skeleton = reportSkeleton(role, request, identity, evidenceSourceList);
+  const instructions = [
     `Perform a fresh-context ${role} review.`,
     `Read only the approved repository at base revision ${request.baseRevision} and Head SHA ${identity.headSha}.`,
     "Do not use or infer implementer conversation, hidden reasoning, handoff notes, or unrelated logs.",
     "Check every acceptance criterion and the role quality rules. Do not modify files or merge.",
-    "Return only one JSON object with schemaVersion=1, role, verdict, requirementsDigest, headSha, diffDigest, summary, acceptanceCriteria, qualityChecks, and findings.",
-    "acceptanceCriteria must contain each approved AC exactly once with status, summary, and evidenceSources.",
-    `qualityChecks must contain each required dimension exactly once: ${qualityDimensions.join(", ")}.`,
-    "Each finding requires severity, title, description, acceptanceCriteria[], evidenceSources[], and optional path/line.",
-    "Verdict must be passed, changes_requested, or clarification_required. Do not use Markdown fences.",
-  ].join(" ");
+    "Below is the exact JSON skeleton for your report. Copy it exactly and replace every <...> placeholder with real content of the type described inside it; do not add, remove, rename, or reorder any key at any nesting level; keep every value that is not itself a <...> placeholder character-for-character unchanged, including schemaVersion, role, requirementsDigest, headSha, diffDigest, every acceptanceCriteria[].criterion, and every qualityChecks[].dimension.",
+    "Every enum-valued field's only legal values are exactly the values written inside its own <...> placeholder in the skeleton -- never invent, abbreviate, translate, or substitute a synonym for any of them.",
+    "Your entire final message must be that one completed JSON object and nothing else: no leading sentence, no trailing sentence, no Markdown code fence, not even a single extra character before the opening { or after the closing }.",
+    ...(retryFeedback === undefined ? [] : [reportRetryFeedbackSentence(retryFeedback.category)]),
+  ];
+  return [...instructions, "JSON SKELETON (copy exactly, only replacing <...> placeholders):"]
+    .join(" ")
+    .concat("\n", JSON.stringify(skeleton, null, 2));
 }
 
 export function reviewerReportMatchesContext(

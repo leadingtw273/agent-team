@@ -5,6 +5,7 @@ import { consumeAttempt, jobSchema, type Job } from "../../domain/jobs/index.js"
 import { createReviewIdentity } from "../../domain/review/index.js";
 import type { CommitChecksSnapshot, MutationOptions } from "../ports/index.js";
 import type {
+  ReportContractFailureCategory,
   ReviewEvidenceBlock,
   ReviewerFailureStage,
   ReviewerPipelineOutcome,
@@ -17,7 +18,7 @@ import {
   sameReviewSha,
   validReviewerRequest,
 } from "./reviewer-policy.js";
-import { runReviewerProvider } from "./reviewer-provider.js";
+import { runReviewerProvider, type ReviewerRunResult } from "./reviewer-provider.js";
 
 function mutation(request: ReviewerPipelineRequest, step: string): MutationOptions {
   return {
@@ -30,8 +31,16 @@ function failed(
   stage: ReviewerFailureStage,
   error: DomainError,
   job: Job,
+  /** C015r decision 4/5: only ever supplied by the `firstFailure` forwarding below, and only ever
+   * non-empty when `stage === "report"` -- see `ReviewerPipelineOutcome`'s own field-level comments
+   * (reviewer-model.ts) for the exact propagation/persistence rules. Every other call site in this
+   * file omits this, so those outcomes are unchanged from before this ticket. */
+  extra?: Readonly<{
+    reportFailureCategory?: ReportContractFailureCategory;
+    rejectedOutput?: string;
+  }>,
 ): ReviewerPipelineOutcome {
-  return Object.freeze({ state: "failed", stage, error, job });
+  return Object.freeze({ state: "failed", stage, error, job, ...extra });
 }
 
 export class ReviewerPipeline {
@@ -144,7 +153,7 @@ export class ReviewerPipeline {
           role === "code_reviewer" ? this.ports.codeReviewer : this.ports.visualReviewer;
         const model = role === "code_reviewer" ? request.models.code : request.models.visual;
         if (provider === undefined || model === undefined) {
-          return Promise.resolve({
+          return Promise.resolve<ReviewerRunResult>({
             kind: "failed" as const,
             stage: "request" as const,
             error: domainError("invariant_violation"),
@@ -189,7 +198,14 @@ export class ReviewerPipeline {
 
     const firstFailure = runs.find((run) => run.kind === "failed");
     if (firstFailure?.kind === "failed") {
-      return failed(firstFailure.stage, firstFailure.error, request.job);
+      return failed(firstFailure.stage, firstFailure.error, request.job, {
+        ...(firstFailure.reportFailureCategory === undefined
+          ? {}
+          : { reportFailureCategory: firstFailure.reportFailureCategory }),
+        ...(firstFailure.rejectedOutput === undefined
+          ? {}
+          : { rejectedOutput: firstFailure.rejectedOutput }),
+      });
     }
     const firstPause = runs.find((run) => run.kind === "paused");
     if (firstPause?.kind === "paused") {

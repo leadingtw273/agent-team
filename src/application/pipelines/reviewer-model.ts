@@ -166,6 +166,33 @@ export const reviewerReportSchema = z
   });
 export type ReviewerReport = z.infer<typeof reviewerReportSchema>;
 
+/**
+ * C015r decision 4 (failure-reason propagation, deliberately *not* a policy/verdict change): the
+ * deterministic classification `reviewer-provider.ts`'s tolerant parser computes for *why* a
+ * `report`-stage provider output still failed even after decision 3's two-step syntactic tolerance
+ * (strip one Markdown fence layer, then extract the first `{` through the last `}` once). This is a
+ * closed, small enum precisely so it can be persisted (job-progress-store.ts's
+ * `review_report_pending_retry`/`requires_manual.cause` -- never the provider's own raw text) and
+ * fed back into a retry's own directive as a fixed sentence (reviewer-policy.ts) -- never by
+ * reflowing the invalid output itself back to the model (coordinator's explicit requirement).
+ *
+ * Precedence when multiple conditions could apply (documented once here, not re-derived per call
+ * site): `empty_output` > `invalid_json` > `preamble_or_trailing_content` > `missing_field` >
+ * `enum_mismatch` > `context_mismatch` > `schema_invalid` (catch-all). Earlier categories are
+ * checked first because they block ever reaching the later, more specific checks (e.g. you cannot
+ * classify *which* schema issue occurred without first having valid JSON at all).
+ */
+export const reportContractFailureCategorySchema = z.enum([
+  "empty_output",
+  "invalid_json",
+  "preamble_or_trailing_content",
+  "missing_field",
+  "enum_mismatch",
+  "context_mismatch",
+  "schema_invalid",
+]);
+export type ReportContractFailureCategory = z.infer<typeof reportContractFailureCategorySchema>;
+
 export interface ReviewerEvidenceIntegrityPort {
   verify(
     evidence: Extract<ReviewEvidenceBlock, { kind: "file" }>,
@@ -222,6 +249,12 @@ export interface ReviewerPipelineRequest {
   readonly deadlineAt: Instant;
   readonly idempotencyKeyPrefix: string;
   readonly signal?: AbortSignal;
+  /** C015r decision 4: set only when this run is a bounded, dedicated report-contract retry (the
+   * previous attempt's `report`-stage output failed decision 3's tolerant parse/schema/context
+   * checks) -- `reviewerDirective` (reviewer-policy.ts) appends one fixed sentence keyed by
+   * `category`, never the previous attempt's raw invalid text (coordinator's explicit requirement:
+   * "不得回灌模型原始無效輸出"). Absent on a first attempt. */
+  readonly reportRetryFeedback?: Readonly<{ category: ReportContractFailureCategory }>;
 }
 
 export type ReviewerFailureStage =
@@ -279,4 +312,16 @@ export type ReviewerPipelineOutcome =
       stage: ReviewerFailureStage;
       error: DomainError;
       job: Job;
+      /** C015r decision 4: only ever populated when `stage === "report"` -- see
+       * `ReportContractFailureCategory`'s own header for what this is and why it exists. */
+      reportFailureCategory?: ReportContractFailureCategory;
+      /** C015r decision 5 (observability sidecar, pure data propagation -- the CLI/adapter layer,
+       * never this application layer, decides whether/where to persist it): the exact text that
+       * failed decision 3's tolerant parse/schema/context checks, only ever populated when
+       * `stage === "report"`. This field is intentionally excluded from every other outcome shape
+       * (never on `changes_requested`/`approved`/etc.) and callers must never copy it into a durable
+       * `JobProgressRecord`/`cause`, an `agent-team run` CLI outcome, a PR, or Linear -- it exists
+       * solely so the CLI-layer diagnostic sidecar (decision 5) can write it, Redactor-scrubbed,
+       * size-capped, 0600, somewhere that is not any of those. */
+      rejectedOutput?: string;
     }>;
