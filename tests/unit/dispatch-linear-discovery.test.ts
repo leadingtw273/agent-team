@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   discoverReadyDispatchCandidates,
+  projectIssueByExternalId,
   type LinearDiscoveryReadModel,
 } from "../../src/adapters/dispatch/linear-discovery.js";
 import {
@@ -360,5 +361,78 @@ describe("discoverReadyDispatchCandidates", () => {
     });
     expect(result.ok).toBe(false);
     expect(calls).toEqual(["readContext"]);
+  });
+});
+
+describe("projectIssueByExternalId (C015c item 2: resume-time issue re-derivation)", () => {
+  it("re-derives the same domain Issue discoverReadyDispatchCandidates would have produced", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshot({ description: filledTemplateDescription() }))),
+    });
+    const result = await projectIssueByExternalId(
+      project(),
+      readModel,
+      "team-1",
+      "proj-1",
+      "linear-issue-1",
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.externalId).toBe("linear-issue-1");
+    expect(result.value.goal).toBe("讓真實 Linear 候選能通過 eligibility。");
+    const expectedId = generateDeterministicIdentifier("issue", "linear-issue-1");
+    expect(expectedId.ok).toBe(true);
+    if (expectedId.ok) expect(result.value.id).toBe(expectedId.value);
+  });
+
+  it("does not require workStatus to still be ready -- original-dispatch eligibility already happened once", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshot({ workStatus: "in_progress" }))),
+    });
+    const result = await projectIssueByExternalId(
+      project(),
+      readModel,
+      "team-1",
+      "proj-1",
+      "linear-issue-1",
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("fails closed when the description's dependencies section became unparsed since dispatch", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              description: `## ${readyGateTemplateHeadings.dependencies}\n某些自由文字依賴\n`,
+            }),
+          ),
+        ),
+    });
+    const result = await projectIssueByExternalId(
+      project(),
+      readModel,
+      "team-1",
+      "proj-1",
+      "linear-issue-1",
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("conflict");
+  });
+
+  it("propagates a readIssue failure", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(err(domainError("external_failure"))),
+    });
+    const result = await projectIssueByExternalId(
+      project(),
+      readModel,
+      "team-1",
+      "proj-1",
+      "linear-issue-1",
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("external_failure");
   });
 });

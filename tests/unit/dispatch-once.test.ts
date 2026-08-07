@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import { dispatchOnce, type DispatchCompositionReady } from "../../src/cli/dispatch/composition.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../src/application/leases/index.js";
 import type { JobRepository } from "../../src/application/dispatch/index.js";
+import type { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
@@ -83,9 +84,22 @@ class NeverCalledLeaseRepository implements LeaseRepository {
   }
 }
 
+/** `readAll`/`update` (C015c item 2's own additional requirement on
+ * `DispatchCompositionReady.jobs`) are never reachable here either -- discovery fails before
+ * `dispatchOnce` (this file's own subject) ever touches `jobs` at all. */
 class NeverCalledJobRepository implements JobRepository {
   called = false;
   create(): ReturnType<JobRepository["create"]> {
+    this.called = true;
+    return Promise.reject(new Error("must never be called: discovery failed first"));
+  }
+
+  readAll(): ReturnType<FileJobRepository["readAll"]> {
+    this.called = true;
+    return Promise.reject(new Error("must never be called: discovery failed first"));
+  }
+
+  update(): ReturnType<FileJobRepository["update"]> {
     this.called = true;
     return Promise.reject(new Error("must never be called: discovery failed first"));
   }
@@ -109,6 +123,9 @@ function readyComposition(readModel: LinearDiscoveryReadModel): DispatchComposit
       teamId: "team-1",
       linearProjectId: "linear-proj-1",
       readModel: readModel as unknown as LinearReadModel,
+      // Never exercised: this fixture only feeds `dispatchOnce` (discovery -> dispatch), well
+      // before `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
+      mutationClient: {} as never,
     },
     project: project(),
     trustedConfig: trustedConfigFixture(),

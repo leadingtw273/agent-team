@@ -142,4 +142,78 @@ describe("FileJobRepository", () => {
     if (!result.ok) expect(result.error.code).toBe("invariant_violation");
     await expect(repository.readAll()).resolves.toEqual({ ok: true, value: [] });
   });
+
+  describe("update (C015c item 1: read-modify-write-under-lock, for pipelines that own a job's lifecycle after create)", () => {
+    it("replaces the matching job in place, leaving other jobs untouched", async () => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+      const otherJob = job({
+        id: id("job", "job_018f47d2-77a4-7cc1-8ef2-1123456789ab"),
+        issueId: id("issue", "issue_018f47d2-77a4-7cc1-8ef2-1123456789ab"),
+      });
+      await repository.create(job());
+      await repository.create(otherJob);
+
+      const updated = job({
+        attempts: { ...emptyAttemptCounters(), reviewRuns: 1 },
+        startedAt: now,
+      });
+      const result = await repository.update(updated, { idempotencyKey: "update-1" });
+      expect(result).toEqual({ ok: true, value: { durability: "confirmed" } });
+
+      const all = await repository.readAll();
+      expect(all.ok).toBe(true);
+      if (all.ok) {
+        expect(all.value).toHaveLength(2);
+        const persisted = all.value.find((entry) => entry.id === updated.id);
+        expect(persisted?.attempts.reviewRuns).toBe(1);
+        expect(persisted?.startedAt).toBe(now);
+        expect(all.value.find((entry) => entry.id === otherJob.id)).toEqual(otherJob);
+      }
+    });
+
+    it("fails closed with not_found when the job does not exist yet -- update never creates", async () => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+
+      const result = await repository.update(job(), { idempotencyKey: "update-missing" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("not_found");
+    });
+
+    it("fails closed on an empty idempotencyKey", async () => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+      await repository.create(job());
+
+      const result = await repository.update(job(), { idempotencyKey: "" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+    });
+
+    it("fails closed on a relative file path", async () => {
+      const repository = new FileJobRepository("jobs.json", "jobs.lock");
+      const result = await repository.update(job(), { idempotencyKey: "update-relative" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+    });
+
+    it("fails closed on a schema-invalid job object instead of writing it", async () => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+      await repository.create(job());
+
+      const malformed = { ...job(), watchdogExtensionGranted: "nope" } as unknown as Job;
+      const result = await repository.update(malformed, { idempotencyKey: "update-invalid" });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+      const all = await repository.readAll();
+      expect(all.ok).toBe(true);
+      if (all.ok) expect(all.value).toEqual([job()]);
+    });
+  });
 });

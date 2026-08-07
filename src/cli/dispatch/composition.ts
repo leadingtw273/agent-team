@@ -61,6 +61,7 @@ import {
 } from "../../adapters/dispatch/index.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
+import { LinearMutationClient } from "../../adapters/linear/write.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { FileRegistrationSetupActivationRegistry } from "../../adapters/registration/index.js";
@@ -110,13 +111,33 @@ export type DispatchCompositionBlockedReason =
 
 export interface DispatchCompositionReady {
   readonly leases: LeaseRepository;
-  readonly jobs: JobRepository;
+  /** C015c item 2: the engine's own `JobRepository` interface only declares `create` --
+   * `runResumeCycle` (resume-composition.ts) also needs `readAll`/`update` (C015c item 1's
+   * addition to `FileJobRepository`, deliberately not added to the engine interface). `Pick<...>`
+   * here (rather than the concrete class) keeps this purely structural, so every existing fake
+   * that only ever implemented plain `JobRepository` needs nothing more than adding those two
+   * extra methods, not becoming a real `FileJobRepository` instance (which is impossible for an
+   * external class anyway -- it has a private field). */
+  readonly jobs: JobRepository & Pick<FileJobRepository, "readAll" | "update">;
   readonly registry: ProjectRegistrySnapshot;
   readonly routingConfig: ModelRoutingConfig;
   readonly discovery: {
     readonly teamId: string;
     readonly linearProjectId: string;
     readonly readModel: LinearReadModel;
+    /** C015c item 5: shares the same `LinearGraphqlTransport`/`readModel` pair as `readModel`
+     * above -- `LinearMutationClient`'s own constructor requires a `LinearIssueReader`, and
+     * `LinearReadModel` already satisfies that shape (`readIssue`), so this is not a second
+     * connection, just a second, narrower view over the same transport. Needed by
+     * `LifecyclePipeline`'s production composition (lifecycle-composition.ts) to mark a merged
+     * issue's Linear work status completed. Narrowed to the three methods
+     * `LinearWorkManagementAdapter` actually calls -- the same `Pick<...>`-over-a-concrete-class
+     * convention `LinearDiscoveryReadModel` (linear-discovery.ts) already established, so tests
+     * can fake this with a plain object instead of a real `LinearMutationClient` instance. */
+    readonly mutationClient: Pick<
+      LinearMutationClient,
+      "observeGithubMerge" | "setAgentCondition" | "appendComment"
+    >;
   };
   readonly project: ProjectRegistrySnapshot["ready"][number]["project"];
   /** The same entry's trusted config (src/application/projects/loader.ts) -- C015b's run-flow
@@ -268,6 +289,7 @@ export async function buildDispatchComposition(
     ...(options.linearFetch === undefined ? {} : { fetch: options.linearFetch }),
   });
   const readModel = new LinearReadModel(linearTransport);
+  const mutationClient = new LinearMutationClient(linearTransport, readModel);
 
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -286,6 +308,7 @@ export async function buildDispatchComposition(
         teamId: readyEntry.project.workManagement.containerId,
         linearProjectId: readyEntry.project.workManagement.projectId,
         readModel,
+        mutationClient,
       }),
       project: readyEntry.project,
       trustedConfig: readyEntry.config,
