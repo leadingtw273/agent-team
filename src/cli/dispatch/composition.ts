@@ -8,13 +8,28 @@
  *
  * Scope (C015a is the "接單" half only): this wires discovery -> eligibility -> lease -> job
  * creation. It deliberately does NOT stand up model provider factories, quota tracking, or
- * pipeline execution -- `routeObservations` is therefore always the empty set here (see
- * `runDispatchOnce` in handlers.ts for the load-bearing consequence: with zero observations,
- * model-work candidates can never reach `kind:"selected"`, so a real (non-dry-run) invocation
- * against typical Linear-discovered work will currently always end in
- * `kind:"waiting", reason:"no_dispatchable_candidate"` -- an honest reflection of "we have not
- * wired up model availability yet," not a bug in this composition). C015b owns wiring a genuine
- * `routeObservations` source.
+ * pipeline execution -- `routeObservations` is therefore always the empty set here.
+ *
+ * A real (non-dry-run) invocation against typical Linear-discovered work will currently always
+ * end in `kind:"waiting"`, for **two independent reasons** -- do not assume fixing one fixes the
+ * other:
+ *
+ * 1. (Earlier, and blocking on its own) The Linear discovery bridge's `toDomainIssue`
+ *    (src/adapters/dispatch/linear-discovery.ts) does not populate `goal`/`acceptanceCriteria`/
+ *    `inScope`/`outOfScope`/`estimatedMinutes` on the `Issue` it produces -- `LinearIssueSnapshot`
+ *    has no such fields at all. `evaluateEligibility` runs *before* routing ever sees a
+ *    candidate, so every real candidate fails eligibility (`reason:"no_eligible_candidates"`) and
+ *    is filtered out long before `routeObservations` is ever consulted.
+ * 2. (Only reachable once #1 is fixed) With zero `routeObservations`, model-work candidates that
+ *    *do* clear eligibility can still never reach `kind:"selected"` (`reason:
+ *    "no_dispatchable_candidate"`) -- an honest reflection of "we have not wired up model
+ *    availability yet," not a bug in this composition.
+ *
+ * Wiring a genuine `routeObservations` source is **not sufficient** to make a real `run` produce
+ * a dispatched job -- #1 has to be closed first, and closing it is not this composition's job
+ * (see linear-discovery.ts's own comment on `toDomainIssue` for why). C015b owns #2;
+ * #1 is presently unowned and should be raised as its own ticket rather than assumed folded into
+ * C015b's scope.
  *
  * `active` is likewise always the empty set here -- this composition has no source of "jobs
  * currently in flight" (that is `pipeline` state, and C015a stands up no pipeline). This is safe

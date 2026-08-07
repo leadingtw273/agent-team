@@ -67,6 +67,17 @@ function toDomainIssue(
 ): Result<Issue, DomainError> {
   const issueId = generateDeterministicIdentifier("issue", snapshot.id);
   if (!issueId.ok) return err(domainError("invariant_violation"));
+  // Deliberately not mapped below: `goal`/`acceptanceCriteria`/`inScope`/`outOfScope`/
+  // `estimatedMinutes`. `LinearIssueSnapshot` (src/adapters/linear/model.ts) carries none of
+  // these fields at all -- there is nothing here to project. Consequence, spelled out so it is
+  // never mistaken for an oversight and "helpfully" patched over: every real candidate this
+  // bridge produces today is missing exactly these five `Issue` fields, so
+  // `evaluateEligibility` (src/domain/eligibility/decision.ts) unconditionally reports
+  // `missing_goal`/`missing_acceptance_criteria`/`missing_in_scope`/`missing_out_of_scope`/
+  // `missing_estimate` and the candidate never dispatches -- fail-closed, not a bug. Populating
+  // these (deciding how a Linear issue is meant to encode goal/acceptance-criteria/scope/estimate
+  // -- body template? custom fields?) is a real domain-judgment call left to C015b or a
+  // dedicated follow-up ticket, not a quick fix to bolt on here.
   const parsed = issueSchema.safeParse({
     schemaVersion: 1,
     id: issueId.value,
