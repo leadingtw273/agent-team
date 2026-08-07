@@ -87,6 +87,70 @@ class FakeClaudeProcess implements ChildProcessHandle {
   }
 }
 
+/** C015f: takes already-serialized raw lines (never `JSON.stringify`s them) -- unlike `chunk()`
+ * above, so a fixture can carry text that has already been through `Redactor.redactText` (i.e.
+ * exactly what `ChildProcessRunner.appendText`, src/adapters/process/runner.ts, would have handed
+ * `ClaudeRunner` from a real child process's stdout). */
+function rawLineChunk(sequence: number, line: string): ProcessOutputChunk {
+  return {
+    sequence,
+    stream: "stdout",
+    bytes: Buffer.from(`${line}\n`, "utf8"),
+    observedAt: instant("2026-08-04T12:01:00.000Z"),
+  };
+}
+
+class FakeClaudeProcessFromRawLines implements ChildProcessHandle {
+  readonly pid = 2346;
+  readonly output: AsyncIterable<ProcessOutputChunk>;
+  readonly #exit: Result<ProcessExit, DomainError>;
+
+  constructor(lines: readonly string[]) {
+    const chunks = lines.map((line, index) => rawLineChunk(index + 1, line));
+    this.output = (async function* () {
+      await Promise.resolve();
+      yield* chunks;
+    })();
+    this.#exit = ok({
+      exitCode: 0,
+      signal: null,
+      startedAt: instant("2026-08-04T12:00:00.000Z"),
+      exitedAt: instant("2026-08-04T12:02:00.000Z"),
+      outputTruncated: false,
+    });
+  }
+
+  writeStdin(): Promise<Result<void, DomainError>> {
+    return Promise.resolve(ok(undefined));
+  }
+
+  closeStdin(): Promise<Result<void, DomainError>> {
+    return Promise.resolve(ok(undefined));
+  }
+
+  wait(): Promise<Result<ProcessExit, DomainError>> {
+    return Promise.resolve(this.#exit);
+  }
+
+  sendSignal(): Promise<Result<void, DomainError>> {
+    return Promise.resolve(ok(undefined));
+  }
+}
+
+class FakeProcessPortFromRawLines implements ProcessPort {
+  readonly child: FakeClaudeProcessFromRawLines;
+  request: ProcessSpawnRequest | undefined;
+
+  constructor(lines: readonly string[]) {
+    this.child = new FakeClaudeProcessFromRawLines(lines);
+  }
+
+  spawn(request: ProcessSpawnRequest): Promise<Result<ChildProcessHandle, DomainError>> {
+    this.request = request;
+    return Promise.resolve(ok(this.child));
+  }
+}
+
 class FakeProcessPort implements ProcessPort {
   readonly child: FakeClaudeProcess;
   request: ProcessSpawnRequest | undefined;
@@ -290,5 +354,66 @@ describe("Claude stream-json runner", () => {
         supportsStructuredEvents: true,
       },
     });
+  });
+
+  /**
+   * C015f: real Claude Code `stream-json` output carries a `signature` field on every
+   * "thinking" content block (a real Anthropic API integrity value, not a secret). This field
+   * only ever reaches `ClaudeRunner` *after* `ChildProcessRunner.appendText`
+   * (src/adapters/process/runner.ts) has already run the raw stdout text through
+   * `Redactor.redactText` -- so this test builds the fixture the same way: serialize a realistic
+   * "thinking" event to a raw line, run it through the *real* `Redactor` class (the same one
+   * production wires up), and feed the resulting (post-redaction) line to `ClaudeRunner` via a
+   * fake process whose chunks are never re-serialized. Before C015f's fix, this line's `signature`
+   * value came back unquoted (`"signature":[REDACTED]`), which is not valid JSON --
+   * `ClaudeRunner`'s own `JSON.parse` (runner.ts) would throw, `invalidStream` would be set, and
+   * the run would fail with `external_failure` even though every other line (including the final
+   * `result` event asserted below) was perfectly valid. This is the exact bug path E101's third
+   * live run hit.
+   */
+  it("does not invalidate the stream on a redacted thinking-block signature line (C015f real bug path)", async () => {
+    const rawThinkingLine = JSON.stringify({
+      type: "assistant",
+      message: {
+        content: [
+          {
+            type: "thinking",
+            thinking: "",
+            signature: "abcXYZ123-real-looking-base64-signature-value==",
+          },
+        ],
+      },
+    });
+    // The exact redaction step `ChildProcessRunner.appendText` applies to every raw stdout chunk
+    // before `ClaudeRunner` ever sees it -- using the real `Redactor` class, not a stand-in.
+    const redactedThinkingLine = new Redactor().redactText(rawThinkingLine);
+    // Sanity-check the fixture is genuinely exercising the redaction path, not accidentally
+    // leaving the line untouched (which would make this test pass for the wrong reason).
+    expect(redactedThinkingLine).not.toBe(rawThinkingLine);
+    expect(redactedThinkingLine).toContain("[REDACTED]");
+
+    const process = new FakeProcessPortFromRawLines([
+      redactedThinkingLine,
+      JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: "Done thinking, here is the result." }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        is_error: false,
+        result: "CLAUDE_RUN_OK",
+        permission_denials: [],
+      }),
+    ]);
+
+    const started = await runner(process).start(runRequest("implementer"));
+    if (!started.ok) throw new Error(started.error.code);
+    const [events, completion] = await Promise.all([
+      collect(started.value.events),
+      started.value.completion(),
+    ]);
+
+    expect(events.map((event) => event.kind)).not.toContain("failed");
+    expect(completion).toMatchObject({ ok: true, value: { outcome: "completed" } });
   });
 });
