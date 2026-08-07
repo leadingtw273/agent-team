@@ -57,6 +57,7 @@ import { join } from "node:path";
 
 import {
   discoverReadyDispatchCandidates,
+  type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
@@ -171,7 +172,21 @@ export interface BuildDispatchCompositionOptions {
 export interface DispatchOncePorts {
   readonly leases: LeaseCoordinator;
   readonly jobs: JobRepository;
+  /** C015o decision 3: the durable, atomically-CAS-guarded per-issue admission claim
+   * (src/adapters/dispatch/issue-admission-store.ts) -- production defaults to a real
+   * `FileIssueAdmissionStore`; `--dry-run` uses the ephemeral `InMemoryIssueAdmissionStore`
+   * (ephemeral-ports.ts), the same "throwaway in-memory" convention `leases`/`jobs` already use. */
+  readonly admission: IssueAdmissionPort;
 }
+
+/** C015o decision 3: an issue whose admission claim was already `state:"active"` when this
+ * candidate was considered -- a *different*, still-unresolved job already owns it. Visible,
+ * distinct from `LinearDiscoverySkippedIssue` (which is discovery's own, engine-independent skip
+ * taxonomy) -- this reason only exists past discovery, at the composition root. */
+export type DispatchOnceAdmissionSkippedIssue = Readonly<{
+  issueId: string;
+  reason: "issue_claim_active";
+}>;
 
 /**
  * `dispatchOnce`'s result. Deliberately a discriminated union distinct from `DispatcherResult`
@@ -189,6 +204,11 @@ export type DispatchOnceOutcome =
       result: DispatcherResult;
       candidates: readonly DispatcherCandidate[];
       discoverySkipped: readonly LinearDiscoverySkippedIssue[];
+      /** C015o decision 3: candidates discovery/eligibility would otherwise have handed to
+       * `Dispatcher.dispatch()`, but whose issue already had an unresolved admission claim from a
+       * different, still-open job -- see `dispatchOnce`'s own comment for the exact claim/
+       * reconcile sequence this guards. */
+      admissionSkipped: readonly DispatchOnceAdmissionSkippedIssue[];
     }>
   | Readonly<{ outcome: "discovery_failed"; error: DomainError }>;
 
@@ -197,6 +217,37 @@ export type DispatchOnceOutcome =
  * are supplied -- the real file-backed ones for a genuine run, or the ephemeral in-memory ones
  * (ephemeral-ports.ts) for `--dry-run`. Factoring this out means both CLI modes exercise the
  * identical engine call, so a dry-run's prediction can never drift from what a real run does.
+ *
+ * C015o decision 3: closes the duplicate-dispatch gap this file's own header already disclosed
+ * (`active:[]`'s "one residual gap" paragraph) -- a lease only guards *this* dispatch attempt's
+ * own execution window, and once a job reaches `requires_manual` (still genuinely unresolved) the
+ * lease has long since been released, leaving nothing durable blocking a second dispatch for the
+ * same still-`ready` Linear issue. The sequence, matching the decision's own literal ordering
+ * ("先 claim...才呼叫 dispatch"):
+ *
+ * 1. Claim admission for *every* candidate discovery/eligibility produced, before
+ *    `Dispatcher.dispatch()` (the unmodified engine call) ever runs -- this is what makes the fix
+ *    crash-safe at "job created" (`Dispatcher.dispatch()` generates the job id internally and only
+ *    once it has already selected a candidate, so the claim necessarily happens first and is
+ *    updated with the real id afterward, never the reverse); a crash between claiming and
+ *    `dispatch()` returning still leaves a durable claim blocking a future duplicate.
+ * 2. A candidate whose issue already has an active claim (a *different*, still-unresolved job)
+ *    never reaches `Dispatcher.dispatch()` at all -- reported via `admissionSkipped`, distinct
+ *    from `discoverySkipped`.
+ * 3. After `dispatch()` returns, reconcile: the one candidate it actually dispatched (if any) gets
+ *    its claim updated with the real job id (`attachJob`); every other claimed-but-not-selected
+ *    candidate has its claim released with reason `"not_dispatched"` (never `"completed"`/
+ *    `"cancelled"`/`"superseded"` -- those are reserved for a job's own real lifecycle ending, see
+ *    issue-admission-store.ts's own header).
+ *
+ * Disclosed residual gap (a deliberate, minimal-scope choice, not an oversight): `Dispatcher.
+ * dispatch()` itself can retry across *multiple* candidates within one call (a lease conflict on
+ * its first choice makes it try the next), and this composition cannot observe that internal
+ * retry loop without modifying `Dispatcher.dispatch()` itself (`src/application`, out of this
+ * ticket's authority). Claiming every candidate up front and reconciling by matching
+ * `result.job.issueId` against the claims already made handles this correctly regardless of which
+ * candidate `dispatch()` internally ends up selecting -- the reconcile step is keyed off the
+ * actual result, never an assumption about which candidate would win.
  */
 export async function dispatchOnce(
   ready: DispatchCompositionReady,
@@ -220,20 +271,53 @@ export async function dispatchOnce(
     config: ready.claude.config,
     workingDirectory: ready.project.localRepositoryPath,
   });
+
+  const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
+  const claimedRevisions = new Map<string, number>();
+  const claimedCandidates: DispatcherCandidate[] = [];
+  for (const candidate of discovered.value.candidates) {
+    const claimed = await ports.admission.claim(ready.project.id, candidate.issue.id);
+    if (!claimed.ok) {
+      admissionSkipped.push(
+        Object.freeze({ issueId: candidate.issue.id, reason: "issue_claim_active" as const }),
+      );
+      continue;
+    }
+    claimedRevisions.set(candidate.issue.id, claimed.value.revision);
+    claimedCandidates.push(candidate);
+  }
+
   const dispatcher = new Dispatcher(ports);
   const result = await dispatcher.dispatch({
     holderId,
-    candidates: discovered.value.candidates,
+    candidates: claimedCandidates,
     registry: ready.registry,
     active: [],
     routingConfig: ready.routingConfig,
     routeObservations,
   });
+
+  const dispatchedIssueId = result.kind === "dispatched" ? result.job.issueId : undefined;
+  for (const [issueId, revision] of claimedRevisions) {
+    if (issueId === dispatchedIssueId && result.kind === "dispatched") {
+      // Best-effort: if this fails, the claim stays active but jobless -- still safe (it still
+      // blocks a future duplicate dispatch for this issue), just missing the job id for
+      // observability until `dispatch resolve` or a future retry fixes it up.
+      await ports.admission.attachJob(ready.project.id, issueId, revision, result.job.id);
+    } else {
+      // Best-effort release: if this fails, the claim stays active and simply blocks this one
+      // issue from being claimed again until it is retried or manually resolved -- safe
+      // (conservative), never a duplicate-dispatch risk.
+      await ports.admission.release(ready.project.id, issueId, revision, "not_dispatched");
+    }
+  }
+
   return Object.freeze({
     outcome: "ran" as const,
     result,
     candidates: discovered.value.candidates,
     discoverySkipped: discovered.value.skipped,
+    admissionSkipped: Object.freeze(admissionSkipped),
   });
 }
 

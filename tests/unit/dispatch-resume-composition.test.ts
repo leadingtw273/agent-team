@@ -41,6 +41,7 @@ import type {
 } from "../../src/application/pipelines/index.js";
 import {
   createFixedClock,
+  domainError,
   ok,
   parseIdentifier,
   parseInstant,
@@ -65,7 +66,12 @@ import {
   type Project,
 } from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
-import { emptyAttemptCounters, jobSchema, type Job } from "../../src/domain/jobs/index.js";
+import {
+  emptyAttemptCounters,
+  jobSchema,
+  watchdogHardStopMs,
+  type Job,
+} from "../../src/domain/jobs/index.js";
 import { headShaSchema } from "../../src/domain/review/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -369,7 +375,7 @@ async function harness(
 
 async function seedProgressRecord(
   progress: FileJobProgressStore,
-  stage: Readonly<{ kind: string; checkpointId?: string }>,
+  stage: Readonly<{ kind: string }> & Readonly<Record<string, unknown>>,
 ) {
   await progress.compareAndSwap(jobId, null, {
     jobId,
@@ -610,5 +616,359 @@ describe("runResumeCycle", () => {
     const { deps } = await harness();
     const result = await runResumeCycle(deps);
     expect(result).toEqual({ ok: true, value: [] });
+  });
+
+  /**
+   * C015o decisions 1 + 2 (D1's confirmed root cause, real incident E101): a retryable reviewer
+   * provider-start failure must become `review_pending_retry` (resumable), never `requires_manual`
+   * -- this is the direct fix for "resume 把 retryable timeout 打成終態". Acceptance criterion (1)
+   * ("retryable reviewer 啟動失敗後不建新 job") is verified end to end from *this* side: the record
+   * stays resumable, so a later `agent-team run` retries the same job instead of ever needing a
+   * fresh dispatch for the same issue at all.
+   */
+  it("a retryable reviewer provider-start failure becomes review_pending_retry, not requires_manual", async () => {
+    const timeoutError = domainError("timeout");
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_start",
+        error: timeoutError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "pending_retry",
+          stage: "provider_start",
+          error: timeoutError,
+          retries: 1,
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "review_pending_retry",
+        retries: 1,
+        lastErrorCode: "timeout",
+      });
+    }
+  });
+
+  it("a second consecutive retryable reviewer failure increments retries to 2, still resumable", async () => {
+    const unavailableError = domainError("unavailable");
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_start",
+        error: unavailableError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, {
+      kind: "review_pending_retry",
+      retries: 1,
+      lastErrorCode: "timeout",
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "pending_retry",
+          stage: "provider_start",
+          error: unavailableError,
+          retries: 2,
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "review_pending_retry",
+        retries: 2,
+        lastErrorCode: "unavailable",
+      });
+    }
+  });
+
+  it("a third consecutive retryable reviewer failure exhausts providerRetryLimit -> requires_manual", async () => {
+    const timeoutError = domainError("timeout");
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_start",
+        error: timeoutError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, {
+      kind: "review_pending_retry",
+      retries: 2,
+      lastErrorCode: "timeout",
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "review_failed:provider_start:timeout" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+  });
+
+  it("a non-retryable reviewer failure goes straight to requires_manual, never review_pending_retry", async () => {
+    const permissionError = domainError("permission_denied");
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_run",
+        error: permissionError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "review_failed:provider_run:permission_denied",
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+  });
+
+  /** Symmetric to the reviewer scenarios above -- `CiRecoveryPipeline.run()`'s own retryable
+   * provider failures get the same `ci_pending_retry` treatment, never a shared counter with the
+   * reviewer's `review_pending_retry`. */
+  it("a retryable CI-recovery provider failure becomes ci_pending_retry, not requires_manual", async () => {
+    const timeoutError = domainError("timeout");
+    const { deps, progress } = await harness({
+      ciRecoveryOutcome: {
+        state: "failed",
+        stage: "provider_start",
+        error: timeoutError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "pending_retry",
+          stage: "provider_start",
+          error: timeoutError,
+          retries: 1,
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "ci_pending_retry",
+        retries: 1,
+        lastErrorCode: "timeout",
+      });
+    }
+  });
+
+  it("ci_pending_retry exhausting providerRetryLimit goes to requires_manual, independent of review's own counter", async () => {
+    const timeoutError = domainError("timeout");
+    const { deps, progress } = await harness({
+      ciRecoveryOutcome: {
+        state: "failed",
+        stage: "provider_run",
+        error: timeoutError,
+        job: job(),
+      },
+    });
+    await seedProgressRecord(progress, {
+      kind: "ci_pending_retry",
+      retries: 2,
+      lastErrorCode: "timeout",
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "ci_recovery_failed:provider_run:timeout" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+  });
+
+  /**
+   * C015o decision 1: the real root cause -- `deadlineAt` must be a genuine future instant, never
+   * `clock.now()` verbatim (see resume-composition.ts's own `computeProviderDeadline` comment for
+   * why that guaranteed an instant, deterministic timeout unrelated to cold-start latency).
+   */
+  it("passes a real future deadline (now + watchdogHardStopMs) to both CiRecovery and Reviewer, never clock.now() verbatim", async () => {
+    const seenDeadlines: string[] = [];
+    const { deps: baseDeps, progress } = await harness();
+    const deps: ResumeCycleDependencies = {
+      ...baseDeps,
+      ciRecovery: {
+        run: (request: { deadlineAt: string }) => {
+          seenDeadlines.push(request.deadlineAt);
+          return Promise.resolve({
+            state: "ready_for_review",
+            source: "polling",
+            job: job(),
+            checks: {},
+          } as never);
+        },
+      },
+      reviewer: {
+        run: (request: { deadlineAt: string }) => {
+          seenDeadlines.push(request.deadlineAt);
+          return Promise.resolve({
+            state: "approved",
+            job: job(),
+            changeRequest: changeRequest(),
+          } as never);
+        },
+      },
+    };
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    await runResumeCycle(deps);
+    expect(seenDeadlines).toHaveLength(2);
+    for (const deadline of seenDeadlines) {
+      expect(deadline).not.toBe(now);
+      expect(Date.parse(deadline)).toBe(Date.parse(now) + watchdogHardStopMs);
+    }
+  });
+
+  /**
+   * C015o decision 5: a retryable failure at a call site with no dedicated attempt-counter stage
+   * (here, the change-request read-back itself) must leave `record.stage` completely untouched --
+   * never demoted to `requires_manual` -- and must report a distinguishable `transient_failure`
+   * outcome, not silently claim `requires_manual` happened when it did not.
+   */
+  it("a retryable getChangeRequest failure leaves the stage untouched and reports transient_failure", async () => {
+    const rateLimitedError = domainError("rate_limited");
+    const { deps: baseDeps, progress } = await harness();
+    const deps: ResumeCycleDependencies = {
+      ...baseDeps,
+      sourceControl: {
+        getChangeRequest: () => Promise.resolve({ ok: false, error: rateLimitedError }),
+      },
+    };
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "transient_failure",
+          reason: "change_request_read_failed",
+          error: rateLimitedError,
+        },
+      ]);
+    }
+    // Stage is untouched -- still ci_waiting, not requires_manual, not even a written revision
+    // bump.
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      expect(reloaded.value?.revision).toBe(0);
+    }
+  });
+
+  it("a non-retryable getChangeRequest failure still goes to requires_manual exactly as before", async () => {
+    const externalFailure = domainError("external_failure");
+    const { deps: baseDeps, progress } = await harness();
+    const deps: ResumeCycleDependencies = {
+      ...baseDeps,
+      sourceControl: {
+        getChangeRequest: () => Promise.resolve({ ok: false, error: externalFailure }),
+      },
+    };
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "change_request_read_failed" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+  });
+
+  /**
+   * C015o decision 5: `transition(...)`'s own CAS write can fail (a genuinely concurrent writer)
+   * -- the caller must report that honestly (`progress_write_failed`), never claim the intended
+   * state change (`requires_manual`, in this scenario) took effect when the durable record was
+   * never actually updated.
+   */
+  it("reports progress_write_failed, never a false requires_manual, when the underlying CAS write loses a race", async () => {
+    const { deps: baseDeps, progress } = await harness({
+      changeRequestState: { state: "closed" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    // Simulate a concurrent writer winning the race for this exact record, between this cycle's
+    // `listForProject` snapshot and its later `transition(...)` call -- the fake `getChangeRequest`
+    // (awaited well before `transition` runs) is the natural place to inject this deterministically.
+    const deps: ResumeCycleDependencies = {
+      ...baseDeps,
+      sourceControl: {
+        getChangeRequest: async () => {
+          const current = await progress.load(jobId);
+          if (current.ok && current.value !== undefined) {
+            const { schemaVersion: _s, revision: _r, updatedAt: _u, ...rest } = current.value;
+            void _s;
+            void _r;
+            void _u;
+            await progress.compareAndSwap(jobId, current.value.revision, rest);
+          }
+          return { ok: true as const, value: changeRequest({ state: "closed" }) };
+        },
+      },
+    };
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toHaveLength(1);
+      const outcome = result.value[0];
+      expect(outcome?.outcome).toBe("progress_write_failed");
+      if (outcome?.outcome === "progress_write_failed") {
+        expect(outcome.error.code).toBe("conflict");
+      }
+    }
+    // The record's stage must still be whatever the concurrent writer actually left it as
+    // (ci_waiting, revision 1) -- never requires_manual, which this attempt only *intended* but
+    // never durably achieved.
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      expect(reloaded.value?.revision).toBe(1);
+    }
   });
 });

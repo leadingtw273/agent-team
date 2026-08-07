@@ -44,9 +44,17 @@ import type {
 } from "../../application/pipelines/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { SourceControlPort } from "../../application/ports/index.js";
-import { ok, type Clock, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  instantFromDate,
+  ok,
+  type Clock,
+  type DomainError,
+  type Instant,
+  type Result,
+} from "../../domain/foundation/index.js";
 import { createRequirementSnapshot, headShaSchema } from "../../domain/review/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
+import { watchdogHardStopMs } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import {
@@ -58,6 +66,7 @@ import {
   type JobProgressRecord,
   type JobProgressRecordMutation,
 } from "../../adapters/dispatch/job-progress-store.js";
+import { FileIssueAdmissionStore } from "../../adapters/dispatch/issue-admission-store.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 
@@ -70,15 +79,84 @@ export type ResumeJobRepository = JobRepository & Pick<FileJobRepository, "readA
 
 /** Stages a fresh `agent-team run` will attempt to drive forward. `"implementing"` is
  * deliberately excluded -- resuming a mid-`ImplementerPipeline` crash is `ReconcileCoordinator`'s
- * job (unbuilt, out of scope), not this one. Terminal stages (`"completed"`/`"failed"`) and
- * fail-closed ones (`"paused"`/`"requires_manual"`) are excluded because nothing here auto-resumes
- * a checkpoint or a human-handoff marker. */
+ * job (unbuilt, out of scope), not this one. Terminal stages (`"completed"`/`"failed"`/
+ * `"superseded"`/`"cancelled"`) and fail-closed ones (`"paused"`/`"requires_manual"`) are excluded
+ * because nothing here auto-resumes a checkpoint or a human-handoff marker.
+ *
+ * C015o decision 2: `"review_pending_retry"`/`"ci_pending_retry"` *are* resumable -- that is the
+ * entire point of the fix. Before this ticket, a retryable provider-start timeout (E101's real
+ * incident) was written as `"requires_manual"`, which this set has always excluded, so the very
+ * next `agent-team run` fell through to a *fresh dispatch* for the same still-`ready` Linear issue
+ * instead of ever retrying the stuck job -- the direct mechanical cause of the duplicate-job bug
+ * this ticket closes (see decision 3's admission-claim fix for the other half of that story). */
 export const resumableStageKinds: ReadonlySet<string> = new Set([
   "ci_waiting",
   "awaiting_review",
   "fix_round",
   "merging",
+  "review_pending_retry",
+  "ci_pending_retry",
 ]);
+
+/**
+ * C015o decision 1: the previous code set `deadlineAt: deps.clock.now()` for both the
+ * `CiRecoveryPipeline`/`ReviewerPipeline` provider requests below -- literally "right now", zero
+ * budget. `ChildProcessRunner.spawn()` (src/adapters/process/runner.ts) checks
+ * `deadlineMs <= Date.now()` *before* ever spawning the child process, so by the time execution
+ * reached that check (even microseconds later), the deadline had already always passed --
+ * guaranteed, deterministic `timeout`, unrelated to Claude/Codex CLI cold-start latency at all
+ * (verified empirically with a real `ChildProcessRunner.spawn()` call: 10/10 reproductions,
+ * `deadlineAt: clock.now()` times out before ever spawning; the exact same call with a real future
+ * deadline spawns and completes normally -- see C015o's own diagnosis,
+ * /home/markchou/.claude/jobs/6152588f/tmp/c015o-diagnose.md).
+ *
+ * Fixed by importing `watchdogHardStopMs` (src/domain/jobs/watchdog.ts) directly, the same source
+ * `implementerProcessDeadlineMs` (src/cli/dispatch/implementer-request.ts) already aligns to --
+ * never a second, independently-chosen literal, so the two call sites can never silently drift
+ * apart. That file's own comment explains the underlying rationale: no `WatchdogCoordinator` is
+ * wired here either, but the bounded child-process deadline this composition sets must still never
+ * exceed the hard-stop boundary the watchdog represents.
+ */
+const resumeProviderDeadlineMs = watchdogHardStopMs;
+
+/** C015o decision 2: `reviewProviderRetries`/`ciProviderRetries`'s shared cap -- deliberately a
+ * *new*, dedicated counter (`JobProgressStage`'s own `retries` field on `review_pending_retry`/
+ * `ci_pending_retry`, job-progress-store.ts), never one of `Job.attempts`'s four existing counters
+ * (`reviewRuns`/`reviewerFixRounds`/`ciFixRounds`/`processRecoveries`, src/domain/jobs/attempts.ts)
+ * -- each of those has its own distinct, already-load-bearing semantics that a provider-start
+ * retry would corrupt if it borrowed one:
+ * - `reviewRuns` only increments once a *complete* reviewer report comes back; a provider that
+ *   never started never produced one.
+ * - `reviewerFixRounds` is not currently incremented by anything real (a separate, disclosed,
+ *   pre-existing gap -- see this file's own header) and means "sent back to the implementer for a
+ *   real code fix", an entirely different event.
+ * - `ciFixRounds` belongs exclusively to `CiRecoveryPipeline`'s own repair-and-repush attempts.
+ * - `processRecoveries` is C013's cap on resuming an exited process from a mid-flight checkpoint,
+ *   not a provider that failed before ever producing one.
+ * Living in `JobProgressStage` (adapter layer) rather than `Job.attempts` (domain layer) is what
+ * keeps this fix entirely inside CLI/adapter authority -- see this file's own module header. */
+const providerRetryLimit = 2;
+
+function computeProviderDeadline(clock: Clock): Instant | undefined {
+  const computed = instantFromDate(new Date(Date.parse(clock.now()) + resumeProviderDeadlineMs));
+  return computed.ok ? computed.value : undefined;
+}
+
+/** `DomainError.retryable` (src/domain/foundation/error.ts) is `true` only for
+ * `timeout`/`unavailable`/`rate_limited`/`quota_unknown`/`interrupted` -- never for
+ * `conflict`/`invariant_violation`/`permission_denied`/`not_found`/`external_failure`, which stay
+ * `requires_manual` exactly as before. This is the one predicate every retryable-vs-terminal
+ * decision in this file defers to -- never re-implemented ad hoc per call site. */
+function isRetryableError(error: DomainError): boolean {
+  return error.retryable;
+}
+
+function currentRetries(
+  record: JobProgressRecord,
+  kind: "review_pending_retry" | "ci_pending_retry",
+): number {
+  return record.stage.kind === kind ? record.stage.retries : 0;
+}
 
 export function defaultJobProgressDirectory(agentTeamHome: string): string {
   return join(agentTeamHome, "state", "dispatch", "progress");
@@ -119,7 +197,31 @@ export type ResumeJobOutcome =
   | Readonly<{ jobId: string; outcome: "checkpointed"; checkpointId: string }>
   | Readonly<{ jobId: string; outcome: "merging" }>
   | Readonly<{ jobId: string; outcome: "completed" }>
-  | Readonly<{ jobId: string; outcome: "failed"; stage: string; error: DomainError }>;
+  | Readonly<{ jobId: string; outcome: "failed"; stage: string; error: DomainError }>
+  // C015o decision 2: a retryable provider-start/provider-run failure that has *not* exhausted
+  // `providerRetryLimit` -- the job stays in `review_pending_retry`/`ci_pending_retry` (resumable)
+  // rather than being forced to `requires_manual`.
+  | Readonly<{
+      jobId: string;
+      outcome: "pending_retry";
+      stage: string;
+      error: DomainError;
+      retries: number;
+    }>
+  // C015o decision 5: `transition(...)`'s CAS write itself failed -- a *different* process's
+  // concurrent write to the same job-progress record, or a genuine storage fault. The in-memory
+  // decision this attempt made (e.g. "this should become requires_manual") was never durably
+  // recorded; the caller must not report the intended outcome as if it had been, and must not
+  // silently retry writing over whatever the record actually now says.
+  | Readonly<{ jobId: string; outcome: "progress_write_failed"; error: DomainError }>
+  // C015o decision 5 (the 5-real-external-call risk class from the diagnosis): a retryable
+  // failure at a call site with no dedicated attempt-counter stage of its own (change request/
+  // job/issue/base-revision reads, review begin/record, auto-merge, lifecycle) -- deliberately
+  // leaves `record.stage` completely untouched (no write at all) so the next `agent-team run`
+  // simply retries the same resume step from scratch. See `requiresManualUnlessRetryable`'s own
+  // comment for the disclosed trade-off (no bounded attempt cap on this path, unlike
+  // `pending_retry`).
+  | Readonly<{ jobId: string; outcome: "transient_failure"; reason: string; error: DomainError }>;
 
 /** Runs one resume attempt for every resumable job-progress record belonging to `dependencies.project`. */
 export async function runResumeCycle(
@@ -190,13 +292,61 @@ async function resumeOneJob(
   }
 }
 
+/**
+ * C015o decision 5: every call site that used to do `await transition(...); return {...}` --
+ * ignoring `transition`'s own `Result` -- claimed the intended state change had happened even when
+ * the underlying CAS write failed (a concurrent writer, or a genuine storage fault). This is the
+ * one place that pattern is now centralized: the caller supplies what it *wants* to become true;
+ * this helper only ever reports that as having happened if the durable write actually confirmed it.
+ */
+async function transitionOrReport(
+  deps: ResumeCycleDependencies,
+  record: JobProgressRecord,
+  next: Partial<JobProgressRecordMutation>,
+  onWritten: () => ResumeJobOutcome,
+): Promise<ResumeJobOutcome> {
+  const written = await transition(deps.progress, record, next);
+  if (!written.ok) {
+    return { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
+  }
+  return onWritten();
+}
+
 async function requiresManual(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
   reason: string,
 ): Promise<ResumeJobOutcome> {
-  await transition(deps.progress, record, { stage: { kind: "requires_manual" } });
-  return { jobId: record.jobId, outcome: "requires_manual", reason };
+  return transitionOrReport(deps, record, { stage: { kind: "requires_manual" } }, () => ({
+    jobId: record.jobId,
+    outcome: "requires_manual",
+    reason,
+  }));
+}
+
+/**
+ * C015o decision 5 (the "5 real external call" risk class the diagnosis named): for a call site
+ * with no dedicated attempt-counter stage of its own, a retryable failure leaves `record.stage`
+ * completely untouched -- no `transition(...)` call at all -- so the next `agent-team run` simply
+ * re-attempts the same resume step from whatever stage the record was already durably in. This is a
+ * disclosed, intentionally minimal-scope choice: unlike `review_pending_retry`/`ci_pending_retry`
+ * (decision 2's dedicated counters), this path has no bounded attempt cap -- a condition that never
+ * resolves retries indefinitely rather than ever reaching `requires_manual` on its own. Decision 2's
+ * own text only asked for a counter at the provider-invocation call sites; adding five more
+ * dedicated counter stages for every other retryable-external-call site was judged out of this
+ * ticket's scope (each would need its own `JobProgressStage` variant), not silently dropped -- see
+ * the completion report.
+ */
+async function requiresManualUnlessRetryable(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  reason: string,
+  error: DomainError | undefined,
+): Promise<ResumeJobOutcome> {
+  if (error !== undefined && isRetryableError(error)) {
+    return { jobId: record.jobId, outcome: "transient_failure", reason, error };
+  }
+  return requiresManual(record, deps, reason);
 }
 
 async function resumeUnderLease(
@@ -210,7 +360,12 @@ async function resumeUnderLease(
   const changeRequestReference = { project: deps.project, changeRequestId };
   const currentChangeRequest = await deps.sourceControl.getChangeRequest(changeRequestReference);
   if (!currentChangeRequest.ok) {
-    return requiresManual(record, deps, "change_request_read_failed");
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "change_request_read_failed",
+      currentChangeRequest.error,
+    );
   }
   // Exact-readback: the recorded branch/headSha must still match live GitHub, unless the PR has
   // since merged out of band (a legitimate, expected race between this resume and a prior run's
@@ -229,12 +384,14 @@ async function resumeUnderLease(
   }
 
   if (record.stage.kind === "merging") {
-    await transition(deps.progress, record, { stage: { kind: "merging" } });
-    return { jobId: record.jobId, outcome: "still_merging" };
+    return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
+      jobId: record.jobId,
+      outcome: "still_merging",
+    }));
   }
 
   const jobs = await deps.jobRepository.readAll();
-  if (!jobs.ok) return requiresManual(record, deps, "job_read_failed");
+  if (!jobs.ok) return requiresManualUnlessRetryable(record, deps, "job_read_failed", jobs.error);
   const job = jobs.value.find((candidate) => candidate.id === record.jobId);
   if (job === undefined) return requiresManual(record, deps, "job_not_found");
 
@@ -245,13 +402,29 @@ async function resumeUnderLease(
     deps.linearProjectId,
     record.externalIssueId,
   );
-  if (!issue.ok) return requiresManual(record, deps, "issue_projection_failed");
+  if (!issue.ok) {
+    return requiresManualUnlessRetryable(record, deps, "issue_projection_failed", issue.error);
+  }
   const requirementSnapshot = createRequirementSnapshot(issue.value, deps.clock.now());
-  if (!requirementSnapshot.ok) return requiresManual(record, deps, "requirement_snapshot_invalid");
+  if (!requirementSnapshot.ok) {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "requirement_snapshot_invalid",
+      requirementSnapshot.error,
+    );
+  }
 
   const git = deps.gitForBaseRevision ?? new LocalGitAdapter();
   const repository = await git.inspectRepository({ rootPath: deps.project.localRepositoryPath });
-  if (!repository.ok) return requiresManual(record, deps, "base_revision_unavailable");
+  if (!repository.ok) {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "base_revision_unavailable",
+      repository.error,
+    );
+  }
 
   const worktree = {
     repositoryRoot: deps.project.localRepositoryPath,
@@ -260,6 +433,9 @@ async function resumeUnderLease(
     headSha: currentChangeRequest.value.headSha,
   };
   const idempotencyKeyPrefix = `cli-dispatch-resume:${record.jobId}:${String(record.revision)}`;
+
+  const ciDeadline = computeProviderDeadline(deps.clock);
+  if (ciDeadline === undefined) return requiresManual(record, deps, "invalid_deadline");
 
   const ciOutcome = await deps.ciRecovery.run({
     trigger: { kind: "polling" },
@@ -274,7 +450,7 @@ async function resumeUnderLease(
     commitMessage: `${issue.value.title} (${issue.value.externalId}) CI 修復`,
     controllerDirective: buildDirective(issue.value),
     externalData: Object.freeze([]),
-    deadlineAt: deps.clock.now(),
+    deadlineAt: ciDeadline,
     idempotencyKeyPrefix: `${idempotencyKeyPrefix}:ci-recovery`,
   });
 
@@ -282,31 +458,64 @@ async function resumeUnderLease(
     case "ci_waiting": {
       const headSha = parsedHeadSha(ciOutcome.checks.headSha);
       if (headSha === undefined) return requiresManual(record, deps, "invalid_head_sha");
-      await transition(deps.progress, record, { stage: { kind: "ci_waiting" }, headSha });
-      return { jobId: record.jobId, outcome: "still_ci_waiting" };
+      return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" }, headSha }, () => ({
+        jobId: record.jobId,
+        outcome: "still_ci_waiting",
+      }));
     }
     case "repair_pushed": {
       const headSha = parsedHeadSha(ciOutcome.commit.sha);
       if (headSha === undefined) return requiresManual(record, deps, "invalid_head_sha");
-      await transition(deps.progress, record, { stage: { kind: "ci_waiting" }, headSha });
-      return { jobId: record.jobId, outcome: "repair_pushed" };
+      return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" }, headSha }, () => ({
+        jobId: record.jobId,
+        outcome: "repair_pushed",
+      }));
     }
     case "checkpointed": {
       const checkpointId = parsedCheckpointId(ciOutcome.checkpointId);
       if (checkpointId === undefined) return requiresManual(record, deps, "invalid_checkpoint_id");
-      await transition(deps.progress, record, { stage: { kind: "paused", checkpointId } });
-      return { jobId: record.jobId, outcome: "checkpointed", checkpointId: ciOutcome.checkpointId };
+      return transitionOrReport(deps, record, { stage: { kind: "paused", checkpointId } }, () => ({
+        jobId: record.jobId,
+        outcome: "checkpointed",
+        checkpointId: ciOutcome.checkpointId,
+      }));
     }
     case "paused":
       return requiresManual(record, deps, `ci_recovery_paused:${ciOutcome.reason}`);
-    case "failed":
-      await transition(deps.progress, record, { stage: { kind: "requires_manual" } });
-      return {
-        jobId: record.jobId,
-        outcome: "failed",
-        stage: ciOutcome.stage,
-        error: ciOutcome.error,
-      };
+    case "failed": {
+      // C015o decision 2: retryable CI-recovery provider failures get the same treatment as
+      // reviewer ones (`ci_pending_retry`, symmetric to `review_pending_retry`) -- see this
+      // file's own module header and `providerRetryLimit`'s comment for why this is a *new*,
+      // dedicated counter rather than any of `Job.attempts`'s four existing ones.
+      if (isRetryableError(ciOutcome.error)) {
+        const retries = currentRetries(record, "ci_pending_retry") + 1;
+        if (retries <= providerRetryLimit) {
+          return transitionOrReport(
+            deps,
+            record,
+            {
+              stage: {
+                kind: "ci_pending_retry",
+                retries,
+                lastErrorCode: ciOutcome.error.code,
+              },
+            },
+            () => ({
+              jobId: record.jobId,
+              outcome: "pending_retry",
+              stage: ciOutcome.stage,
+              error: ciOutcome.error,
+              retries,
+            }),
+          );
+        }
+      }
+      return requiresManual(
+        record,
+        deps,
+        `ci_recovery_failed:${ciOutcome.stage}:${ciOutcome.error.code}`,
+      );
+    }
     case "ready_for_review":
       break;
   }
@@ -344,10 +553,14 @@ async function resumeReview(
     expectedHeadSha,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
   });
-  if (begin.state === "failed") return requiresManual(record, deps, "review_begin_failed");
+  if (begin.state === "failed") {
+    return requiresManualUnlessRetryable(record, deps, "review_begin_failed", begin.error);
+  }
   if (begin.state === "not_ready") {
-    await transition(deps.progress, record, { stage: { kind: "ci_waiting" } });
-    return { jobId: record.jobId, outcome: "still_ci_waiting" };
+    return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" } }, () => ({
+      jobId: record.jobId,
+      outcome: "still_ci_waiting",
+    }));
   }
   if (begin.state === "already_approved") {
     // Disclosed limitation (see file header): this resume path never leaves a job in a state
@@ -355,6 +568,9 @@ async function resumeReview(
     // this code has no fresh evidence for.
     return requiresManual(record, deps, "already_approved_reuse_unimplemented");
   }
+
+  const reviewDeadline = computeProviderDeadline(deps.clock);
+  if (reviewDeadline === undefined) return requiresManual(record, deps, "invalid_deadline");
 
   const reviewOutcome = await deps.reviewer.run({
     job: context.job,
@@ -367,35 +583,62 @@ async function resumeReview(
     expectedHeadSha,
     models: { code: record.model },
     evidence: Object.freeze([]),
-    deadlineAt: deps.clock.now(),
+    deadlineAt: reviewDeadline,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
   });
 
   switch (reviewOutcome.state) {
     case "not_ready": {
-      await transition(deps.progress, record, { stage: { kind: "ci_waiting" } });
-      return { jobId: record.jobId, outcome: "still_ci_waiting" };
+      return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" } }, () => ({
+        jobId: record.jobId,
+        outcome: "still_ci_waiting",
+      }));
     }
     case "checkpointed": {
       const checkpointId = parsedCheckpointId(reviewOutcome.checkpointId);
       if (checkpointId === undefined) return requiresManual(record, deps, "invalid_checkpoint_id");
-      await transition(deps.progress, record, { stage: { kind: "paused", checkpointId } });
-      return {
+      return transitionOrReport(deps, record, { stage: { kind: "paused", checkpointId } }, () => ({
         jobId: record.jobId,
         outcome: "checkpointed",
         checkpointId: reviewOutcome.checkpointId,
-      };
+      }));
     }
     case "paused":
       return requiresManual(record, deps, `review_paused:${reviewOutcome.reason}`);
-    case "failed":
-      await transition(deps.progress, record, { stage: { kind: "requires_manual" } });
-      return {
-        jobId: record.jobId,
-        outcome: "failed",
-        stage: reviewOutcome.stage,
-        error: reviewOutcome.error,
-      };
+    case "failed": {
+      // C015o decision 2 (D1's confirmed root cause): a retryable reviewer provider-start/
+      // provider-run failure gets a bounded, dedicated `review_pending_retry` state instead of
+      // being forced straight to `requires_manual` -- see `providerRetryLimit`'s own comment for
+      // why this is a *new* counter, never one of `Job.attempts`'s four existing ones.
+      if (isRetryableError(reviewOutcome.error)) {
+        const retries = currentRetries(record, "review_pending_retry") + 1;
+        if (retries <= providerRetryLimit) {
+          return transitionOrReport(
+            deps,
+            record,
+            {
+              stage: {
+                kind: "review_pending_retry",
+                retries,
+                lastErrorCode: reviewOutcome.error.code,
+              },
+            },
+            () => ({
+              jobId: record.jobId,
+              outcome: "pending_retry",
+              stage: reviewOutcome.stage,
+              error: reviewOutcome.error,
+              retries,
+            }),
+          );
+        }
+      }
+      return requiresManual(
+        record,
+        deps,
+        `review_failed:${reviewOutcome.stage}:${reviewOutcome.error.code}`,
+      );
+    }
     case "changes_requested":
     case "clarification_required": {
       const record$ = await deps.reviewStatus.record({
@@ -405,9 +648,14 @@ async function resumeReview(
         idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
         decision: reviewOutcome,
       });
-      if (record$.state === "failed") return requiresManual(record, deps, "review_record_failed");
-      await transition(deps.progress, record, { stage: { kind: "fix_round" } });
-      return { jobId: record.jobId, outcome: "fix_round", verdict: reviewOutcome.state };
+      if (record$.state === "failed") {
+        return requiresManualUnlessRetryable(record, deps, "review_record_failed", record$.error);
+      }
+      return transitionOrReport(deps, record, { stage: { kind: "fix_round" } }, () => ({
+        jobId: record.jobId,
+        outcome: "fix_round",
+        verdict: reviewOutcome.state,
+      }));
     }
     case "approved":
       break;
@@ -421,7 +669,9 @@ async function resumeReview(
     decision: reviewOutcome,
   });
   if (recorded.state !== "approved") {
-    return requiresManual(record, deps, "review_record_did_not_approve");
+    return recorded.state === "failed"
+      ? requiresManualUnlessRetryable(record, deps, "review_record_did_not_approve", recorded.error)
+      : requiresManual(record, deps, "review_record_did_not_approve");
   }
 
   const enabled = await deps.autoMerge.enable({
@@ -434,13 +684,22 @@ async function resumeReview(
     approval: recorded.approval,
   });
   if (enabled.state !== "enabled") {
-    return requiresManual(record, deps, `auto_merge_not_enabled:${enabled.state}`);
+    return enabled.state === "failed"
+      ? requiresManualUnlessRetryable(
+          record,
+          deps,
+          `auto_merge_not_enabled:${enabled.state}`,
+          enabled.error,
+        )
+      : requiresManual(record, deps, `auto_merge_not_enabled:${enabled.state}`);
   }
   if (enabled.changeRequest.state === "merged") {
     return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
   }
-  await transition(deps.progress, record, { stage: { kind: "merging" } });
-  return { jobId: record.jobId, outcome: "merging" };
+  return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
+    jobId: record.jobId,
+    outcome: "merging",
+  }));
 }
 
 async function finishMerged(
@@ -457,12 +716,34 @@ async function finishMerged(
     idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
   });
   if (outcome.state !== "completed") {
-    return requiresManual(record, deps, `lifecycle_not_completed:${outcome.state}`);
+    return outcome.state === "failed"
+      ? requiresManualUnlessRetryable(
+          record,
+          deps,
+          `lifecycle_not_completed:${outcome.state}`,
+          outcome.error,
+        )
+      : requiresManual(record, deps, `lifecycle_not_completed:${outcome.state}`);
   }
-  await transition(deps.progress, record, { stage: { kind: "completed" } });
-  return { jobId: record.jobId, outcome: "completed" };
+  return transitionOrReport(deps, record, { stage: { kind: "completed" } }, () => ({
+    jobId: record.jobId,
+    outcome: "completed",
+  }));
 }
 
 export function buildJobProgressStore(agentTeamHome: string): FileJobProgressStore {
   return new FileJobProgressStore(defaultJobProgressDirectory(agentTeamHome));
+}
+
+/** C015o decision 3: sibling directory to job-progress's own (`state/dispatch/admission`, not
+ * nested inside `state/dispatch/progress` -- a different composite key space, `projectId`+
+ * `issueId` rather than `jobId`, so keeping them visually distinct on disk avoids ever conflating
+ * "job progress record" with "issue admission claim" while reading `${AGENT_TEAM_HOME}/state`
+ * directly). */
+export function defaultIssueAdmissionDirectory(agentTeamHome: string): string {
+  return join(agentTeamHome, "state", "dispatch", "admission");
+}
+
+export function buildIssueAdmissionStore(agentTeamHome: string): FileIssueAdmissionStore {
+  return new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(agentTeamHome));
 }

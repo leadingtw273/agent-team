@@ -160,6 +160,7 @@ describe("FileJobProgressStore", () => {
 
   it("accepts every stage variant, including paused with a checkpointId reference", () => {
     const checkpointId = "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+    const otherJobId = "job_018f47d2-77a4-7cc1-8ef2-1123456789ab";
     const stages = [
       { kind: "implementing" as const },
       { kind: "ci_waiting" as const },
@@ -170,6 +171,12 @@ describe("FileJobProgressStore", () => {
       { kind: "failed" as const },
       { kind: "paused" as const, checkpointId },
       { kind: "requires_manual" as const },
+      // C015o decision 2: retryable-provider-failure resumable stages.
+      { kind: "review_pending_retry" as const, retries: 1, lastErrorCode: "timeout" },
+      { kind: "ci_pending_retry" as const, retries: 0, lastErrorCode: "unavailable" },
+      // C015o decision 4: explicit, human-issued terminal verdicts.
+      { kind: "superseded" as const, supersededByJobId: otherJobId },
+      { kind: "cancelled" as const },
     ];
     for (const stage of stages) {
       // Deliberately not routed through `baseRecord()` here: this test exercises runtime schema

@@ -12,6 +12,7 @@
 import { describe, expect, it } from "vitest";
 
 import { dispatchOnce, type DispatchCompositionReady } from "../../src/cli/dispatch/composition.js";
+import { InMemoryIssueAdmissionStore } from "../../src/cli/dispatch/ephemeral-ports.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../src/application/leases/index.js";
 import type { JobRepository } from "../../src/application/dispatch/index.js";
 import type { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
@@ -150,7 +151,13 @@ describe("dispatchOnce discovery-failure mapping (C015a observation 4)", () => {
 
     const outcome = await dispatchOnce(
       ready,
-      { leases: new LeaseCoordinator(ready.leases), jobs: ready.jobs },
+      {
+        leases: new LeaseCoordinator(ready.leases),
+        jobs: ready.jobs,
+        // Discovery fails before dispatchOnce would ever reach admission claiming -- an
+        // ephemeral, never-persisted store is enough to satisfy the port shape here.
+        admission: new InMemoryIssueAdmissionStore(),
+      },
       "holder-1",
     );
 

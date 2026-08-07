@@ -7,9 +7,11 @@
  * never touch the filesystem at all.
  */
 import {
+  createClock,
   domainError,
   err,
   ok,
+  type Clock,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
@@ -21,6 +23,10 @@ import type {
 import type { Job } from "../../domain/jobs/index.js";
 import type { JobRepository, JobWriteReceipt } from "../../application/dispatch/index.js";
 import type { Lease } from "../../domain/jobs/index.js";
+import type {
+  IssueAdmissionRecord,
+  IssueAdmissionReleaseReason,
+} from "../../adapters/dispatch/issue-admission-store.js";
 
 export class InMemoryLeaseRepository implements LeaseRepository {
   #leases: readonly Lease[] = [];
@@ -62,5 +68,99 @@ export class InMemoryJobRepository implements JobRepository {
 
   list(): readonly Job[] {
     return this.#jobs;
+  }
+}
+
+/**
+ * C015o decision 3: the same "throwaway, in-memory-only" convention as
+ * `InMemoryLeaseRepository`/`InMemoryJobRepository` above, extended to the new per-issue admission
+ * claim (src/adapters/dispatch/issue-admission-store.ts) -- `dispatchOnce` (composition.ts) claims
+ * unconditionally before calling `Dispatcher.dispatch()`, so `--dry-run` needs *some* admission
+ * port to satisfy that same code path (never a special-cased skip), and this guarantees zero
+ * mutation of the real, durable admission store on disk. Starting empty every invocation is the
+ * same accepted limitation `InMemoryLeaseRepository`/`InMemoryJobRepository` already have: a
+ * `--dry-run` prediction cannot reflect a *real* lease/job/claim that already exists from a prior
+ * genuine run -- not a new regression this ticket introduces.
+ */
+export class InMemoryIssueAdmissionStore {
+  #records = new Map<string, IssueAdmissionRecord>();
+  readonly #clock: Clock;
+
+  constructor(clock: Clock = createClock()) {
+    this.#clock = clock;
+  }
+
+  #key(projectId: string, issueId: string): string {
+    return `${projectId}__${issueId}`;
+  }
+
+  load(
+    projectId: string,
+    issueId: string,
+  ): Promise<Result<IssueAdmissionRecord | undefined, DomainError>> {
+    return Promise.resolve(ok(this.#records.get(this.#key(projectId, issueId))));
+  }
+
+  claim(projectId: string, issueId: string): Promise<Result<IssueAdmissionRecord, DomainError>> {
+    const key = this.#key(projectId, issueId);
+    const existing = this.#records.get(key);
+    if (existing?.state === "active") return Promise.resolve(err(domainError("conflict")));
+    const now = this.#clock.now();
+    const record = {
+      schemaVersion: 1 as const,
+      revision: (existing?.revision ?? -1) + 1,
+      projectId,
+      issueId,
+      state: "active" as const,
+      claimedAt: now,
+      updatedAt: now,
+    } as IssueAdmissionRecord;
+    this.#records.set(key, record);
+    return Promise.resolve(ok(record));
+  }
+
+  attachJob(
+    projectId: string,
+    issueId: string,
+    expectedRevision: number,
+    jobId: string,
+  ): Promise<Result<IssueAdmissionRecord, DomainError>> {
+    const key = this.#key(projectId, issueId);
+    const existing = this.#records.get(key);
+    if (existing?.revision !== expectedRevision || existing.state !== "active") {
+      return Promise.resolve(err(domainError("conflict")));
+    }
+    const updated = {
+      ...existing,
+      jobId,
+      revision: existing.revision + 1,
+      updatedAt: this.#clock.now(),
+    } as IssueAdmissionRecord;
+    this.#records.set(key, updated);
+    return Promise.resolve(ok(updated));
+  }
+
+  release(
+    projectId: string,
+    issueId: string,
+    expectedRevision: number,
+    reason: IssueAdmissionReleaseReason,
+    supersededByJobId?: string,
+  ): Promise<Result<IssueAdmissionRecord, DomainError>> {
+    const key = this.#key(projectId, issueId);
+    const existing = this.#records.get(key);
+    if (existing?.revision !== expectedRevision || existing.state !== "active") {
+      return Promise.resolve(err(domainError("conflict")));
+    }
+    const updated = {
+      ...existing,
+      state: "released" as const,
+      releaseReason: reason,
+      ...(supersededByJobId === undefined ? {} : { supersededByJobId }),
+      revision: existing.revision + 1,
+      updatedAt: this.#clock.now(),
+    } as IssueAdmissionRecord;
+    this.#records.set(key, updated);
+    return Promise.resolve(ok(updated));
   }
 }
