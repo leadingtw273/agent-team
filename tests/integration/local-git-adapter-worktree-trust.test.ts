@@ -154,7 +154,26 @@ describe("LocalGitAdapter worktree trust (C015m)", () => {
     await new Promise<void>((resolve, reject) => {
       execFile(
         "git",
-        ["commit", "--no-gpg-sign", "-m", "control", "--allow-empty"],
+        [
+          // -c user.name/user.email supplies *only* commit identity, portably, on a CI runner
+          // that has no global git identity configured -- unlike this repo's own README.md
+          // fixture commit (which relies on repository-local config set in buildFixture), this
+          // control commit runs against the tampered .git, whose discovery resolves to the
+          // freshly created, disconnected "evil" gitdir that shares no config with the main
+          // repository, so there is nothing else for identity to come from here. This is
+          // deliberately still *not* --git-dir/--work-tree and *not* -c core.hooksPath=/-c
+          // core.fsmonitor= -- adding either would defeat this test's only purpose, which is to
+          // prove the *unhardened*, naive cwd-based-discovery pattern is genuinely exploitable.
+          "-c",
+          "user.name=Agent Team Control",
+          "-c",
+          "user.email=agent-team-control@example.invalid",
+          "commit",
+          "--no-gpg-sign",
+          "-m",
+          "control",
+          "--allow-empty",
+        ],
         { cwd: fixture.worktree.path, encoding: "utf8" },
         (error) => {
           if (error === null) resolve();
