@@ -1,0 +1,278 @@
+/**
+ * C015a unit tests: `discoverReadyDispatchCandidates` (src/adapters/dispatch/linear-discovery.ts)
+ * against a fake `LinearDiscoveryReadModel` (readContext/listIssueIdsInState/readIssue) -- no
+ * real Linear network access. Covers: full candidate conversion (deterministic id derivation,
+ * field mapping); an issue with no agent-role label is skipped and visible in `skipped` (the
+ * packet's own explicit requirement); a single malformed/unready/unreadable issue never blocks
+ * the rest of the batch.
+ */
+import { describe, expect, it } from "vitest";
+
+import {
+  discoverReadyDispatchCandidates,
+  type LinearDiscoveryReadModel,
+} from "../../src/adapters/dispatch/linear-discovery.js";
+import {
+  buildLinearReadCatalog,
+  linearAgentRoleNames,
+  linearAgentStatusNames,
+  linearBlockingReasonNames,
+  linearReviewRequirementNames,
+  linearWorkStatusNames,
+  type LinearIssueSnapshot,
+  type LinearLabelRecord,
+  type LinearProjectContext,
+  type LinearWorkflowStateRecord,
+} from "../../src/adapters/linear/model.js";
+import {
+  domainError,
+  err,
+  generateDeterministicIdentifier,
+  ok,
+} from "../../src/domain/foundation/index.js";
+import {
+  agentRoleSchema,
+  reviewRequirementSchema,
+  projectSchema,
+  type Project,
+} from "../../src/domain/project/index.js";
+import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
+
+function project(): Project {
+  return projectSchema.parse({
+    schemaVersion: 1,
+    id: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    displayName: "Sandbox",
+    localRepositoryPath: "/tmp/sandbox",
+    defaultBranch: "main",
+    workManagement: { provider: "linear", containerId: "team-1", projectId: "proj-1" },
+    sourceControl: { provider: "github", repository: "owner/sandbox" },
+  });
+}
+
+/** Builds a genuinely complete, `buildLinearReadCatalog`-validated catalog -- same technique the
+ * O006 integration test fixtures use -- so this fixture is exactly as strict as the real
+ * `LinearReadModel.readContext` would produce, without needing any `any`/unsafe cast. */
+function context(): LinearProjectContext {
+  const states: LinearWorkflowStateRecord[] = Object.entries(linearWorkStatusNames).map(
+    ([status, name], index) => ({ id: `state-${status}-${String(index)}`, name, type: status }),
+  );
+  function group(groupName: string, id: string): LinearLabelRecord {
+    return { id, name: groupName, isGroup: true, parentId: null };
+  }
+  function child(name: string, parentId: string, id: string): LinearLabelRecord {
+    return { id, name, isGroup: false, parentId };
+  }
+  const groupIds = {
+    agentRole: "label-group-agent-role",
+    reviewRequirement: "label-group-review-requirement",
+    agentStatus: "label-group-agent-status",
+    blockingReason: "label-group-blocking-reason",
+  };
+  const labels: LinearLabelRecord[] = [
+    group("Agent 角色", groupIds.agentRole),
+    ...agentRoleSchema.options.map((key, index) =>
+      child(linearAgentRoleNames[key], groupIds.agentRole, `label-agent-role-${String(index)}`),
+    ),
+    group("審查需求", groupIds.reviewRequirement),
+    ...reviewRequirementSchema.options.map((key, index) =>
+      child(
+        linearReviewRequirementNames[key],
+        groupIds.reviewRequirement,
+        `label-review-requirement-${String(index)}`,
+      ),
+    ),
+    group("Agent 狀態", groupIds.agentStatus),
+    ...agentStatuses.map((key, index) =>
+      child(
+        linearAgentStatusNames[key],
+        groupIds.agentStatus,
+        `label-agent-status-${String(index)}`,
+      ),
+    ),
+    group("阻塞原因", groupIds.blockingReason),
+    ...blockingReasons.map((key, index) =>
+      child(
+        linearBlockingReasonNames[key],
+        groupIds.blockingReason,
+        `label-blocking-reason-${String(index)}`,
+      ),
+    ),
+  ];
+  const catalog = buildLinearReadCatalog(states, labels);
+  if (!catalog.ok) throw new Error("fixture invariant violated: catalog must build cleanly");
+  return Object.freeze({
+    team: Object.freeze({ id: "team-1", name: "Team", key: "TM" }),
+    project: Object.freeze({ id: "proj-1", name: "Project" }),
+    catalog: catalog.value,
+  });
+}
+
+function baseSnapshotFields() {
+  return {
+    id: "linear-issue-1",
+    identifier: "SBX-1",
+    title: "Ship the thing",
+    updatedAt: "2026-08-07T00:00:00.000Z" as never,
+    teamId: "team-1",
+    projectId: "proj-1",
+    workStatus: "ready" as const,
+    otherLabelIds: [],
+    relations: [],
+    comments: [],
+  };
+}
+
+function snapshot(overrides: Partial<LinearIssueSnapshot> = {}): LinearIssueSnapshot {
+  return Object.freeze({
+    ...baseSnapshotFields(),
+    agentRole: "implementer" as const,
+    ...overrides,
+  });
+}
+
+/** Distinct from `snapshot({agentRole: undefined})` -- `exactOptionalPropertyTypes` forbids
+ * assigning `undefined` to an optional property explicitly, so this builds a snapshot that
+ * genuinely omits the key altogether (the real shape an issue with no agent-role label has). */
+function snapshotWithoutAgentRole(): LinearIssueSnapshot {
+  return Object.freeze({ ...baseSnapshotFields() });
+}
+
+function fakeReadModel(
+  overrides: Partial<LinearDiscoveryReadModel> = {},
+): LinearDiscoveryReadModel {
+  return {
+    readContext: () => Promise.resolve(ok(context())),
+    listIssueIdsInState: () => Promise.resolve(ok(["linear-issue-1"])),
+    readIssue: () => Promise.resolve(ok(snapshot())),
+    ...overrides,
+  };
+}
+
+describe("discoverReadyDispatchCandidates", () => {
+  it("converts a ready, fully-projected issue into exactly one candidate", async () => {
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel: fakeReadModel(),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(1);
+    expect(result.value.skipped).toHaveLength(0);
+    const candidate = result.value.candidates[0];
+    expect(candidate?.stage).toBe("implementation");
+    expect(candidate?.workKind).toBe("model");
+    expect(candidate?.readyAt).toBe("2026-08-07T00:00:00.000Z");
+    expect(candidate?.issue.externalId).toBe("linear-issue-1");
+    expect(candidate?.issue.agentRole).toBe("implementer");
+    expect(candidate?.issue.projectId).toBe(project().id);
+
+    // The domain id is deterministically derived from the Linear id -- stable across polls.
+    const expectedId = generateDeterministicIdentifier("issue", "linear-issue-1");
+    expect(expectedId.ok).toBe(true);
+    if (expectedId.ok) expect(candidate?.issue.id).toBe(expectedId.value);
+  });
+
+  it("skips (and reports, never silently drops) an issue with no agent-role label", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshotWithoutAgentRole())),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "no_agent_role" } },
+    ]);
+  });
+
+  it("skips (defense in depth) an issue whose workStatus is no longer ready", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshot({ workStatus: "in_progress" }))),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "not_ready" } },
+    ]);
+  });
+
+  it("a single unreadable issue is skipped without aborting the rest of the batch", async () => {
+    const readModel = fakeReadModel({
+      listIssueIdsInState: () => Promise.resolve(ok(["linear-issue-1", "linear-issue-2"])),
+      readIssue: (_context, issueId) => {
+        if (issueId === "linear-issue-1") {
+          return Promise.resolve(err(domainError("external_failure")));
+        }
+        return Promise.resolve(ok(snapshot({ id: "linear-issue-2" })));
+      },
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(1);
+    expect(result.value.candidates[0]?.issue.externalId).toBe("linear-issue-2");
+    expect(result.value.skipped).toHaveLength(1);
+    expect(result.value.skipped[0]?.externalIssueId).toBe("linear-issue-1");
+    expect(result.value.skipped[0]?.reason.code).toBe("read_failed");
+  });
+
+  it("a title that fails domain Issue validation is skipped as issue_invalid, not thrown", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshot({ title: "" }))),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "issue_invalid" } },
+    ]);
+  });
+
+  it("propagates a genuine readContext failure (no listIssueIdsInState/readIssue attempted)", async () => {
+    const calls: string[] = [];
+    const readModel = fakeReadModel({
+      readContext: () => {
+        calls.push("readContext");
+        return Promise.resolve(err(domainError("external_failure")));
+      },
+      listIssueIdsInState: () => {
+        calls.push("listIssueIdsInState");
+        return Promise.resolve(ok([]));
+      },
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(false);
+    expect(calls).toEqual(["readContext"]);
+  });
+});

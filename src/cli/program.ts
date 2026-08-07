@@ -43,7 +43,9 @@ export interface RegistrationCliHandlers {
 }
 
 export interface CliHandlers {
-  readonly run: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
+  readonly run: (
+    input: Readonly<{ projectId?: string; dryRun?: boolean }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -146,10 +148,18 @@ export function createProgram(
 
   program
     .command("run")
-    .description("執行一次派工與 Controller pipeline")
-    .argument("[project-id]", "只處理指定專案")
-    .action((projectId: string | undefined) =>
-      action(state, io, () => handlers.run(projectId === undefined ? {} : { projectId }))(),
+    .description(
+      "輪詢 Linear 待執行工單、評估 eligibility、取租約並建立 Job（C015a：接單半場，不執行模型／不啟動 pipeline）",
+    )
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .option("--dry-run", "只印出候選與 eligibility 結果，不取租約、不建 Job")
+    .action((options: { readonly project: string; readonly dryRun?: boolean }) =>
+      action(state, io, () =>
+        handlers.run({
+          projectId: options.project,
+          ...(options.dryRun === true ? { dryRun: true } : {}),
+        }),
+      )(),
     );
 
   program

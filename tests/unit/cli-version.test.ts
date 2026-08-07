@@ -63,7 +63,8 @@ describe("agent-team CLI contract", () => {
         -h, --help                   display help for command
 
       Commands:
-        run [project-id]             執行一次派工與 Controller pipeline
+        run [options]                輪詢 Linear 待執行工單、評估 eligibility、取租約並建立
+                                     Job（C015a：接單半場，不執行模型／不啟動 pipeline）
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
         health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑
@@ -88,7 +89,9 @@ describe("agent-team CLI contract", () => {
     const commands = handlers({ state: "success", message: "完成" });
     const sink = output();
 
-    await expect(runCli(metadata, ["run", "project-a"], commands, sink.io)).resolves.toBe(0);
+    await expect(
+      runCli(metadata, ["run", "--project", "project-a"], commands, sink.io),
+    ).resolves.toBe(0);
     await expect(
       runCli(
         metadata,
