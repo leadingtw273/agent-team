@@ -168,6 +168,47 @@ describe("text redaction", () => {
         JSON.parse(output);
       }).not.toThrow();
     });
+
+    it("does not leak a fragment of the value when it contains an escaped double quote (acceptance review round 1)", () => {
+      // The exact adversarial case the acceptance review found: the naive `"[^"]*"` alternation
+      // stops matching at the *escaped* quote (treating `\"` as a real closing quote), leaving
+      // `def"` behind, unredacted, in the output.
+      const input = String.raw`{"signature":"abc\"def"}`;
+
+      const output = new Redactor().redactText(input);
+
+      expect(output).not.toContain("def");
+      expect(output).not.toContain("abc");
+      expect(output).toBe(`{"signature":"${redactedValue}"}`);
+      expect(() => {
+        JSON.parse(output);
+      }).not.toThrow();
+    });
+
+    it("does not leak a fragment when the value ends in an escaped backslash (\\\\)", () => {
+      // A value ending in `\\` (an escaped backslash, not an escaped quote) is the other
+      // classic JSON-string edge case: naively scanning for the next `"` after a `\` must not
+      // be confused by which character the backslash actually escapes.
+      const input = String.raw`{"signature":"abc\\"}`;
+
+      const output = new Redactor().redactText(input);
+
+      expect(output).not.toContain("abc");
+      expect(output).toBe(`{"signature":"${redactedValue}"}`);
+      expect(() => {
+        JSON.parse(output);
+      }).not.toThrow();
+    });
+
+    it("does not leak a fragment of a single-quoted value containing an escaped single quote", () => {
+      const input = String.raw`{'signature':'abc\'def'}`;
+
+      const output = new Redactor().redactText(input);
+
+      expect(output).not.toContain("def");
+      expect(output).not.toContain("abc");
+      expect(output).toBe(`{'signature':'${redactedValue}'}`);
+    });
   });
 });
 

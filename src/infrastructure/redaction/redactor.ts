@@ -129,7 +129,7 @@ export class Redactor {
         this.isSensitiveKey(decodeQueryKey(key)) ? `${separator}${key}=${redactedValue}` : match,
     );
     output = output.replace(
-      /(^|[\s,{;])(["']?)([a-z][a-z0-9_-]*)(\2\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gimu,
+      /(^|[\s,{;])(["']?)([a-z][a-z0-9_-]*)(\2\s*[:=]\s*)("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s,;}\r\n]+)/gimu,
       (match, boundary: string, quote: string, key: string, separator: string, value: string) => {
         if (!this.isSensitiveKey(key)) return match;
         // C015f: the value must still be fully replaced -- never leaked, no partial retention --
@@ -141,6 +141,17 @@ export class Redactor {
         // rest of the event stream, including the final `result` event, is perfectly valid. An
         // unquoted/bare value (the existing log-line/URL style this function was originally
         // written for, e.g. `key=value`) keeps its prior bare-replacement behavior unchanged.
+        //
+        // C015f acceptance review (round 1): the quoted-value alternations must recognize
+        // *escaped* quotes as part of the string (standard JSON string grammar, `(?:[^"\\]|\\.)*`
+        // rather than a naive `[^"]*`) -- otherwise a value containing an escaped quote (e.g.
+        // `"signature":"abc\"def"`) stops matching at the escaped `\"`, leaving the remainder
+        // (`def"`) unredacted and leaking a fragment of the original value. This pre-existed
+        // C015f's own fix (the alternation's character class was carried over unchanged); fixed
+        // here per the review's explicit condition-1 standard. Never hit by Claude's own
+        // `signature` values (always base64, `A-Za-z0-9+/=`, no quotes/backslashes -- confirmed
+        // by the acceptance review), but this is a shared security primitive, not something
+        // scoped to just that one caller.
         if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
           return `${boundary}${quote}${key}${separator}"${redactedValue}"`;
         }
