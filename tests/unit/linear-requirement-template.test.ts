@@ -353,4 +353,68 @@ describe("parseReadyGateTemplate", () => {
       expect(result.risks).toEqual(["真正的風險項目"]);
     });
   });
+
+  describe("bullet marker normalization (C015d: Linear normalizes '- ' to '* ' on save)", () => {
+    it("parses acceptanceCriteria/inScope/outOfScope from LEA-14's actual Linear-normalized read-back format (* bullets, blank line after each heading)", () => {
+      // This is not a hypothetical -- it is the literal shape E101's first real Linear issue
+      // (LEA-14) came back as after being read back from Linear: every `- ` bullet the human
+      // typed while filling in the template was silently rewritten to `* ` by Linear's own
+      // description editor on save, and a blank line was inserted between each heading and its
+      // body.
+      const description = `## ${readyGateTemplateHeadings.acceptanceCriteria}
+
+* 完整範本可以解析成功
+* 缺欄位不會讓整支程式崩潰
+
+## ${readyGateTemplateHeadings.inScope}
+
+* 撰寫解析器
+* 撰寫測試
+
+## ${readyGateTemplateHeadings.outOfScope}
+
+* 不修改引擎`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.acceptanceCriteria).toEqual([
+        "完整範本可以解析成功",
+        "缺欄位不會讓整支程式崩潰",
+      ]);
+      expect(result.inScope).toEqual(["撰寫解析器", "撰寫測試"]);
+      expect(result.outOfScope).toEqual(["不修改引擎"]);
+    });
+
+    it("accepts '- ' (the documented marker)", () => {
+      const description = `## ${readyGateTemplateHeadings.inScope}
+- 撰寫解析器`;
+      expect(parseReadyGateTemplate(description).inScope).toEqual(["撰寫解析器"]);
+    });
+
+    it("accepts '* ' (Linear's normalized marker)", () => {
+      const description = `## ${readyGateTemplateHeadings.inScope}
+* 撰寫解析器`;
+      expect(parseReadyGateTemplate(description).inScope).toEqual(["撰寫解析器"]);
+    });
+
+    it("accepts '+ ' (the third CommonMark bullet marker)", () => {
+      const description = `## ${readyGateTemplateHeadings.inScope}
++ 撰寫解析器`;
+      expect(parseReadyGateTemplate(description).inScope).toEqual(["撰寫解析器"]);
+    });
+
+    it("parses a single list with mixed bullet markers across its lines", () => {
+      const description = `## ${readyGateTemplateHeadings.acceptanceCriteria}
+- 第一項用連字號
+* 第二項用星號
++ 第三項用加號`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.acceptanceCriteria).toEqual(["第一項用連字號", "第二項用星號", "第三項用加號"]);
+    });
+
+    it("still does not accept a numbered list -- the template asks for bullets, not an ordered list", () => {
+      const description = `## ${readyGateTemplateHeadings.inScope}
+1. 撰寫解析器
+2. 撰寫測試`;
+      expect(parseReadyGateTemplate(description).inScope).toBeUndefined();
+    });
+  });
 });
