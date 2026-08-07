@@ -175,28 +175,53 @@ export interface LinearProvisionOutcome {
   readonly preview: LinearProvisionPreview;
 }
 
-const readyGateTemplateDescription = `## 目標（必填）
+/**
+ * C015b: single source of truth for the Ready Gate template's section headings. The C015b
+ * requirement-template parser (src/adapters/linear/requirement-template.ts) imports these
+ * constants directly rather than duplicating the heading strings -- if this template's wording
+ * ever changes, the parser changes with it automatically instead of silently drifting apart and
+ * failing to recognize real Linear issues.
+ */
+export const readyGateTemplateHeadings = Object.freeze({
+  goal: "目標（必填）",
+  background: "背景（必填）",
+  acceptanceCriteria: "驗收條件（必填）",
+  inScope: "範圍內（必填）",
+  outOfScope: "範圍外（必填）",
+  dependencies: "依賴關係（必填；沒有請填「無」）",
+  estimatedMinutes: "預估體量（必填；目標 15～30 分鐘，超過 45 分鐘先拆單）",
+  constraints: "補充限制（選填）",
+  risks: "預期風險（選填）",
+  changeRegions: "預期變更區域（選填）",
+} as const);
 
-## 背景（必填）
+/** The literal placeholder text the template asks the human to overwrite. Also a shared constant
+ * so the C015b parser can recognize an untouched placeholder as "not actually filled in" rather
+ * than treating it as real content. */
+export const readyGateTemplatePlaceholder = "（請填寫）";
 
-## 驗收條件（必填）
-- （請填寫）
+const readyGateTemplateDescription = `## ${readyGateTemplateHeadings.goal}
 
-## 範圍內（必填）
-- （請填寫）
+## ${readyGateTemplateHeadings.background}
 
-## 範圍外（必填）
-- （請填寫）
+## ${readyGateTemplateHeadings.acceptanceCriteria}
+- ${readyGateTemplatePlaceholder}
 
-## 依賴關係（必填；沒有請填「無」）
+## ${readyGateTemplateHeadings.inScope}
+- ${readyGateTemplatePlaceholder}
 
-## 預估體量（必填；目標 15～30 分鐘，超過 45 分鐘先拆單）
+## ${readyGateTemplateHeadings.outOfScope}
+- ${readyGateTemplatePlaceholder}
 
-## 補充限制（選填）
+## ${readyGateTemplateHeadings.dependencies}
 
-## 預期風險（選填）
+## ${readyGateTemplateHeadings.estimatedMinutes}
 
-## 預期變更區域（選填）`;
+## ${readyGateTemplateHeadings.constraints}
+
+## ${readyGateTemplateHeadings.risks}
+
+## ${readyGateTemplateHeadings.changeRegions}`;
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);

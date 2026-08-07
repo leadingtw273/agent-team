@@ -2,6 +2,7 @@ export * from "./model.js";
 export * from "./provision.js";
 export * from "./read.js";
 export * from "./reconcile.js";
+export * from "./requirement-template.js";
 export * from "./transport.js";
 export * from "./upload.js";
 export * from "./webhook.js";
