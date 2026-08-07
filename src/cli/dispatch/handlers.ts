@@ -283,6 +283,7 @@ export function createDispatchCliHandlers(
             clock,
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
+            admission: buildIssueAdmissionStore(options.agentTeamHome),
           });
           if (!cycle.ok) {
             return outcome("failed", {

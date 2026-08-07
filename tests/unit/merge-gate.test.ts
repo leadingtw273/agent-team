@@ -4,6 +4,7 @@ import {
   AutoMergeGate,
   REVIEW_STATUS_CONTEXT,
   ReviewStatusCoordinator,
+  type MergeGateAutoMergeAttempt,
   type MergeGatePorts,
   type RecordReviewRequest,
   type ReviewerPipelineOutcome,
@@ -233,6 +234,7 @@ function mergePorts(
     statuses?: CommitStatusesSnapshot;
     diff?: readonly EffectiveTreeChange[];
     calls?: string[];
+    enableAutoMergeAttempt?: MergeGateAutoMergeAttempt;
   } = {},
 ): MergeGatePorts {
   const sha = options.sha ?? headSha;
@@ -259,7 +261,14 @@ function mergePorts(
       }),
       enableAutoMerge: vi.fn(() => {
         calls.push("auto_merge");
-        return Promise.resolve(ok(changeRequest(sha, { autoMergeEnabled: true })));
+        return Promise.resolve(
+          ok(
+            options.enableAutoMergeAttempt ?? {
+              outcome: "enabled" as const,
+              changeRequest: changeRequest(sha, { autoMergeEnabled: true }),
+            },
+          ),
+        );
       }),
     },
   };
@@ -379,7 +388,7 @@ describe("auto-merge gate", () => {
     const ports = mergePorts({ calls });
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
 
-    expect(outcome).toMatchObject({ state: "enabled", reuse: "unchanged", identity });
+    expect(outcome).toMatchObject({ state: "auto_merge_enabled", reuse: "unchanged", identity });
     expect(calls).toEqual(["auto_merge"]);
     expect(ports.sourceControl.getChangeRequest).toHaveBeenCalledTimes(2);
     expect(ports.sourceControl.enableAutoMerge).toHaveBeenCalledWith(
@@ -394,7 +403,7 @@ describe("auto-merge gate", () => {
     const ports = mergePorts({ sha: rebasedHeadSha, calls });
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest(rebasedHeadSha));
 
-    expect(outcome).toMatchObject({ state: "enabled", reuse: "ci_revalidation" });
+    expect(outcome).toMatchObject({ state: "auto_merge_enabled", reuse: "ci_revalidation" });
     expect(calls).toEqual(["comment", "status", "auto_merge"]);
     const append = vi.mocked(ports.sourceControl.appendChangeRequestComment);
     expect(append.mock.calls[0]?.[0].body).toContain("ci_revalidated_without_new_reviewer_run");
@@ -466,5 +475,92 @@ describe("auto-merge gate", () => {
 
     expect(outcome).toMatchObject({ state: "not_ready", reason });
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * C015t decision 1 acceptance criterion ①: each of the union's newly-introduced/renamed branches
+ * gets its own dedicated test -- `auto_merge_enabled` is already covered above (renamed from
+ * `"enabled"`); this block covers `directly_merged` and both ways `already_merged_external` can be
+ * reached (the very first readback, and the port's own `enableAutoMerge` call reporting an
+ * already-merged snapshot).
+ */
+describe("auto-merge gate: C015t decision 1 merge outcomes", () => {
+  it("directly_merged: the enableAutoMerge port call itself performed the squash fallback", async () => {
+    const calls: string[] = [];
+    const ports = mergePorts({
+      calls,
+      enableAutoMergeAttempt: {
+        outcome: "merged_directly",
+        changeRequest: changeRequest(headSha, { state: "merged", autoMergeEnabled: false }),
+      },
+    });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({
+      state: "directly_merged",
+      changeRequest: { state: "merged", headSha },
+    });
+    expect(calls).toEqual(["auto_merge"]);
+  });
+
+  it("already_merged_external: the enableAutoMerge port call found it already merged by something else", async () => {
+    const ports = mergePorts({
+      enableAutoMergeAttempt: {
+        outcome: "merged_externally",
+        changeRequest: changeRequest(headSha, { state: "merged", autoMergeEnabled: false }),
+      },
+    });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({
+      state: "already_merged_external",
+      changeRequest: { state: "merged", headSha },
+    });
+  });
+
+  it("already_merged_external: detected at the very first readback, before enableAutoMerge is ever called", async () => {
+    const ports = mergePorts({ cr: changeRequest(headSha, { state: "merged" }) });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({
+      state: "already_merged_external",
+      changeRequest: { state: "merged", headSha },
+    });
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("already_merged_external: detected at the pre-merge readback (first read still open, second read merged)", async () => {
+    const calls: string[] = [];
+    const ports = mergePorts({ calls });
+    const getChangeRequest = vi.mocked(ports.sourceControl.getChangeRequest);
+    getChangeRequest
+      .mockResolvedValueOnce(ok(changeRequest(headSha))) // the very first readback: still open
+      .mockResolvedValueOnce(ok(changeRequest(headSha, { state: "merged" }))); // the pre-merge readback: merged
+
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({
+      state: "already_merged_external",
+      changeRequest: { state: "merged", headSha },
+    });
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it("rejects a merged_directly/merged_externally attempt whose head SHA does not match (fails closed, never assumed authorized)", async () => {
+    const ports = mergePorts({
+      enableAutoMergeAttempt: {
+        outcome: "merged_directly",
+        changeRequest: changeRequest(rebasedHeadSha, { state: "merged" }),
+      },
+    });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "auto_merge",
+      error: { code: "conflict" },
+    });
   });
 });

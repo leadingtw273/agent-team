@@ -27,6 +27,10 @@ import {
   type ResumeCycleDependencies,
 } from "../../src/cli/dispatch/resume-composition.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
+import type {
+  IssueAdmissionPort,
+  IssueAdmissionRecord,
+} from "../../src/adapters/dispatch/issue-admission-store.js";
 import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linear-discovery.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
@@ -42,6 +46,7 @@ import type {
 import {
   createFixedClock,
   domainError,
+  err,
   ok,
   parseIdentifier,
   parseInstant,
@@ -265,6 +270,99 @@ interface Harness {
   /** C015r decision 4: every request this test run's fake `reviewer.run` received, in order -- lets
    * a test assert `reportRetryFeedback` was (or was not) threaded in. */
   readonly reviewerRequests: unknown[];
+  /** C015t decision 1/3: every request this test run's fake `lifecycle.run` received, in order --
+   * lets a test assert `mergeAuthorizationHeadSha` is present (or deliberately absent) and inspect
+   * `idempotencyKeyPrefix`. */
+  readonly lifecycleRequests: unknown[];
+  /** C015t decision 3: the fake admission store `reconcileMergeStateUnderLease` releases through --
+   * seeded with one active claim for `(projectId, issueId)` by default so release-path tests have
+   * something real to release. */
+  readonly admission: InMemoryAdmissionFake;
+}
+
+/** C015t decision 3: minimal in-memory fake satisfying `IssueAdmissionPort` -- only `load`/`release`
+ * are ever exercised by `reconcileMergeStateUnderLease` (the ordinary resume path never touches
+ * admission at all), but the full interface is implemented for type compatibility. */
+class InMemoryAdmissionFake implements IssueAdmissionPort {
+  #records = new Map<string, IssueAdmissionRecord>();
+  readonly releaseCalls: Readonly<{ projectId: string; issueId: string; reason: string }>[] = [];
+
+  #key(projectId: string, issueId: string): string {
+    return `${projectId}__${issueId}`;
+  }
+
+  seedActive(projectId: string, issueId: string, jobId?: string): void {
+    this.#records.set(this.#key(projectId, issueId), {
+      schemaVersion: 1,
+      revision: 0,
+      projectId: projectId as never,
+      issueId: issueId as never,
+      state: "active",
+      claimedAt: now,
+      updatedAt: now,
+      ...(jobId === undefined ? {} : { jobId: jobId as never }),
+    });
+  }
+
+  load(projectId: string, issueId: string) {
+    return Promise.resolve(ok(this.#records.get(this.#key(projectId, issueId))));
+  }
+
+  claim(projectId: string, issueId: string) {
+    if (this.#records.get(this.#key(projectId, issueId))?.state === "active") {
+      return Promise.resolve(err(domainError("conflict")));
+    }
+    const record: IssueAdmissionRecord = {
+      schemaVersion: 1,
+      revision: 0,
+      projectId: projectId as never,
+      issueId: issueId as never,
+      state: "active",
+      claimedAt: now,
+      updatedAt: now,
+    };
+    this.#records.set(this.#key(projectId, issueId), record);
+    return Promise.resolve(ok(record));
+  }
+
+  attachJob(projectId: string, issueId: string, expectedRevision: number, jobId: string) {
+    const existing = this.#records.get(this.#key(projectId, issueId));
+    if (existing?.revision !== expectedRevision) {
+      return Promise.resolve(err(domainError("conflict")));
+    }
+    const updated: IssueAdmissionRecord = {
+      ...existing,
+      jobId: jobId as never,
+      revision: existing.revision + 1,
+      updatedAt: now,
+    };
+    this.#records.set(this.#key(projectId, issueId), updated);
+    return Promise.resolve(ok(updated));
+  }
+
+  release(
+    projectId: string,
+    issueId: string,
+    expectedRevision: number,
+    reason: string,
+    supersededByJobId?: string,
+  ) {
+    this.releaseCalls.push({ projectId, issueId, reason });
+    const existing = this.#records.get(this.#key(projectId, issueId));
+    if (existing?.revision !== expectedRevision) {
+      return Promise.resolve(err(domainError("conflict")));
+    }
+    const updated: IssueAdmissionRecord = {
+      ...existing,
+      state: "released",
+      releaseReason: reason as never,
+      revision: existing.revision + 1,
+      updatedAt: now,
+      ...(supersededByJobId === undefined ? {} : { supersededByJobId: supersededByJobId as never }),
+    };
+    this.#records.set(this.#key(projectId, issueId), updated);
+    return Promise.resolve(ok(updated));
+  }
 }
 
 async function harness(
@@ -300,6 +398,9 @@ async function harness(
   const sidecarRecords: Readonly<{ jobId: string; category: string; rejectedOutput: string }>[] =
     [];
   const reviewerRequests: unknown[] = [];
+  const lifecycleRequests: unknown[] = [];
+  const admission = new InMemoryAdmissionFake();
+  admission.seedActive(projectId, issueId, jobId);
   const deps: ResumeCycleDependencies = {
     progress,
     jobRepository,
@@ -361,7 +462,7 @@ async function harness(
         return Promise.resolve(
           overrides.enableOutcome ??
             ({
-              state: "enabled",
+              state: "auto_merge_enabled",
               reuse: "unchanged",
               identity: {},
               changeRequest: changeRequest({ state: "merged" }),
@@ -370,8 +471,9 @@ async function harness(
       },
     },
     lifecycle: {
-      run: () => {
+      run: (lifecycleRequest) => {
         calls.push("lifecycle.run");
+        lifecycleRequests.push(lifecycleRequest);
         return Promise.resolve(
           overrides.lifecycleOutcome ??
             ({ state: "completed", merge: "authorized", headSha, autoMergePaused: false } as never),
@@ -387,8 +489,19 @@ async function harness(
         return Promise.resolve(ok({ path: `/fake/${input.jobId}.json` }));
       },
     },
+    admission,
   };
-  return { deps, progress, jobRepository, calls, repositoryPath, sidecarRecords, reviewerRequests };
+  return {
+    deps,
+    progress,
+    jobRepository,
+    calls,
+    repositoryPath,
+    sidecarRecords,
+    reviewerRequests,
+    lifecycleRequests,
+    admission,
+  };
 }
 
 async function seedProgressRecord(
@@ -1135,5 +1248,325 @@ describe("runResumeCycle", () => {
       expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
       expect(reloaded.value?.revision).toBe(1);
     }
+  });
+});
+
+/**
+ * C015t decisions 1-3: `AutoMergeGate.enable()`'s new outcome union mapping, the `merge` cause-stage
+ * fix, and the narrow `requires_manual` readback re-entry. Every test here uses the real
+ * `EnableAutoMergeOutcome` type (imported above) for its fixtures -- no hand-rolled shapes that could
+ * silently drift from the actual union.
+ */
+describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow requires_manual readback", () => {
+  it("② directly_merged: converges through Lifecycle with controller authorization, writes completed, and releases admission", async () => {
+    const { deps, progress, lifecycleRequests, admission } = await harness({
+      enableOutcome: {
+        state: "directly_merged",
+        changeRequest: changeRequest({ state: "merged" }),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+
+    expect(lifecycleRequests).toHaveLength(1);
+    expect(lifecycleRequests[0]).toMatchObject({ mergeAuthorizationHeadSha: headSha });
+
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+
+    expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("③ already_merged_external: converges through Lifecycle but explicitly WITHOUT controller authorization (provenance never reverse-inferred)", async () => {
+    const { deps, progress, lifecycleRequests, admission } = await harness({
+      enableOutcome: {
+        state: "already_merged_external",
+        changeRequest: changeRequest({ state: "merged" }),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+
+    expect(lifecycleRequests).toHaveLength(1);
+    // The exact assertion codex's review named: this must never carry a head-SHA-derived
+    // authorization for a merge this call chain did not itself cause.
+    expect(lifecycleRequests[0]).not.toHaveProperty("mergeAuthorizationHeadSha");
+
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+    expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("④ auto_merge_enabled not yet landed stays at merging (unchanged pre-existing behavior)", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: {
+        state: "auto_merge_enabled",
+        reuse: "unchanged",
+        identity: {} as never,
+        changeRequest: changeRequest({ autoMergeEnabled: true }),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merging" }]);
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "merging" });
+  });
+
+  it("④ not_ready:ci_pending / ci_failed map to still_ci_waiting (ci_waiting stage)", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: { state: "not_ready", reason: "ci_pending" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("④ re_review_required maps to awaiting_review, not requires_manual", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: {
+        state: "re_review_required",
+        reason: "effective_diff_changed",
+        identity: {} as never,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "awaiting_review" }]);
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "awaiting_review" });
+  });
+
+  it("④ not_ready:review_status_missing also maps to awaiting_review", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: { state: "not_ready", reason: "review_status_missing" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "awaiting_review" }]);
+  });
+
+  it("④ closed-not-merged-shaped not_ready reasons (draft/conflict) still go to requires_manual, cause.stage=merge", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: { state: "not_ready", reason: "draft" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "auto_merge_not_enabled:not_ready:draft" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "auto_merge_not_enabled" },
+      });
+    }
+  });
+
+  it("⑤ a genuine auto_merge `failed` outcome writes cause.stage=merge, not review (the exact C015s mistag this ticket fixes)", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: {
+        state: "failed",
+        stage: "auto_merge",
+        error: domainError("conflict"),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    await runResumeCycle(deps);
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "auto_merge_not_enabled" },
+      });
+    }
+  });
+
+  it("⑥ narrow readback only fires for auto_merge_not_enabled/lifecycle_not_completed -- other requires_manual reasonCodes are left completely untouched", async () => {
+    const { deps, progress, calls } = await harness();
+    // jobId (the harness default): reconcilable reasonCode -- should be picked up.
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: {
+        stage: "merge",
+        reasonCode: "auto_merge_not_enabled",
+        attempts: { count: 1 },
+      },
+    });
+    // A second, distinct job at requires_manual for a NON-reconcilable reasonCode -- must be left
+    // byte-for-byte untouched: no readback call, no CAS write.
+    const otherJobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-1123456789ab");
+    await progress.compareAndSwap(otherJobId, null, {
+      jobId: otherJobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "claude-opus",
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "setup",
+          reasonCode: "change_request_unavailable",
+          attempts: { count: 1 },
+        },
+      },
+      branch: "agent-team/job-2",
+      worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
+      changeRequestId: "43",
+      headSha,
+    });
+    const before = await progress.load(otherJobId);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // Exactly one outcome -- for jobId's own reconcile pass. otherJobId never appears at all.
+      expect(result.value.map((outcome) => outcome.jobId)).toEqual([jobId]);
+    }
+    // Exactly one getChangeRequest call (jobId's reconcile readback) -- otherJobId's own
+    // changeRequestId ("43") was never queried at all.
+    expect(calls.filter((call) => call === "getChangeRequest")).toHaveLength(1);
+
+    const after = await progress.load(otherJobId);
+    expect(after).toEqual(before);
+  });
+
+  it("⑥/decision 3: readback=open leaves requires_manual completely unchanged, never auto-released", async () => {
+    const { deps, progress, admission } = await harness({
+      changeRequestState: { state: "open" },
+    });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "auto_merge_not_enabled", attempts: { count: 1 } },
+    });
+    const before = await progress.load(jobId);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "merge_reconcile_unchanged", readback: "open" },
+      ]);
+    }
+    const after = await progress.load(jobId);
+    expect(after).toEqual(before);
+    expect(admission.releaseCalls).toEqual([]);
+  });
+
+  it("decision 3: readback=closed-not-merged leaves requires_manual unchanged -- never completed, never releases admission", async () => {
+    const { deps, progress, admission } = await harness({
+      changeRequestState: { state: "closed" },
+    });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "lifecycle_not_completed", attempts: { count: 1 } },
+    });
+    const before = await progress.load(jobId);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "merge_reconcile_unchanged", readback: "closed_not_merged" },
+      ]);
+    }
+    const after = await progress.load(jobId);
+    expect(after).toEqual(before);
+    expect(admission.releaseCalls).toEqual([]);
+  });
+
+  it("decision 3: readback=merged converges -- Lifecycle runs unauthorized, progress becomes completed, admission releases last", async () => {
+    const { deps, progress, lifecycleRequests, admission } = await harness({
+      changeRequestState: { state: "merged" },
+    });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "auto_merge_not_enabled", attempts: { count: 1 } },
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merge_reconciled" }]);
+
+    expect(lifecycleRequests).toHaveLength(1);
+    expect(lifecycleRequests[0]).not.toHaveProperty("mergeAuthorizationHeadSha");
+    expect(lifecycleRequests[0]).toMatchObject({
+      idempotencyKeyPrefix: `cli-dispatch-reconcile:${jobId}:0:lifecycle`,
+    });
+
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+    expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("⑦ decision 3: a Lifecycle failure during reconcile leaves the record completely untouched (idempotent retry, same revision)", async () => {
+    const { deps, progress, lifecycleRequests, admission } = await harness({
+      changeRequestState: { state: "merged" },
+      lifecycleOutcome: {
+        state: "failed",
+        stage: "work_status",
+        error: domainError("external_failure"),
+      } as never,
+    });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "auto_merge_not_enabled", attempts: { count: 1 } },
+    });
+    const before = await progress.load(jobId);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toHaveLength(1);
+      expect(result.value[0]?.outcome).toBe("merge_reconcile_lifecycle_failed");
+    }
+    const after = await progress.load(jobId);
+    expect(after).toEqual(before); // no CAS write at all -- same revision preserved
+    expect(admission.releaseCalls).toEqual([]);
+
+    // Retrying (same revision, unchanged record) must reuse the exact same idempotencyKeyPrefix.
+    await runResumeCycle(deps);
+    expect(lifecycleRequests).toHaveLength(2);
+    const [first, second] = lifecycleRequests as { idempotencyKeyPrefix: string }[];
+    expect(first?.idempotencyKeyPrefix).toBe(second?.idempotencyKeyPrefix);
+  });
+
+  it("⑦ decision 3: admission already released by a concurrent process is treated as success, not an error", async () => {
+    const { deps, progress, admission } = await harness({
+      changeRequestState: { state: "merged" },
+    });
+    await admission.release(projectId, issueId, 0, "completed");
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "lifecycle_not_completed", attempts: { count: 1 } },
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merge_reconciled" }]);
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
   });
 });
