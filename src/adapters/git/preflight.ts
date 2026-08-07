@@ -27,7 +27,20 @@ export type GitPreflightFinding =
   | Readonly<{ code: "unsafe_symlink"; path: string }>
   | Readonly<{ code: "suspected_secret"; path: string }>
   | Readonly<{ code: "unscannable_file"; path: string }>
-  | Readonly<{ code: "overlapping_job_change"; path: string; otherJobId: string }>;
+  | Readonly<{ code: "overlapping_job_change"; path: string; otherJobId: string }>
+  | Readonly<{ code: "gitattributes_modified"; path: string }>;
+
+/** C015m: `git add`/`git diff`/etc. select clean/process filters and diff drivers by consulting
+ * whichever `.gitattributes` files are present in the tree -- a provider-writable `.gitattributes`
+ * is therefore a config-driven code-execution surface in its own right if a trusted repository's
+ * config ever defines an executable filter/diff driver (see C015m's Phase 1/Phase 2 review for the
+ * full rationale). This ticket's policy is the simplest safe one: reject *any* change to *any*
+ * `.gitattributes` file (root or per-directory) unconditionally, regardless of `declaredRegions` --
+ * a legitimate task that genuinely needs to change attributes is rare enough that fail-closed here
+ * is an acceptable, disclosed limitation, not a silent gap. */
+function isGitAttributesPath(path: string): boolean {
+  return path === ".gitattributes" || path.endsWith("/.gitattributes");
+}
 
 export interface ConcurrentGitJob {
   readonly jobId: string;
@@ -174,6 +187,9 @@ export class GitPreflight {
           !request.declaredRegions.some((region) => regionContains(region, path))
         ) {
           findings.push({ code: "outside_declared_region", path });
+        }
+        if (isGitAttributesPath(path)) {
+          findings.push({ code: "gitattributes_modified", path });
         }
         for (const [otherJobId, paths] of peerPaths) {
           if (paths.has(path)) findings.push({ code: "overlapping_job_change", path, otherJobId });

@@ -200,4 +200,42 @@ describe("Git preflight", () => {
     });
     expect(malformed.ok ? "ok" : malformed.error.code).toBe("external_failure");
   });
+
+  /**
+   * C015m: `.gitattributes` selects which clean/process filter or diff driver `git` runs for a
+   * path (see `git help gitattributes`) -- a provider-writable `.gitattributes` is a
+   * config-driven code-execution surface in its own right if a trusted repository's config ever
+   * defines an executable filter/diff driver. This ticket's policy: reject *any* change to *any*
+   * `.gitattributes` file unconditionally, with a fixed, dedicated finding code -- regardless of
+   * `declaredRegions` (it must fail closed even if a task's own declared regions happen to cover
+   * the repository root).
+   */
+  it("rejects any .gitattributes change unconditionally, even inside a declared region", async () => {
+    const environment = await fixture();
+    await writeFile(join(environment.worktree.path, ".gitattributes"), "* -text\n", "utf8");
+    await mkdir(join(environment.worktree.path, "src", "nested"));
+    await writeFile(
+      join(environment.worktree.path, "src", "nested", ".gitattributes"),
+      "*.bin filter=lfs\n",
+      "utf8",
+    );
+
+    const result = await new GitPreflight(environment.git).inspect({
+      worktree: environment.worktree,
+      // Both changed paths are deliberately *inside* their own declared region -- proves the
+      // rejection is unconditional, not just an incidental outside_declared_region finding.
+      declaredRegions: [
+        { path: ".gitattributes", coverage: "exact" },
+        { path: "src", coverage: "subtree" },
+      ],
+      expectedUntrackedPaths: [".gitattributes", "src/nested/.gitattributes"],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.allowed).toBe(false);
+    expect(result.value.findings).toEqual([
+      { code: "gitattributes_modified", path: ".gitattributes" },
+      { code: "gitattributes_modified", path: "src/nested/.gitattributes" },
+    ]);
+  });
 });
