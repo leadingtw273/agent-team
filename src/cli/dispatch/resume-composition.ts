@@ -33,6 +33,7 @@
  */
 import { join } from "node:path";
 
+import type { JobRepository } from "../../application/dispatch/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type {
   CiRecoveryPipeline,
@@ -60,12 +61,19 @@ import {
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 
+/** The engine's own `JobRepository` interface only declares `create` -- this module also needs
+ * `readAll` (find the job by id) and `update` (C015c item 1's addition to `FileJobRepository`,
+ * deliberately not added to the engine interface). Kept structural (`Pick`, not the concrete
+ * class) so a fake only needs these two extra methods, not to become an actual
+ * `FileJobRepository` instance (impossible for an external class -- it has a private field). */
+export type ResumeJobRepository = JobRepository & Pick<FileJobRepository, "readAll" | "update">;
+
 /** Stages a fresh `agent-team run` will attempt to drive forward. `"implementing"` is
  * deliberately excluded -- resuming a mid-`ImplementerPipeline` crash is `ReconcileCoordinator`'s
  * job (unbuilt, out of scope), not this one. Terminal stages (`"completed"`/`"failed"`) and
  * fail-closed ones (`"paused"`/`"requires_manual"`) are excluded because nothing here auto-resumes
  * a checkpoint or a human-handoff marker. */
-const resumableStageKinds: ReadonlySet<string> = new Set([
+export const resumableStageKinds: ReadonlySet<string> = new Set([
   "ci_waiting",
   "awaiting_review",
   "fix_round",
@@ -78,7 +86,7 @@ export function defaultJobProgressDirectory(agentTeamHome: string): string {
 
 export interface ResumeCycleDependencies {
   readonly progress: FileJobProgressStore;
-  readonly jobRepository: FileJobRepository;
+  readonly jobRepository: ResumeJobRepository;
   readonly leases: LeaseCoordinator;
   readonly sourceControl: Pick<SourceControlPort, "getChangeRequest">;
   readonly readModel: LinearDiscoveryReadModel;

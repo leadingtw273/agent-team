@@ -33,6 +33,16 @@ import {
   buildImplementerPipeline,
   type BuildImplementerPipelineResult,
 } from "./implementer-composition.js";
+import {
+  buildJobProgressStore,
+  resumableStageKinds,
+  runResumeCycle,
+  type ResumeJobOutcome,
+} from "./resume-composition.js";
+import {
+  buildResumeComposition,
+  type BuildResumeCompositionResult,
+} from "./resume-full-composition.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -50,6 +60,11 @@ export interface CreateDispatchCliHandlersOptions {
   readonly buildImplementerPipeline?: (
     options: Parameters<typeof buildImplementerPipeline>[0],
   ) => Promise<BuildImplementerPipelineResult>;
+  /** C015c item 2: injectable for tests; production defaults to the real `buildResumeComposition`
+   * (the GitHub-auth-gated bundle of CiRecovery/Reviewer/ReviewStatus+AutoMerge/Lifecycle). */
+  readonly buildResumeComposition?: (
+    options: Parameters<typeof buildResumeComposition>[0],
+  ) => Promise<BuildResumeCompositionResult>;
   readonly clock?: Clock;
 }
 
@@ -144,6 +159,90 @@ export function createDispatchCliHandlers(
 
       const holderId = generateHolderId();
       const dryRun = input.dryRun === true;
+
+      // C015c item 2: resume any of this project's own ci_waiting-or-later jobs *before*
+      // considering a fresh dispatch -- never in `--dry-run`, which must stay zero-mutation/
+      // zero-network exactly as C015a/b left it (real GitHub/Linear calls happen inside
+      // `runResumeCycle`). A single `run` invocation either resumes existing work or dispatches
+      // new work, never both -- the next invocation picks up whichever is still outstanding.
+      if (!dryRun) {
+        const progress = buildJobProgressStore(options.agentTeamHome);
+        const existingProgress = await progress.listForProject(build.value.project.id);
+        if (!existingProgress.ok) {
+          return outcome("failed", {
+            operation: "dispatch_run",
+            state: "blocked",
+            projectId: input.projectId,
+            reason: "job_progress_read_failed",
+            message: "讀取本機 job 進度索引失敗（外部/檔案系統故障，非設定缺失，可重試）。",
+            error: existingProgress.error,
+          });
+        }
+        const resumable = existingProgress.value.filter((record) =>
+          resumableStageKinds.has(record.stage.kind),
+        );
+        if (resumable.length > 0) {
+          const resumeComposition = await (
+            options.buildResumeComposition ?? buildResumeComposition
+          )({
+            agentTeamHome: options.agentTeamHome,
+            claudeConfig: build.value.claude.config,
+            jobs: build.value.jobs,
+            readModel: build.value.discovery.readModel,
+            mutationClient: build.value.discovery.mutationClient,
+            teamId: build.value.discovery.teamId,
+            linearProjectId: build.value.discovery.linearProjectId,
+            progress,
+          });
+          if (resumeComposition.state !== "ready") {
+            return outcome("blocked", {
+              operation: "dispatch_run",
+              state: "blocked",
+              projectId: input.projectId,
+              reason: resumeComposition.reason,
+              message: implementerCompositionBlockedMessages[resumeComposition.reason],
+            });
+          }
+          const cycle = await runResumeCycle({
+            progress,
+            jobRepository: build.value.jobs,
+            leases: new LeaseCoordinator(build.value.leases),
+            sourceControl: resumeComposition.value.sourceControl,
+            readModel: build.value.discovery.readModel,
+            teamId: build.value.discovery.teamId,
+            linearProjectId: build.value.discovery.linearProjectId,
+            project: build.value.project,
+            trustedConfig: build.value.trustedConfig,
+            ciRecovery: resumeComposition.value.ciRecovery,
+            reviewer: resumeComposition.value.reviewer,
+            reviewStatus: resumeComposition.value.reviewStatus,
+            autoMerge: resumeComposition.value.autoMerge,
+            lifecycle: resumeComposition.value.lifecycle,
+            clock,
+            holderId,
+          });
+          if (!cycle.ok) {
+            return outcome("failed", {
+              operation: "dispatch_run",
+              state: "blocked",
+              projectId: input.projectId,
+              reason: "resume_cycle_failed",
+              message: "恢復既有工作流程時發生非預期錯誤。",
+              error: cycle.error,
+            });
+          }
+          return outcome(
+            cycle.value.some((job) => job.outcome === "failed") ? "failed" : "success",
+            {
+              operation: "dispatch_run",
+              state: "resumed",
+              projectId: input.projectId,
+              resumed: cycle.value satisfies readonly ResumeJobOutcome[],
+            },
+          );
+        }
+      }
+
       const ports = dryRun
         ? {
             leases: new LeaseCoordinator(new InMemoryLeaseRepository()),

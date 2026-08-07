@@ -111,7 +111,14 @@ export type DispatchCompositionBlockedReason =
 
 export interface DispatchCompositionReady {
   readonly leases: LeaseRepository;
-  readonly jobs: JobRepository;
+  /** C015c item 2: the engine's own `JobRepository` interface only declares `create` --
+   * `runResumeCycle` (resume-composition.ts) also needs `readAll`/`update` (C015c item 1's
+   * addition to `FileJobRepository`, deliberately not added to the engine interface). `Pick<...>`
+   * here (rather than the concrete class) keeps this purely structural, so every existing fake
+   * that only ever implemented plain `JobRepository` needs nothing more than adding those two
+   * extra methods, not becoming a real `FileJobRepository` instance (which is impossible for an
+   * external class anyway -- it has a private field). */
+  readonly jobs: JobRepository & Pick<FileJobRepository, "readAll" | "update">;
   readonly registry: ProjectRegistrySnapshot;
   readonly routingConfig: ModelRoutingConfig;
   readonly discovery: {

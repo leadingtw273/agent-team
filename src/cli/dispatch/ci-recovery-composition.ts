@@ -25,7 +25,7 @@ export type CiRecoveryCompositionBlockedReason = "github_authentication_unavaila
 export interface BuildCiRecoveryPipelineOptions {
   readonly agentTeamHome: string;
   readonly claudeConfig: DispatchProviderConfig["claude"];
-  readonly jobs: FileJobRepository;
+  readonly jobs: Pick<FileJobRepository, "update">;
   /** Injectable for tests; production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
 }

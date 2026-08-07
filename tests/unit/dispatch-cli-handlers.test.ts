@@ -27,7 +27,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ok } from "../../src/domain/foundation/index.js";
+import { ok, parseIdentifier, type Identifier } from "../../src/domain/foundation/index.js";
 import type { DomainError, Result } from "../../src/domain/foundation/index.js";
 import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
 import type { JobRepository, JobWriteReceipt } from "../../src/application/dispatch/index.js";
@@ -42,7 +42,9 @@ import type { ModelRoutingConfig } from "../../src/application/routing/index.js"
 import type { Job, Lease } from "../../src/domain/jobs/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
+import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
 import type { LinearReadModel } from "../../src/adapters/linear/read.js";
+import type { BuildResumeCompositionResult } from "../../src/cli/dispatch/resume-full-composition.js";
 
 const discoverSpy = vi.hoisted(() => vi.fn());
 
@@ -213,14 +215,27 @@ class CountingLeaseRepository implements LeaseRepository {
   }
 }
 
-/** Counts every call, then delegates -- wraps the exact `FileJobRepository` production wires up. */
+/** Counts every call, then delegates -- wraps the exact `FileJobRepository` production wires up.
+ * `readAll`/`update` (C015c item 2's own additional requirement on `DispatchCompositionReady.jobs`)
+ * pass straight through uncounted -- this fake's own job is only to prove `create` call counts,
+ * unaffected by that later addition. */
 class CountingJobRepository implements JobRepository {
   calls = 0;
-  constructor(private readonly delegate: JobRepository) {}
+  constructor(private readonly delegate: FileJobRepository) {}
 
   create(job: Job): Promise<Result<JobWriteReceipt, DomainError>> {
     this.calls += 1;
     return this.delegate.create(job);
+  }
+
+  readAll(): ReturnType<FileJobRepository["readAll"]> {
+    return this.delegate.readAll();
+  }
+
+  update(
+    ...arguments_: Parameters<FileJobRepository["update"]>
+  ): ReturnType<FileJobRepository["update"]> {
+    return this.delegate.update(...arguments_);
   }
 }
 
@@ -352,5 +367,144 @@ describe("createDispatchCliHandlers dry-run vs real-mode port isolation (C015a F
     const persistedJobs = await realJobs.readAll();
     expect(persistedJobs.ok).toBe(true);
     if (persistedJobs.ok) expect(persistedJobs.value).toHaveLength(1);
+  });
+});
+
+function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
+  const parsed = parseIdentifier(scope, value);
+  if (!parsed.ok) throw new Error(parsed.error.code);
+  return parsed.value;
+}
+
+async function seedResumableProgressRecord(stateRoot: string): Promise<Identifier<"job">> {
+  const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+  const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+  await progress.compareAndSwap(jobId, null, {
+    jobId,
+    projectId: id("project", projectId),
+    issueId: id("issue", issueId),
+    externalIssueId: "linear-issue-1",
+    model: "claude-opus",
+    stage: { kind: "ci_waiting" },
+    branch: `agent-team/${jobId}`,
+    worktreePath: "/tmp/does-not-need-to-exist-for-this-fake",
+    changeRequestId: "42",
+  });
+  return jobId;
+}
+
+describe("createDispatchCliHandlers resume wiring (C015c item 2)", () => {
+  it("--dry-run never touches or acts on an existing resumable job-progress record", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const jobId = await seedResumableProgressRecord(stateRoot);
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        throw new Error("must never be called: --dry-run must never attempt a resume");
+      },
+    });
+
+    const outcome = await handlers.run({ projectId, dryRun: true });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as { state: string };
+    expect(payload.state).toBe("dry_run");
+
+    const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      expect(reloaded.value?.revision).toBe(0);
+    }
+  });
+
+  it("resumes an existing job before considering a fresh dispatch, and never reaches discovery in the same invocation", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const jobId = await seedResumableProgressRecord(stateRoot);
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () =>
+        Promise.resolve({
+          state: "ready",
+          value: {
+            sourceControl: {
+              getChangeRequest: () =>
+                Promise.resolve({
+                  ok: false,
+                  error: { code: "external_failure", detail: undefined },
+                }),
+            },
+            ciRecovery: { run: () => Promise.reject(new Error("unused")) },
+            reviewer: { run: () => Promise.reject(new Error("unused")) },
+            reviewStatus: {
+              begin: () => Promise.reject(new Error("unused")),
+              record: () => Promise.reject(new Error("unused")),
+            },
+            autoMerge: { enable: () => Promise.reject(new Error("unused")) },
+            lifecycle: { run: () => Promise.reject(new Error("unused")) },
+          },
+        } as unknown as Promise<BuildResumeCompositionResult>),
+      // Substituting `runResumeCycle` itself is not supported by the handler (it is a direct
+      // module-level import, not an injected option) -- instead this test scripts the resume
+      // composition's `sourceControl.getChangeRequest` to fail immediately, which is enough to
+      // prove control genuinely reached `runResumeCycle` and returned *before* discovery, without
+      // needing the full pipeline chain scripted (that full chain is covered by
+      // dispatch-resume-composition.test.ts's own dedicated happy-path test).
+    });
+
+    const outcome = await handlers.run({ projectId });
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      state: string;
+      resumed: readonly { jobId: string; outcome: string }[];
+    };
+    expect(payload.state).toBe("resumed");
+    expect(payload.resumed).toEqual([
+      { jobId, outcome: "requires_manual", reason: "change_request_read_failed" },
+    ]);
+    expect(discoverSpy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a blocked resume composition (e.g. GitHub auth unavailable) as state:blocked, without touching the progress record", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const jobId = await seedResumableProgressRecord(stateRoot);
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () =>
+        Promise.resolve({ state: "blocked", reason: "github_authentication_unavailable" }),
+    });
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("blocked");
+    const payload = JSON.parse(outcome.message ?? "{}") as { state: string; reason: string };
+    expect(payload.state).toBe("blocked");
+    expect(payload.reason).toBe("github_authentication_unavailable");
+    expect(discoverSpy).not.toHaveBeenCalled();
+
+    const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.revision).toBe(0);
+  });
+
+  it("falls through to the ordinary dispatch flow when there is no resumable record", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        throw new Error("must never be called: nothing to resume");
+      },
+    });
+
+    const outcome = await handlers.run({ projectId });
+    const payload = JSON.parse(outcome.message ?? "{}") as { state: string };
+    expect(payload.state).toBe("dispatched");
+    expect(discoverSpy).toHaveBeenCalledTimes(1);
   });
 });

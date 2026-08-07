@@ -35,7 +35,7 @@ export type ReviewerCompositionBlockedReason = "github_authentication_unavailabl
 export interface BuildReviewerPipelineOptions {
   readonly agentTeamHome: string;
   readonly claudeConfig: DispatchProviderConfig["claude"];
-  readonly jobs: FileJobRepository;
+  readonly jobs: Pick<FileJobRepository, "update">;
   /** Injectable for tests (same convention as `implementer-composition.ts`); production defaults
    * to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;

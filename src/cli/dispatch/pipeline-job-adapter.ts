@@ -9,8 +9,13 @@ import type { AsyncPortResult, MutationOptions } from "../../application/ports/i
 import type { Job } from "../../domain/jobs/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 
+/** Narrowed to `update` only -- the sole method this adapter calls -- kept structural (`Pick`,
+ * not the concrete class) so a caller composing with a `JobRepository & Pick<...>` intersection
+ * (C015c item 2's `ResumeJobRepository`, resume-composition.ts) can pass it straight through. */
+type JobUpdateRepository = Pick<FileJobRepository, "update">;
+
 export class FileJobUpdateAdapter {
-  constructor(private readonly repository: FileJobRepository) {}
+  constructor(private readonly repository: JobUpdateRepository) {}
 
   update(
     job: Job,
