@@ -18,10 +18,15 @@ import { randomUUID } from "node:crypto";
 
 import type { CliHandlers } from "../program.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
+import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
 import { createClock, type Clock } from "../../domain/foundation/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
+import {
+  resolveAuthoritativeBaseRevision,
+  type AuthoritativeBaseFailure,
+} from "./authoritative-base.js";
 import {
   buildDispatchComposition,
   dispatchOnce,
@@ -74,6 +79,12 @@ export interface CreateDispatchCliHandlersOptions {
   readonly buildResumeComposition?: (
     options: Parameters<typeof buildResumeComposition>[0],
   ) => Promise<BuildResumeCompositionResult>;
+  /** C015x decision 1: injectable for tests; production defaults to the real
+   * `resolveAuthoritativeBaseRevision` (this ticket's fix -- see that file's own header). Existing
+   * tests that predate this ticket and only care about the pipeline hand-off (not this resolution
+   * itself) inject a trivial fake here rather than needing a real `origin` remote/GitHub
+   * credentials just to get past this step. */
+  readonly resolveAuthoritativeBase?: typeof resolveAuthoritativeBaseRevision;
   readonly clock?: Clock;
 }
 
@@ -108,6 +119,25 @@ const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>
 
 function outcome(state: "success" | "failed" | "blocked", payload: unknown) {
   return Object.freeze({ state, message: JSON.stringify(payload) });
+}
+
+/** C015x decision 1: `AuthoritativeBaseFailure`'s three variants carry different evidence
+ * (`default_branch_mismatch` has no `DomainError` at all -- it is a live cross-check disagreement,
+ * not an external-call failure) -- this normalizes them into a single serializable shape for the
+ * CLI's own JSON output, never dropping whichever evidence that specific reason actually has. */
+function authoritativeBaseErrorDetail(
+  error: AuthoritativeBaseFailure,
+): Readonly<Record<string, unknown>> {
+  switch (error.reason) {
+    case "default_branch_metadata_unavailable":
+    case "authoritative_branch_unavailable":
+      return Object.freeze({ code: error.error.code });
+    case "default_branch_mismatch":
+      return Object.freeze({
+        githubDefaultBranch: error.githubDefaultBranch,
+        configuredDefaultBranch: error.configuredDefaultBranch,
+      });
+  }
 }
 
 function pipelineOutcomePayload(
@@ -406,22 +436,35 @@ export function createDispatchCliHandlers(
             });
           }
 
-          // The worktree must be pinned to a real, resolved revision -- never the branch name
-          // itself (see implementer-request.ts's own comment on `baseRevision`). A fresh
-          // `LocalGitAdapter` here (rather than reaching into `pipelineComposition.value.ports.git`)
-          // is deliberate: `ImplementerPipelinePorts.git` is narrowed to
-          // `Pick<GitPort,"createWorktree"|"stagePaths"|"commit"|"inspectWorkingTree"|"push">`,
-          // which does not include `inspectRepository` -- `LocalGitAdapter` is a stateless CLI
-          // wrapper, so constructing a second instance is cheap and does not duplicate any state.
-          const repository = await new LocalGitAdapter().inspectRepository({
-            rootPath: build.value.project.localRepositoryPath,
-          });
-          if (!repository.ok) {
+          // C015x decision 1: the worktree must be pinned to a real, *authoritative* revision --
+          // never the branch name itself (see implementer-request.ts's own comment on
+          // `baseRevision`), and, since this ticket, never the local clone's own possibly-stale
+          // checked-out `HEAD` either (the coordinator's own root-cause finding for the real BEHIND
+          // incident this ticket fixes: `inspectRepository(...).headSha` reflects whatever the
+          // *local* clone happened to be checked out to, which this project's own local clone never
+          // re-syncs on its own -- not GitHub's actual current default-branch tip). Fresh
+          // `LocalGitAdapter`/`GitHubAdapter` instances here (rather than reaching into
+          // `pipelineComposition.value.ports.git`) are deliberate for the exact same reason the
+          // prior version of this comment already gave for `LocalGitAdapter`:
+          // `ImplementerPipelinePorts.git` is narrowed to
+          // `Pick<GitPort,"createWorktree"|"stagePaths"|"commit"|"inspectWorkingTree"|"push">`
+          // (missing both `inspectRepository` and the new `resolveAuthoritativeBranch`), and both
+          // adapters are stateless CLI wrappers -- constructing fresh instances is cheap and does
+          // not duplicate any state.
+          const authoritativeBase = await (
+            options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision
+          )(
+            build.value.project,
+            { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
+            { idempotencyKey: `cli-dispatch:${result.job.id}:authoritative-base` },
+          );
+          if (!authoritativeBase.ok) {
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
-              pipelineReason: "base_revision_unavailable",
-              error: repository.error,
+              pipelineReason: "authoritative_base_unavailable",
+              reason: authoritativeBase.error.reason,
+              error: authoritativeBaseErrorDetail(authoritativeBase.error),
             });
           }
 
@@ -449,7 +492,7 @@ export function createDispatchCliHandlers(
             model,
             agentTeamHome: options.agentTeamHome,
             clock,
-            baseRevision: repository.value.headSha,
+            baseRevision: authoritativeBase.value.baseRevision,
           });
           if (!request.ok) {
             return outcome("failed", {

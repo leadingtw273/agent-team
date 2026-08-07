@@ -82,6 +82,8 @@ function pull(
     headBranch: "task/fixture",
     headSha: sha,
     mergeability: "mergeable",
+    mergeStateStatus: "clean",
+    baseSha: "2".repeat(40),
     autoMergeEnabled: false,
     updatedAt: timestamp,
     ...overrides,

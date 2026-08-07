@@ -183,6 +183,8 @@ class FakeGh implements Pick<
       headBranch: pr.headBranch,
       headSha,
       mergeability: "mergeable" as const,
+      mergeStateStatus: "clean" as const,
+      baseSha: "2".repeat(40),
       autoMergeEnabled: pr.autoMergeEnabled,
       updatedAt: new Date().toISOString(),
     };

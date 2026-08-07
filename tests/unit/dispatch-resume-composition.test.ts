@@ -280,6 +280,11 @@ interface Harness {
    * seeded with one active claim for `(projectId, issueId)` by default so release-path tests have
    * something real to release. */
   readonly admission: InMemoryAdmissionFake;
+  /** C015x decision 3: the real on-disk directory `progress` (`FileJobProgressStore`) is rooted
+   * at -- exposed so a restart-safety test can construct a *second*, independent
+   * `FileJobProgressStore` instance against the same directory (simulating a fresh
+   * `agent-team run` process) and prove the persisted `noProgressCount`/`fingerprint` survive. */
+  readonly progressDirectory: string;
 }
 
 /** C015t decision 3: minimal in-memory fake satisfying `IssueAdmissionPort` -- only `load`/`release`
@@ -508,6 +513,7 @@ async function harness(
     reviewerRequests,
     lifecycleRequests,
     admission,
+    progressDirectory,
   };
 }
 
@@ -1325,7 +1331,19 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merging" }]);
     const reloaded = await progress.load(jobId);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "merging" });
+    // C015x decision 3: the arm-time write now seeds the persisted readback fingerprint/bound --
+    // no longer the bare `{kind:"merging"}` -- see job-progress-store.ts's own header for why
+    // `armedAt`/`fingerprint`/`noProgressCount` are all still schema-optional (back-compat with a
+    // real, un-migrated `~/.agent-team/state` record this ticket is forbidden from touching), even
+    // though every *new* write (this one included) always populates them.
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "merging",
+        armedAt: now,
+        fingerprint: { headSha, baseSha: "", mergeStateStatus: "unknown", merged: false },
+        noProgressCount: 0,
+      });
+    }
   });
 
   it("④ not_ready:ci_pending / ci_failed map to still_ci_waiting (ci_waiting stage)", async () => {
@@ -1672,5 +1690,173 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merge_reconciled" }]);
     const reloaded = await progress.load(jobId);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+  });
+});
+
+/**
+ * C015x decision 3 (acceptance criterion ③): the resume-time half of the bounded `"merging"` wait
+ * (`resumeMergingStage`, resume-composition.ts). Each test here builds its own `sourceControl` fake
+ * on top of `harness()`'s otherwise-real wiring (real `FileJobProgressStore`, real
+ * `FileJobRepository`, real `InMemoryAdmissionFake`) so the exact authoritative readback returned
+ * on each individual `runResumeCycle` call can be varied call-by-call -- something `harness()`'s
+ * own `changeRequestState` override cannot do (it is bound once, for the whole harness).
+ */
+describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted no-progress limit)", () => {
+  function readbackDeps(
+    base: Harness,
+    readback: () => Readonly<Record<string, unknown>>,
+  ): ResumeCycleDependencies {
+    return {
+      ...base.deps,
+      sourceControl: { getChangeRequest: () => Promise.resolve(ok(changeRequest(readback()))) },
+    };
+  }
+
+  it("escalates immediately to requires_manual(change_request_behind_base) the instant mergeStateStatus is behind, with no prior history", async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, { kind: "merging" });
+    const deps = readbackDeps(base, () => ({
+      mergeStateStatus: "behind",
+      baseSha: "b".repeat(40),
+    }));
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "change_request_behind_base" },
+      ]);
+    }
+
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "change_request_behind_base",
+          attempts: { count: 1 },
+          mergeEvidence: {
+            headSha,
+            baseSha: "b".repeat(40),
+            mergeStateStatus: "behind",
+            merged: false,
+          },
+        },
+      });
+    }
+  });
+
+  it("escalates to requires_manual(auto_merge_stalled) only on the 5th consecutive unchanged readback, staying still_merging (and persisting noProgressCount) on the first 4", async () => {
+    const base = await harness();
+    // Seeded in the *normal* arm-time shape (matching exactly what `resumeReview`'s own
+    // `auto_merge_enabled` arm-time write produces, resume-composition.ts) -- not the bare
+    // pre-C015x shape (that migration path is covered by its own dedicated test below, where the
+    // very first resume legitimately seeds a fresh baseline rather than counting as "no progress").
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "c".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+    });
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: "c".repeat(40) }));
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const result = await runResumeCycle(deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+      const reloaded = await base.progress.load(jobId);
+      if (reloaded.ok) {
+        expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: attempt });
+      }
+    }
+
+    // Restart-safety (acceptance criterion ③'s own explicit requirement): a *different*
+    // `FileJobProgressStore` instance against the exact same on-disk directory -- simulating a
+    // fresh `agent-team run` process -- must see the persisted count and continue it, not reset it.
+    const restartedProgress = new FileJobProgressStore(base.progressDirectory);
+    const restartedDeps: ResumeCycleDependencies = { ...deps, progress: restartedProgress };
+
+    const fifth = await runResumeCycle(restartedDeps);
+    expect(fifth.ok).toBe(true);
+    if (fifth.ok) {
+      expect(fifth.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "auto_merge_stalled" },
+      ]);
+    }
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "auto_merge_stalled",
+          attempts: { count: 5 },
+          mergeEvidence: {
+            headSha,
+            baseSha: "c".repeat(40),
+            mergeStateStatus: "clean",
+            merged: false,
+          },
+        },
+      });
+    }
+  });
+
+  it("a changed fingerprint resets noProgressCount to 0 rather than escalating, even after prior no-progress resumes", async () => {
+    const base = await harness();
+    let baseSha = "d".repeat(40);
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha, mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+    });
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha }));
+
+    await runResumeCycle(deps);
+    await runResumeCycle(deps);
+    const beforeChange = await base.progress.load(jobId);
+    if (beforeChange.ok) {
+      expect(beforeChange.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 2 });
+    }
+
+    // The base branch's own tip moved (a real progress signal, e.g. a future E105 update-branch
+    // action, or simply the base being re-observed differently) -- this must reset, not escalate.
+    baseSha = "e".repeat(40);
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 0 });
+    }
+  });
+
+  it('migrates a pre-C015x bare {kind:"merging"} record on its first resume, seeding a fresh baseline rather than treating absent history as zero progress', async () => {
+    const base = await harness();
+    // Exactly the shape a real, un-migrated `~/.agent-team/state` record has today -- this ticket
+    // is forbidden from editing or migrating any existing file under that directory, so
+    // `resumeMergingStage` must handle this shape correctly forever, not just once.
+    await seedProgressRecord(base.progress, { kind: "merging" });
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: "f".repeat(40) }));
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "merging",
+        armedAt: now,
+        fingerprint: {
+          headSha,
+          baseSha: "f".repeat(40),
+          mergeStateStatus: "clean",
+          merged: false,
+        },
+        noProgressCount: 0,
+      });
+    }
   });
 });

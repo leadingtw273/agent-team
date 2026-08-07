@@ -44,7 +44,7 @@ import type {
   LifecyclePipeline,
 } from "../../application/pipelines/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
-import type { SourceControlPort } from "../../application/ports/index.js";
+import type { ChangeRequestSnapshot, SourceControlPort } from "../../application/ports/index.js";
 import {
   domainError,
   instantFromDate,
@@ -67,6 +67,7 @@ import {
   FileJobProgressStore,
   type JobProgressRecord,
   type JobProgressRecordMutation,
+  type MergeReadbackFingerprint,
   type RequiresManualCause,
   type RequiresManualReasonCode,
   type RequiresManualStage,
@@ -163,6 +164,18 @@ const providerRetryLimit = 2;
  * 上限 1"), not 2 -- a single, prompt-guided retry, not the same budget as an infrastructure hiccup. */
 const reportContractRetryLimit = 1;
 
+/** C015x decision 3: an independent, dedicated bound on how many *consecutive* resumes of a
+ * `"merging"` job may observe an unchanged authoritative readback fingerprint before this
+ * controller gives up waiting for GitHub to actually execute the already-enabled auto-merge and
+ * hands off to a human. Deliberately never `providerRetryLimit`/`reportContractRetryLimit` above,
+ * nor any of `Job.attempts`'s four counters (see `providerRetryLimit`'s own comment for why none of
+ * those apply here either) -- none of those describe "GitHub itself has not moved the PR forward",
+ * which involves no provider invocation and no report-contract failure at all. The exact number (5)
+ * is this ticket's own judgment call, not a value the coordinator's decision text dictated --
+ * flagged as such in the completion report for later adjustment if operational experience says
+ * otherwise. */
+const mergingNoProgressLimit = 5;
+
 function currentReportContractRetries(record: JobProgressRecord): number {
   return record.stage.kind === "review_report_pending_retry" ? record.stage.retries : 0;
 }
@@ -171,18 +184,50 @@ function currentReportContractRetries(record: JobProgressRecord): number {
  * supply -- see `requiresManualCauseSchema`'s own header (job-progress-store.ts) for the full
  * rationale. `count` defaults to 1 (a single-shot failure, no retry loop tracked for that call site);
  * only the `review_report_contract` reasonCode's own call site passes a real, larger count (the
- * report-contract retry counter's value at exhaustion) and a `lastCategory`. */
+ * report-contract retry counter's value at exhaustion) and a `lastCategory`. C015x decision 3 adds
+ * `mergeEvidence` -- the coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause"
+ * requirement -- passed only by `resumeMergingStage`'s two new call sites. */
 function requiresManualCause(
   stage: RequiresManualStage,
   reasonCode: RequiresManualReasonCode,
   count = 1,
   lastCategory?: ReportContractFailureCategory,
+  mergeEvidence?: MergeReadbackFingerprint,
 ): RequiresManualCause {
   return Object.freeze({
     stage,
     reasonCode,
     attempts: Object.freeze({ count, ...(lastCategory === undefined ? {} : { lastCategory }) }),
+    ...(mergeEvidence === undefined ? {} : { mergeEvidence }),
   });
+}
+
+/** C015x decision 3: derives the persisted readback fingerprint from a fresh, authoritative
+ * `ChangeRequestSnapshot` -- the exact four observables codex's own review named ("PR head SHA、
+ * base SHA、mergeable state、merge commit／merged 狀態") as what "no progress" must be judged
+ * against, never a local retry counter alone. `mergeStateStatus`/`baseSha` are optional on
+ * `ChangeRequestSnapshot` only for pre-existing test-fixture back-compat (see that type's own
+ * header, source-control.ts) -- the real `GitHubAdapter` always populates both, so `"unknown"`/the
+ * empty-string fallback below is only ever reached by a fake that does not care about this path. */
+function mergeFingerprintOf(snapshot: ChangeRequestSnapshot): MergeReadbackFingerprint {
+  return Object.freeze({
+    headSha: snapshot.headSha,
+    baseSha: snapshot.baseSha ?? "",
+    mergeStateStatus: snapshot.mergeStateStatus ?? "unknown",
+    merged: snapshot.state === "merged",
+  });
+}
+
+function mergeFingerprintsEqual(
+  left: MergeReadbackFingerprint,
+  right: MergeReadbackFingerprint,
+): boolean {
+  return (
+    left.headSha === right.headSha &&
+    left.baseSha === right.baseSha &&
+    left.mergeStateStatus === right.mergeStateStatus &&
+    left.merged === right.merged
+  );
 }
 
 function computeProviderDeadline(clock: Clock): Instant | undefined {
@@ -629,6 +674,78 @@ async function requiresManualUnlessRetryable(
   return requiresManual(record, deps, reason, cause);
 }
 
+/**
+ * C015x decision 3: the resume-time half of the bounded `"merging"` wait -- `resumeUnderLease`
+ * calls this once it already knows `record.stage.kind === "merging"` (a fresh, authoritative
+ * `current` readback for this exact change request already in hand from that same call's own
+ * pre-flight check). Two escalation rules, both fail-closed to `requires_manual` with the
+ * authoritative evidence attached (never a silent, unbounded wait):
+ *
+ * - `mergeStateStatus === "behind"` escalates *immediately*, regardless of history -- this
+ *   project's own `strictRequiredStatusChecksPolicy` ruleset (O004) means GitHub can never execute
+ *   this merge while behind, no matter how many more times this job is resumed.
+ * - Otherwise, if the freshly observed fingerprint is byte-for-byte identical to the last persisted
+ *   one, `noProgressCount` increments; at `mergingNoProgressLimit` it escalates to
+ *   `auto_merge_stalled`. Any *change* in the fingerprint (progress, or simply the very first
+ *   resume since this stage was armed/migrated) resets the counter to 0 rather than escalating.
+ *
+ * The `stage.kind !== "merging"` branch below is unreachable through the one real call site (the
+ * check happens immediately before calling) -- kept only as this file's own established
+ * fail-closed-on-invariant-violation style, never silently assumed away.
+ */
+async function resumeMergingStage(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  current: ChangeRequestSnapshot,
+): Promise<ResumeJobOutcome> {
+  if (record.stage.kind !== "merging") {
+    return requiresManual(
+      record,
+      deps,
+      "merging_stage_invariant_violation",
+      requiresManualCause("merge", "auto_merge_not_enabled"),
+    );
+  }
+  const stage = record.stage;
+  const observed = mergeFingerprintOf(current);
+
+  if (observed.mergeStateStatus === "behind") {
+    return requiresManual(
+      record,
+      deps,
+      "change_request_behind_base",
+      requiresManualCause("merge", "change_request_behind_base", 1, undefined, observed),
+    );
+  }
+
+  const previous = stage.fingerprint;
+  const progressed = previous === undefined || !mergeFingerprintsEqual(previous, observed);
+  const noProgressCount = progressed ? 0 : (stage.noProgressCount ?? 0) + 1;
+
+  if (!progressed && noProgressCount >= mergingNoProgressLimit) {
+    return requiresManual(
+      record,
+      deps,
+      "auto_merge_stalled",
+      requiresManualCause("merge", "auto_merge_stalled", noProgressCount, undefined, observed),
+    );
+  }
+
+  return transitionOrReport(
+    deps,
+    record,
+    {
+      stage: {
+        kind: "merging",
+        armedAt: stage.armedAt ?? deps.clock.now(),
+        fingerprint: observed,
+        noProgressCount,
+      },
+    },
+    () => ({ jobId: record.jobId, outcome: "still_merging" }),
+  );
+}
+
 async function resumeUnderLease(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
@@ -694,10 +811,7 @@ async function resumeUnderLease(
   }
 
   if (record.stage.kind === "merging") {
-    return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
-      jobId: record.jobId,
-      outcome: "still_merging",
-    }));
+    return resumeMergingStage(record, deps, currentChangeRequest.value);
   }
 
   const jobs = await deps.jobRepository.readAll();
@@ -1183,10 +1297,22 @@ async function resumeReview(
         // below). Controller-authorized: this exact call armed it.
         return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
       }
-      return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
-        jobId: record.jobId,
-        outcome: "merging",
-      }));
+      // C015x decision 3: arms the persisted readback fingerprint/bound at the exact moment
+      // auto-merge is enabled -- never left bare -- so `resumeMergingStage` has a real baseline to
+      // compare every subsequent resume's fresh readback against, from the very first resume.
+      return transitionOrReport(
+        deps,
+        record,
+        {
+          stage: {
+            kind: "merging",
+            armedAt: deps.clock.now(),
+            fingerprint: mergeFingerprintOf(enabled.changeRequest),
+            noProgressCount: 0,
+          },
+        },
+        () => ({ jobId: record.jobId, outcome: "merging" }),
+      );
     }
     case "directly_merged":
       // This exact call performed the squash fallback and confirmed it landed -- controller-

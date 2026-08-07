@@ -95,6 +95,15 @@ const changeRequestSchema = z
     headBranch: z.string().min(1),
     headSha: shaSchema,
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]),
+    // C015x decision 2: mirrors `ChangeRequestSnapshot.mergeStateStatus`/`baseSha`
+    // (application/ports/source-control.ts) -- optional here for the exact same reason that port
+    // type itself made them optional: a session file durably written before this ticket never had
+    // them, and this store must keep reading those back successfully (never migrated, per this
+    // file's own established "read-back must never break" discipline).
+    mergeStateStatus: z
+      .enum(["clean", "behind", "blocked", "dirty", "draft", "unstable", "unknown"])
+      .optional(),
+    baseSha: shaSchema.optional(),
     autoMergeEnabled: z.boolean(),
     updatedAt: instantSchema,
   })

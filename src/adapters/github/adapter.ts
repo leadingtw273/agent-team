@@ -42,10 +42,25 @@ const projectedChangeRequestSchema = z
     headBranch: z.string().min(1),
     headSha: z.string().regex(shaPattern),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]),
+    // C015x decision 2: GitHub's own `mergeable_state` -- see `ChangeRequestSnapshot.mergeStateStatus`'s
+    // own header (application/ports/source-control.ts) for why this is required here (the real
+    // adapter always populates it) despite being optional on that port-level type.
+    mergeStateStatus: z.enum([
+      "clean",
+      "behind",
+      "blocked",
+      "dirty",
+      "draft",
+      "unstable",
+      "unknown",
+    ]),
+    // C015x decision 3: GitHub's own current base-branch tip (`.base.sha`).
+    baseSha: z.string().regex(shaPattern),
     autoMergeEnabled: z.boolean(),
     updatedAt: z.string(),
   })
   .strict();
+const repositoryMetadataSchema = z.object({ defaultBranch: z.string().min(1) }).strict();
 const draftCandidateSchema = z
   .array(
     z
@@ -123,7 +138,8 @@ const readyForReviewMutationSchema = z
 const squashMergeResultSchema = z.object({ merged: z.boolean() }).strict();
 
 const changeRequestProjection =
-  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
+  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:(if .mergeable_state == "behind" then "behind" elif .mergeable_state == "clean" then "clean" elif .mergeable_state == "blocked" then "blocked" elif .mergeable_state == "dirty" then "dirty" elif .mergeable_state == "draft" then "draft" elif .mergeable_state == "unstable" then "unstable" else "unknown" end),baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
+const repositoryMetadataProjection = "{defaultBranch:.default_branch}";
 const checkProjection =
   '{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),url:.html_url}';
 const checksProjection = `{totalCount:.total_count,checks:[.check_runs[] | ${checkProjection}]}`;
@@ -134,6 +150,14 @@ const enableAutoMergeMutation =
   "mutation($pullRequestId:ID!,$expectedHeadOid:GitObjectID!,$mergeMethod:PullRequestMergeMethod!){enablePullRequestAutoMerge(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid,mergeMethod:$mergeMethod}){pullRequest{id}}}";
 const markReadyForReviewMutation =
   "mutation($pullRequestId:ID!){markPullRequestReadyForReview(input:{pullRequestId:$pullRequestId}){pullRequest{id,isDraft}}}";
+
+/** C015x decision 1 step ①: adapter-only (never added to the shared `SourceControlPort`) --
+ * precedent for a narrow, provider-specific capability beyond the shared port is
+ * `squashMergeChangeRequest` below. Consumed only by
+ * `resolveAuthoritativeBaseRevision` (src/cli/dispatch/authoritative-base.ts). */
+export interface RepositoryMetadata {
+  readonly defaultBranch: string;
+}
 
 export interface GhJsonTransport {
   requestJson<Output>(
@@ -711,5 +735,25 @@ export class GitHubAdapter implements SourceControlPort {
     if (!closed.ok) return closed;
     const readBack = await this.getChangeRequest(reference, options);
     return readBack.ok && readBack.value.state === "closed" ? readBack : failure();
+  }
+
+  /**
+   * C015x decision 1 step ①: reads GitHub's own live `default_branch` for this repository -- the
+   * *caller* (`resolveAuthoritativeBaseRevision`) is responsible for comparing this against
+   * whatever the project's own local config claims (`Project.defaultBranch`) and failing closed on
+   * a mismatch; this method only ever reports GitHub's own truth, never validates it against
+   * anything else. A read, not a mutation -- unlike every other adapter-only/port method on this
+   * class, it takes `ReadOptions`, not `MutationOptions`.
+   */
+  async getRepositoryMetadata(
+    reference: SourceControlRepositoryRef,
+    options: ReadOptions = {},
+  ): Promise<Result<RepositoryMetadata, DomainError>> {
+    if (!validRepository(reference)) return failure();
+    return this.transport.requestJson(
+      ["api", `repos/${repositoryPath(reference)}`, "--jq", repositoryMetadataProjection],
+      repositoryMetadataSchema,
+      options,
+    );
   }
 }

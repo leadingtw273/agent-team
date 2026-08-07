@@ -17,9 +17,14 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { domainError, ok } from "../../src/domain/foundation/index.js";
+import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
-import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
+import {
+  issueSchema,
+  projectSchema,
+  type Issue,
+  type Project,
+} from "../../src/domain/project/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
@@ -227,6 +232,9 @@ function buildHandlers(
   buildImplementerPipeline: Parameters<
     typeof createDispatchCliHandlers
   >[0]["buildImplementerPipeline"],
+  resolveAuthoritativeBase?: Parameters<
+    typeof createDispatchCliHandlers
+  >[0]["resolveAuthoritativeBase"],
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -260,12 +268,34 @@ function buildHandlers(
   return createDispatchCliHandlers({
     agentTeamHome: stateRoot,
     buildComposition,
+    resolveAuthoritativeBase:
+      resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
     ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
   });
 }
 
 function fakePipeline(run: ImplementerPipeline["run"]): ImplementerPipeline {
   return { ports: undefined as never, run } as unknown as ImplementerPipeline;
+}
+
+/**
+ * C015x decision 1: this file's whole point is the pipeline hand-off *after* the worktree base is
+ * resolved, not the resolution itself (that has its own dedicated unit tests,
+ * authoritative-base-revision.test.ts) -- `temporaryRepository()` is a real, initialized git repo
+ * with no `origin` remote and no GitHub credentials, so exercising the *real*
+ * `resolveAuthoritativeBaseRevision` here would need both. This fake reproduces exactly what the
+ * pre-C015x code path did (read the local repo's own real HEAD), preserving every existing
+ * assertion in this file (including the one real `createWorktree` call whose `startPoint` must
+ * still be a real, resolvable revision of `repositoryPath`).
+ */
+function fakeResolveAuthoritativeBase(repositoryPath: string) {
+  return async (project: Project) => {
+    const repo = await new LocalGitAdapter().inspectRepository({ rootPath: repositoryPath });
+    if (!repo.ok) {
+      return err({ reason: "authoritative_branch_unavailable" as const, error: repo.error });
+    }
+    return ok({ baseRevision: repo.value.headSha, defaultBranch: project.defaultBranch });
+  };
 }
 
 describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
@@ -498,5 +528,87 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     // return `failure("conflict")` and this would instead observe `pipeline:"failed"`,
     // `stage:"worktree"` -- exactly E101's real failure shape.
     expect(payload.pipeline).toBe("paused");
+  });
+
+  /**
+   * C015x decision 1: the pipeline hand-off's `baseRevision` must be whatever
+   * `resolveAuthoritativeBase` (injected here, deliberately different from
+   * `fakeResolveAuthoritativeBase`'s own "read the real local repo HEAD" default) returned -- never
+   * silently recomputed some other way. A distinct, made-up SHA proves the wiring is real, not a
+   * coincidence of both paths happening to agree.
+   */
+  it("passes resolveAuthoritativeBase's own baseRevision straight through to the pipeline request", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const distinctiveBaseRevision = "9".repeat(40);
+    let observedBaseRevision: string | undefined;
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      () =>
+        Promise.resolve({
+          state: "ready",
+          value: fakePipeline((request) => {
+            observedBaseRevision = request.baseRevision;
+            return Promise.resolve({
+              state: "paused",
+              reason: "provider_interrupted",
+              job: request.job,
+              worktree: {
+                repositoryRoot: repositoryPath,
+                path: "/tmp/wt",
+                branch: request.branch,
+                headSha: distinctiveBaseRevision,
+              },
+            });
+          }),
+        }),
+      () => Promise.resolve(ok({ baseRevision: distinctiveBaseRevision, defaultBranch: "main" })),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    expect(observedBaseRevision).toBe(distinctiveBaseRevision);
+  });
+
+  /**
+   * C015x decision 1: a failure at any of the five authoritative-base-resolution steps must fail
+   * closed to `pipeline:"failed"`, never silently fall back to the local repo's own (possibly
+   * stale) HEAD -- exactly the root-cause behavior this ticket exists to close.
+   */
+  it("fails closed with pipelineReason:authoritative_base_unavailable when resolveAuthoritativeBase fails, never falling back to a local HEAD read", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    // The pipeline *composition* builder still succeeds (handlers.ts builds it before resolving
+    // the authoritative base) -- what must never be reached is the pipeline's own `run()`, which
+    // is where `baseRevision` would actually be consumed.
+    const runSpy = vi.fn(() =>
+      Promise.reject(new Error("must never run once the authoritative base fails")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      () => Promise.resolve({ state: "ready", value: fakePipeline(runSpy) }),
+      () =>
+        Promise.resolve(
+          err({
+            reason: "default_branch_mismatch",
+            githubDefaultBranch: "master",
+            configuredDefaultBranch: "main",
+          }),
+        ),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      reason: string;
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("authoritative_base_unavailable");
+    expect(payload.reason).toBe("default_branch_mismatch");
+    expect(runSpy).not.toHaveBeenCalled();
   });
 });
