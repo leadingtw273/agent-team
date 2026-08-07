@@ -28,13 +28,18 @@ import {
   type BuildDispatchCompositionResult,
   type DispatchCompositionBlockedReason,
 } from "./composition.js";
-import { InMemoryJobRepository, InMemoryLeaseRepository } from "./ephemeral-ports.js";
+import {
+  InMemoryIssueAdmissionStore,
+  InMemoryJobRepository,
+  InMemoryLeaseRepository,
+} from "./ephemeral-ports.js";
 import { buildImplementerPipelineRequest } from "./implementer-request.js";
 import {
   buildImplementerPipeline,
   type BuildImplementerPipelineResult,
 } from "./implementer-composition.js";
 import {
+  buildIssueAdmissionStore,
   buildJobProgressStore,
   resumableStageKinds,
   runResumeCycle,
@@ -44,6 +49,7 @@ import {
   buildResumeComposition,
   type BuildResumeCompositionResult,
 } from "./resume-full-composition.js";
+import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 
 export interface CreateDispatchCliHandlersOptions {
@@ -74,7 +80,7 @@ const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = 
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
 
-type DispatchHandlers = Pick<CliHandlers, "run">;
+type DispatchHandlers = Pick<CliHandlers, "run" | "dispatchResolve">;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
   draft_unavailable:
@@ -157,7 +163,16 @@ export function createDispatchCliHandlers(
   const clock = options.clock ?? createClock();
   const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
 
+  // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/
+  // admission stores -- there is no `--dry-run` concept for it (it is itself the manual escape
+  // hatch out of a stuck real job; a dry-run version would have nothing meaningful to predict).
+  const dispatchResolve = createDispatchResolveHandler({
+    progress: buildJobProgressStore(options.agentTeamHome),
+    admission: buildIssueAdmissionStore(options.agentTeamHome),
+  });
+
   return Object.freeze({
+    dispatchResolve,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
         return outcome("blocked", {
@@ -293,8 +308,13 @@ export function createDispatchCliHandlers(
         ? {
             leases: new LeaseCoordinator(new InMemoryLeaseRepository()),
             jobs: new InMemoryJobRepository(),
+            admission: new InMemoryIssueAdmissionStore(),
           }
-        : { leases: new LeaseCoordinator(build.value.leases), jobs: build.value.jobs };
+        : {
+            leases: new LeaseCoordinator(build.value.leases),
+            jobs: build.value.jobs,
+            admission: buildIssueAdmissionStore(options.agentTeamHome),
+          };
 
       const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId);
       if (dispatchOnceOutcome.outcome === "discovery_failed") {
@@ -307,7 +327,7 @@ export function createDispatchCliHandlers(
           error: dispatchOnceOutcome.error,
         });
       }
-      const { result, candidates, discoverySkipped } = dispatchOnceOutcome;
+      const { result, candidates, discoverySkipped, admissionSkipped } = dispatchOnceOutcome;
       const candidateSummaries = candidates.map((candidate) => ({
         issueId: candidate.issue.id,
         externalId: candidate.issue.externalId,
@@ -326,6 +346,7 @@ export function createDispatchCliHandlers(
           projectId: input.projectId,
           result,
           discoverySkipped,
+          admissionSkipped,
           candidateSummaries,
         });
       }
@@ -342,6 +363,7 @@ export function createDispatchCliHandlers(
             holderId,
             skipped: result.skipped,
             discoverySkipped,
+            admissionSkipped,
           };
 
           // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
@@ -483,6 +505,7 @@ export function createDispatchCliHandlers(
             reason: result.reason,
             skipped: result.skipped,
             discoverySkipped,
+            admissionSkipped,
           });
         case "blocked":
           return outcome("failed", {
@@ -492,6 +515,7 @@ export function createDispatchCliHandlers(
             reason: result.reason,
             skipped: result.skipped,
             discoverySkipped,
+            admissionSkipped,
           });
       }
     },

@@ -46,6 +46,12 @@ export interface CliHandlers {
   readonly run: (
     input: Readonly<{ projectId?: string; dryRun?: boolean }>,
   ) => Promise<CliCommandOutcome>;
+  /** C015o decision 4: the human-issued escape hatch out of `requires_manual` (or any other
+   * stuck, non-terminal job-progress stage) -- see src/cli/dispatch/resolve-handlers.ts's own
+   * header for the full rationale. */
+  readonly dispatchResolve: (
+    input: Readonly<{ jobId: string; as: "superseded" | "cancelled"; supersededByJobId?: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -85,6 +91,7 @@ const defaultRegistrationHandlers: RegistrationCliHandlers = Object.freeze({
 
 export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
+  dispatchResolve: () => blocked("dispatch resolve"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   health: () => blocked("health"),
@@ -160,6 +167,37 @@ export function createProgram(
           ...(options.dryRun === true ? { dryRun: true } : {}),
         }),
       )(),
+    );
+
+  const dispatch = program.command("dispatch").description("C015o：手動收斂卡住的 dispatch job");
+  dispatch
+    .command("resolve")
+    .description(
+      "以 stdin 確認字串把一個非終態的 job-progress 記錄（例如 requires_manual）標記為" +
+        " superseded 或 cancelled，並釋放其 issue admission claim（唯一能安全放行重新派工的方式）",
+    )
+    .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
+    .addOption(
+      new Option("--as <verdict>", "終態判定")
+        .choices(["superseded", "cancelled"])
+        .makeOptionMandatory(),
+    )
+    .option("--superseded-by <job-id>", "取代此 job 的新 job id（--as superseded 時必填）")
+    .action(
+      (options: {
+        readonly job: string;
+        readonly as: "superseded" | "cancelled";
+        readonly supersededBy?: string;
+      }) =>
+        action(state, io, () =>
+          handlers.dispatchResolve({
+            jobId: options.job,
+            as: options.as,
+            ...(options.supersededBy === undefined
+              ? {}
+              : { supersededByJobId: options.supersededBy }),
+          }),
+        )(),
     );
 
   program

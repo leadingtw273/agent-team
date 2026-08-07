@@ -33,6 +33,7 @@ function output() {
 function handlers(outcome: CliCommandOutcome = { state: "success" }) {
   return {
     run: vi.fn(() => Promise.resolve(outcome)),
+    dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     health: vi.fn(() => Promise.resolve(outcome)),
@@ -65,6 +66,7 @@ describe("agent-team CLI contract", () => {
       Commands:
         run [options]                輪詢 Linear 待執行工單、評估 eligibility、取租約並建立
                                      Job（C015a：接單半場，不執行模型／不啟動 pipeline）
+        dispatch                     C015o：手動收斂卡住的 dispatch job
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
         health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑

@@ -54,6 +54,7 @@ import { trustedProjectConfigSchema } from "../../src/application/projects/index
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
+import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
 import { headShaSchema } from "../../src/domain/review/index.js";
 
 const run = promisify(execFile);
@@ -311,9 +312,13 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     };
 
     // === Real discovery (real parseReadyGateTemplate) -> real eligibility -> real dispatch ===
+    // C015o decision 3: a real, file-backed admission store (same temp root as everything else
+    // this fixture already uses), never the ephemeral in-memory one -- this is the genuine-run
+    // path, not `--dry-run`.
+    const admission = new FileIssueAdmissionStore(join(root, "state", "dispatch", "admission"));
     const dispatched = await dispatchOnce(
       ready,
-      { leases: new LeaseCoordinator(leases), jobs },
+      { leases: new LeaseCoordinator(leases), jobs, admission },
       "holder-e2e",
     );
     if (dispatched.outcome !== "ran") {

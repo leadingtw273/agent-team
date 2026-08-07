@@ -65,6 +65,18 @@ const instantSchema = z
 /** Decimal PR number, never the opaque GitHub node id -- see this file's own header (O009c). */
 const changeRequestNumberSchema = z.string().regex(/^\d+$/u).max(20);
 
+/** Bounded, structural cap only -- the *policy* cap (2 attempts, decision 2's
+ * `reviewProviderRetries`/`ciProviderRetries`) is enforced by resume-composition.ts before it ever
+ * writes a record with this stage; this schema-level bound exists only to keep the field itself
+ * sane (never negative, never absurdly large) regardless of caller bugs. */
+const providerRetryCountSchema = z.number().int().min(0).max(100);
+/** The `DomainError.code` string that caused this retry -- purely for a human/log to read (see
+ * this store's own header: `stage` carries no engine meaning). Not re-validated against
+ * `DomainErrorCode`'s fixed enum here deliberately -- this file must never need to import that
+ * enum just to stay in sync with it; resume-composition.ts is what decides whether a code is
+ * `retryable` before ever reaching this stage at all. */
+const lastErrorCodeSchema = z.string().trim().min(1).max(64);
+
 export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("implementing") }).strict(),
   z.object({ kind: z.literal("ci_waiting") }).strict(),
@@ -80,6 +92,35 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   // A resume attempt found the recorded state did not match live reality (branch/head SHA/open
   // status mismatch) -- fail-closed: never guessed at, never auto-corrected, left for a human.
   z.object({ kind: z.literal("requires_manual") }).strict(),
+  // C015o decision 2: `ReviewerPipeline.run()`/`CiRecoveryPipeline.run()` returned `state:"failed"`
+  // with a *retryable* `DomainError` (timeout/unavailable/rate_limited/quota_unknown/interrupted)
+  // at a provider-invocation stage -- not a state mismatch, not a permission/invariant/conflict
+  // error, which still go straight to `requires_manual`. Resumable (see `resumableStageKinds`
+  // below) up to a fixed attempt cap tracked by `retries`; the cap itself is enforced by
+  // resume-composition.ts, which transitions to `requires_manual` once exhausted.
+  z
+    .object({
+      kind: z.literal("review_pending_retry"),
+      retries: providerRetryCountSchema,
+      lastErrorCode: lastErrorCodeSchema,
+    })
+    .strict(),
+  // Symmetric to `review_pending_retry`, for `CiRecoveryPipeline.run()`'s own retryable
+  // `provider_start`/`provider_run` failures -- named to pair visibly with its reviewer sibling.
+  z
+    .object({
+      kind: z.literal("ci_pending_retry"),
+      retries: providerRetryCountSchema,
+      lastErrorCode: lastErrorCodeSchema,
+    })
+    .strict(),
+  // C015o decision 4: an explicit, human-issued terminal verdict via `agent-team dispatch resolve`
+  // -- this job's own work is being abandoned in favor of `supersededByJobId` (a different job that
+  // now owns this issue, e.g. after a duplicate-dispatch incident). Never written automatically.
+  z.object({ kind: z.literal("superseded"), supersededByJobId: jobIdSchema }).strict(),
+  // C015o decision 4: an explicit, human-issued terminal verdict via `agent-team dispatch resolve`
+  // -- this job's work is abandoned outright, no successor job. Never written automatically.
+  z.object({ kind: z.literal("cancelled") }).strict(),
 ]);
 
 export type JobProgressStage = z.infer<typeof jobProgressStageSchema>;
