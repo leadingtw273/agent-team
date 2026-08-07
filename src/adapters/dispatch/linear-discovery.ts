@@ -42,7 +42,8 @@ export type LinearDiscoverySkipReason =
   | Readonly<{ code: "not_ready" }>
   | Readonly<{ code: "no_agent_role" }>
   | Readonly<{ code: "dependencies_unparsed" }>
-  | Readonly<{ code: "issue_invalid" }>;
+  | Readonly<{ code: "issue_invalid" }>
+  | Readonly<{ code: "missing_change_regions" }>;
 
 export interface LinearDiscoverySkippedIssue {
   readonly externalIssueId: string;
@@ -190,6 +191,30 @@ export async function discoverReadyDispatchCandidates(
         Object.freeze({
           externalIssueId,
           reason: Object.freeze({ code: "issue_invalid" as const }),
+        }),
+      );
+      continue;
+    }
+    // C015j: `evaluateEligibility` (src/domain/eligibility/decision.ts) never checks
+    // `changeRegions` -- it is not one of the fields the Ready Gate contract makes a hard
+    // eligibility blocker -- but `ImplementerPipeline.run()`'s `requestShapeValid`
+    // (src/application/pipelines/implementer.ts) hard-requires it non-empty for the one role
+    // that actually drives that pipeline today (`role === "implementer"`, see
+    // src/cli/dispatch/handlers.ts's `pipeline: "not_applicable_role"` branch for every other
+    // role). Without this check, a candidate with no `changeRegions` would sail through
+    // eligibility, get dispatched, acquire a lease and a job, and only then fail at the
+    // pipeline-request stage with a generic `invariant_violation` -- exactly what E101's first
+    // real run hit. Skipping here (visibly, via its own reason code, mirroring
+    // `dependencies_unparsed` above) closes that gap without touching `evaluateEligibility`'s
+    // own blocker set (a domain-layer change) or `requestShapeValid`'s semantics (an
+    // application-layer change) -- both remain exactly as before. Scoped to the implementer
+    // role specifically: no other role's pipeline currently reads `changeRegions` at all, so
+    // gating universally would incorrectly block roles that have no such requirement.
+    if (issue.value.agentRole === "implementer" && issue.value.changeRegions === undefined) {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "missing_change_regions" as const }),
         }),
       );
       continue;

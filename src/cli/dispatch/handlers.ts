@@ -124,7 +124,29 @@ function pipelineOutcomePayload(
         ...(outcome.toolSummary === undefined ? {} : { toolSummary: outcome.toolSummary }),
       });
     case "failed":
-      return Object.freeze({ pipeline: "failed", stage: outcome.stage, error: outcome.error });
+      return Object.freeze({
+        pipeline: "failed",
+        stage: outcome.stage,
+        error: outcome.error,
+        // C015j (side item): `ImplementerPipeline.run()`'s own internal request-shape validation
+        // (`requestShapeValid`/`validRequest`, src/application/pipelines/implementer.ts) fails
+        // closed with a single generic `domainError("invariant_violation")` for every one of the
+        // many distinct things it checks (idempotency key shape, worktree path, branch, model,
+        // deadline, changeRegions, ...) -- `DomainError.code` is a fixed, small enum (see
+        // domain/foundation/error.ts) that cannot grow a dedicated code per check without
+        // touching the domain foundation type itself (an engine change, outside this ticket's
+        // authority). This adds a fixed, diagnosable CLI-layer reason on top -- it never changes
+        // `error.code` itself, which is still exactly what the engine returned; it only gives an
+        // operator reading `agent-team run`'s JSON output something more specific than
+        // `invariant_violation` to search for. C015j's main fix (the discovery-layer
+        // `missing_change_regions` skip, src/adapters/dispatch/linear-discovery.ts) already
+        // prevents the one known *data-quality* cause of this stage failing for implementer-role
+        // candidates -- what is left here is a genuine internal-invariant failure (a bug in this
+        // CLI layer's own `buildImplementerPipelineRequest`, not a bad Linear issue).
+        ...(outcome.stage === "request"
+          ? { pipelineReason: "implementer_pipeline_request_rejected" }
+          : {}),
+      });
   }
 }
 

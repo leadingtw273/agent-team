@@ -125,10 +125,22 @@ function baseSnapshotFields() {
   };
 }
 
+/** C015j: the default `snapshot()` fixture must carry `changeRegions` (via a minimal, valid Ready
+ * Gate description containing only that one heading -- `parseReadyGateTemplate` already tolerates
+ * a description with just one heading, see the `dependencies_unparsed` fixture below for the same
+ * technique) so that every existing test built on top of the bare `snapshot()` default continues
+ * to represent a genuinely dispatch-shaped implementer candidate, not the exact gap this ticket
+ * closes (an implementer-role issue missing `changeRegions`). Tests that want to exercise the gap
+ * itself override `description` explicitly (see the dedicated test below). */
+function minimalChangeRegionsDescription(): string {
+  return `## ${readyGateTemplateHeadings.changeRegions}\n- src/adapters/dispatch/linear-discovery.ts\n`;
+}
+
 function snapshot(overrides: Partial<LinearIssueSnapshot> = {}): LinearIssueSnapshot {
   return Object.freeze({
     ...baseSnapshotFields(),
     agentRole: "implementer" as const,
+    description: minimalChangeRegionsDescription(),
     ...overrides,
   });
 }
@@ -260,6 +272,68 @@ describe("discoverReadyDispatchCandidates", () => {
     expect(result.value.skipped).toEqual([
       { externalIssueId: "linear-issue-1", reason: { code: "dependencies_unparsed" } },
     ]);
+  });
+
+  /**
+   * C015j: closes the gap C015e's own backlog note flagged -- `evaluateEligibility`
+   * (src/domain/eligibility/decision.ts) never checks `changeRegions`, but
+   * `ImplementerPipeline.run()`'s `requestShapeValid` (src/application/pipelines/implementer.ts)
+   * hard-requires it non-empty for the implementer role, so without this discovery-layer skip an
+   * implementer-role candidate missing `changeRegions` would pass eligibility, get dispatched,
+   * and only then fail at the pipeline-request stage with a generic `invariant_violation` --
+   * exactly what E101's first real run hit.
+   */
+  it("C015j: skips (visibly, with its own reason) an implementer-role issue missing changeRegions", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(snapshot({ description: `## ${readyGateTemplateHeadings.goal}\n目標內容\n` })),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "missing_change_regions" } },
+    ]);
+  });
+
+  /**
+   * C015j: the `missing_change_regions` skip is scoped to the implementer role specifically --
+   * no other role currently drives a pipeline that reads `changeRegions` at all (see
+   * src/cli/dispatch/handlers.ts's `pipeline: "not_applicable_role"` branch), so gating
+   * universally would incorrectly block roles that have no such requirement.
+   */
+  it("C015j: does not require changeRegions for a non-implementer role", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              agentRole: "code_reviewer",
+              description: `## ${readyGateTemplateHeadings.goal}\n目標內容\n`,
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.skipped).toHaveLength(0);
+    expect(result.value.candidates).toHaveLength(1);
+    expect(result.value.candidates[0]?.issue.agentRole).toBe("code_reviewer");
+    expect(result.value.candidates[0]?.issue.changeRegions).toBeUndefined();
   });
 
   it("skips (and reports, never silently drops) an issue with no agent-role label", async () => {
