@@ -45,6 +45,21 @@ const projectedChangeRequestSchema = z
     // C015x decision 2: GitHub's own `mergeable_state` -- see `ChangeRequestSnapshot.mergeStateStatus`'s
     // own header (application/ports/source-control.ts) for why this is required here (the real
     // adapter always populates it) despite being optional on that port-level type.
+    //
+    // C015y decision B: this is the *only* validation of `.mergeable_state` -- `changeRequestProjection`
+    // below passes it through verbatim (no jq-side `if/elif ... else "unknown"` mapping anymore).
+    // Three cases, all handled correctly by this schema alone:
+    // - GitHub explicitly returns the literal string `"unknown"` -- a legitimate transient (GitHub
+    //   is still computing mergeability) -- passes this enum, stays `"unknown"`.
+    // - The field is missing, `null`, or GitHub renames/typos it -- jq's `.mergeable_state` on a
+    //   missing/null field yields JSON `null`, which this enum rejects -- the whole response fails
+    //   schema validation -> `external_failure`. This is deliberately *not* silently downgraded to
+    //   `"unknown"` (the pre-C015y jq expression's own broad `else "unknown"` fallback did exactly
+    //   that, and could never be caught by any test: see this file's own header on why no test ever
+    //   executed the real jq string before this ticket).
+    // - GitHub adds a genuinely new `mergeable_state` value this enum does not yet list -- also
+    //   rejected by this same schema, fail-closed rather than silently treated as `"unknown"` --
+    //   the enum must be explicitly extended once that value's real semantics are known.
     mergeStateStatus: z.enum([
       "clean",
       "behind",
@@ -137,8 +152,19 @@ const readyForReviewMutationSchema = z
   .strict();
 const squashMergeResultSchema = z.object({ merged: z.boolean() }).strict();
 
+// C015y decision B: `mergeStateStatus` used to be its own `if/elif ... else "unknown"` chain here
+// -- a *broad fallback* that silently mapped every unrecognized/missing `.mergeable_state` value
+// to the same `"unknown"` this schema also treats as a legitimate transient, making a schema/field
+// typo structurally indistinguishable from GitHub's own "still computing" signal. Passing
+// `.mergeable_state` straight through and letting `projectedChangeRequestSchema`'s existing
+// `z.enum([...])` be the *only* validation means a missing/null/typo'd field now fails schema
+// validation (`external_failure`) instead of silently degrading -- see that schema field's own
+// comment for the full three-way breakdown. `mergeability` (the boolean-derived 3-state field)
+// keeps its own `if/elif/else` mapping unchanged -- that `else "unknown"` is a genuine, correct
+// 2-valued-boolean-to-3-state map (GitHub's `.mergeable` is `true`/`false`/`null`), not a
+// many-values-collapsed-into-one-catch-all like the one this ticket removes.
 const changeRequestProjection =
-  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:(if .mergeable_state == "behind" then "behind" elif .mergeable_state == "clean" then "clean" elif .mergeable_state == "blocked" then "blocked" elif .mergeable_state == "dirty" then "dirty" elif .mergeable_state == "draft" then "draft" elif .mergeable_state == "unstable" then "unstable" else "unknown" end),baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
+  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:.mergeable_state,baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
 const repositoryMetadataProjection = "{defaultBranch:.default_branch}";
 const checkProjection =
   '{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),url:.html_url}';

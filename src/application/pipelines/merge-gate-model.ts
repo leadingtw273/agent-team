@@ -178,6 +178,14 @@ export type EnableAutoMergeOutcome =
         | "draft"
         | "merge_conflict"
         | "mergeability_unknown"
-        | "review_status_missing";
+        | "review_status_missing"
+        // C015y decision D: GitHub's own `mergeable_state` reads `"behind"` -- this project's own
+        // `strictRequiredStatusChecksPolicy` ruleset (O004) means GitHub can never execute this
+        // merge while behind, no matter how "mergeable" the boolean-derived `mergeability` field
+        // above independently claims. Checked at *both* readback points inside `enable()` (the
+        // very first readback and the immediately-pre-merge readback) -- never just one -- so a PR
+        // that only becomes behind in the narrow window between them is still caught before this
+        // gate ever calls `enableAutoMerge`.
+        | "behind";
     }>
   | Readonly<{ state: "failed"; stage: MergeGateFailureStage; error: DomainError }>;

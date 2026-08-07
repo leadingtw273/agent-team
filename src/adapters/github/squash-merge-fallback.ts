@@ -31,6 +31,12 @@ export function isSafeToSquashMergeDirectly(
     current.value.state === "open" &&
     !current.value.draft &&
     current.value.mergeability === "mergeable" &&
+    // C015y decision D (arm-time interception, point 3 of 3): `mergeability === "mergeable"`
+    // alone can still be BEHIND -- see `EnableAutoMergeOutcome`'s `"behind"` reason header
+    // (merge-gate-model.ts) for why that matters here too. `mergeStateStatus` is optional purely
+    // for pre-existing test-fixture back-compat (see `ChangeRequestSnapshot.mergeStateStatus`'s
+    // own header) -- an omitted value is never treated as behind.
+    current.value.mergeStateStatus !== "behind" &&
     current.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase()
   );
 }

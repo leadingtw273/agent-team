@@ -377,6 +377,14 @@ export class AutoMergeGate {
     if (current.value.mergeability === "unknown") {
       return Object.freeze({ state: "not_ready", reason: "mergeability_unknown" });
     }
+    // C015y decision D (arm-time interception, point 1 of 3): `mergeability === "mergeable"` can
+    // still be BEHIND -- `mergeability` is derived only from GitHub's boolean `.mergeable`, which
+    // says nothing about O004's `strictRequiredStatusChecksPolicy` ruleset ever refusing to
+    // execute the merge while behind. Never arm auto-merge on a BEHIND PR in the first place; see
+    // this outcome's own header (merge-gate-model.ts) for the other two interception points.
+    if (current.value.mergeStateStatus === "behind") {
+      return Object.freeze({ state: "not_ready", reason: "behind" });
+    }
 
     const checks = await this.ports.sourceControl.getCommitChecks(
       { project: request.project },
@@ -487,6 +495,14 @@ export class AutoMergeGate {
     if (!beforeMerge.ok) return mergeFailure("change_request", beforeMerge.error);
     if (alreadyMergedExternally(beforeMerge.value, request.expectedHeadSha)) {
       return Object.freeze({ state: "already_merged_external", changeRequest: beforeMerge.value });
+    }
+    // C015y decision D (arm-time interception, point 2 of 3): catches a PR that only became
+    // BEHIND in the narrow window between the very first readback above and this immediately-
+    // pre-merge one -- same `not_ready`/`"behind"` shape as point 1, not folded into the generic
+    // `mergeFailure("change_request", conflict)` block below, so `resumeUnderLease`'s own
+    // `switch(enabled.reason)` handles both interception points identically.
+    if (beforeMerge.value.mergeStateStatus === "behind") {
+      return Object.freeze({ state: "not_ready", reason: "behind" });
     }
     if (
       beforeMerge.value.state !== "open" ||

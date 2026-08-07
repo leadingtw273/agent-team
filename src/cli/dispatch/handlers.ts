@@ -317,6 +317,19 @@ export function createDispatchCliHandlers(
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
             admission: buildIssueAdmissionStore(options.agentTeamHome),
+            // C015y decision A: only ever exercised when `resumeUnderLease` finds a *legacy*
+            // (pre-C015y) job-progress record with no persisted `baseRevision` -- see
+            // `resolveLegacyBaseRevision`'s own header (resume-composition.ts). Bound to the exact
+            // same `resolveAuthoritativeBaseRevision` fresh dispatch uses just above, with fresh,
+            // stateless port instances for the same reason that call site's own comment gives (cheap,
+            // no shared state to duplicate) -- this is never a second, independently-drifting
+            // implementation of "what counts as authoritative."
+            resolveAuthoritativeBase: (project, resolveOptions) =>
+              (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
+                project,
+                { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
+                resolveOptions,
+              ),
           });
           if (!cycle.ok) {
             return outcome("failed", {
@@ -520,6 +533,23 @@ export function createDispatchCliHandlers(
                 error: { code: "invariant_violation" },
               });
             }
+            // C015y decision A: the same authoritative SHA this dispatch just pinned the worktree
+            // to (`authoritativeBase.value.baseRevision`) is persisted here as this job's
+            // henceforth-immutable `baseRevision` -- see job-progress-store.ts's own header on
+            // that field. `authoritativeBase.value.baseRevision` is already a real git SHA
+            // (`resolveAuthoritativeBaseRevision`'s own contract), so this parse only guards
+            // against a malformed injected test fake; it is never expected to fail in production.
+            const dispatchBaseRevision = headShaSchema.safeParse(
+              authoritativeBase.value.baseRevision,
+            );
+            if (!dispatchBaseRevision.success) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: { code: "invariant_violation" },
+              });
+            }
             const recorded = await progress.compareAndSwap(result.job.id, null, {
               jobId: result.job.id,
               projectId: build.value.project.id,
@@ -531,6 +561,7 @@ export function createDispatchCliHandlers(
               worktreePath: request.value.worktreePath,
               changeRequestId: String(pipelineOutcome.changeRequest.number),
               headSha: headSha.data,
+              baseRevision: dispatchBaseRevision.data,
             });
             if (!recorded.ok) {
               return outcome("failed", {

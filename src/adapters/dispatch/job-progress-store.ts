@@ -114,6 +114,15 @@ export const requiresManualReasonCodeSchema = z.enum([
   "invalid_deadline",
   "invalid_head_sha",
   "invalid_checkpoint_id",
+  // C015y decision A: a *legacy* (pre-C015y) record has no persisted `baseRevision` --
+  // `resolveLegacyBaseRevision` (resume-composition.ts) re-resolves the authoritative base and
+  // cross-checks it against this exact resume's own fresh PR readback (`baseSha`) before ever
+  // trusting it. This reasonCode covers that cross-check failing (mismatch, or the freshly
+  // resolved value not even being a well-formed SHA) -- never the resolution call itself failing,
+  // which reuses `base_revision_unavailable` below (the same reasonCode fresh dispatch already
+  // uses for that failure mode, via `requiresManualUnlessRetryable`). Fail-closed by design: this
+  // never guesses which of the two conflicting values (if either) is actually correct.
+  "legacy_base_revision_mismatch",
   // ci_recovery
   "ci_recovery_paused",
   "ci_recovery_failed",
@@ -138,7 +147,21 @@ export const requiresManualReasonCodeSchema = z.enum([
   // C015x decision 3: `mergingNoProgressLimit` consecutive resumes observed the exact same
   // authoritative readback fingerprint (head SHA, base SHA, mergeable state, merged) -- auto-merge
   // was enabled, but GitHub has not moved the PR forward at all across every one of those resumes.
+  // C015y decision C: this reasonCode is now reached by *either* half of a two-layer wall-clock
+  // rule (see `resumeMergingStage`'s own header, resume-composition.ts) -- the `ResumeJobOutcome`'s
+  // own `reason` string (never this persisted enum) distinguishes which half fired, for a
+  // human/log reading it.
   "auto_merge_stalled",
+  // C015y decision C: `mergeStateStatus` has read `"unknown"` on every one of at least
+  // `mergeStateUnknownMinReadbacks` consecutive *fresh* readbacks, spanning at least
+  // `mergeStateUnknownWallClockMs` wall-clock -- GitHub's own "still computing" transient must not
+  // be allowed to stall this job forever just because it never happens to resolve to a concrete
+  // state. Deliberately independent of `auto_merge_stalled` above (that reasonCode's own
+  // `noProgressCount`/wall-clock tracking never even advances while `mergeStateStatus` is
+  // `"unknown"` -- see this file's own `merging` stage schema comment on `unknownSince`/
+  // `unknownCount`). The 30-minute absolute deadline (`auto_merge_stalled`'s own second OR-branch)
+  // still applies independently and unconditionally even while this is flapping.
+  "merge_state_unknown_timeout",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 
@@ -165,6 +188,25 @@ const mergeReadbackFingerprintSchema = z
   .strict();
 export type MergeReadbackFingerprint = z.infer<typeof mergeReadbackFingerprintSchema>;
 
+/** C015y decision C: the wall-clock evidence codex's review named as missing from every
+ * `"merging"`-stage `requires_manual` escalation -- `armedAt`/`lastProgressAt`/`observedAt`/
+ * `elapsedMs` (the exact four fields the ticket text specifies), so a human reading a stalled job's
+ * `cause` can see *how long* it has actually been stuck, not just an invocation count.
+ * `lastProgressAt` is optional here for the one legitimate case where it genuinely never existed:
+ * a job escalating on the 30-minute absolute deadline before any concrete (non-`"unknown"`)
+ * fingerprint was ever observed at all. `elapsedMs` is always measured from `armedAt` to
+ * `observedAt` -- the one wall-clock quantity that is unambiguous regardless of which of the two
+ * OR-branches fired. */
+const requiresManualStallTimingSchema = z
+  .object({
+    armedAt: instantSchema,
+    lastProgressAt: instantSchema.optional(),
+    observedAt: instantSchema,
+    elapsedMs: z.number().int().nonnegative(),
+  })
+  .strict();
+export type RequiresManualStallTiming = z.infer<typeof requiresManualStallTimingSchema>;
+
 export const requiresManualCauseSchema = z
   .object({
     stage: requiresManualStageSchema,
@@ -175,12 +217,18 @@ export const requiresManualCauseSchema = z
         lastCategory: reportContractFailureCategorySchema.optional(),
       })
       .strict(),
-    // C015x decision 3: populated only for the two merge-stage reasonCodes this ticket adds
-    // (`change_request_behind_base`/`auto_merge_stalled`) -- the coordinator's explicit "保留當時
-    // head/base SHA 與狀態證據於 cause" requirement. Optional for every other reasonCode and for
-    // every pre-existing, un-migrated `cause` record (same backward-compatibility rationale as
-    // `cause` itself being optional on the stage below -- see this file's own header comment).
+    // C015x decision 3: populated only for the merge-stage reasonCodes this ticket (and C015y)
+    // add (`change_request_behind_base`/`auto_merge_stalled`/`merge_state_unknown_timeout`) -- the
+    // coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause" requirement. Optional for
+    // every other reasonCode and for every pre-existing, un-migrated `cause` record (same
+    // backward-compatibility rationale as `cause` itself being optional on the stage below -- see
+    // this file's own header comment).
     mergeEvidence: mergeReadbackFingerprintSchema.optional(),
+    // C015y decision C: populated only for `auto_merge_stalled`/`merge_state_unknown_timeout` --
+    // see `requiresManualStallTimingSchema`'s own header. Optional for the same reason
+    // `mergeEvidence` above is: every other reasonCode, and every pre-existing record written
+    // before this ticket, never has it.
+    stallTiming: requiresManualStallTimingSchema.optional(),
   })
   .strict();
 export type RequiresManualCause = z.infer<typeof requiresManualCauseSchema>;
@@ -206,6 +254,24 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
       armedAt: instantSchema.optional(),
       fingerprint: mergeReadbackFingerprintSchema.optional(),
       noProgressCount: z.number().int().min(0).max(1_000).optional(),
+      // C015y decision C: the wall-clock half of the bounded wait `armedAt` alone never actually
+      // gated (codex's review confirmed this was always the original, half-implemented
+      // requirement) -- updated *only* when the observed fingerprint changes substantively; never
+      // touched by re-persisting an unchanged fingerprint, and never touched while
+      // `mergeStateStatus` reads `"unknown"` (see `unknownSince`/`unknownCount` below for that
+      // separate machinery). Optional for the same backward-compatibility reason every other field
+      // on this stage is.
+      lastProgressAt: instantSchema.optional(),
+      // C015y decision C: tracks a currently-in-progress streak of consecutive *fresh* `"unknown"`
+      // `mergeStateStatus` readings -- deliberately independent of `noProgressCount`/
+      // `lastProgressAt` above (an `"unknown"` reading means GitHub is still computing, which is
+      // neither evidence of progress nor of no-progress on the underlying merge itself).
+      // `unknownSince` is when the *current* unknown streak began; `unknownCount` is how many
+      // consecutive fresh readbacks it has spanned. Both are cleared (not merely zeroed) the
+      // moment a non-`"unknown"` reading is observed again -- see `resumeMergingStage`'s own
+      // header, resume-composition.ts.
+      unknownSince: instantSchema.optional(),
+      unknownCount: z.number().int().min(0).max(1_000).optional(),
     })
     .strict(),
   z.object({ kind: z.literal("completed") }).strict(),
@@ -292,6 +358,20 @@ export const jobProgressRecordSchema = z
     worktreePath: z.string().startsWith("/").min(2).max(1024),
     changeRequestId: changeRequestNumberSchema.optional(),
     headSha: headShaSchema.optional(),
+    /** C015y decision A: the authoritative base revision dispatch resolved *once*
+     * (`resolveAuthoritativeBaseRevision`, authoritative-base.ts) -- written exactly once, at the
+     * same moment `changeRequestId`/`headSha` above are first learned (see `handlers.ts`'s own
+     * dispatch-time write), and never overwritten afterward: every `resumeUnderLease` call reads
+     * this value back rather than re-deriving it from whatever the local git checkout happens to
+     * be pointed at that moment (the exact bug this ticket closes -- see this module's own header
+     * for why that mattered: a floating base makes the reviewer/merge-gate diff digest computed
+     * against a moving target). Optional purely for backward compatibility with records written by
+     * C015x and earlier (this ticket, like every prior one touching this store, is forbidden from
+     * editing or migrating any existing file under `~/.agent-team/state`) -- `resolveLegacyBaseRevision`
+     * (resume-composition.ts) is what repairs a legacy record missing this field, itself CAS-writing
+     * this exact field once it has cross-checked a freshly re-resolved value against this exact
+     * resume's own fresh PR readback. */
+    baseRevision: headShaSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict();
