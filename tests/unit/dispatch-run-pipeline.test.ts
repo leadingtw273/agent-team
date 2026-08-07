@@ -17,7 +17,7 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ok } from "../../src/domain/foundation/index.js";
+import { domainError, ok } from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
 import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
@@ -374,6 +374,44 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as { pipeline: string; stage: string };
     expect(payload.pipeline).toBe("failed");
     expect(payload.stage).toBe("provider_run");
+  });
+
+  /**
+   * C015j (side item): a `stage:"request"` pipeline failure (`ImplementerPipeline.run()`'s own
+   * `requestShapeValid`/`validRequest` -- src/application/pipelines/implementer.ts -- always
+   * returns a generic `domainError("invariant_violation")`, never anything more specific) must
+   * still surface a fixed, diagnosable `pipelineReason` in this CLI layer's JSON output, on top
+   * of (never replacing) the engine's own `error.code`.
+   */
+  it('adds a fixed, diagnosable pipelineReason for a stage:"request" pipeline failure', async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "failed",
+            stage: "request",
+            error: domainError("invariant_violation"),
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      stage: string;
+      pipelineReason: string;
+      error: { code: string };
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.stage).toBe("request");
+    expect(payload.pipelineReason).toBe("implementer_pipeline_request_rejected");
+    // The engine's own error code is preserved verbatim, not overwritten by the new CLI-layer
+    // reason.
+    expect(payload.error.code).toBe("invariant_violation");
   });
 
   it("maps a blocked pipeline composition (no gh auth) to a failed payload with the fixed message", async () => {
