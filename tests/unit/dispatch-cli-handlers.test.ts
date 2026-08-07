@@ -629,7 +629,7 @@ describe("createDispatchCliHandlers resume wiring (C015c item 2)", () => {
                   state: "completed",
                   merge: "authorized",
                   headSha: mergedChangeRequestFixture().headSha,
-                  autoMergePaused: false,
+                  autoMergeDisposition: "not_required" as const,
                 }),
             },
           },
