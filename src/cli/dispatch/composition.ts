@@ -62,6 +62,7 @@ import {
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
+import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { FileRegistrationSetupActivationRegistry } from "../../adapters/registration/index.js";
 import {
   Dispatcher,
@@ -69,11 +70,13 @@ import {
   type DispatcherResult,
 } from "../../application/dispatch/index.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../application/leases/index.js";
+import type { ProcessPort } from "../../application/ports/index.js";
 import {
   ProjectRegistry,
   TrustedProjectConfigLoader,
   type ProjectRegistrySnapshot,
   type TrustedProjectActivationPort,
+  type TrustedProjectConfig,
   type TrustedProjectGitPort,
   type TrustedProjectRejectionReason,
 } from "../../application/projects/index.js";
@@ -87,6 +90,12 @@ import {
   loadHostRegistrationSetupDraft,
 } from "../registration/draft-store.js";
 import { readLinearApiKey } from "../registration/secrets.js";
+import { observeClaudeRouteCandidates } from "./claude-observation.js";
+import {
+  defaultDispatchProviderConfigPath,
+  loadHostDispatchProviderConfig,
+  type DispatchProviderConfig,
+} from "./provider-config-store.js";
 import {
   defaultDispatchRoutingConfigPath,
   loadHostDispatchRoutingConfig,
@@ -96,6 +105,7 @@ export type DispatchCompositionBlockedReason =
   | "draft_unavailable"
   | "linear_api_key_missing"
   | "routing_config_unavailable"
+  | "provider_config_unavailable"
   | TrustedProjectRejectionReason;
 
 export interface DispatchCompositionReady {
@@ -109,6 +119,15 @@ export interface DispatchCompositionReady {
     readonly readModel: LinearReadModel;
   };
   readonly project: ProjectRegistrySnapshot["ready"][number]["project"];
+  /** The same entry's trusted config (src/application/projects/loader.ts) -- C015b's run-flow
+   * needs this to build an `ImplementerPipelineRequest`; C015a never needed it because it never
+   * ran a pipeline. */
+  readonly trustedConfig: TrustedProjectConfig;
+  readonly claude: {
+    readonly config: DispatchProviderConfig["claude"];
+    /** Injectable for tests; production defaults to a real `ChildProcessRunner` (R001). */
+    readonly process: ProcessPort;
+  };
 }
 
 export type BuildDispatchCompositionResult =
@@ -124,6 +143,8 @@ export interface BuildDispatchCompositionOptions {
    * production defaults to a real `LocalGitAdapter`/`FileRegistrationSetupActivationRegistry`. */
   readonly gitPort?: TrustedProjectGitPort;
   readonly activationPort?: TrustedProjectActivationPort;
+  /** Injectable for tests; production defaults to a real `ChildProcessRunner`. */
+  readonly claudeProcessPort?: ProcessPort;
 }
 
 export interface DispatchOncePorts {
@@ -170,6 +191,14 @@ export async function dispatchOnce(
   if (!discovered.ok) {
     return Object.freeze({ outcome: "discovery_failed" as const, error: discovered.error });
   }
+  // C015b item 2: a real (not hard-coded-empty) observation -- see claude-observation.ts's own
+  // header for exactly what "real" means here (a live `--version` probe, not a static echo) and
+  // what it deliberately does not attempt (quota tracking; no adapter for that exists yet).
+  const routeObservations = await observeClaudeRouteCandidates({
+    process: ready.claude.process,
+    config: ready.claude.config,
+    workingDirectory: ready.project.localRepositoryPath,
+  });
   const dispatcher = new Dispatcher(ports);
   const result = await dispatcher.dispatch({
     holderId,
@@ -177,7 +206,7 @@ export async function dispatchOnce(
     registry: ready.registry,
     active: [],
     routingConfig: ready.routingConfig,
-    routeObservations: [],
+    routeObservations,
   });
   return Object.freeze({
     outcome: "ran" as const,
@@ -206,6 +235,12 @@ export async function buildDispatchComposition(
   const routingConfig = await loadHostDispatchRoutingConfig(routingConfigPath);
   if (!routingConfig.ok) {
     return Object.freeze({ state: "blocked", reason: "routing_config_unavailable" });
+  }
+
+  const providerConfigPath = defaultDispatchProviderConfigPath(agentTeamHome);
+  const providerConfig = await loadHostDispatchProviderConfig(providerConfigPath);
+  if (!providerConfig.ok) {
+    return Object.freeze({ state: "blocked", reason: "provider_config_unavailable" });
   }
 
   const stateRoot = join(agentTeamHome, "state");
@@ -253,6 +288,11 @@ export async function buildDispatchComposition(
         readModel,
       }),
       project: readyEntry.project,
+      trustedConfig: readyEntry.config,
+      claude: Object.freeze({
+        config: providerConfig.value.claude,
+        process: options.claudeProcessPort ?? new ChildProcessRunner(),
+      }),
     }),
   });
 }

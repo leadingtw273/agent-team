@@ -148,6 +148,17 @@ async function writeRoutingConfig(agentTeamHome: string, value: unknown): Promis
   await writeFile(join(directory, "routing.json"), JSON.stringify(value), "utf8");
 }
 
+const validProviderConfig = {
+  schemaVersion: 1,
+  claude: { executable: "claude", models: ["opus"], account: "default" },
+};
+
+async function writeProviderConfig(agentTeamHome: string, value: unknown): Promise<void> {
+  const directory = join(agentTeamHome, "config", "dispatch");
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "providers.json"), JSON.stringify(value), "utf8");
+}
+
 describe("buildDispatchComposition", () => {
   it("blocks with draft_unavailable when no draft file exists", async () => {
     const agentTeamHome = await temporaryHome();
@@ -191,10 +202,40 @@ describe("buildDispatchComposition", () => {
     expect(result).toEqual({ state: "blocked", reason: "routing_config_unavailable" });
   });
 
+  it("blocks with provider_config_unavailable when providers.json is missing, before ever reading activation", async () => {
+    const agentTeamHome = await temporaryHome();
+    await writeDraft(agentTeamHome, project());
+    await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    const result = await buildDispatchComposition({
+      agentTeamHome,
+      projectId,
+      environment: { LINEAR_API_KEY: "test-key" },
+      activationPort: { read: () => Promise.reject(new Error("must never be called")) },
+    });
+    expect(result).toEqual({ state: "blocked", reason: "provider_config_unavailable" });
+  });
+
+  it("blocks with provider_config_unavailable when providers.json fails schema validation", async () => {
+    const agentTeamHome = await temporaryHome();
+    await writeDraft(agentTeamHome, project());
+    await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    await writeProviderConfig(agentTeamHome, {
+      schemaVersion: 1,
+      claude: { executable: "claude" },
+    });
+    const result = await buildDispatchComposition({
+      agentTeamHome,
+      projectId,
+      environment: { LINEAR_API_KEY: "test-key" },
+    });
+    expect(result).toEqual({ state: "blocked", reason: "provider_config_unavailable" });
+  });
+
   it("blocks with activation_missing when the project has never been activated", async () => {
     const agentTeamHome = await temporaryHome();
     await writeDraft(agentTeamHome, project());
     await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    await writeProviderConfig(agentTeamHome, validProviderConfig);
     const config = trustedConfig(project());
     const result = await buildDispatchComposition({
       agentTeamHome,
@@ -210,6 +251,7 @@ describe("buildDispatchComposition", () => {
     const agentTeamHome = await temporaryHome();
     await writeDraft(agentTeamHome, project());
     await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    await writeProviderConfig(agentTeamHome, validProviderConfig);
     const result = await buildDispatchComposition({
       agentTeamHome,
       projectId,
@@ -227,6 +269,7 @@ describe("buildDispatchComposition", () => {
     const agentTeamHome = await temporaryHome();
     await writeDraft(agentTeamHome, project());
     await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    await writeProviderConfig(agentTeamHome, validProviderConfig);
     const config = trustedConfig(project());
     const result = await buildDispatchComposition({
       agentTeamHome,
@@ -242,5 +285,7 @@ describe("buildDispatchComposition", () => {
     expect(result.value.routingConfig).toEqual(validRoutingConfig);
     expect(result.value.registry.ready).toHaveLength(1);
     expect(result.value.project.id).toBe(projectId);
+    expect(result.value.trustedConfig).toEqual(config);
+    expect(result.value.claude.config).toEqual(validProviderConfig.claude);
   });
 });

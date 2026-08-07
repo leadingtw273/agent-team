@@ -40,6 +40,8 @@ const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>
   linear_api_key_missing: "缺少 LINEAR_API_KEY 環境變數。",
   routing_config_unavailable:
     "找不到有效的 Model Routing 設定檔（${AGENT_TEAM_HOME}/config/dispatch/routing.json），或格式不符 schema。",
+  provider_config_unavailable:
+    "找不到有效的 Provider 設定檔（${AGENT_TEAM_HOME}/config/dispatch/providers.json），或格式不符 schema。",
   invalid_registry_entry: "專案設定物件本身不符合 Project schema。",
   trusted_config_missing: "專案 repository 內找不到 .agent-team/project.json。",
   trusted_config_unavailable: "讀取專案 repository 內 .agent-team/project.json 失敗。",

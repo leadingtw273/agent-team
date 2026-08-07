@@ -36,9 +36,9 @@ function project(): Project {
   });
 }
 
-function registry(): ProjectRegistrySnapshot {
+function trustedConfigFixture() {
   const projectValue = project();
-  const config = trustedProjectConfigSchema.parse({
+  return trustedProjectConfigSchema.parse({
     schemaVersion: 1,
     projectId,
     defaultBranch: "main",
@@ -50,8 +50,18 @@ function registry(): ProjectRegistrySnapshot {
     roleInstructions: {},
     commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
   });
+}
+
+function registry(): ProjectRegistrySnapshot {
   return {
-    ready: [{ state: "ready", project: projectValue, config, revisionSha: "a".repeat(40) }],
+    ready: [
+      {
+        state: "ready",
+        project: project(),
+        config: trustedConfigFixture(),
+        revisionSha: "a".repeat(40),
+      },
+    ],
     rejected: [],
   };
 }
@@ -81,6 +91,14 @@ class NeverCalledJobRepository implements JobRepository {
   }
 }
 
+/** Never expected to be called -- discovery fails before `dispatchOnce` ever reaches the
+ * capability probe, so this stub only needs to satisfy the type. */
+class NeverCalledProcessPort {
+  spawn(): ReturnType<import("../../src/application/ports/index.js").ProcessPort["spawn"]> {
+    return Promise.reject(new Error("must never be called: discovery failed first"));
+  }
+}
+
 function readyComposition(readModel: LinearDiscoveryReadModel): DispatchCompositionReady {
   return {
     leases: new NeverCalledLeaseRepository(),
@@ -93,6 +111,11 @@ function readyComposition(readModel: LinearDiscoveryReadModel): DispatchComposit
       readModel: readModel as unknown as LinearReadModel,
     },
     project: project(),
+    trustedConfig: trustedConfigFixture(),
+    claude: {
+      config: { executable: "claude", models: ["opus"], account: "default" },
+      process: new NeverCalledProcessPort(),
+    },
   };
 }
 

@@ -9,15 +9,17 @@
  * would still pass if the candidate were simply ineligible in both modes).
  *
  * `discoverReadyDispatchCandidates` is mocked to return one directly-built, fully-eligible
- * `DispatcherCandidate` (plus one skipped entry, to prove `discoverySkipped` flows through). This
- * is necessary, not a convenience: `linear-discovery.ts`'s `toDomainIssue` does not populate
- * `goal`/`acceptanceCriteria`/`inScope`/`outOfScope`/`estimatedMinutes` on the `Issue` it produces
- * (`LinearIssueSnapshot` has no such fields), so no *real* discovery result can ever pass
- * `evaluateEligibility` today -- see `dispatch-once-lease-conflict.test.ts` for the same
- * work-around and a fuller explanation, and the completion report for this gap disclosed as a
- * residual risk. Without an eligible candidate, the real-mode contrast test could never show a
- * non-zero write count, which would defeat its whole purpose (ruling out "always zero regardless
- * of branch").
+ * `DispatcherCandidate` (plus one skipped entry, to prove `discoverySkipped` flows through) for
+ * determinism -- this file's job is to test the handler's dry-run/real-mode port switching, not
+ * to re-prove eligibility parsing (dispatch-linear-discovery.test.ts already covers a genuine
+ * Ready Gate description end to end). The candidate still uses `workKind:"mechanical"`/
+ * `stage:"ci"` (see `eligibleCandidate()` below) to bypass model routing/routeObservations
+ * entirely, so this handler-level test's outcome does not depend on whatever the real Claude
+ * capability probe (wired into `dispatchOnce` as of item 2) happens to report in this
+ * environment -- see `dispatch-once-lease-conflict.test.ts` for the identical technique and a
+ * fuller explanation. Without an eligible candidate, the real-mode contrast test could never show
+ * a non-zero write count, which would defeat its whole purpose (ruling out "always zero
+ * regardless of branch").
  */
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -104,9 +106,9 @@ function project() {
   });
 }
 
-function registry(): ProjectRegistrySnapshot {
+function trustedConfigFixture() {
   const projectValue = project();
-  const config = trustedProjectConfigSchema.parse({
+  return trustedProjectConfigSchema.parse({
     schemaVersion: 1,
     projectId,
     defaultBranch: "main",
@@ -118,8 +120,18 @@ function registry(): ProjectRegistrySnapshot {
     roleInstructions: {},
     commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
   });
+}
+
+function registry(): ProjectRegistrySnapshot {
   return {
-    ready: [{ state: "ready", project: projectValue, config, revisionSha: "a".repeat(40) }],
+    ready: [
+      {
+        state: "ready",
+        project: project(),
+        config: trustedConfigFixture(),
+        revisionSha: "a".repeat(40),
+      },
+    ],
     rejected: [],
   };
 }
@@ -217,6 +229,37 @@ const unusedReadModel = {
   listIssueIdsInState: () => Promise.reject(new Error("must never be called: discovery is mocked")),
 } as unknown as LinearReadModel;
 
+/** `dispatchOnce` (item 2) now genuinely calls `observeClaudeRouteCandidates` on every
+ * invocation, dry-run or not -- this fake reports a zero exit so the probe resolves cleanly. Its
+ * result has no bearing on this file's assertions: `eligibleCandidate()` is `workKind:"mechanical"`
+ * (see its own comment), which bypasses model routing/routeObservations entirely regardless of
+ * what this probe reports. */
+class ReadyProcessPort {
+  spawn() {
+    return Promise.resolve(
+      ok({
+        pid: 1,
+        output: (async function* () {
+          await Promise.resolve();
+        })(),
+        writeStdin: () => Promise.resolve(ok(undefined)),
+        closeStdin: () => Promise.resolve(ok(undefined)),
+        sendSignal: () => Promise.resolve(ok(undefined)),
+        wait: () =>
+          Promise.resolve(
+            ok({
+              exitCode: 0,
+              signal: null,
+              startedAt: "2026-08-07T00:00:00.000Z" as never,
+              exitedAt: "2026-08-07T00:00:00.000Z" as never,
+              outputTruncated: false,
+            }),
+          ),
+      }),
+    );
+  }
+}
+
 function fakeBuildComposition(stateRoot: string) {
   const realLeases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -242,6 +285,11 @@ function fakeBuildComposition(stateRoot: string) {
           readModel: unusedReadModel,
         },
         project: project(),
+        trustedConfig: trustedConfigFixture(),
+        claude: {
+          config: { executable: "claude", models: ["opus"], account: "default" },
+          process: new ReadyProcessPort(),
+        },
       },
     });
   return { buildComposition, leases, jobs, realLeases, realJobs };
