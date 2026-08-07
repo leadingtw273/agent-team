@@ -77,7 +77,7 @@ export interface DiscoverReadyDispatchCandidatesOptions {
  * have enough context to make safely (see requirement-template.ts's own header for the fuller
  * rationale on why free text is never turned into guessed issue ids either).
  */
-function toDomainIssue(
+export function toDomainIssue(
   project: Project,
   snapshot: LinearIssueSnapshot,
   template: Omit<ReadyGateTemplateFields, "dependencies"> & {
@@ -207,4 +207,36 @@ export async function discoverReadyDispatchCandidates(
   return ok(
     Object.freeze({ candidates: Object.freeze(candidates), skipped: Object.freeze(skipped) }),
   );
+}
+
+/**
+ * C015c item 2: re-derives the same domain `Issue` a resumed job's `CiRecoveryPipeline`/
+ * `ReviewerPipeline` request needs, from nothing but the raw Linear external id a
+ * `JobProgressRecord` (src/adapters/dispatch/job-progress-store.ts) persists -- the domain
+ * `issueId` on that record is a one-way `generateDeterministicIdentifier` hash, unrecoverable on
+ * its own. Deliberately does not repeat `discoverReadyDispatchCandidates`'s own
+ * `workStatus === "ready"`/`agentRole` gates: those are *original-dispatch eligibility* checks,
+ * already satisfied once (this issue would not have a `Job` at all otherwise) -- re-imposing them
+ * here would wrongly refuse to resume a job whose issue has since (harmlessly) moved workflow
+ * state. A `dependencies_unparsed` description edit made *after* dispatch is the one thing still
+ * worth failing closed on, since silently reusing a stale `dependencies` field a human may have
+ * just changed would be a real correctness risk, not a cosmetic one.
+ */
+export async function projectIssueByExternalId(
+  project: Project,
+  readModel: LinearDiscoveryReadModel,
+  teamId: string,
+  linearProjectId: string,
+  externalIssueId: string,
+): Promise<Result<Issue, DomainError>> {
+  const context = await readModel.readContext(teamId, linearProjectId);
+  if (!context.ok) return context;
+  const snapshot = await readModel.readIssue(context.value, externalIssueId);
+  if (!snapshot.ok) return snapshot;
+  const template = parseReadyGateTemplate(snapshot.value.description);
+  if (template.dependencies.kind === "unparsed") return err(domainError("conflict"));
+  return toDomainIssue(project, snapshot.value, {
+    ...template,
+    dependencies: template.dependencies,
+  });
 }
