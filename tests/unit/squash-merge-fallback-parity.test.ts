@@ -17,7 +17,11 @@ import { z } from "zod";
 
 import { createGitHubSquashMergePort } from "../../src/adapters/registration/setup-composition.js";
 import { buildMergeGateSourceControl } from "../../src/cli/dispatch/status-merge-composition.js";
-import { GitHubAdapter, type GhJsonTransport } from "../../src/adapters/github/index.js";
+import {
+  GitHubAdapter,
+  isSafeToSquashMergeDirectly,
+  type GhJsonTransport,
+} from "../../src/adapters/github/index.js";
 import {
   domainError,
   err,
@@ -107,6 +111,10 @@ async function runRegistrationSideFallback(
     ...(fallbackReRead["state"] === "open" &&
     fallbackReRead["draft"] === false &&
     fallbackReRead["mergeability"] === "mergeable" &&
+    // C015y decision D: mirrors `isSafeToSquashMergeDirectly`'s own added condition -- this
+    // test's gate for "should the fake transport even expect the squash-merge steps" must track
+    // production's real predicate, or a BEHIND fixture would leave scripted steps unconsumed.
+    fallbackReRead["mergeStateStatus"] !== "behind" &&
     fallbackReRead["headSha"] === sha
       ? [
           { value: pull() }, // squashMergeChangeRequest's own internal pre-check
@@ -142,6 +150,10 @@ async function runMergeGateSideFallback(
     ...(fallbackReRead["state"] === "open" &&
     fallbackReRead["draft"] === false &&
     fallbackReRead["mergeability"] === "mergeable" &&
+    // C015y decision D: mirrors `isSafeToSquashMergeDirectly`'s own added condition -- this
+    // test's gate for "should the fake transport even expect the squash-merge steps" must track
+    // production's real predicate, or a BEHIND fixture would leave scripted steps unconsumed.
+    fallbackReRead["mergeStateStatus"] !== "behind" &&
     fallbackReRead["headSha"] === sha
       ? [
           { value: pull() }, // squashMergeChangeRequest's own internal pre-check
@@ -208,5 +220,34 @@ describe("O009d squash-merge fallback: cross-implementation behavioral parity", 
     ]);
     expect(registration).toEqual({ merged: false, errorCode: "external_failure" });
     expect(mergeGate).toEqual({ merged: false, errorCode: "external_failure" });
+  });
+
+  // C015y decision D (arm-time interception, point 3 of 3): the shared predicate itself
+  // (`isSafeToSquashMergeDirectly`) must decline a BEHIND re-read even though every other field
+  // (`state`/`draft`/`mergeability`/`headSha`) is otherwise unambiguously safe -- `mergeability`
+  // says nothing about O004's `strictRequiredStatusChecksPolicy` ruleset. Both implementations
+  // share the exact same predicate, so proving it here proves it for both call sites at once.
+  it("both implementations decline when the fallback re-read is BEHIND, even though every other field looks safe", async () => {
+    const fixture = pull({ mergeStateStatus: "behind" });
+    const [registration, mergeGate] = await Promise.all([
+      runRegistrationSideFallback(fixture),
+      runMergeGateSideFallback(fixture),
+    ]);
+    expect(registration).toEqual({ merged: false, errorCode: "external_failure" });
+    expect(mergeGate).toEqual({ merged: false, errorCode: "external_failure" });
+  });
+
+  /** Direct, non-integration coverage of the shared predicate itself -- the two
+   * `run*SideFallback` helpers above both preserve the *original* `enableAutoMerge` error whether
+   * `isSafeToSquashMergeDirectly` correctly declines early or (hypothetically) incorrectly
+   * proceeds and then fails for an unrelated reason, so they cannot alone distinguish those two
+   * cases from each other. This calls the predicate directly, with every other field
+   * unambiguously safe, so only the `mergeStateStatus` check can be responsible for the result. */
+  it("isSafeToSquashMergeDirectly itself returns false for a BEHIND snapshot with every other field otherwise safe, and true once mergeStateStatus is anything else", () => {
+    const safeExceptBehind = ok(pull({ mergeStateStatus: "behind" }) as never);
+    expect(isSafeToSquashMergeDirectly(safeExceptBehind, sha)).toBe(false);
+
+    const safe = ok(pull({ mergeStateStatus: "clean" }) as never);
+    expect(isSafeToSquashMergeDirectly(safe, sha)).toBe(true);
   });
 });

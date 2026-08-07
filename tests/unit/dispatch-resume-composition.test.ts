@@ -52,6 +52,7 @@ import {
   ok,
   parseIdentifier,
   parseInstant,
+  type Clock,
   type Identifier,
   type Instant,
 } from "../../src/domain/foundation/index.js";
@@ -117,6 +118,18 @@ const headShaValue = "a".repeat(40);
 const headSha = (() => {
   const parsed = headShaSchema.safeParse(headShaValue);
   if (!parsed.success) throw new Error("fixture invariant violated: invalid head sha");
+  return parsed.data;
+})();
+/** C015y decision A: the fixture "authoritative base" every test's default `changeRequest()`
+ * (its `baseSha`) and default `resolveAuthoritativeBase` fake agree on -- almost every existing
+ * test in this file seeds a *legacy* (pre-C015y) progress record (`seedProgressRecord` never sets
+ * `baseRevision`), so `resolveLegacyBaseRevision`'s cross-check runs on every one of them; this
+ * shared constant is what lets that cross-check succeed transparently unless a test deliberately
+ * varies one side of it (see the dedicated `C015y decision A` describe block below for those). */
+const baseRevisionValue = "f".repeat(40);
+const baseRevision = (() => {
+  const parsed = headShaSchema.safeParse(baseRevisionValue);
+  if (!parsed.success) throw new Error("fixture invariant violated: invalid base revision");
   return parsed.data;
 })();
 
@@ -235,6 +248,9 @@ function changeRequest(overrides: Readonly<Record<string, unknown>> = {}) {
     headBranch: "agent-team/job-1",
     headSha,
     mergeability: "mergeable" as const,
+    // C015y decision A: matches `baseRevisionValue`/the harness's default `resolveAuthoritativeBase`
+    // fake -- see that constant's own header for why this must agree by default.
+    baseSha: baseRevisionValue,
     autoMergeEnabled: false,
     updatedAt: now,
     ...overrides,
@@ -382,6 +398,9 @@ async function harness(
     enableOutcome: EnableAutoMergeOutcome;
     lifecycleOutcome: LifecyclePipelineOutcome;
     leaseConflict: boolean;
+    resolveAuthoritativeBaseOutcome: Awaited<
+      ReturnType<ResumeCycleDependencies["resolveAuthoritativeBase"]>
+    >;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -494,6 +513,16 @@ async function harness(
     },
     clock: createFixedClock(now),
     holderId: "resume-holder",
+    // C015y decision A: only ever exercised when a seeded record has no `baseRevision` (the
+    // legacy-repair path) -- see `resolveLegacyBaseRevision`'s own header. Returns
+    // `baseRevisionValue`, matching `changeRequest()`'s own default `baseSha` so the cross-check
+    // succeeds transparently for every test that does not deliberately vary one side of it.
+    resolveAuthoritativeBase: () => {
+      calls.push("resolveAuthoritativeBase");
+      return Promise.resolve(
+        overrides.resolveAuthoritativeBaseOutcome ?? ok({ baseRevision, defaultBranch: "main" }),
+      );
+    },
     reviewReportSidecar: {
       record: (input) => {
         calls.push("reviewReportSidecar.record");
@@ -546,6 +575,9 @@ describe("runResumeCycle", () => {
     expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
     expect(calls).toEqual([
       "getChangeRequest",
+      // C015y decision A: this record is legacy (no `baseRevision`) -- `resolveLegacyBaseRevision`
+      // runs once, cross-checks, and CAS-writes a baseline before the rest of the resume proceeds.
+      "resolveAuthoritativeBase",
       "ciRecovery.run",
       "reviewStatus.begin",
       "reviewer.run",
@@ -765,7 +797,7 @@ describe("runResumeCycle", () => {
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
-    expect(calls).toEqual(["getChangeRequest", "ciRecovery.run"]);
+    expect(calls).toEqual(["getChangeRequest", "resolveAuthoritativeBase", "ciRecovery.run"]);
   });
 
   it("does nothing when there is no resumable record for the project", async () => {
@@ -1340,8 +1372,15 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       expect(reloaded.value?.stage).toEqual({
         kind: "merging",
         armedAt: now,
-        fingerprint: { headSha, baseSha: "", mergeStateStatus: "unknown", merged: false },
+        fingerprint: {
+          headSha,
+          baseSha: baseRevisionValue,
+          mergeStateStatus: "unknown",
+          merged: false,
+        },
         noProgressCount: 0,
+        // C015y decision C: seeded to this same arm-time instant.
+        lastProgressAt: now,
       });
     }
   });
@@ -1712,6 +1751,27 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     };
   }
 
+  /** C015y decision C acceptance criterion ③: every wall-clock assertion in this describe block
+   * needs a *controllable* clock -- `createFixedClock` (harness()'s own default) never advances,
+   * so it cannot exercise the new `now - lastProgressAt`/`now - armedAt` conditions at all. A
+   * closure-based fake satisfying the plain `Clock` interface (`{now(): Instant}`) is sufficient;
+   * no production seam changes needed for this. */
+  function mutableClock(
+    start: Instant,
+  ): Readonly<{ clock: Clock; advanceMinutes: (m: number) => void }> {
+    let value = start;
+    return Object.freeze({
+      clock: Object.freeze({ now: () => value }),
+      advanceMinutes(minutes: number) {
+        const next = new Date(Date.parse(value) + minutes * 60_000).toISOString();
+        const parsed = parseInstant(next);
+        if (!parsed.ok)
+          throw new Error("fixture invariant violated: clock advance produced an invalid instant");
+        value = parsed.value;
+      },
+    });
+  }
+
   it("escalates immediately to requires_manual(change_request_behind_base) the instant mergeStateStatus is behind, with no prior history", async () => {
     const base = await harness();
     await seedProgressRecord(base.progress, { kind: "merging" });
@@ -1747,7 +1807,29 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     }
   });
 
-  it("escalates to requires_manual(auto_merge_stalled) only on the 5th consecutive unchanged readback, staying still_merging (and persisting noProgressCount) on the first 4", async () => {
+  it("C015y decision C: invocation count ALONE never escalates -- 5+ resumes with zero elapsed wall-clock time stay still_merging forever (the exact half-implemented gap codex's review named)", async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "c".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+    });
+    // harness()'s own `createFixedClock(now)` -- deliberately never advances.
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: "c".repeat(40) }));
+
+    for (let attempt = 1; attempt <= 8; attempt += 1) {
+      const result = await runResumeCycle(deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+      const reloaded = await base.progress.load(jobId);
+      if (reloaded.ok) {
+        expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: attempt });
+      }
+    }
+  });
+
+  it("escalates to requires_manual(auto_merge_stalled) only once BOTH noProgressCount>=5 AND >=10 minutes have elapsed since the last observed progress -- staying still_merging on the first 4, surviving a restart into a fresh FileJobProgressStore instance", async () => {
     const base = await harness();
     // Seeded in the *normal* arm-time shape (matching exactly what `resumeReview`'s own
     // `auto_merge_enabled` arm-time write produces, resume-composition.ts) -- not the bare
@@ -1759,7 +1841,11 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       fingerprint: { headSha, baseSha: "c".repeat(40), mergeStateStatus: "clean", merged: false },
       noProgressCount: 0,
     });
-    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: "c".repeat(40) }));
+    const clock = mutableClock(now);
+    const deps: ResumeCycleDependencies = {
+      ...readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: "c".repeat(40) })),
+      clock: clock.clock,
+    };
 
     for (let attempt = 1; attempt <= 4; attempt += 1) {
       const result = await runResumeCycle(deps);
@@ -1767,13 +1853,25 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
       const reloaded = await base.progress.load(jobId);
       if (reloaded.ok) {
-        expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: attempt });
+        expect(reloaded.value?.stage).toMatchObject({
+          kind: "merging",
+          noProgressCount: attempt,
+          // `lastProgressAt` is seeded on the very first observation (attempt 1) and never moves
+          // again while the fingerprint stays unchanged -- unlike `noProgressCount`, it does not
+          // track the attempt number.
+          lastProgressAt: now,
+        });
       }
+      // 3 minutes per resume -- by the 5th call (below) this totals 12 minutes since attempt 1's
+      // own `lastProgressAt` baseline: >= the 10-minute wall-clock bound, but still comfortably
+      // under the independent 30-minute absolute deadline.
+      clock.advanceMinutes(3);
     }
 
     // Restart-safety (acceptance criterion ③'s own explicit requirement): a *different*
     // `FileJobProgressStore` instance against the exact same on-disk directory -- simulating a
-    // fresh `agent-team run` process -- must see the persisted count and continue it, not reset it.
+    // fresh `agent-team run` process -- must see the persisted count *and* `lastProgressAt`, and
+    // continue both, not reset either.
     const restartedProgress = new FileJobProgressStore(base.progressDirectory);
     const restartedDeps: ResumeCycleDependencies = { ...deps, progress: restartedProgress };
 
@@ -1781,7 +1879,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     expect(fifth.ok).toBe(true);
     if (fifth.ok) {
       expect(fifth.value).toEqual([
-        { jobId, outcome: "requires_manual", reason: "auto_merge_stalled" },
+        { jobId, outcome: "requires_manual", reason: "auto_merge_stalled:no_progress_timeout" },
       ]);
     }
     const reloaded = await base.progress.load(jobId);
@@ -1797,6 +1895,12 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
             baseSha: "c".repeat(40),
             mergeStateStatus: "clean",
             merged: false,
+          },
+          stallTiming: {
+            armedAt: now,
+            lastProgressAt: now,
+            observedAt: clock.clock.now(),
+            elapsedMs: 12 * 60_000,
           },
         },
       });
@@ -1856,7 +1960,379 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
           merged: false,
         },
         noProgressCount: 0,
+        // C015y decision C: seeded to this same first-observation instant.
+        lastProgressAt: now,
       });
+    }
+  });
+
+  it("C015y decision C: the 30-minute absolute deadline fires unconditionally, even when the fingerprint keeps changing every resume (never gated on noProgressCount at all)", async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "a".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+      lastProgressAt: now,
+    });
+    const clock = mutableClock(now);
+    let currentBaseSha = "a".repeat(40);
+    const deps: ResumeCycleDependencies = {
+      ...readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: currentBaseSha })),
+      clock: clock.clock,
+    };
+
+    // Three resumes, 5 minutes apart (15 minutes cumulative -- still under the 30-minute deadline),
+    // each observing a genuinely *different* base SHA (real progress every time) -- noProgressCount
+    // would stay at 0 forever under the first OR-branch alone.
+    for (const nextSha of ["b".repeat(40), "c".repeat(40), "d".repeat(40)]) {
+      clock.advanceMinutes(5);
+      currentBaseSha = nextSha;
+      const result = await runResumeCycle(deps);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+      const reloaded = await base.progress.load(jobId);
+      if (reloaded.ok) {
+        expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 0 });
+      }
+    }
+
+    // A 4th resume, 20 minutes later -- 35 minutes total since `armedAt`, still with fresh progress
+    // (a new base SHA again) -- must still escalate on elapsed time alone.
+    clock.advanceMinutes(20);
+    currentBaseSha = "e".repeat(40);
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "auto_merge_stalled:absolute_deadline" },
+      ]);
+    }
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "auto_merge_stalled",
+          stallTiming: { armedAt: now, elapsedMs: 35 * 60_000 },
+        },
+      });
+    }
+  });
+
+  it('C015y decision C: mergeStateStatus "unknown" is tracked independently of noProgressCount -- it neither counts toward, nor resets, ordinary progress tracking', async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "a".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 2,
+      lastProgressAt: now,
+    });
+    const clock = mutableClock(now);
+    const deps: ResumeCycleDependencies = {
+      ...readbackDeps(base, () => ({ mergeStateStatus: "unknown", baseSha: "a".repeat(40) })),
+      clock: clock.clock,
+    };
+
+    clock.advanceMinutes(1);
+    const first = await runResumeCycle(deps);
+    expect(first.ok).toBe(true);
+    if (first.ok) expect(first.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const afterFirst = await base.progress.load(jobId);
+    if (afterFirst.ok) {
+      // `noProgressCount`/`lastProgressAt`/`fingerprint` all stay exactly as they were before this
+      // "unknown" observation -- only `unknownSince`/`unknownCount` move.
+      expect(afterFirst.value?.stage).toMatchObject({
+        kind: "merging",
+        noProgressCount: 2,
+        lastProgressAt: now,
+        fingerprint: { mergeStateStatus: "clean" },
+        unknownCount: 1,
+      });
+    }
+
+    clock.advanceMinutes(1);
+    const second = await runResumeCycle(deps);
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const afterSecond = await base.progress.load(jobId);
+    if (afterSecond.ok) {
+      expect(afterSecond.value?.stage).toMatchObject({
+        kind: "merging",
+        noProgressCount: 2,
+        unknownCount: 2,
+      });
+    }
+  });
+
+  it('C015y decision C: mergeStateStatus "unknown" persisting across >=2 fresh readbacks and >=10 minutes escalates to requires_manual(merge_state_unknown_timeout), independent of the 30-minute absolute deadline', async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "a".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+      lastProgressAt: now,
+    });
+    const clock = mutableClock(now);
+    const deps: ResumeCycleDependencies = {
+      ...readbackDeps(base, () => ({ mergeStateStatus: "unknown", baseSha: "a".repeat(40) })),
+      clock: clock.clock,
+    };
+
+    clock.advanceMinutes(1);
+    const first = await runResumeCycle(deps);
+    expect(first.ok).toBe(true);
+    if (first.ok) expect(first.value).toEqual([{ jobId, outcome: "still_merging" }]);
+
+    // Total elapsed since the first "unknown" observation is now 11 minutes (>= 10), and this is
+    // the 2nd consecutive fresh "unknown" readback (>= 2) -- escalates. Still well under the
+    // independent 30-minute absolute deadline (11 < 30), proving this fires on its own bound, not
+    // as a side effect of that one.
+    clock.advanceMinutes(10);
+    const second = await runResumeCycle(deps);
+    expect(second.ok).toBe(true);
+    if (second.ok) {
+      expect(second.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "merge_state_unknown_timeout" },
+      ]);
+    }
+    const reloaded = await base.progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "merge_state_unknown_timeout",
+          attempts: { count: 2 },
+          mergeEvidence: { mergeStateStatus: "unknown" },
+          stallTiming: { armedAt: now, elapsedMs: 11 * 60_000 },
+        },
+      });
+    }
+  });
+
+  it('C015y decision C: a non-"unknown" reading clears an in-progress unknown streak rather than letting it accumulate across an interruption', async () => {
+    const base = await harness();
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      fingerprint: { headSha, baseSha: "a".repeat(40), mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+      lastProgressAt: now,
+    });
+    const clock = mutableClock(now);
+    let currentStatus: "unknown" | "clean" = "unknown";
+    const deps: ResumeCycleDependencies = {
+      ...readbackDeps(base, () => ({ mergeStateStatus: currentStatus, baseSha: "a".repeat(40) })),
+      clock: clock.clock,
+    };
+
+    clock.advanceMinutes(1);
+    await runResumeCycle(deps);
+    const afterUnknown = await base.progress.load(jobId);
+    if (afterUnknown.ok) {
+      expect(afterUnknown.value?.stage).toMatchObject({ kind: "merging", unknownCount: 1 });
+    }
+
+    // A concrete reading interrupts the streak -- unknownSince/unknownCount must be cleared, not
+    // merely paused, so a *later* unknown streak starts counting from zero again.
+    currentStatus = "clean";
+    clock.advanceMinutes(1);
+    await runResumeCycle(deps);
+    const afterClean = await base.progress.load(jobId);
+    if (afterClean.ok) {
+      expect(afterClean.value?.stage).not.toHaveProperty("unknownSince");
+      expect(afterClean.value?.stage).not.toHaveProperty("unknownCount");
+    }
+
+    currentStatus = "unknown";
+    clock.advanceMinutes(11);
+    const third = await runResumeCycle(deps);
+    // If the earlier streak had survived, this single fresh "unknown" reading (count=1) would not
+    // yet meet `mergeStateUnknownMinReadbacks` (2) -- it must stay still_merging, not escalate.
+    expect(third.ok).toBe(true);
+    if (third.ok) expect(third.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const afterRestart = await base.progress.load(jobId);
+    if (afterRestart.ok) {
+      expect(afterRestart.value?.stage).toMatchObject({ unknownCount: 1 });
+    }
+  });
+});
+
+/**
+ * C015y decision A (acceptance criterion ①): dispatch resolves the authoritative base exactly
+ * once and persists it as `baseRevision`; resume must read it back, never re-derive it. Every
+ * other test in this file relies on the *legacy* repair path implicitly (via `seedProgressRecord`
+ * never setting `baseRevision` and the harness's own default `resolveAuthoritativeBase` fake
+ * agreeing with `changeRequest()`'s default `baseSha`) -- these tests instead exercise the
+ * persisted-value and failure paths directly.
+ */
+describe("C015y decision A: persisted baseRevision is authoritative -- resume reads it back, never re-derives it", () => {
+  const persistedBaseRevisionValue = "9".repeat(40);
+  const persistedBaseRevision = (() => {
+    const parsed = headShaSchema.safeParse(persistedBaseRevisionValue);
+    if (!parsed.success) throw new Error("fixture invariant violated");
+    return parsed.data;
+  })();
+
+  async function seedLegacyCiWaiting(progress: FileJobProgressStore) {
+    await progress.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "claude-opus",
+      stage: { kind: "ci_waiting" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
+      changeRequestId: "42",
+      headSha,
+      // Deliberately omits `baseRevision` -- the legacy shape.
+    });
+  }
+
+  it("a record that already carries baseRevision is trusted as-is: resolveAuthoritativeBase is never called, and that exact value reaches the reviewer request", async () => {
+    const { deps, progress, calls, reviewerRequests } = await harness();
+    await progress.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "claude-opus",
+      stage: { kind: "ci_waiting" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
+      changeRequestId: "42",
+      headSha,
+      // Deliberately a *different* SHA from `baseRevisionValue`/`current.baseSha` -- if resume
+      // ever re-derived or cross-checked this, the reviewer request below would observe the wrong
+      // value, or this test's own `resolveAuthoritativeBase` call-count assertion would fail.
+      baseRevision: persistedBaseRevision,
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+    expect(calls).not.toContain("resolveAuthoritativeBase");
+    expect(reviewerRequests).toHaveLength(1);
+    expect(reviewerRequests[0]).toMatchObject({ baseRevision: persistedBaseRevisionValue });
+  });
+
+  it("a legacy record (no baseRevision) whose freshly re-resolved base does not match the fresh PR readback's own baseSha fails closed to requires_manual(legacy_base_revision_mismatch), leaving the record's stage untouched", async () => {
+    const mismatchedBaseRevision = "8".repeat(40);
+    const parsedMismatch = headShaSchema.safeParse(mismatchedBaseRevision);
+    if (!parsedMismatch.success) throw new Error("fixture invariant violated");
+    const { deps, progress } = await harness({
+      resolveAuthoritativeBaseOutcome: ok({
+        baseRevision: parsedMismatch.data,
+        defaultBranch: "main",
+      }),
+    });
+    await seedLegacyCiWaiting(progress);
+    const before = await progress.load(jobId);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "legacy_base_revision_mismatch" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "legacy_base_revision_mismatch" },
+      });
+    }
+    // Never silently claims to have restored the *original* dispatch baseline -- see this
+    // describe block's own header and `resolveLegacyBaseRevision`'s own header
+    // (resume-composition.ts) for why a mismatch can only ever fail closed, never guess which
+    // side (if either) is correct.
+    expect(before.ok && before.value?.baseRevision).toBeUndefined();
+  });
+
+  it("a legacy record whose resolveAuthoritativeBase call fails with a retryable error surfaces as transient_failure, not requires_manual", async () => {
+    const { deps, progress } = await harness({
+      resolveAuthoritativeBaseOutcome: err({
+        reason: "authoritative_branch_unavailable",
+        error: domainError("timeout"),
+      }),
+    });
+    await seedLegacyCiWaiting(progress);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        expect.objectContaining({ jobId, outcome: "transient_failure" }),
+      ]);
+    }
+  });
+
+  it("a legacy record whose resolveAuthoritativeBase call fails with a non-retryable default_branch_mismatch fails closed to requires_manual(base_revision_unavailable)", async () => {
+    const { deps, progress } = await harness({
+      resolveAuthoritativeBaseOutcome: err({
+        reason: "default_branch_mismatch",
+        githubDefaultBranch: "trunk",
+        configuredDefaultBranch: "main",
+      }),
+    });
+    await seedLegacyCiWaiting(progress);
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "legacy_base_revision_unavailable:default_branch_mismatch",
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "setup", reasonCode: "base_revision_unavailable" },
+      });
+    }
+  });
+
+  it("a legacy record whose repair CAS write itself fails (concurrent writer) surfaces as progress_write_failed, never silently proceeding on an unpersisted base", async () => {
+    /** Intercepts *only* the one CAS write `resolveLegacyBaseRevision` makes (the mutation whose
+     * `next` includes `baseRevision`) and reports a conflict exactly once -- every other write in
+     * this test (the initial seed above) goes through untouched. */
+    class ConflictOnceOnBaseRevisionWrite extends FileJobProgressStore {
+      #triggered = false;
+      override async compareAndSwap(
+        conflictJobId: string,
+        expectedRevision: number | null,
+        next: Parameters<FileJobProgressStore["compareAndSwap"]>[2],
+        options?: Parameters<FileJobProgressStore["compareAndSwap"]>[3],
+      ) {
+        if (!this.#triggered && "baseRevision" in next) {
+          this.#triggered = true;
+          return err(domainError("conflict"));
+        }
+        return super.compareAndSwap(conflictJobId, expectedRevision, next, options);
+      }
+    }
+    const { deps, progress: realProgress, progressDirectory } = await harness();
+    await seedLegacyCiWaiting(realProgress);
+    const conflictingProgress = new ConflictOnceOnBaseRevisionWrite(progressDirectory);
+    const wrapped: ResumeCycleDependencies = { ...deps, progress: conflictingProgress };
+
+    const result = await runResumeCycle(wrapped);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        expect.objectContaining({ jobId, outcome: "progress_write_failed" }),
+      ]);
     }
   });
 });

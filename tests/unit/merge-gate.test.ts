@@ -469,11 +469,29 @@ describe("auto-merge gate", () => {
     ["conflict", { cr: changeRequest(headSha, { mergeability: "conflicting" }) }, "merge_conflict"],
     ["red CI", { checks: checks(headSha, "failure") }, "ci_failed"],
     ["missing review status", { statuses: statuses(headSha, "pending") }, "review_status_missing"],
+    // C015y decision D (arm-time interception, point 1 of 3): `mergePorts`'s own `getChangeRequest`
+    // fake returns the *same* `cr` for every call, so this one row exercises both the very first
+    // readback and the pre-merge readback simultaneously -- see the dedicated test below for the
+    // narrower "only becomes behind between the two reads" case.
+    ["BEHIND", { cr: changeRequest(headSha, { mergeStateStatus: "behind" }) }, "behind"],
   ] as const)("does not merge when %s blocks the gate", async (_name, options, reason) => {
     const ports = mergePorts(options);
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
 
     expect(outcome).toMatchObject({ state: "not_ready", reason });
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("C015y decision D (arm-time interception, point 2 of 3): a PR that is only BEHIND at the immediately-pre-merge readback (first read still clean) is still caught before enableAutoMerge is ever called", async () => {
+    const ports = mergePorts();
+    const getChangeRequest = vi.mocked(ports.sourceControl.getChangeRequest);
+    getChangeRequest
+      .mockResolvedValueOnce(ok(changeRequest(headSha))) // the very first readback: clean
+      .mockResolvedValueOnce(ok(changeRequest(headSha, { mergeStateStatus: "behind" }))); // pre-merge: behind
+
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({ state: "not_ready", reason: "behind" });
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
   });
 });

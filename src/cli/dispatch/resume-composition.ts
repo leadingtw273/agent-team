@@ -47,6 +47,7 @@ import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { ChangeRequestSnapshot, SourceControlPort } from "../../application/ports/index.js";
 import {
   domainError,
+  err,
   instantFromDate,
   ok,
   type Clock,
@@ -54,11 +55,14 @@ import {
   type Instant,
   type Result,
 } from "../../domain/foundation/index.js";
-import { createRequirementSnapshot, headShaSchema } from "../../domain/review/index.js";
+import {
+  createRequirementSnapshot,
+  headShaSchema,
+  type HeadSha,
+} from "../../domain/review/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import { watchdogHardStopMs } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
-import { LocalGitAdapter } from "../../adapters/git/index.js";
 import {
   projectIssueByExternalId,
   type LinearDiscoveryReadModel,
@@ -71,7 +75,9 @@ import {
   type RequiresManualCause,
   type RequiresManualReasonCode,
   type RequiresManualStage,
+  type RequiresManualStallTiming,
 } from "../../adapters/dispatch/job-progress-store.js";
+import type { AuthoritativeBaseFailure, AuthoritativeBaseRevision } from "./authoritative-base.js";
 import {
   FileIssueAdmissionStore,
   type IssueAdmissionPort,
@@ -176,6 +182,39 @@ const reportContractRetryLimit = 1;
  * otherwise. */
 const mergingNoProgressLimit = 5;
 
+/**
+ * C015y decision C: the wall-clock half of the bounded `"merging"` wait -- codex's review
+ * confirmed `armedAt` being persisted-but-never-read was always the original requirement's other
+ * half, dropped by C015x. `resumeMergingStage` applies these as a two-layer OR:
+ *
+ * ```
+ * stall = (noProgressCount >= mergingNoProgressLimit && now - lastProgressAt >= mergingNoProgressWallClockMs)
+ *      || (now - armedAt >= mergingAbsoluteDeadlineMs)
+ * ```
+ *
+ * The second branch is an *unconditional* backstop -- it fires purely on elapsed time since arming,
+ * regardless of whether the fingerprint has been changing (i.e. even a `"merging"` job that keeps
+ * observing fresh progress every single resume still escalates once 30 minutes have passed since
+ * it was armed). This is codex's own explicit formula, not a narrower "only when stalled" reading of
+ * it -- an absolute ceiling on how long any job may sit in `"merging"` at all, independent of the
+ * per-resume progress signal the first branch tracks.
+ *
+ * All wall-clock reads go through `deps.clock.now()`, never `Date.now()` directly -- this file's
+ * own established discipline (`computeProviderDeadline` above is the pre-existing precedent).
+ */
+const mergingNoProgressWallClockMs = 10 * 60_000;
+const mergingAbsoluteDeadlineMs = 30 * 60_000;
+
+/** C015y decision C: `mergeStateStatus === "unknown"` must not count toward
+ * `mergingNoProgressLimit`/`mergingNoProgressWallClockMs` above (GitHub still computing is neither
+ * progress nor no-progress on the underlying merge) -- but it also cannot be allowed to flap
+ * forever without ever being noticed, so it gets its own independent bound: at least this many
+ * consecutive *fresh* `"unknown"` readbacks, spanning at least this much wall-clock, escalates to
+ * `merge_state_unknown_timeout`. `mergingAbsoluteDeadlineMs` above still applies unconditionally
+ * even while this is flapping (checked first, in `resumeMergingStage`). */
+const mergeStateUnknownMinReadbacks = 2;
+const mergeStateUnknownWallClockMs = 10 * 60_000;
+
 function currentReportContractRetries(record: JobProgressRecord): number {
   return record.stage.kind === "review_report_pending_retry" ? record.stage.retries : 0;
 }
@@ -186,19 +225,48 @@ function currentReportContractRetries(record: JobProgressRecord): number {
  * only the `review_report_contract` reasonCode's own call site passes a real, larger count (the
  * report-contract retry counter's value at exhaustion) and a `lastCategory`. C015x decision 3 adds
  * `mergeEvidence` -- the coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause"
- * requirement -- passed only by `resumeMergingStage`'s two new call sites. */
+ * requirement -- passed only by `resumeMergingStage`'s call sites. C015y decision C adds
+ * `stallTiming` -- the wall-clock evidence codex's review named as missing -- passed only by the
+ * two `resumeMergingStage` call sites that actually escalate on a timing condition
+ * (`auto_merge_stalled`/`merge_state_unknown_timeout`), never `change_request_behind_base` (that
+ * one escalates unconditionally, with no timing judgment involved at all). */
 function requiresManualCause(
   stage: RequiresManualStage,
   reasonCode: RequiresManualReasonCode,
   count = 1,
   lastCategory?: ReportContractFailureCategory,
   mergeEvidence?: MergeReadbackFingerprint,
+  stallTiming?: RequiresManualStallTiming,
 ): RequiresManualCause {
   return Object.freeze({
     stage,
     reasonCode,
     attempts: Object.freeze({ count, ...(lastCategory === undefined ? {} : { lastCategory }) }),
     ...(mergeEvidence === undefined ? {} : { mergeEvidence }),
+    ...(stallTiming === undefined ? {} : { stallTiming }),
+  });
+}
+
+/** C015y decision C: milliseconds elapsed between two `Instant`s -- the one primitive every
+ * wall-clock comparison in `resumeMergingStage` reduces to. Both arguments always come from
+ * `deps.clock.now()` (directly, or persisted from a prior call to it) -- never `Date.now()`. */
+function elapsedMs(from: Instant, to: Instant): number {
+  return Date.parse(to) - Date.parse(from);
+}
+
+/** C015y decision C: assembles the `cause.stallTiming` evidence every timing-based
+ * `"merging"`-stage escalation attaches -- `elapsedMs` is always measured from `armedAt` (the
+ * unambiguous, never-reset baseline), regardless of which of the two OR-branches actually fired. */
+function stallTimingOf(
+  armedAt: Instant,
+  lastProgressAt: Instant | undefined,
+  observedAt: Instant,
+): RequiresManualStallTiming {
+  return Object.freeze({
+    armedAt,
+    ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
+    observedAt,
+    elapsedMs: elapsedMs(armedAt, observedAt),
   });
 }
 
@@ -272,8 +340,18 @@ export interface ResumeCycleDependencies {
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
   readonly clock: Clock;
   readonly holderId: string;
-  /** Injectable for tests; production defaults to a real `LocalGitAdapter`. */
-  readonly gitForBaseRevision?: Pick<LocalGitAdapter, "inspectRepository">;
+  /** C015y decision A: resolves the authoritative base revision when repairing a *legacy*
+   * (pre-C015y) job-progress record that has no persisted `baseRevision` -- see
+   * `resolveLegacyBaseRevision`'s own header. This is a thin, already-ports-bound wrapper around
+   * the *same* `resolveAuthoritativeBaseRevision` (authoritative-base.ts) a fresh dispatch uses
+   * (handlers.ts), never a second, independently-drifting implementation of "what counts as
+   * authoritative" -- keeping this module itself free of any direct `GitHubAdapter`/
+   * `LocalGitAdapter` construction (see this file's own module header on staying free of
+   * GitHub-authentication wiring concerns; handlers.ts/resume-full-composition.ts own that). */
+  readonly resolveAuthoritativeBase: (
+    project: Project,
+    options: Readonly<{ idempotencyKey: string; signal?: AbortSignal }>,
+  ) => Promise<Result<AuthoritativeBaseRevision, AuthoritativeBaseFailure>>;
   /** C015r decision 5: the observability sidecar -- see its own file header
    * (review-report-diagnostics-sidecar.ts) for the full rule set. Only ever called from within this
    * module's own `report`-stage failure handling; never anywhere else. */
@@ -675,19 +753,32 @@ async function requiresManualUnlessRetryable(
 }
 
 /**
- * C015x decision 3: the resume-time half of the bounded `"merging"` wait -- `resumeUnderLease`
- * calls this once it already knows `record.stage.kind === "merging"` (a fresh, authoritative
- * `current` readback for this exact change request already in hand from that same call's own
- * pre-flight check). Two escalation rules, both fail-closed to `requires_manual` with the
- * authoritative evidence attached (never a silent, unbounded wait):
+ * C015x decision 3 + C015y decision C: the resume-time half of the bounded `"merging"` wait --
+ * `resumeUnderLease` calls this once it already knows `record.stage.kind === "merging"` (a fresh,
+ * authoritative `current` readback for this exact change request already in hand from that same
+ * call's own pre-flight check). Escalation rules, in priority order, all fail-closed to
+ * `requires_manual` with the authoritative evidence attached (never a silent, unbounded wait):
  *
- * - `mergeStateStatus === "behind"` escalates *immediately*, regardless of history -- this
- *   project's own `strictRequiredStatusChecksPolicy` ruleset (O004) means GitHub can never execute
- *   this merge while behind, no matter how many more times this job is resumed.
- * - Otherwise, if the freshly observed fingerprint is byte-for-byte identical to the last persisted
- *   one, `noProgressCount` increments; at `mergingNoProgressLimit` it escalates to
- *   `auto_merge_stalled`. Any *change* in the fingerprint (progress, or simply the very first
- *   resume since this stage was armed/migrated) resets the counter to 0 rather than escalating.
+ * 1. `mergeStateStatus === "behind"` escalates *immediately*, regardless of history or elapsed
+ *    time -- this project's own `strictRequiredStatusChecksPolicy` ruleset (O004) means GitHub can
+ *    never execute this merge while behind, no matter how many more times this job is resumed.
+ * 2. The 30-minute absolute deadline (`mergingAbsoluteDeadlineMs`, measured from `armedAt`) fires
+ *    *unconditionally* -- even if the fingerprint has been changing every single resume. This is
+ *    checked before the `"unknown"` case below on purpose: an `"unknown"` `mergeStateStatus`
+ *    flapping in and out must never be able to postpone this indefinitely.
+ * 3. `mergeStateStatus === "unknown"` is tracked entirely separately from ordinary progress
+ *    (`unknownSince`/`unknownCount`, never `fingerprint`/`noProgressCount`/`lastProgressAt`) --
+ *    `mergeStateUnknownMinReadbacks` consecutive fresh `"unknown"` reads spanning
+ *    `mergeStateUnknownWallClockMs` escalates to `merge_state_unknown_timeout`. Any non-`"unknown"`
+ *    reading clears this streak.
+ * 4. Otherwise, ordinary progress tracking: if the freshly observed fingerprint is byte-for-byte
+ *    identical to the last persisted one, `noProgressCount` increments and `lastProgressAt` stays
+ *    put; escalates to `auto_merge_stalled` only once *both* `noProgressCount >=
+ *    mergingNoProgressLimit` *and* `now - lastProgressAt >= mergingNoProgressWallClockMs` hold
+ *    (an invocation-count alone was never sufficient -- see `mergingNoProgressWallClockMs`'s own
+ *    header for why). Any *change* in the fingerprint (progress, or simply the very first
+ *    concrete resume since this stage was armed/migrated) resets the counter to 0 and moves
+ *    `lastProgressAt` forward, rather than escalating.
  *
  * The `stage.kind !== "merging"` branch below is unreachable through the one real call site (the
  * check happens immediately before calling) -- kept only as this file's own established
@@ -708,6 +799,8 @@ async function resumeMergingStage(
   }
   const stage = record.stage;
   const observed = mergeFingerprintOf(current);
+  const observedAt = deps.clock.now();
+  const armedAt = stage.armedAt ?? observedAt;
 
   if (observed.mergeStateStatus === "behind") {
     return requiresManual(
@@ -718,16 +811,86 @@ async function resumeMergingStage(
     );
   }
 
-  const previous = stage.fingerprint;
-  const progressed = previous === undefined || !mergeFingerprintsEqual(previous, observed);
-  const noProgressCount = progressed ? 0 : (stage.noProgressCount ?? 0) + 1;
-
-  if (!progressed && noProgressCount >= mergingNoProgressLimit) {
+  if (elapsedMs(armedAt, observedAt) >= mergingAbsoluteDeadlineMs) {
     return requiresManual(
       record,
       deps,
-      "auto_merge_stalled",
-      requiresManualCause("merge", "auto_merge_stalled", noProgressCount, undefined, observed),
+      "auto_merge_stalled:absolute_deadline",
+      requiresManualCause(
+        "merge",
+        "auto_merge_stalled",
+        (stage.noProgressCount ?? 0) + 1,
+        undefined,
+        observed,
+        stallTimingOf(armedAt, stage.lastProgressAt, observedAt),
+      ),
+    );
+  }
+
+  if (observed.mergeStateStatus === "unknown") {
+    const unknownSince = stage.unknownSince ?? observedAt;
+    const unknownCount = (stage.unknownCount ?? 0) + 1;
+    if (
+      unknownCount >= mergeStateUnknownMinReadbacks &&
+      elapsedMs(unknownSince, observedAt) >= mergeStateUnknownWallClockMs
+    ) {
+      return requiresManual(
+        record,
+        deps,
+        "merge_state_unknown_timeout",
+        requiresManualCause(
+          "merge",
+          "merge_state_unknown_timeout",
+          unknownCount,
+          undefined,
+          observed,
+          stallTimingOf(armedAt, stage.lastProgressAt, observedAt),
+        ),
+      );
+    }
+    // Deliberately never touches `fingerprint`/`noProgressCount`/`lastProgressAt` -- an
+    // `"unknown"` reading is GitHub still computing, not evidence either way about the underlying
+    // merge's own progress (see this stage's own schema header, job-progress-store.ts).
+    return transitionOrReport(
+      deps,
+      record,
+      {
+        stage: {
+          kind: "merging",
+          armedAt,
+          fingerprint: stage.fingerprint,
+          noProgressCount: stage.noProgressCount ?? 0,
+          lastProgressAt: stage.lastProgressAt,
+          unknownSince,
+          unknownCount,
+        },
+      },
+      () => ({ jobId: record.jobId, outcome: "still_merging" }),
+    );
+  }
+
+  const previous = stage.fingerprint;
+  const progressed = previous === undefined || !mergeFingerprintsEqual(previous, observed);
+  const lastProgressAt = progressed ? observedAt : (stage.lastProgressAt ?? observedAt);
+  const noProgressCount = progressed ? 0 : (stage.noProgressCount ?? 0) + 1;
+
+  if (
+    !progressed &&
+    noProgressCount >= mergingNoProgressLimit &&
+    elapsedMs(lastProgressAt, observedAt) >= mergingNoProgressWallClockMs
+  ) {
+    return requiresManual(
+      record,
+      deps,
+      "auto_merge_stalled:no_progress_timeout",
+      requiresManualCause(
+        "merge",
+        "auto_merge_stalled",
+        noProgressCount,
+        undefined,
+        observed,
+        stallTimingOf(armedAt, lastProgressAt, observedAt),
+      ),
     );
   }
 
@@ -737,13 +900,83 @@ async function resumeMergingStage(
     {
       stage: {
         kind: "merging",
-        armedAt: stage.armedAt ?? deps.clock.now(),
+        armedAt,
         fingerprint: observed,
         noProgressCount,
+        lastProgressAt,
+        unknownSince: undefined,
+        unknownCount: undefined,
       },
     },
     () => ({ jobId: record.jobId, outcome: "still_merging" }),
   );
+}
+
+/**
+ * C015y decision A: repairs a *legacy* (pre-C015y) job-progress record that has no persisted
+ * `baseRevision` -- runs entirely inside the caller's already-held lease (`resumeUnderLease` is
+ * only ever reached after `resumeOneJob` acquires one; see this file's own module header for why
+ * every mutation here is already lease-guarded). Re-resolves the authoritative base the exact same
+ * way a fresh dispatch does (`deps.resolveAuthoritativeBase`, wired to
+ * `resolveAuthoritativeBaseRevision` -- see authoritative-base.ts), then cross-checks that result
+ * against *this exact resume's own* fresh PR readback (`current.baseSha` -- already in hand from
+ * `resumeUnderLease`'s own pre-flight `getChangeRequest` call, never a second, separate GitHub
+ * call) before ever trusting it. Any mismatch, resolution failure, or CAS write failure fails
+ * closed -- `requires_manual` for the first two, `progress_write_failed` for the third (the same
+ * convention every other CAS write in this file follows via `transitionOrReport`).
+ *
+ * This can only ever *establish* a legacy record's new baseline going forward -- it cannot and
+ * does not claim to reconstruct whatever base the original dispatch actually used. That
+ * information was never persisted anywhere and no longer exists; guessing at it would be exactly
+ * the kind of "trust local state as if it were authoritative" mistake this whole ticket exists to
+ * close.
+ */
+async function resolveLegacyBaseRevision(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  current: ChangeRequestSnapshot,
+): Promise<
+  Result<Readonly<{ record: JobProgressRecord; baseRevision: HeadSha }>, ResumeJobOutcome>
+> {
+  const resolved = await deps.resolveAuthoritativeBase(deps.project, {
+    idempotencyKey: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:legacy-base`,
+  });
+  if (!resolved.ok) {
+    return err(
+      await requiresManualUnlessRetryable(
+        record,
+        deps,
+        `legacy_base_revision_unavailable:${resolved.error.reason}`,
+        resolved.error.reason === "default_branch_mismatch" ? undefined : resolved.error.error,
+        requiresManualCause("setup", "base_revision_unavailable"),
+      ),
+    );
+  }
+  // Cross-check against *this exact resume's own* fresh PR readback -- never guessed, never
+  // trusted alone. `current.baseSha` is optional purely for pre-existing test-fixture back-compat
+  // (see `ChangeRequestSnapshot.baseSha`'s own header) -- a fixture/live PR that omits or malforms
+  // it can never pass this check, by design (fail closed, not "assume it's fine").
+  const resolvedBaseSha = headShaSchema.safeParse(resolved.value.baseRevision);
+  const freshPrBaseSha = headShaSchema.safeParse(current.baseSha ?? "");
+  if (
+    !resolvedBaseSha.success ||
+    !freshPrBaseSha.success ||
+    resolvedBaseSha.data.toLowerCase() !== freshPrBaseSha.data.toLowerCase()
+  ) {
+    return err(
+      await requiresManual(
+        record,
+        deps,
+        "legacy_base_revision_mismatch",
+        requiresManualCause("setup", "legacy_base_revision_mismatch"),
+      ),
+    );
+  }
+  const written = await transition(deps.progress, record, { baseRevision: resolvedBaseSha.data });
+  if (!written.ok) {
+    return err({ jobId: record.jobId, outcome: "progress_write_failed", error: written.error });
+  }
+  return ok({ record: written.value, baseRevision: resolvedBaseSha.data });
 }
 
 async function resumeUnderLease(
@@ -861,16 +1094,20 @@ async function resumeUnderLease(
     );
   }
 
-  const git = deps.gitForBaseRevision ?? new LocalGitAdapter();
-  const repository = await git.inspectRepository({ rootPath: deps.project.localRepositoryPath });
-  if (!repository.ok) {
-    return requiresManualUnlessRetryable(
-      record,
-      deps,
-      "base_revision_unavailable",
-      repository.error,
-      requiresManualCause("setup", "base_revision_unavailable"),
-    );
+  // C015y decision A: the authoritative base is read from the durable record, never re-derived
+  // from the local git checkout -- see this file's own module header and job-progress-store.ts's
+  // `baseRevision` field header for why. `record` is reassigned (not merely read) when the legacy
+  // repair path CAS-writes a new revision -- every subsequent `transition`/`transitionOrReport`
+  // call in this function (and in `resumeReview` below, which receives this exact `record`) must
+  // use that fresh revision, never the stale one this function started with.
+  let baseRevision: HeadSha;
+  if (record.baseRevision !== undefined) {
+    baseRevision = record.baseRevision;
+  } else {
+    const repaired = await resolveLegacyBaseRevision(record, deps, currentChangeRequest.value);
+    if (!repaired.ok) return repaired.error;
+    record = repaired.value.record;
+    baseRevision = repaired.value.baseRevision;
   }
 
   const worktree = {
@@ -1007,7 +1244,7 @@ async function resumeUnderLease(
     requirementSnapshot: requirementSnapshot.value,
     worktree,
     changeRequest: currentChangeRequest.value,
-    baseRevision: repository.value.headSha,
+    baseRevision,
     idempotencyKeyPrefix,
   });
 }
@@ -1300,15 +1537,19 @@ async function resumeReview(
       // C015x decision 3: arms the persisted readback fingerprint/bound at the exact moment
       // auto-merge is enabled -- never left bare -- so `resumeMergingStage` has a real baseline to
       // compare every subsequent resume's fresh readback against, from the very first resume.
+      // C015y decision C: `lastProgressAt` is seeded to this same arm-time instant -- the natural
+      // baseline "progress" is measured against until the fingerprint next actually changes.
+      const armedAt = deps.clock.now();
       return transitionOrReport(
         deps,
         record,
         {
           stage: {
             kind: "merging",
-            armedAt: deps.clock.now(),
+            armedAt,
             fingerprint: mergeFingerprintOf(enabled.changeRequest),
             noProgressCount: 0,
+            lastProgressAt: armedAt,
           },
         },
         () => ({ jobId: record.jobId, outcome: "merging" }),
@@ -1359,6 +1600,19 @@ async function resumeReview(
             deps,
             `auto_merge_not_enabled:not_ready:${enabled.reason}`,
             requiresManualCause("merge", "auto_merge_not_enabled"),
+          );
+        case "behind":
+          // C015y decision D: `AutoMergeGate.enable()` caught this BEHIND before ever calling
+          // `enableAutoMerge` (point 1 or 2 of the three arm-time interceptions -- see that
+          // outcome's own header, merge-gate-model.ts). Same immediate, unconditional escalation
+          // as `resumeMergingStage`'s own BEHIND check -- GitHub's `strictRequiredStatusChecksPolicy`
+          // ruleset (O004) can never execute this merge while behind, so there is nothing to gain
+          // by waiting for a future resume.
+          return requiresManual(
+            record,
+            deps,
+            "change_request_behind_base",
+            requiresManualCause("merge", "change_request_behind_base"),
           );
       }
     case "failed":
