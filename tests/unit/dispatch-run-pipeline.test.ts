@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ok } from "../../src/domain/foundation/index.js";
+import { LocalGitAdapter } from "../../src/adapters/git/index.js";
 import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
@@ -405,5 +406,59 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     expect(payload.state).toBe("dispatched");
     expect(payload.pipeline).toBe("not_applicable_role");
     expect(buildImplementerPipeline).not.toHaveBeenCalled();
+  });
+
+  /**
+   * C015e: a genuinely fresh `AGENT_TEAM_HOME` (`temporaryStateRoot()` only ever `mkdtemp`s an
+   * empty directory -- nothing under it, including `state/`, is ever pre-created by this test or
+   * by `buildHandlers`). Every other test in this file fakes the pipeline's `run()` with a
+   * canned JS object, so none of them ever exercise a *real* `LocalGitAdapter.createWorktree`
+   * call at the real `request.worktreePath` handlers.ts computed -- this is exactly why E101's
+   * second real run died here (`stage:"worktree"`, `failure("conflict")`, because
+   * `${AGENT_TEAM_HOME}/state/dispatch/worktrees` never existed) while every existing test stayed
+   * green. This test's fake pipeline is the one exception: it does a real `createWorktree` at the
+   * real path, so it only passes if `ensureDispatchWorktreesDirectory` (handlers.ts, called right
+   * before this pipeline hand-off) actually created that directory first.
+   */
+  it("creates the dispatch worktrees parent directory before the pipeline hand-off, on a genuinely fresh AGENT_TEAM_HOME", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(async (request) => {
+          const created = await new LocalGitAdapter().createWorktree(
+            {
+              rootPath: request.repositoryRoot,
+              path: request.worktreePath,
+              branch: request.branch,
+              startPoint: request.baseRevision,
+            },
+            { idempotencyKey: "c015e-real-worktree" },
+          );
+          if (!created.ok) {
+            return { state: "failed", stage: "worktree", error: created.error, job: request.job };
+          }
+          return {
+            state: "paused",
+            reason: "provider_interrupted",
+            job: request.job,
+            worktree: created.value,
+          };
+        }),
+      }),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      stage?: string;
+      error?: { code: string };
+    };
+    // If `ensureDispatchWorktreesDirectory` were missing (or broken), `createWorktree` would
+    // return `failure("conflict")` and this would instead observe `pipeline:"failed"`,
+    // `stage:"worktree"` -- exactly E101's real failure shape.
+    expect(payload.pipeline).toBe("paused");
   });
 });
