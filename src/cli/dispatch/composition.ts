@@ -15,6 +15,28 @@
  * `kind:"waiting", reason:"no_dispatchable_candidate"` -- an honest reflection of "we have not
  * wired up model availability yet," not a bug in this composition). C015b owns wiring a genuine
  * `routeObservations` source.
+ *
+ * `active` is likewise always the empty set here -- this composition has no source of "jobs
+ * currently in flight" (that is `pipeline` state, and C015a stands up no pipeline). This is safe
+ * against duplicate dispatch of the *same* issue because the real guard against that is not
+ * `active`, it is the per-issue `Lease`: `canAcquireLease` (src/domain/jobs/lease.ts) treats an
+ * active lease with a matching `issueId` (not just `jobId`) as a conflict, and `dispatchOnce`
+ * always constructs a real `LeaseCoordinator` over the ports it is given (a real
+ * `FileLeaseRepository` for a genuine run, an ephemeral in-memory one for `--dry-run` --
+ * see `tests/unit/dispatch-once-lease-conflict.test.ts` for a real-file-backed proof of this).
+ * The one residual gap `active:[]` leaves open: once a lease *expires* (its holder is presumed
+ * dead), and the underlying Linear issue is still `ready` (C015a runs no pipeline, so nothing
+ * ever moves it out of ready), a later `run` will create a *second* `Job` record for the same
+ * issue -- this is judged acceptable, not a defect, because lease expiry's whole semantic is "the
+ * previous attempt is presumed dead, retry", and C015b's own execution is itself lease-gated so
+ * the two job records can never run concurrently.
+ *
+ * `dependencyContexts` is never passed to `Dispatcher.dispatch()` here (C015a has no source of
+ * cross-issue completion state). This is fail-closed, not fail-open: `evaluateEligibility`
+ * (src/domain/eligibility/decision.ts) defaults an unresolvable dependency to `"unknown"` state
+ * when no context entry exists, which is never treated as `"completed"` -- so any issue declaring
+ * `dependencies: { kind: "issues" }` is unconditionally ineligible until C015b wires a real
+ * dependency-state source, never silently dispatched early.
  */
 import { join } from "node:path";
 
@@ -42,6 +64,7 @@ import {
 } from "../../application/projects/index.js";
 import type { ModelRoutingConfig } from "../../application/routing/index.js";
 import type { JobRepository } from "../../application/dispatch/index.js";
+import type { DomainError } from "../../domain/foundation/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import {
@@ -94,6 +117,25 @@ export interface DispatchOncePorts {
 }
 
 /**
+ * `dispatchOnce`'s result. Deliberately a discriminated union distinct from `DispatcherResult`
+ * (the engine's own type, src/application/dispatch/dispatcher.ts) rather than reusing the
+ * engine's `kind:"blocked", reason:"invalid_runtime_input"` shape for a discovery failure: a
+ * Linear read failure is an *external call fault* upstream of the engine ever running, not the
+ * engine rejecting malformed input it was handed. Collapsing the two under one reason code would
+ * mislead whoever reads the CLI's JSON output into debugging the wrong layer (see the C015a
+ * acceptance review's observation on this exact point). This type is additive to, and never
+ * modifies, the engine's own `DispatcherResult`.
+ */
+export type DispatchOnceOutcome =
+  | Readonly<{
+      outcome: "ran";
+      result: DispatcherResult;
+      candidates: readonly DispatcherCandidate[];
+      discoverySkipped: readonly LinearDiscoverySkippedIssue[];
+    }>
+  | Readonly<{ outcome: "discovery_failed"; error: DomainError }>;
+
+/**
  * Runs the real discovery -> `Dispatcher.dispatch()` path exactly once, against whichever ports
  * are supplied -- the real file-backed ones for a genuine run, or the ephemeral in-memory ones
  * (ephemeral-ports.ts) for `--dry-run`. Factoring this out means both CLI modes exercise the
@@ -103,13 +145,7 @@ export async function dispatchOnce(
   ready: DispatchCompositionReady,
   ports: DispatchOncePorts,
   holderId: string,
-): Promise<
-  Readonly<{
-    result: DispatcherResult;
-    candidates: readonly DispatcherCandidate[];
-    discoverySkipped: readonly LinearDiscoverySkippedIssue[];
-  }>
-> {
+): Promise<DispatchOnceOutcome> {
   const discovered = await discoverReadyDispatchCandidates({
     project: ready.project,
     teamId: ready.discovery.teamId,
@@ -117,11 +153,7 @@ export async function dispatchOnce(
     readModel: ready.discovery.readModel,
   });
   if (!discovered.ok) {
-    return Object.freeze({
-      result: Object.freeze({ kind: "blocked", reason: "invalid_runtime_input", skipped: [] }),
-      candidates: [],
-      discoverySkipped: [],
-    });
+    return Object.freeze({ outcome: "discovery_failed" as const, error: discovered.error });
   }
   const dispatcher = new Dispatcher(ports);
   const result = await dispatcher.dispatch({
@@ -133,6 +165,7 @@ export async function dispatchOnce(
     routeObservations: [],
   });
   return Object.freeze({
+    outcome: "ran" as const,
     result,
     candidates: discovered.value.candidates,
     discoverySkipped: discovered.value.skipped,

@@ -97,11 +97,18 @@ export function createDispatchCliHandlers(
           }
         : { leases: new LeaseCoordinator(build.value.leases), jobs: build.value.jobs };
 
-      const { result, candidates, discoverySkipped } = await dispatchOnce(
-        build.value,
-        ports,
-        holderId,
-      );
+      const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId);
+      if (dispatchOnceOutcome.outcome === "discovery_failed") {
+        return outcome("failed", {
+          operation: "dispatch_run",
+          state: "blocked",
+          projectId: input.projectId,
+          reason: "discovery_failed",
+          message: "讀取 Linear 待執行工單失敗（外部呼叫故障，非設定缺失，可重試）。",
+          error: dispatchOnceOutcome.error,
+        });
+      }
+      const { result, candidates, discoverySkipped } = dispatchOnceOutcome;
       const candidateSummaries = candidates.map((candidate) => ({
         issueId: candidate.issue.id,
         externalId: candidate.issue.externalId,
