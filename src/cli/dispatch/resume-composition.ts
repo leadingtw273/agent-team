@@ -323,7 +323,7 @@ export type ResumeJobOutcome =
  * state mismatch or a review-side rejection that no readback can safely second-guess, and stays
  * exactly as fail-closed as C015o's admission design always intended.
  */
-function isMergeReconcilable(record: JobProgressRecord): record is JobProgressRecord & {
+export function isMergeReconcilable(record: JobProgressRecord): record is JobProgressRecord & {
   stage: Extract<JobProgressRecord["stage"], { kind: "requires_manual" }>;
 } {
   return (
@@ -332,6 +332,38 @@ function isMergeReconcilable(record: JobProgressRecord): record is JobProgressRe
     (record.stage.cause.reasonCode === "auto_merge_not_enabled" ||
       record.stage.cause.reasonCode === "lifecycle_not_completed")
   );
+}
+
+/**
+ * C015u decision 1: the *complete* predicate for "this record needs `runResumeCycle` to look at it
+ * at all" -- `resumableStageKinds.has(...)` alone (the pre-C015t predicate) went stale the moment
+ * C015t added the second, narrower candidate class (`isMergeReconcilable`). This is the exact bug a
+ * real E101 run just hit: `handlers.ts`'s own pre-flight gate only checked
+ * `resumableStageKinds`, so a `requires_manual` record with `cause.reasonCode:
+ * "auto_merge_not_enabled"` (genuinely reconcilable) never even reached `runResumeCycle` -- the CLI
+ * fell straight through to fresh dispatch, which then correctly got blocked by the still-active
+ * admission claim, producing the exact silent-no-op the coordinator observed
+ * (`state:"waiting","reason":"no_eligible_candidates"`).
+ *
+ * `runResumeCycle` itself is *not* changed by this predicate -- it still separately filters into
+ * `resumable`/`mergeReconcilable` and drives each through its own distinct code path (a normal
+ * resume attempt vs. the narrow, read-only readback). This function exists *only* so every outer
+ * gate that has to decide "is there anything for `runResumeCycle` to do" (today: `handlers.ts`'s
+ * own pre-flight check before building the GitHub-auth-gated resume composition and ensuring the
+ * worktree directory exists) can ask one question and get the right answer, rather than
+ * re-deriving (and inevitably drifting from) `runResumeCycle`'s own eligibility logic a second time.
+ *
+ * Deliberately not "call `runResumeCycle` unconditionally, let it no-op if there's nothing to do":
+ * codex's review named the concrete cost of that alternative -- a project with *zero* existing
+ * progress records (the common case: no prior job at all, or every prior job already terminal) would
+ * still pay for building the full GitHub-auth-gated resume composition and an `ensureDispatchWorktreesDirectory`
+ * call on every single `agent-team run`, and -- worse -- would turn an otherwise-dispatchable run
+ * into `github_authentication_unavailable`-blocked the moment GitHub auth is not configured, even
+ * though this run had no resume work to do at all and a fresh dispatch never needed GitHub auth in
+ * the first place.
+ */
+export function isResumeCandidate(record: JobProgressRecord): boolean {
+  return resumableStageKinds.has(record.stage.kind) || isMergeReconcilable(record);
 }
 
 /** Runs one resume attempt for every resumable job-progress record belonging to `dependencies.project`,

@@ -42,7 +42,7 @@ import {
   buildIssueAdmissionStore,
   buildJobProgressStore,
   buildReviewReportDiagnosticsSidecar,
-  resumableStageKinds,
+  isResumeCandidate,
   runResumeCycle,
   type ResumeJobOutcome,
 } from "./resume-composition.js";
@@ -220,10 +220,13 @@ export function createDispatchCliHandlers(
             error: existingProgress.error,
           });
         }
-        const resumable = existingProgress.value.filter((record) =>
-          resumableStageKinds.has(record.stage.kind),
-        );
-        if (resumable.length > 0) {
+        // C015u decision 1: `isResumeCandidate` -- not `resumableStageKinds` alone -- is the
+        // complete gate. See that function's own header (resume-composition.ts) for exactly why
+        // this drifted stale the moment C015t added its second, narrower candidate class, and why
+        // this stays a pre-flight "is there anything at all" check rather than calling
+        // `runResumeCycle` unconditionally.
+        const hasResumeCandidate = existingProgress.value.some(isResumeCandidate);
+        if (hasResumeCandidate) {
           const resumeComposition = await (
             options.buildResumeComposition ?? buildResumeComposition
           )({

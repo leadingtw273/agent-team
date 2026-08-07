@@ -43,6 +43,7 @@ import type { Job, Lease } from "../../src/domain/jobs/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
+import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
 import type { LinearReadModel } from "../../src/adapters/linear/read.js";
 import type { BuildResumeCompositionResult } from "../../src/cli/dispatch/resume-full-composition.js";
 
@@ -393,6 +394,73 @@ async function seedResumableProgressRecord(stateRoot: string): Promise<Identifie
   return jobId;
 }
 
+/** C015u decision 2/3: seeds a `requires_manual` record with a specific `cause.reasonCode` -- the
+ * exact real-world shape `job_dbae5b6a` was stuck in (`auto_merge_not_enabled`) when C015u's own
+ * real-world incident happened, and the negative-case shape (any reasonCode outside decision 3's
+ * narrow whitelist) that must still fall through to ordinary discovery/admission. */
+async function seedRequiresManualProgressRecord(
+  stateRoot: string,
+  reasonCode: "auto_merge_not_enabled" | "lifecycle_not_completed" | "change_request_unavailable",
+): Promise<Identifier<"job">> {
+  const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+  const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+  await progress.compareAndSwap(jobId, null, {
+    jobId,
+    projectId: id("project", projectId),
+    issueId: id("issue", issueId),
+    externalIssueId: "linear-issue-1",
+    model: "claude-opus",
+    stage: {
+      kind: "requires_manual",
+      cause: {
+        stage: reasonCode === "change_request_unavailable" ? "setup" : "merge",
+        reasonCode,
+        attempts: { count: 1 },
+      },
+    },
+    branch: `agent-team/${jobId}`,
+    worktreePath: "/tmp/does-not-need-to-exist-for-this-fake",
+    changeRequestId: "42",
+  });
+  return jobId;
+}
+
+/** C015u decision 2: claims and attaches an *active* admission claim for `(projectId, issueId)` --
+ * the durable state a real dispatched-then-stuck job leaves behind, and the exact resource decision
+ * 2's positive case must prove gets released, and its negative case must prove stays untouched
+ * (and therefore still blocks a fresh dispatch attempt for the same issue). Real, file-backed
+ * `FileIssueAdmissionStore` at the same `stateRoot` the handler itself builds one at -- so read-back
+ * afterward is a genuine end-to-end check, not a fake standing in for one. */
+async function seedActiveAdmissionClaim(
+  stateRoot: string,
+  jobId: Identifier<"job">,
+): Promise<FileIssueAdmissionStore> {
+  const admission = new FileIssueAdmissionStore(join(stateRoot, "state", "dispatch", "admission"));
+  const claimed = await admission.claim(projectId, issueId);
+  if (!claimed.ok) throw new Error(claimed.error.code);
+  const attached = await admission.attachJob(projectId, issueId, claimed.value.revision, jobId);
+  if (!attached.ok) throw new Error(attached.error.code);
+  return admission;
+}
+
+/** C015u decision 2: a minimal, real `ChangeRequestSnapshot`-shaped fixture -- only the fields
+ * `AutoMergeGate`/`LifecyclePipeline`/the reconcile readback itself actually read. */
+function mergedChangeRequestFixture() {
+  return {
+    id: "PR_node_fixture",
+    number: 7,
+    url: "https://github.com/owner/sandbox/pull/7",
+    state: "merged" as const,
+    draft: false,
+    baseBranch: "main",
+    headBranch: "agent-team/job-1",
+    headSha: "a".repeat(40),
+    mergeability: "mergeable" as const,
+    autoMergeEnabled: false,
+    updatedAt: "2026-08-08T00:00:00.000Z",
+  };
+}
+
 describe("createDispatchCliHandlers resume wiring (C015c item 2)", () => {
   it("--dry-run never touches or acts on an existing resumable job-progress record", async () => {
     const stateRoot = await temporaryStateRoot();
@@ -506,5 +574,244 @@ describe("createDispatchCliHandlers resume wiring (C015c item 2)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as { state: string };
     expect(payload.state).toBe("dispatched");
     expect(discoverSpy).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * C015u decision 2 (this ticket's own core deliverable): a real E101 run got stuck exactly this
+   * way -- `job_dbae5b6a` sat at `requires_manual` with `cause.reasonCode: "auto_merge_not_enabled"`
+   * (PR #7 had genuinely already merged), and `agent-team run` silently fell through to fresh
+   * dispatch (`{"state":"waiting","reason":"no_eligible_candidates"}`) because `handlers.ts`'s own
+   * pre-flight gate only ever checked `resumableStageKinds`, never `isMergeReconcilable`'s narrower
+   * class. This test proves the fix through the *production* handler entry point end to end --
+   * not `runResumeCycle` directly (that path was always correct; C015o/C015q/C015r/C015s/C015t's own
+   * unit tests already exhaustively cover it) -- with real, file-backed `FileJobProgressStore`/
+   * `FileIssueAdmissionStore` instances at the same `stateRoot` the handler itself builds them at.
+   */
+  it("resumes a narrowly-reconcilable requires_manual record (C015u's own real-world incident), never reaching discovery, and releases admission on convergence", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const jobId = await seedRequiresManualProgressRecord(stateRoot, "auto_merge_not_enabled");
+    const admission = await seedActiveAdmissionClaim(stateRoot, jobId);
+    const claimBefore = await admission.load(projectId, issueId);
+    expect(claimBefore).toMatchObject({ ok: true, value: { state: "active", jobId } });
+
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () =>
+        Promise.resolve({
+          state: "ready",
+          value: {
+            sourceControl: {
+              getChangeRequest: () => Promise.resolve(ok(mergedChangeRequestFixture())),
+            },
+            ciRecovery: {
+              run: () =>
+                Promise.reject(new Error("must never be called: reconcile never re-runs CI")),
+            },
+            reviewer: {
+              run: () =>
+                Promise.reject(new Error("must never be called: reconcile never re-reviews")),
+            },
+            reviewStatus: {
+              begin: () => Promise.reject(new Error("must never be called")),
+              record: () => Promise.reject(new Error("must never be called")),
+            },
+            autoMerge: {
+              enable: () =>
+                Promise.reject(
+                  new Error("must never be called: reconcile never re-enables auto-merge"),
+                ),
+            },
+            lifecycle: {
+              run: () =>
+                Promise.resolve({
+                  state: "completed",
+                  merge: "authorized",
+                  headSha: mergedChangeRequestFixture().headSha,
+                  autoMergePaused: false,
+                }),
+            },
+          },
+        } as unknown as Promise<BuildResumeCompositionResult>),
+    });
+
+    const outcome = await handlers.run({ projectId });
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      state: string;
+      resumed: readonly { jobId: string; outcome: string }[];
+    };
+    expect(payload.state).toBe("resumed");
+    expect(payload.resumed).toEqual([{ jobId, outcome: "merge_reconciled" }]);
+    expect(discoverSpy).not.toHaveBeenCalled();
+
+    const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+    const reloaded = await progress.load(jobId);
+    expect(reloaded).toMatchObject({ ok: true, value: { stage: { kind: "completed" } } });
+
+    const claimAfter = await admission.load(projectId, issueId);
+    expect(claimAfter).toMatchObject({
+      ok: true,
+      value: { state: "released", releaseReason: "completed" },
+    });
+  });
+
+  it("a requires_manual record outside decision 3's narrow whitelist never builds a resume composition -- falls through to discovery, correctly blocked by the still-active admission claim", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const jobId = await seedRequiresManualProgressRecord(stateRoot, "change_request_unavailable");
+    const admission = await seedActiveAdmissionClaim(stateRoot, jobId);
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        throw new Error(
+          "must never be called: change_request_unavailable is not in decision 3's whitelist",
+        );
+      },
+    });
+
+    const outcome = await handlers.run({ projectId });
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      state: string;
+      admissionSkipped?: readonly { issueId: string; reason: string }[];
+    };
+    // Falls all the way through to ordinary discovery/dispatch -- the seeded requires_manual
+    // record is simply never looked at again by this call (predicate correctly excludes it).
+    expect(discoverSpy).toHaveBeenCalledTimes(1);
+    expect(payload.admissionSkipped).toEqual([{ issueId, reason: "issue_claim_active" }]);
+
+    // The requires_manual record itself, and its admission claim, are untouched -- proving the
+    // predicate did not accidentally widen to "any requires_manual record".
+    const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+    const reloaded = await progress.load(jobId);
+    expect(reloaded).toMatchObject({
+      ok: true,
+      value: { revision: 0, stage: { kind: "requires_manual" } },
+    });
+    const claim = await admission.load(projectId, issueId);
+    expect(claim).toMatchObject({ ok: true, value: { state: "active", jobId } });
+  });
+});
+
+/**
+ * C015u decision 3: a small routing matrix over `agent-team run`'s *outer* path selection --
+ * "does this input reach discovery, or a resume/reconcile composition, or neither" -- not a
+ * re-test of what happens once inside either path (that is `dispatch-resume-composition.test.ts`'s
+ * job for the resume/reconcile state machine, and `dispatch-once.test.ts`'s for discovery/dispatch).
+ * Deliberately five rows, not a full cross-product of every handler entry point x every job stage
+ * (codex's review explicitly warned that would be high-cost and brittle without adding real
+ * coverage) -- rows ①④⑤ are already independently proven by
+ * "resumes an existing job before considering a fresh dispatch..."/"falls through to the ordinary
+ * dispatch flow..."/"--dry-run never touches or acts on an existing resumable job-progress
+ * record" above; they are restated here, self-contained, so the whole matrix is visible and
+ * auditable in one place rather than requiring a reader to reassemble it from three separate
+ * `describe` blocks.
+ */
+describe("C015u decision 3: dispatch run routing matrix (outer path selection only)", () => {
+  it("① a general resumable stage (ci_waiting) routes to resume composition/cycle, never discovery", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    await seedResumableProgressRecord(stateRoot);
+    let resumeCompositionBuilt = false;
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        resumeCompositionBuilt = true;
+        return Promise.resolve({
+          state: "blocked",
+          reason: "github_authentication_unavailable",
+        });
+      },
+    });
+
+    await handlers.run({ projectId });
+    expect(resumeCompositionBuilt).toBe(true);
+    expect(discoverSpy).not.toHaveBeenCalled();
+  });
+
+  it("② a narrowly-reconcilable requires_manual routes to resume composition/reconcile, never discovery", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    await seedRequiresManualProgressRecord(stateRoot, "lifecycle_not_completed");
+    let resumeCompositionBuilt = false;
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        resumeCompositionBuilt = true;
+        return Promise.resolve({
+          state: "blocked",
+          reason: "github_authentication_unavailable",
+        });
+      },
+    });
+
+    await handlers.run({ projectId });
+    expect(resumeCompositionBuilt).toBe(true);
+    expect(discoverSpy).not.toHaveBeenCalled();
+  });
+
+  it("③ a non-reconcilable requires_manual never routes to resume -- falls to discovery/admission", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    await seedRequiresManualProgressRecord(stateRoot, "change_request_unavailable");
+    let resumeCompositionBuilt = false;
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        resumeCompositionBuilt = true;
+        return Promise.resolve({
+          state: "blocked",
+          reason: "github_authentication_unavailable",
+        });
+      },
+    });
+
+    await handlers.run({ projectId });
+    expect(resumeCompositionBuilt).toBe(false);
+    expect(discoverSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("④ no progress record at all routes straight to fresh dispatch", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    let resumeCompositionBuilt = false;
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        resumeCompositionBuilt = true;
+        return Promise.resolve({
+          state: "blocked",
+          reason: "github_authentication_unavailable",
+        });
+      },
+    });
+
+    await handlers.run({ projectId });
+    expect(resumeCompositionBuilt).toBe(false);
+    expect(discoverSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("⑤ --dry-run never resumes, even with an eligible resume candidate present, and makes zero external calls", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    await seedRequiresManualProgressRecord(stateRoot, "auto_merge_not_enabled");
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      buildResumeComposition: () => {
+        throw new Error("must never be called: --dry-run must never attempt a resume/reconcile");
+      },
+    });
+
+    const outcome = await handlers.run({ projectId, dryRun: true });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as { state: string };
+    expect(payload.state).toBe("dry_run");
+    expect(discoverSpy).toHaveBeenCalledTimes(1); // dry-run still previews discovery -- just never mutates.
   });
 });
