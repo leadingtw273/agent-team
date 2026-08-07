@@ -157,6 +157,29 @@ const labelsQuery = `
     }
   }
 `;
+/** C015a: exact-filter list query, same style as O006's own marker-scoped `issues(filter:...)`
+ * query (proactive-probe-linear.ts) -- never a fuzzy/text search, always an equality filter on
+ * team+project+state ids. */
+const issueIdsInStateQuery = `
+  query AgentTeamListIssueIdsInState($teamId: ID!, $projectId: ID!, $stateId: ID!, $after: String) {
+    issues(
+      filter: {
+        team: { id: { eq: $teamId } }
+        project: { id: { eq: $projectId } }
+        state: { id: { eq: $stateId } }
+      }
+      first: 50
+      after: $after
+    ) {
+      nodes { id }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+const issueIdsInStatePageSchema = z
+  .object({ issues: connectionSchema(z.object({ id: idSchema }).strict()) })
+  .strict();
+
 const issueBaseQuery = `
   query AgentTeamReadIssue($issueId: String!) {
     issue(id: $issueId) {
@@ -300,6 +323,33 @@ export class LinearReadModel {
     const team: LinearTeamRecord = Object.freeze({ ...identity.value.team });
     const project: LinearNamedRecord = Object.freeze({ ...identity.value.project });
     return ok(Object.freeze({ team, project, catalog: catalog.value }));
+  }
+
+  /**
+   * C015a: lists every issue id currently in `stateId` for this context's team+project -- the
+   * one capability a Linear discovery poll needs that this class did not previously expose (only
+   * `readIssue`, single-issue-by-id, existed before). Never mutates, never invents an id: purely
+   * an equality filter over provider-origin data, exactly the query-authoring pattern
+   * `readContext` above already uses. Callers project each returned id through `readIssue` to get
+   * a fully-verified `LinearIssueSnapshot` -- this method intentionally returns ids only, so a
+   * single malformed issue can never abort the whole listing.
+   */
+  async listIssueIdsInState(
+    context: LinearProjectContext,
+    stateId: string,
+    options: ReadOptions = {},
+  ): Promise<Result<readonly string[], DomainError>> {
+    const result = await this.transport.paginate<unknown, { readonly id: string }>(
+      {
+        operationName: "AgentTeamListIssueIdsInState",
+        query: issueIdsInStateQuery,
+        variables: { teamId: context.team.id, projectId: context.project.id, stateId },
+        selectConnection: (data) => issueIdsInStatePageSchema.parse(data).issues,
+      },
+      options,
+    );
+    if (!result.ok) return result;
+    return ok(Object.freeze(result.value.map((node) => node.id)));
   }
 
   async readIssue(

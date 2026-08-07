@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { createDispatchCliHandlers } from "./dispatch/index.js";
 import { createWakeupHealthHandler } from "./health/index.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
@@ -20,6 +21,7 @@ const agentTeamHome = process.env["AGENT_TEAM_HOME"] ?? join(homedir(), ".agent-
 
 process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ...defaultCliHandlers,
+  ...createDispatchCliHandlers({ agentTeamHome }),
   health: createWakeupHealthHandler(),
   ingest: createLocalWebhookIngestHandler({
     ...(process.env["AGENT_TEAM_HOME"] === undefined ? {} : { agentTeamHome }),
