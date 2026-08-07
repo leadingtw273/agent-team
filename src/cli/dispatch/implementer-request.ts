@@ -37,6 +37,25 @@ function bulletList(heading: string, items: readonly string[] | undefined): stri
   return `${heading}：\n${items.map((item) => `- ${item}`).join("\n")}`;
 }
 
+/**
+ * `GitPreflight.inspect` (src/adapters/git/preflight.ts:160-183) checks `unexpected_untracked`
+ * *independently* of `declaredRegions` membership -- a brand-new file the provider creates
+ * *inside* a declared region is still flagged unless its exact path is also listed in
+ * `expectedUntrackedPaths`. Only `coverage:"exact"` regions are used as the source for this: each
+ * one already names one literal file path, which is exactly what "this specific new file is
+ * expected" needs. `coverage:"subtree"` regions cannot contribute (no literal path to list), so a
+ * genuinely new file the provider creates inside a `"subtree"` region will still trip
+ * `unexpected_untracked` -- a disclosed limitation, not a silent one: the Ready Gate template
+ * parser (`requirement-template.ts`) only ever emits `coverage:"exact"`, so this covers every
+ * `changeRegions` entry this ticket's own discovery path can actually produce.
+ */
+function expectedUntrackedPathsFrom(issue: Issue): readonly string[] | undefined {
+  const exactPaths = (issue.changeRegions ?? [])
+    .filter((region) => region.coverage === "exact")
+    .map((region) => region.path);
+  return exactPaths.length > 0 ? exactPaths : undefined;
+}
+
 /** Builds the text handed to Claude as `controllerDirective`/the PR body -- there is no
  * "team lead" stage in this minimal path (that is a separate, unbuilt role/pipeline), so this is
  * the closest equivalent: a plain restatement of exactly the structured fields eligibility already
@@ -93,6 +112,7 @@ export function buildImplementerPipelineRequest(
     options.job.id,
   );
   const directive = buildDirective(options.issue);
+  const expectedUntrackedPaths = expectedUntrackedPathsFrom(options.issue);
 
   return ok(
     Object.freeze({
@@ -113,6 +133,7 @@ export function buildImplementerPipelineRequest(
       externalData: Object.freeze([]),
       deadlineAt: deadlineAt.value,
       idempotencyKeyPrefix: `cli-dispatch:${options.job.id}`,
+      ...(expectedUntrackedPaths === undefined ? {} : { expectedUntrackedPaths }),
     }),
   );
 }

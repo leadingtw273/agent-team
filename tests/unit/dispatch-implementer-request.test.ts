@@ -139,6 +139,53 @@ describe("buildImplementerPipelineRequest", () => {
     expect(request.idempotencyKeyPrefix).toBe(`cli-dispatch:${jobId}`);
   });
 
+  it("derives expectedUntrackedPaths from exact-coverage changeRegions (GitPreflight needs this for new files)", () => {
+    const result = buildImplementerPipelineRequest({
+      job: job(),
+      issue: issue(),
+      project: project(),
+      trustedConfig: trustedConfig(),
+      model: "opus",
+      agentTeamHome: "/tmp/agent-team-home",
+      clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // `issue()`'s own fixture declares exactly this one changeRegion (coverage:"exact").
+    expect(result.value.expectedUntrackedPaths).toEqual([
+      "src/cli/dispatch/implementer-request.ts",
+    ]);
+  });
+
+  it("leaves expectedUntrackedPaths absent when the issue declares no changeRegions at all", () => {
+    const noRegionIssue = issueSchema.parse({
+      schemaVersion: 1,
+      id: issueId,
+      projectId,
+      externalId: "linear-issue-1",
+      title: "No regions",
+      dependencies: { kind: "none" },
+      priority: "high",
+      agentRole: "implementer",
+      reviewRequirement: "code_review",
+      estimatedMinutes: 30,
+    });
+    const result = buildImplementerPipelineRequest({
+      job: job(),
+      issue: noRegionIssue,
+      project: project(),
+      trustedConfig: trustedConfig(),
+      model: "opus",
+      agentTeamHome: "/tmp/agent-team-home",
+      clock: createFixedClock(now),
+      baseRevision: "a".repeat(40),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.expectedUntrackedPaths).toBeUndefined();
+  });
+
   it("sets deadlineAt to exactly the 60-minute watchdog hard-stop boundary, never beyond it", () => {
     const result = buildImplementerPipelineRequest({
       job: job(),
