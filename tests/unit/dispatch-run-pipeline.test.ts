@@ -244,6 +244,9 @@ function buildHandlers(
           teamId: "team-1",
           linearProjectId: "linear-proj-1",
           readModel: unusedReadModel,
+          // Never exercised here: these tests stop at pipeline-outcome mapping, well before
+          // `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
+          mutationClient: {} as never,
         },
         project: project(repositoryPath),
         trustedConfig: trustedConfigFixture(),

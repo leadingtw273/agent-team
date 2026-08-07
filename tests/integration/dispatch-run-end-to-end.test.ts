@@ -296,6 +296,9 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
         teamId: "team-1",
         linearProjectId: "linear-proj-1",
         readModel: readModel as never,
+        // Never exercised by this test: the E2E chain stops at `ci_waiting`, well before
+        // `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
+        mutationClient: {} as never,
       },
       project,
       trustedConfig,

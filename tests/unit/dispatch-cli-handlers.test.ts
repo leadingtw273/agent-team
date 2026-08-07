@@ -288,6 +288,9 @@ function fakeBuildComposition(stateRoot: string) {
           teamId: "team-1",
           linearProjectId: "linear-proj-1",
           readModel: unusedReadModel,
+          // Never exercised here: these handler tests stop at dry-run/dispatch outcomes, well
+          // before `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
+          mutationClient: {} as never,
         },
         project: project(),
         trustedConfig: trustedConfigFixture(),
