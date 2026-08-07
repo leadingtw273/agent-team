@@ -1,3 +1,25 @@
+/**
+ * C015v: fixes a deadlock where two independently-correct earlier decisions interacted badly --
+ * C015c made `LifecyclePolicyPort`'s NoOp production adapter honestly report `"unknown"` (it has no
+ * real capability to pause anything), and C015t made the narrow `requires_manual` reconcile path
+ * deliberately withhold merge authorization for out-of-process merges (never reverse-inferred from
+ * head-SHA equality) -- but `#handleMerge` then treated *every* out-of-process merge's "unknown"
+ * pause result as fail-closed, including the overwhelming common case where the change request is
+ * already `merged` and there is structurally nothing left to pause. A real E101 job hit exactly
+ * this: Linear could never reach Done, local progress could never reach `completed`, and the
+ * admission claim could never release, for a PR that had genuinely, safely already merged.
+ *
+ * Scope boundary (explicit, not implicit): this ticket implements *only* the fact-convergence half
+ * of the problem -- an already-merged change request can always converge to a truthful terminal
+ * state (`completed` with an honest `autoMergeDisposition`, or `failed`/fail-closed if genuinely
+ * ambiguous). It does **not** implement any real future-auto-merge-isolation capability (E116's own,
+ * separate scope: e.g. a GitHub repository-level auto-merge disable, or a persistent per-project
+ * quarantine) -- `NoOpAutoMergePauseAdapter` still has zero real pause capability after this ticket,
+ * and this file's own audit-comment wording is deliberately written so it can never claim otherwise.
+ * That capability, if ever required, needs its own ticket with its own persistent-quarantine design,
+ * readback, and re-enable authorization -- it must never be satisfied by quietly reusing this
+ * ticket's fact-convergence fix.
+ */
 import { domainError, type DomainError } from "../../domain/foundation/index.js";
 import { projectSchema } from "../../domain/project/index.js";
 import { transitionWorkStatus } from "../../domain/workflow/index.js";
@@ -52,10 +74,18 @@ function issueMatchesRequest(
   );
 }
 
+/**
+ * C015v decision 3 (a hard wording rule, not a style choice): the `not_applicable` branch must
+ * state plainly that the merged PR has no pending auto-merge left to cancel -- it must never reuse
+ * the `paused` branch's "已暫停此專案新的 Auto-merge" wording, which would falsely claim a
+ * project-wide safety action that never happened (E116's own, deliberately-deferred scope; see this
+ * file's header). Every sentence here is a fixed template selected by `disposition`, never
+ * freeform text, so this invariant cannot drift call by call.
+ */
 function mergeComment(
   request: LifecyclePipelineRequest,
   headSha: string,
-  outOfProcess: boolean,
+  disposition: "not_required" | "paused" | "not_applicable",
 ): string {
   const common = [
     "🤖 Agent Team｜團隊管理者",
@@ -63,14 +93,19 @@ function mergeComment(
     `- PR：${request.changeRequestId}`,
     `- Head SHA：${headSha}`,
   ];
-  return outOfProcess
-    ? [
-        ...common,
-        "- 稽核：流程外合併，缺少 Controller 的精確 Head 合併授權",
-        "- 安全處置：已暫停此專案新的 Auto-merge，等待團隊管理者檢查",
-        "- 後續：不自動 Revert；現有合併結果保留",
-      ].join("\n")
-    : [...common, "- 稽核：精確 Head 合併授權相符", "- 後續：等待下游生命週期對帳"].join("\n");
+  if (disposition === "not_required") {
+    return [...common, "- 稽核：精確 Head 合併授權相符", "- 後續：等待下游生命週期對帳"].join("\n");
+  }
+  const safetyLine =
+    disposition === "paused"
+      ? "- 安全處置：已暫停此專案新的 Auto-merge，等待團隊管理者檢查"
+      : "- 安全處置：該 PR 已合併，無 pending auto-merge 可取消";
+  return [
+    ...common,
+    "- 稽核：流程外合併，缺少 Controller 的精確 Head 合併授權",
+    safetyLine,
+    "- 後續：不自動 Revert；現有合併結果保留",
+  ].join("\n");
 }
 
 function closedComment(request: LifecyclePipelineRequest): string {
@@ -148,6 +183,16 @@ export class LifecyclePipeline {
       issue.workStatus !== "canceled" &&
       request.mergeAuthorizationHeadSha !== undefined &&
       sameSha(request.mergeAuthorizationHeadSha, mergedHeadSha);
+    // C015v decision 1: `autoMergeDisposition` defaults to `"not_required"` -- the in-process,
+    // authorized-merge case, where pausing anything was never on the table. The `!authorized`
+    // branch below is the *only* place this can become `"paused"`/`"not_applicable"`, and this
+    // method -- having just performed (in `run()`, immediately before dispatching here) the
+    // authoritative readback that proved `mergedHeadSha` is real -- is what supplies that fact to
+    // `pauseAutoMerge` (via `reason: "out_of_process_merge"` + `mergedHeadSha`); the policy port
+    // itself never independently re-derives "is this already merged" from anything else. `"unknown"`
+    // (a genuine pause attempt that could not be confirmed) still fails closed exactly as before
+    // this ticket -- only the previously-unreachable `"not_applicable"` case is new.
+    let autoMergeDisposition: "not_required" | "paused" | "not_applicable" = "not_required";
     if (!authorized) {
       const paused = await this.ports.policy.pauseAutoMerge(
         {
@@ -159,9 +204,10 @@ export class LifecyclePipeline {
         mutation(request, "pause-auto-merge"),
       );
       if (!paused.ok) return failed("policy", paused.error);
-      if (paused.value.durability !== "confirmed") {
+      if (paused.value.state === "unknown") {
         return failed("policy", domainError("external_failure"));
       }
+      autoMergeDisposition = paused.value.state;
     }
 
     if (issue.workStatus !== "completed") {
@@ -185,7 +231,7 @@ export class LifecyclePipeline {
     }
     const comment = await this.ports.workManagement.appendComment(
       { project: request.project, externalIssueId: request.externalIssueId },
-      mergeComment(request, mergedHeadSha, !authorized),
+      mergeComment(request, mergedHeadSha, autoMergeDisposition),
       mutation(request, authorized ? "authorized-merge-comment" : "out-of-process-merge-comment"),
     );
     if (!comment.ok) return failed("comment", comment.error);
@@ -193,7 +239,7 @@ export class LifecyclePipeline {
       state: "completed",
       merge: authorized ? "authorized" : "out_of_process",
       headSha: mergedHeadSha,
-      autoMergePaused: !authorized,
+      autoMergeDisposition,
     });
   }
 

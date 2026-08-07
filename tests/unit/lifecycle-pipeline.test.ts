@@ -4,6 +4,7 @@ import {
   LifecyclePipeline,
   type LifecyclePipelinePorts,
   type LifecyclePipelineRequest,
+  type PauseAutoMergeOutcome,
 } from "../../src/application/pipelines/index.js";
 import type {
   ChangeRequestSnapshot,
@@ -76,7 +77,11 @@ function issueSnapshot(
 interface FixtureOptions {
   readonly changeRequest?: ChangeRequestSnapshot;
   readonly issue?: WorkManagementIssueSnapshot;
-  readonly policyDurability?: "confirmed" | "unknown";
+  /** C015v decision 1: defaults to `not_applicable` -- the real production
+   * `NoOpAutoMergePauseAdapter`'s own only honest answer for its one call site (an already-merged
+   * change request; see that adapter's own header for why this is not a guess). Override to
+   * exercise `"paused"`/`"unknown"` explicitly. */
+  readonly policyOutcome?: PauseAutoMergeOutcome;
   readonly policyFailure?: boolean;
   readonly checkpoint?: "not_required" | "preserved";
   readonly activeWorkStopped?: boolean;
@@ -115,7 +120,15 @@ function ports(options: FixtureOptions = {}): LifecyclePipelinePorts {
         calls.push("pause_auto_merge");
         return options.policyFailure === true
           ? Promise.resolve(err(domainError("external_failure")))
-          : Promise.resolve(ok({ durability: options.policyDurability ?? "confirmed" }));
+          : Promise.resolve(
+              ok(
+                options.policyOutcome ?? {
+                  state: "not_applicable" as const,
+                  reason: "change_request_already_merged" as const,
+                  observedState: "merged" as const,
+                },
+              ),
+            );
       }),
     },
     cancellation: {
@@ -160,7 +173,7 @@ describe("merged lifecycle", () => {
       state: "completed",
       merge: "authorized",
       headSha,
-      autoMergePaused: false,
+      autoMergeDisposition: "not_required",
     });
     expect(calls[0]).toBe("work_status:completed");
     expect(comments(calls)[0]).toContain("精確 Head 合併授權相符");
@@ -184,7 +197,38 @@ describe("merged lifecycle", () => {
     expect(comments(calls)).toHaveLength(1);
   });
 
-  it("completes but audits an out-of-process merge after durably pausing new auto-merge", async () => {
+  it("completes but audits an out-of-process merge after durably pausing new auto-merge (a real future pause capability, none exists in production today)", async () => {
+    const calls: string[] = [];
+    const fixture = ports({
+      changeRequest: changeRequest("merged"),
+      policyOutcome: { state: "paused", durability: "confirmed" },
+      calls,
+    });
+    const outcome = await new LifecyclePipeline(fixture).run(
+      request({ mergeAuthorizationHeadSha: otherSha }),
+    );
+
+    expect(outcome).toEqual({
+      state: "completed",
+      merge: "out_of_process",
+      headSha,
+      autoMergeDisposition: "paused",
+    });
+    expect(calls[0]).toBe("pause_auto_merge");
+    expect(calls[1]).toBe("work_status:completed");
+    expect(comments(calls)[0]).toContain("流程外合併");
+    expect(comments(calls)[0]).toContain("已暫停此專案新的 Auto-merge");
+    expect(comments(calls)[0]).toContain("不自動 Revert");
+  });
+
+  /**
+   * C015v decision 1 (this ticket's own core fix, real-world regression test): the change request
+   * is `merged` out-of-process, and the policy adapter honestly reports `not_applicable` (the
+   * production `NoOpAutoMergePauseAdapter`'s own real, unconditional answer) -- this must converge
+   * exactly like the `"paused"` case above, not fail closed. This is the exact shape that
+   * deadlocked a real E101 job before this ticket.
+   */
+  it("C015v: completes an out-of-process merge when the policy adapter reports not_applicable (already merged, nothing to pause)", async () => {
     const calls: string[] = [];
     const fixture = ports({ changeRequest: changeRequest("merged"), calls });
     const outcome = await new LifecyclePipeline(fixture).run(
@@ -195,19 +239,23 @@ describe("merged lifecycle", () => {
       state: "completed",
       merge: "out_of_process",
       headSha,
-      autoMergePaused: true,
+      autoMergeDisposition: "not_applicable",
     });
     expect(calls[0]).toBe("pause_auto_merge");
     expect(calls[1]).toBe("work_status:completed");
-    expect(comments(calls)[0]).toContain("流程外合併");
+    // C015v decision 3's hard wording rule: must say there is nothing to cancel, and must never
+    // reuse the "paused" branch's "已暫停此專案新的 Auto-merge" claim (a project-wide safety action
+    // that never happened -- E116's own, deliberately-deferred scope).
+    expect(comments(calls)[0]).toContain("該 PR 已合併，無 pending auto-merge 可取消");
+    expect(comments(calls)[0]).not.toContain("已暫停此專案新的 Auto-merge");
     expect(comments(calls)[0]).toContain("不自動 Revert");
   });
 
-  it("fails closed before Done when the project auto-merge pause is not durable", async () => {
+  it("fails closed before Done when the project auto-merge pause is genuinely unknown (never conflated with not_applicable)", async () => {
     const calls: string[] = [];
     const fixture = ports({
       changeRequest: changeRequest("merged"),
-      policyDurability: "unknown",
+      policyOutcome: { state: "unknown", durability: "unknown" },
       calls,
     });
     const outcome = await new LifecyclePipeline(fixture).run(request());
@@ -323,6 +371,12 @@ describe("lifecycle authority boundaries", () => {
     expect(calls).toEqual([]);
   });
 
+  /** C015v decision 4's third required automated case: a canceled issue whose PR also happens to
+   * be merged must never be mis-transitioned to Done just because the policy step now accepts
+   * `not_applicable` as "fine, continue" -- the domain's own `transitionWorkStatus` (canceled is
+   * terminal, `src/domain/workflow/transition.ts:34`) is what actually blocks this, unchanged by
+   * this ticket; this test proves that guard still fires with the new, more permissive policy step
+   * in front of it. */
   it("does not let an already-canceled terminal issue silently become completed", async () => {
     const calls: string[] = [];
     const fixture = ports({

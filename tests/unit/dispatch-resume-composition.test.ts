@@ -35,14 +35,16 @@ import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linea
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
 import { LeaseCoordinator } from "../../src/application/leases/index.js";
-import type {
-  CiRecoveryPipelineOutcome,
-  ReviewerPipelineOutcome,
-  BeginReviewOutcome,
-  RecordReviewOutcome,
-  EnableAutoMergeOutcome,
-  LifecyclePipelineOutcome,
+import {
+  LifecyclePipeline,
+  type CiRecoveryPipelineOutcome,
+  type ReviewerPipelineOutcome,
+  type BeginReviewOutcome,
+  type RecordReviewOutcome,
+  type EnableAutoMergeOutcome,
+  type LifecyclePipelineOutcome,
 } from "../../src/application/pipelines/index.js";
+import { NoOpAutoMergePauseAdapter } from "../../src/cli/dispatch/lifecycle-policy-adapter.js";
 import {
   createFixedClock,
   domainError,
@@ -476,7 +478,12 @@ async function harness(
         lifecycleRequests.push(lifecycleRequest);
         return Promise.resolve(
           overrides.lifecycleOutcome ??
-            ({ state: "completed", merge: "authorized", headSha, autoMergePaused: false } as never),
+            ({
+              state: "completed",
+              merge: "authorized",
+              headSha,
+              autoMergeDisposition: "not_required" as const,
+            } as never),
         );
       },
     },
@@ -1519,6 +1526,103 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     const reloaded = await progress.load(jobId);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  /**
+   * C015v decision 4's composition-matrix requirement: `merge provenance × PR state × policy
+   * capability × Linear status × admission state`, covering the exact cell that deadlocked a real
+   * E101 job before this ticket -- `external × merged × no real pause capability × non-terminal ×
+   * active claim`. The test above already covers this shape with a *fake* `deps.lifecycle`; this
+   * one swaps in a genuinely real `LifecyclePipeline` -- constructed with the real, capability-less
+   * `NoOpAutoMergePauseAdapter` for policy (never a mocked `LifecyclePolicyPort`) -- so the full
+   * chain (decision 3's admission-guarded reconcile pass -> real Lifecycle -> real policy adapter ->
+   * real Linear-status transition -> real admission release) is proven to actually compose, not
+   * just that each piece individually behaves correctly in isolation.
+   */
+  it("C015v decision 4 composition matrix: external provenance × merged PR × no real pause capability × non-terminal Linear status × active admission claim all converge together", async () => {
+    const { deps, progress, admission } = await harness({
+      changeRequestState: { state: "merged" },
+    });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "auto_merge_not_enabled", attempts: { count: 1 } },
+    });
+
+    const linearCalls: string[] = [];
+    let commentBody = "";
+    const realLifecycle = new LifecyclePipeline({
+      sourceControl: {
+        getChangeRequest: () => Promise.resolve(ok(changeRequest({ state: "merged" }))),
+        closeChangeRequest: () =>
+          Promise.reject(new Error("must never be called: merge path only")),
+      },
+      workManagement: {
+        getIssue: () => {
+          linearCalls.push("getIssue");
+          return Promise.resolve(
+            ok({
+              issue: {
+                schemaVersion: 1 as const,
+                id: issueId,
+                projectId,
+                externalId: externalIssueId,
+                title: "Ship it",
+              },
+              // Non-terminal Linear status -- the exact matrix cell requiring a real completed
+              // transition, not a no-op against an already-Done issue.
+              workStatus: "in_review" as const,
+              updatedAt: now,
+              revision: "1",
+            }),
+          );
+        },
+        setWorkStatus: () => {
+          linearCalls.push("setWorkStatus");
+          return Promise.resolve(
+            ok({
+              issue: {
+                schemaVersion: 1 as const,
+                id: issueId,
+                projectId,
+                externalId: externalIssueId,
+                title: "Ship it",
+              },
+              workStatus: "completed" as const,
+              updatedAt: now,
+              revision: "2",
+            }),
+          );
+        },
+        setAgentCondition: () => Promise.reject(new Error("must never be called")),
+        appendComment: (_reference: unknown, body: string) => {
+          linearCalls.push("appendComment");
+          commentBody = body;
+          return Promise.resolve(ok({ id: "comment-1", body, createdAt: now }));
+        },
+      },
+      // Real, capability-less adapter -- never a mocked `LifecyclePolicyPort`. Its own only
+      // possible answer, `not_applicable`, is what this whole matrix cell hinges on.
+      policy: new NoOpAutoMergePauseAdapter(),
+      cancellation: {
+        prepare: () => Promise.reject(new Error("must never be called: merge path only")),
+      },
+    });
+
+    const result = await runResumeCycle({ ...deps, lifecycle: realLifecycle });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merge_reconciled" }]);
+
+    expect(linearCalls).toEqual(["getIssue", "setWorkStatus", "appendComment"]);
+    expect(commentBody).toContain("該 PR 已合併，無 pending auto-merge 可取消");
+    expect(commentBody).not.toContain("已暫停此專案新的 Auto-merge");
+
+    const reloaded = await progress.load(jobId);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+    const claim = await admission.load(projectId, issueId);
+    expect(claim).toMatchObject({
+      ok: true,
+      value: { state: "released", releaseReason: "completed" },
+    });
   });
 
   it("⑦ decision 3: a Lifecycle failure during reconcile leaves the record completely untouched (idempotent retry, same revision)", async () => {
