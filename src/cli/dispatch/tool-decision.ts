@@ -78,13 +78,18 @@ function summarize(
 }
 
 export class FailClosedToolDecisionAdapter implements ProviderToolDecisionPort {
-  constructor(private readonly policyForProject: (projectId: string) => ProjectSafetyPolicy) {}
-
   decide(
     event: Extract<ProviderEvent, { kind: "tool_request" }>,
     context: Parameters<ProviderToolDecisionPort["decide"]>[1],
   ) {
-    const policy = this.policyForProject(context.project.id);
+    // `longTermAllowedCategories` is always empty: there is no UI/long-term approval mechanism in
+    // this ticket's scope, so no category is ever pre-approved -- the decision below is
+    // unconditional regardless of what this policy says anyway (see the file header).
+    const policy: ProjectSafetyPolicy = {
+      projectId: context.project.id,
+      projectRoot: context.project.localRepositoryPath,
+      longTermAllowedCategories: [],
+    };
     return Promise.resolve(
       ok(
         Object.freeze({

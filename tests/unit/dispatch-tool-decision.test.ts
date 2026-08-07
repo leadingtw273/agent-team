@@ -8,7 +8,6 @@
 import { describe, expect, it } from "vitest";
 
 import { FailClosedToolDecisionAdapter } from "../../src/cli/dispatch/tool-decision.js";
-import type { ProjectSafetyPolicy } from "../../src/application/safety/index.js";
 import {
   parseIdentifier,
   parseInstant,
@@ -57,15 +56,6 @@ function job(): Job {
   });
 }
 
-function policy(longTermAllowedCategories: readonly string[] = []): ProjectSafetyPolicy {
-  return {
-    projectId,
-    projectRoot: "/tmp/sandbox",
-    longTermAllowedCategories:
-      longTermAllowedCategories as ProjectSafetyPolicy["longTermAllowedCategories"],
-  };
-}
-
 function toolRequest(tool: string, payload: Readonly<Record<string, unknown>>) {
   return Object.freeze({
     kind: "tool_request" as const,
@@ -78,7 +68,7 @@ function toolRequest(tool: string, payload: Readonly<Record<string, unknown>>) {
 
 describe("FailClosedToolDecisionAdapter", () => {
   it("declines and pauses even when the payload looks ordinary", async () => {
-    const adapter = new FailClosedToolDecisionAdapter(() => policy());
+    const adapter = new FailClosedToolDecisionAdapter();
     const result = await adapter.decide(toolRequest("Bash", { command: "ls -la" }), {
       job: job(),
       project: project(),
@@ -91,7 +81,7 @@ describe("FailClosedToolDecisionAdapter", () => {
   });
 
   it("declines and pauses when the payload looks dangerous", async () => {
-    const adapter = new FailClosedToolDecisionAdapter(() => policy());
+    const adapter = new FailClosedToolDecisionAdapter();
     const result = await adapter.decide(toolRequest("Bash", { command: "rm -rf /tmp/sandbox" }), {
       job: job(),
       project: project(),
@@ -103,11 +93,12 @@ describe("FailClosedToolDecisionAdapter", () => {
     expect(result.value.summary).toContain("dangerous");
   });
 
-  it("declines and pauses even when the dangerous category is long-term allowed for this project", async () => {
-    // The whole point of "不得自動核可": even if a category were pre-approved for ordinary
-    // process spawning elsewhere, a provider tool_request in this ticket's scope still never
-    // auto-approves.
-    const adapter = new FailClosedToolDecisionAdapter(() => policy(["project_destructive"]));
+  it("never grants any long-term-allowed category -- the policy it builds always has an empty list", async () => {
+    // The whole point of "不得自動核可": this adapter has no way to be configured with a
+    // pre-approved category at all (unlike `evaluateProcessSafety`'s general design, which does
+    // support one) -- `longTermAllowedCategories` is hard-coded empty every single call, so a
+    // "dangerous" classification can never resolve to "execute" even in principle.
+    const adapter = new FailClosedToolDecisionAdapter();
     const result = await adapter.decide(toolRequest("Bash", { command: "rm -rf /tmp/sandbox" }), {
       job: job(),
       project: project(),
@@ -119,7 +110,7 @@ describe("FailClosedToolDecisionAdapter", () => {
   });
 
   it("declines and pauses when the payload cannot be classified at all", async () => {
-    const adapter = new FailClosedToolDecisionAdapter(() => policy());
+    const adapter = new FailClosedToolDecisionAdapter();
     const result = await adapter.decide(toolRequest("WebFetch", { url: "https://example.com" }), {
       job: job(),
       project: project(),
