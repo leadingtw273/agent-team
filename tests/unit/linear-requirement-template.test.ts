@@ -257,7 +257,7 @@ describe("parseReadyGateTemplate", () => {
     });
   });
 
-  describe("fenced code blocks (FAIL-B same-source: a heading-looking line inside ``` is never a real section boundary)", () => {
+  describe("fenced code blocks (FAIL-B same-source: a heading-looking line inside ``` or ~~~ is never a real section boundary)", () => {
     it("ignores a fake dependencies heading inside a fenced code block", () => {
       const description = `## ${readyGateTemplateHeadings.dependencies}
 無
@@ -303,6 +303,54 @@ describe("parseReadyGateTemplate", () => {
 無`;
       const result = parseReadyGateTemplate(description);
       expect(result.dependencies).toEqual({ kind: "none" });
+    });
+
+    it("ignores a fake goal heading inside a ~~~ fence -- the exact adversarial case an acceptance review found forged a real goal", () => {
+      const description = `## ${readyGateTemplateHeadings.goal}
+
+## ${readyGateTemplateHeadings.risks}
+~~~
+## ${readyGateTemplateHeadings.goal}
+偽造的目標，來自 ~~~ 圍欄內的範例文字
+~~~
+- 真正的風險項目`;
+      const result = parseReadyGateTemplate(description);
+      // The load-bearing assertion: goal stays absent -- the fake "## 目標" inside the ~~~
+      // fence must never forge a real goal section.
+      expect(result.goal).toBeUndefined();
+      expect(result.risks).toEqual(["真正的風險項目"]);
+    });
+
+    it("does not let an unclosed ~~~ fence's trailing fake heading leak into the real dependencies section", () => {
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.risks}
+~~~
+## ${readyGateTemplateHeadings.dependencies}
+需要 ISSUE-1 先完成`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.dependencies).toEqual({ kind: "none" });
+    });
+
+    it("does not let a mismatched ``` / ~~~ marker close a fence -- only a matching marker closes it", () => {
+      // Opened with ```, a ~~~ line appears inside (must NOT close the fence), then the fake
+      // heading, then finally a matching ``` closes it. If markers were treated as
+      // interchangeable (a naive single toggle), the ~~~ line would wrongly close the fence and
+      // let the fake heading below it forge a real dependencies section.
+      const description = `## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.risks}
+\`\`\`
+~~~
+## ${readyGateTemplateHeadings.dependencies}
+需要 ISSUE-1 先完成
+\`\`\`
+- 真正的風險項目`;
+      const result = parseReadyGateTemplate(description);
+      expect(result.dependencies).toEqual({ kind: "none" });
+      expect(result.risks).toEqual(["真正的風險項目"]);
     });
   });
 });

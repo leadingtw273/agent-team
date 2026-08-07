@@ -87,7 +87,9 @@ export interface ReadyGateTemplateFields {
 }
 
 const headingLinePattern = /^##\s+(.+?)\s*$/u;
-const fenceLinePattern = /^\s*```/u;
+/** Matches either fence marker as its own capture group so the caller can tell which one opened
+ * the fence -- see `splitSections`'s own comment on why mixed markers must not close each other. */
+const fenceLinePattern = /^\s*(```|~~~)/u;
 
 export interface ParsedSections {
   readonly bodies: ReadonlyMap<string, string>;
@@ -108,12 +110,17 @@ export interface ParsedSections {
  *   into a dispatchable `none`. This function now records every heading that occurs more than
  *   once in `duplicated`; callers (`parseDependencies` especially) must treat a duplicated
  *   heading as unsafe to use at all, regardless of which occurrence's text looks fine.
- * - **Fenced code blocks.** A `## 依賴關係`-looking line inside a ``` fence is markdown sample
- *   text, not a real section boundary -- this was letting a code block that merely *illustrates*
- *   the template's own syntax hijack real section parsing (the same underlying hazard as the
- *   duplicate-heading issue: something that looks like the real heading is not the real answer).
- *   Fence state is tracked per line (any line whose trimmed content starts with ``` toggles it);
- *   while inside a fence, `##`-looking lines are treated as ordinary body text, not headings.
+ * - **Fenced code blocks.** A `## 依賴關係`-looking line inside a ``` or `~~~` fence is markdown
+ *   sample text, not a real section boundary -- this was letting a code block that merely
+ *   *illustrates* the template's own syntax hijack real section parsing (the same underlying
+ *   hazard as the duplicate-heading issue: something that looks like the real heading is not the
+ *   real answer). Fence state tracks *which marker opened it*: a fence opened with ``` closes
+ *   only on a ``` line, one opened with `~~~` closes only on a matching `~~~` line -- a
+ *   mismatched marker encountered while already inside a fence is just more fence content, not a
+ *   close (this mirrors CommonMark's own fence-pairing rule; an acceptance review found a naive
+ *   single-toggle implementation let a `~~~`-fenced fake heading get treated as real once the
+ *   toggle had been flipped by an unrelated marker). While inside any open fence, `##`-looking
+ *   lines are treated as ordinary body text, never headings.
  */
 function splitSections(description: string): ParsedSections {
   const bodies = new Map<string, string>();
@@ -121,7 +128,7 @@ function splitSections(description: string): ParsedSections {
   const duplicated = new Set<string>();
   let currentHeading: string | undefined;
   let buffer: string[] = [];
-  let inFence = false;
+  let openFenceMarker: string | undefined;
 
   function flush(): void {
     if (currentHeading !== undefined) {
@@ -130,12 +137,19 @@ function splitSections(description: string): ParsedSections {
   }
 
   for (const line of description.split(/\r\n|\r|\n/u)) {
-    if (fenceLinePattern.test(line)) {
-      inFence = !inFence;
+    const fenceMatch = fenceLinePattern.exec(line);
+    if (fenceMatch?.[1] !== undefined) {
+      if (openFenceMarker === undefined) {
+        openFenceMarker = fenceMatch[1];
+      } else if (openFenceMarker === fenceMatch[1]) {
+        openFenceMarker = undefined;
+      }
+      // A mismatched marker (or any fence line while already inside a fence) is fence content,
+      // not a boundary -- it falls through to the ordinary buffer.push below.
       if (currentHeading !== undefined) buffer.push(line);
       continue;
     }
-    const match = inFence ? null : headingLinePattern.exec(line);
+    const match = openFenceMarker === undefined ? headingLinePattern.exec(line) : null;
     if (match?.[1] !== undefined) {
       flush();
       const heading = match[1];
