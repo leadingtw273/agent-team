@@ -154,7 +154,7 @@ async function runMergeGateSideFallback(
   });
   transport.expectDone();
   if (!result.ok) return { merged: false, errorCode: result.error.code };
-  return { merged: result.value.state === "merged" };
+  return { merged: result.value.outcome === "merged_directly" };
 }
 
 describe("O009d squash-merge fallback: cross-implementation behavioral parity", () => {

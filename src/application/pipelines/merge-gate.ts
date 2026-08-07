@@ -52,6 +52,20 @@ function mergeFailure(stage: MergeGateFailureStage, error: DomainError): EnableA
   return Object.freeze({ state: "failed", stage, error });
 }
 
+/**
+ * C015t decision 1: a change request found `state:"merged"` at the exact head this gate was asked
+ * to authorize, at a point in `enable()` that is strictly *before* this call could itself have
+ * caused a merge -- always `"already_merged_external"`, never `"directly_merged"` (the latter can
+ * only come from the fallback squash this gate's own `enableAutoMerge` port call may perform,
+ * handled separately below, never from a plain readback).
+ */
+function alreadyMergedExternally(
+  snapshot: Readonly<{ state: string; headSha: string }>,
+  expectedHeadSha: string,
+): boolean {
+  return snapshot.state === "merged" && sameSha(snapshot.headSha, expectedHeadSha);
+}
+
 function decisionMatchesRequest(request: RecordReviewRequest): boolean {
   const { decision } = request;
   const reportsValid = decision.reports.every(
@@ -346,6 +360,9 @@ export class AutoMergeGate {
       request.signal === undefined ? {} : { signal: request.signal },
     );
     if (!current.ok) return mergeFailure("change_request", current.error);
+    if (alreadyMergedExternally(current.value, request.expectedHeadSha)) {
+      return Object.freeze({ state: "already_merged_external", changeRequest: current.value });
+    }
     if (
       current.value.state !== "open" ||
       current.value.baseBranch !== request.project.defaultBranch ||
@@ -468,6 +485,9 @@ export class AutoMergeGate {
       request.signal === undefined ? {} : { signal: request.signal },
     );
     if (!beforeMerge.ok) return mergeFailure("change_request", beforeMerge.error);
+    if (alreadyMergedExternally(beforeMerge.value, request.expectedHeadSha)) {
+      return Object.freeze({ state: "already_merged_external", changeRequest: beforeMerge.value });
+    }
     if (
       beforeMerge.value.state !== "open" ||
       beforeMerge.value.draft ||
@@ -482,19 +502,38 @@ export class AutoMergeGate {
       mutation(request, "enable-auto-merge"),
     );
     if (!enabled.ok) return mergeFailure("auto_merge", enabled.error);
+    const attempt = enabled.value;
+    // C015t decision 1: `attempt.outcome` is the one place provenance ("did this call cause the
+    // merge, or find one already there") is decided -- by `buildMergeGateSourceControl`
+    // (src/cli/dispatch/status-merge-composition.ts), the only composition root that knows whether
+    // it personally invoked the direct-squash fallback. This gate never re-derives that from head-
+    // SHA equality; it only validates the returned snapshot is internally consistent.
+    if (attempt.outcome === "merged_directly" || attempt.outcome === "merged_externally") {
+      if (
+        !sameSha(attempt.changeRequest.headSha, request.expectedHeadSha) ||
+        attempt.changeRequest.state !== "merged"
+      ) {
+        return mergeFailure("auto_merge", domainError("conflict"));
+      }
+      return Object.freeze({
+        state:
+          attempt.outcome === "merged_directly" ? "directly_merged" : "already_merged_external",
+        changeRequest: attempt.changeRequest,
+      });
+    }
     if (
-      enabled.value.state !== "open" ||
-      enabled.value.draft ||
-      !enabled.value.autoMergeEnabled ||
-      !sameSha(enabled.value.headSha, request.expectedHeadSha)
+      attempt.changeRequest.state !== "open" ||
+      attempt.changeRequest.draft ||
+      !attempt.changeRequest.autoMergeEnabled ||
+      !sameSha(attempt.changeRequest.headSha, request.expectedHeadSha)
     ) {
       return mergeFailure("auto_merge", domainError("conflict"));
     }
     return Object.freeze({
-      state: "enabled",
+      state: "auto_merge_enabled",
       reuse,
       identity: identity.value,
-      changeRequest: enabled.value,
+      changeRequest: attempt.changeRequest,
     });
   }
 }

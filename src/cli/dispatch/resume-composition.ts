@@ -46,6 +46,7 @@ import type {
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { SourceControlPort } from "../../application/ports/index.js";
 import {
+  domainError,
   instantFromDate,
   ok,
   type Clock,
@@ -70,7 +71,10 @@ import {
   type RequiresManualReasonCode,
   type RequiresManualStage,
 } from "../../adapters/dispatch/job-progress-store.js";
-import { FileIssueAdmissionStore } from "../../adapters/dispatch/issue-admission-store.js";
+import {
+  FileIssueAdmissionStore,
+  type IssueAdmissionPort,
+} from "../../adapters/dispatch/issue-admission-store.js";
 import {
   FileReviewReportDiagnosticsSidecar,
   defaultReviewReportSidecarDirectory,
@@ -229,6 +233,11 @@ export interface ResumeCycleDependencies {
    * (review-report-diagnostics-sidecar.ts) for the full rule set. Only ever called from within this
    * module's own `report`-stage failure handling; never anywhere else. */
   readonly reviewReportSidecar: ReviewReportDiagnosticsSidecarPort;
+  /** C015t decision 3: needed *only* by `reconcileMergeStateUnderLease`'s final step (release the
+   * claim, and only after Lifecycle and the progress CAS have both durably confirmed) -- the
+   * ordinary resumable-stage path (`resumeUnderLease`/`resumeReview`) never touches admission at
+   * all, exactly as before this ticket. */
+  readonly admission: IssueAdmissionPort;
 }
 
 export type ResumeJobOutcome =
@@ -236,6 +245,13 @@ export type ResumeJobOutcome =
   | Readonly<{ jobId: string; outcome: "requires_manual"; reason: string }>
   | Readonly<{ jobId: string; outcome: "still_ci_waiting" }>
   | Readonly<{ jobId: string; outcome: "still_merging" }>
+  // C015t decision 1: `AutoMergeGate.enable()`'s `"re_review_required"`/`not_ready:
+  // "review_status_missing"` outcomes -- genuinely needs a fresh review, not a human, and not the
+  // same thing as "still waiting on CI" (`still_ci_waiting`). Functionally identical re-entry to
+  // `still_ci_waiting` today (see `resumableStageKinds`'s own comment: `"awaiting_review"` and
+  // `"ci_waiting"` both fall through the same generic CiRecovery-then-Reviewer sequence), but a
+  // distinct, more accurate label for anyone reading `agent-team run`'s own output.
+  | Readonly<{ jobId: string; outcome: "awaiting_review" }>
   | Readonly<{ jobId: string; outcome: "repair_pushed" }>
   | Readonly<{
       jobId: string;
@@ -269,19 +285,72 @@ export type ResumeJobOutcome =
   // simply retries the same resume step from scratch. See `requiresManualUnlessRetryable`'s own
   // comment for the disclosed trade-off (no bounded attempt cap on this path, unlike
   // `pending_retry`).
-  | Readonly<{ jobId: string; outcome: "transient_failure"; reason: string; error: DomainError }>;
+  | Readonly<{ jobId: string; outcome: "transient_failure"; reason: string; error: DomainError }>
+  // C015t decision 3: the narrow, read-only re-entry check for `requires_manual` records whose
+  // `cause.reasonCode` is in the "external might already have succeeded" set
+  // (`isMergeReconcilable`'s own comment). None of these ever change `record.stage` except
+  // `"merge_reconciled"` (the one full-success case, itself only reached after Lifecycle, the
+  // progress CAS, *and* admission release all durably confirmed, in that order).
+  | Readonly<{ jobId: string; outcome: "merge_reconciled" }>
+  | Readonly<{
+      jobId: string;
+      outcome: "merge_reconcile_unchanged";
+      readback: "open" | "closed_not_merged";
+    }>
+  | Readonly<{ jobId: string; outcome: "merge_reconcile_readback_failed"; error: DomainError }>
+  | Readonly<{ jobId: string; outcome: "merge_reconcile_lifecycle_failed"; error: DomainError }>
+  // C015t decision 1 (acceptance criterion ②'s own explicit requirement): a genuine, ordinary
+  // completion -- whether reached through the normal `resumeReview`/`resumeUnderLease` flow
+  // (`finishMerged`) or through decision 3's narrow reconcile pass -- must also release the job's
+  // admission claim, not just write `completed`. This was a pre-existing C015o gap (nothing ever
+  // called `admission.release(..., "completed")` on a normal success path before this ticket,
+  // disclosed in the completion report) that this ticket closes as part of making the whole
+  // merge-to-completion chain honest end to end. Shared by both call sites via
+  // `releaseCompletedAdmission`; the job is already durably `completed` by the time this can ever
+  // be reported, so a failure here is always safe to retry independently (never redoes Lifecycle).
+  | Readonly<{ jobId: string; outcome: "admission_release_failed"; error: DomainError }>;
 
-/** Runs one resume attempt for every resumable job-progress record belonging to `dependencies.project`. */
+/**
+ * C015t decision 3: the narrow, read-only re-entry set for `requires_manual` records -- deliberately
+ * *not* a blanket reopening of `requires_manual` (codex's own review explicitly warned against a
+ * general reconciliation classifier scanning every stuck job; the coordinator's decision 3 draws the
+ * line at exactly the two reasonCodes where the underlying failure was itself about whether an
+ * *external* system (GitHub's merge, then Lifecycle's Linear transition) had already succeeded --
+ * `auto_merge_not_enabled` (this ticket's own root-cause incident) and `lifecycle_not_completed`
+ * (the same class of drift one stage later: Lifecycle itself failed to complete, but the merge that
+ * triggered it may have still gone through). Every other `requires_manual` reasonCode
+ * (`change_request_unavailable`, `job_unavailable`, `review_not_approved`, ...) describes a genuine
+ * state mismatch or a review-side rejection that no readback can safely second-guess, and stays
+ * exactly as fail-closed as C015o's admission design always intended.
+ */
+function isMergeReconcilable(record: JobProgressRecord): record is JobProgressRecord & {
+  stage: Extract<JobProgressRecord["stage"], { kind: "requires_manual" }>;
+} {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause !== undefined &&
+    (record.stage.cause.reasonCode === "auto_merge_not_enabled" ||
+      record.stage.cause.reasonCode === "lifecycle_not_completed")
+  );
+}
+
+/** Runs one resume attempt for every resumable job-progress record belonging to `dependencies.project`,
+ * plus (C015t decision 3) a narrow, read-only merge-state reconciliation pass over `requires_manual`
+ * records whose cause matches `isMergeReconcilable`. */
 export async function runResumeCycle(
   dependencies: ResumeCycleDependencies,
 ): Promise<Result<readonly ResumeJobOutcome[], DomainError>> {
   const records = await dependencies.progress.listForProject(dependencies.project.id);
   if (!records.ok) return records;
   const resumable = records.value.filter((record) => resumableStageKinds.has(record.stage.kind));
+  const mergeReconcilable = records.value.filter((record) => isMergeReconcilable(record));
 
   const outcomes: ResumeJobOutcome[] = [];
   for (const record of resumable) {
     outcomes.push(await resumeOneJob(record, dependencies));
+  }
+  for (const record of mergeReconcilable) {
+    outcomes.push(await reconcileMergeStateOneJob(record, dependencies));
   }
   return ok(Object.freeze(outcomes));
 }
@@ -338,6 +407,135 @@ async function resumeOneJob(
   } finally {
     await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
   }
+}
+
+/** C015t decision 3: same lease discipline as `resumeOneJob` -- guards against a concurrent
+ * `agent-team run`/reconcile pass racing on the same job while this narrow readback is in flight. */
+async function reconcileMergeStateOneJob(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<ResumeJobOutcome> {
+  const lease = await deps.leases.acquire({
+    jobId: record.jobId,
+    issueId: record.issueId,
+    holderId: deps.holderId,
+  });
+  if (!lease.ok) return { jobId: record.jobId, outcome: "lease_conflict" };
+
+  try {
+    return await reconcileMergeStateUnderLease(record, deps);
+  } finally {
+    await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
+  }
+}
+
+/**
+ * C015t decision 3: reads back the authoritative PR state for a `requires_manual` job whose cause
+ * matches `isMergeReconcilable`, and converges *only* the unambiguous case (`state:"merged"`) --
+ * `"open"` and `"closed"`-not-merged both leave the record completely untouched, exactly per the
+ * coordinator's explicit rule ("不擅自解除"/"不得完成也不得釋放 admission").
+ *
+ * Ordering is load-bearing: Lifecycle runs first; only once it durably reports `"completed"` does
+ * this function CAS the progress record to `completed`; only once *that* durably confirms does it
+ * release the admission claim. Any step failing leaves everything durable exactly as it was before
+ * this call (no partial writes), so the next reconcile pass safely retries the *entire* sequence
+ * from scratch with the same `record.revision` -- and therefore the same Lifecycle
+ * `idempotencyKeyPrefix` -- rather than a differently-keyed, potentially-duplicating retry.
+ *
+ * Provenance from this path is always treated as unknown/external (never self-authorized) -- see
+ * `finishMerged`'s own header and decision 1's explicit requirement. This function intentionally
+ * does *not* call `finishMerged` (which, on Lifecycle failure, itself writes a fresh
+ * `requires_manual` via `transitionOrReport` -- correct for the normal resume path, but it would
+ * bump `record.revision` here and break the same-idempotencyKey retry guarantee this function
+ * needs); it drives `deps.lifecycle.run(...)` directly instead.
+ */
+/**
+ * C015t decision 1 (acceptance criterion ②): shared by `finishMerged` (the normal resume path) and
+ * `reconcileMergeStateUnderLease` (decision 3's backstop) -- both must release the job's admission
+ * claim once, and only once, the job is durably `completed`. Never an error if the claim is already
+ * released or was never active (a concurrent process may have already done this, or the claim may
+ * legitimately not exist any more for another honest reason) -- only a genuine store failure
+ * propagates.
+ */
+async function releaseCompletedAdmission(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<Result<void, DomainError>> {
+  const claim = await deps.admission.load(deps.project.id, record.issueId);
+  if (!claim.ok) return claim;
+  if (claim.value?.state !== "active") return ok(undefined);
+  const released = await deps.admission.release(
+    deps.project.id,
+    record.issueId,
+    claim.value.revision,
+    "completed",
+  );
+  if (!released.ok) return released;
+  return ok(undefined);
+}
+
+async function reconcileMergeStateUnderLease(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<ResumeJobOutcome> {
+  const changeRequestId = record.changeRequestId;
+  if (changeRequestId === undefined) {
+    return {
+      jobId: record.jobId,
+      outcome: "merge_reconcile_readback_failed",
+      error: domainError("invariant_violation"),
+    };
+  }
+  const current = await deps.sourceControl.getChangeRequest({
+    project: deps.project,
+    changeRequestId,
+  });
+  if (!current.ok) {
+    return {
+      jobId: record.jobId,
+      outcome: "merge_reconcile_readback_failed",
+      error: current.error,
+    };
+  }
+  if (current.value.state === "open") {
+    return { jobId: record.jobId, outcome: "merge_reconcile_unchanged", readback: "open" };
+  }
+  if (current.value.state !== "merged") {
+    // "closed", not merged -- the coordinator's explicit human-handling branch.
+    return {
+      jobId: record.jobId,
+      outcome: "merge_reconcile_unchanged",
+      readback: "closed_not_merged",
+    };
+  }
+
+  const lifecycleOutcome = await deps.lifecycle.run({
+    project: deps.project,
+    externalIssueId: record.externalIssueId,
+    changeRequestId,
+    idempotencyKeyPrefix: `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`,
+  });
+  if (lifecycleOutcome.state !== "completed") {
+    return {
+      jobId: record.jobId,
+      outcome: "merge_reconcile_lifecycle_failed",
+      error:
+        lifecycleOutcome.state === "failed"
+          ? lifecycleOutcome.error
+          : domainError("external_failure"),
+    };
+  }
+
+  const completed = await transition(deps.progress, record, { stage: { kind: "completed" } });
+  if (!completed.ok) {
+    return { jobId: record.jobId, outcome: "progress_write_failed", error: completed.error };
+  }
+
+  const released = await releaseCompletedAdmission(record, deps);
+  if (!released.ok) {
+    return { jobId: record.jobId, outcome: "admission_release_failed", error: released.error };
+  }
+  return { jobId: record.jobId, outcome: "merge_reconciled" };
 }
 
 /**
@@ -426,8 +624,22 @@ async function resumeUnderLease(
   // Exact-readback: the recorded branch/headSha must still match live GitHub, unless the PR has
   // since merged out of band (a legitimate, expected race between this resume and a prior run's
   // own auto-merge/manual merge) -- everything else is a genuine mismatch, fail-closed.
+  //
+  // C015t decision 1: this readback alone cannot tell *who* merged it -- it is a generic
+  // pre-flight check that runs for every resumable stage, not a report from the exact call that
+  // caused the merge. The one case where controller authorization is still defensible is
+  // `record.stage.kind === "merging"`: a *durable*, previously-written record of this same
+  // controller having itself successfully enabled auto-merge for this exact job (never inferred
+  // from head-SHA equality alone, which codex's review named as the actual bug in the prior
+  // version of this line -- head-SHA equality is only ever used here as a *consistency check* on
+  // top of that durable record, never as the sole justification). Any other stage kind finding the
+  // PR already merged is genuinely unexplained from this job's own history and must not be
+  // self-authorized -- Lifecycle's own out-of-process-merge handling (lifecycle.ts's
+  // `#handleMerge`) is what correctly takes over in that case.
   if (currentChangeRequest.value.state === "merged") {
-    return finishMerged(record, deps, changeRequestId, currentChangeRequest.value.headSha);
+    const authorizedHeadSha =
+      record.stage.kind === "merging" ? currentChangeRequest.value.headSha : undefined;
+    return finishMerged(record, deps, changeRequestId, authorizedHeadSha);
   }
   if (
     currentChangeRequest.value.headBranch !== record.branch ||
@@ -926,42 +1138,105 @@ async function resumeReview(
     baseRevision: context.baseRevision,
     approval: recorded.approval,
   });
-  if (enabled.state !== "enabled") {
-    return enabled.state === "failed"
-      ? requiresManualUnlessRetryable(
-          record,
-          deps,
-          `auto_merge_not_enabled:${enabled.state}`,
-          enabled.error,
-          requiresManualCause("review", "auto_merge_not_enabled"),
-        )
-      : requiresManual(
-          record,
-          deps,
-          `auto_merge_not_enabled:${enabled.state}`,
-          requiresManualCause("review", "auto_merge_not_enabled"),
-        );
+  // C015t decision 1: `AutoMergeGate.enable()`'s outcome union now distinguishes exactly why/how a
+  // merge did or didn't happen -- this switch is the CLI-side mapping table the coordinator
+  // specified, and it is exhaustive over every state the engine can return (see
+  // `EnableAutoMergeOutcome`'s own header, merge-gate-model.ts).
+  switch (enabled.state) {
+    case "auto_merge_enabled": {
+      if (enabled.changeRequest.state === "merged") {
+        // Same synchronous call chain that just enabled auto-merge found it already merged by the
+        // time this check ran -- a pre-existing, disclosed race this ticket does not regress
+        // (unlike the C015q/C015s incident, which is `directly_merged`/`already_merged_external`
+        // below). Controller-authorized: this exact call armed it.
+        return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
+      }
+      return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
+        jobId: record.jobId,
+        outcome: "merging",
+      }));
+    }
+    case "directly_merged":
+      // This exact call performed the squash fallback and confirmed it landed -- controller-
+      // authorized (see `finishMerged`'s own header for why this is never re-derived elsewhere).
+      return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
+    case "already_merged_external":
+      // Found already merged before this call could have caused it -- explicitly NOT controller-
+      // authorized. Lifecycle still runs (Linear still needs its Done transition and audit
+      // comment; see coordinator's decision 1: honest marking is required, the *policy* of
+      // pausing auto-merge/warning on out-of-process merges is Lifecycle's own existing job and
+      // is out of this ticket's scope either way).
+      return finishMerged(record, deps, context.changeRequestId, undefined);
+    case "re_review_required":
+      // The diff/requirements genuinely changed since the approval this job recorded -- needs a
+      // fresh review, not a human. `AutoMergeGate.enable()` has already posted its own
+      // invalidation comment/status before returning this (merge-gate.ts, unchanged by this
+      // ticket); this is purely the CLI-side resume label.
+      return transitionOrReport(deps, record, { stage: { kind: "awaiting_review" } }, () => ({
+        jobId: record.jobId,
+        outcome: "awaiting_review",
+      }));
+    case "not_ready":
+      switch (enabled.reason) {
+        case "ci_pending":
+        case "ci_failed":
+          return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" } }, () => ({
+            jobId: record.jobId,
+            outcome: "still_ci_waiting",
+          }));
+        case "review_status_missing":
+          return transitionOrReport(deps, record, { stage: { kind: "awaiting_review" } }, () => ({
+            jobId: record.jobId,
+            outcome: "awaiting_review",
+          }));
+        case "draft":
+        case "merge_conflict":
+        case "mergeability_unknown":
+          // Not explicitly named in the coordinator's decision 1 list -- left exactly as the
+          // pre-existing (pre-C015t) behavior, requires_manual, since none of these three are
+          // "external already succeeded" cases and touching them is not authorized by this
+          // ticket's boundary. Disclosed in the completion report.
+          return requiresManual(
+            record,
+            deps,
+            `auto_merge_not_enabled:not_ready:${enabled.reason}`,
+            requiresManualCause("merge", "auto_merge_not_enabled"),
+          );
+      }
+    case "failed":
+      return requiresManualUnlessRetryable(
+        record,
+        deps,
+        `auto_merge_not_enabled:failed:${enabled.stage}:${enabled.error.code}`,
+        enabled.error,
+        requiresManualCause("merge", "auto_merge_not_enabled"),
+      );
   }
-  if (enabled.changeRequest.state === "merged") {
-    return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
-  }
-  return transitionOrReport(deps, record, { stage: { kind: "merging" } }, () => ({
-    jobId: record.jobId,
-    outcome: "merging",
-  }));
 }
 
+/**
+ * C015t decision 1: `authorizedHeadSha` is the one and only channel through which "this merge is
+ * controller-authorized" reaches Lifecycle -- every caller must decide it *before* calling this
+ * function, from a real provenance signal (a union state this exact call chain produced, or a
+ * durable prior-stage record), never by re-deriving it from `mergedHeadSha` itself. Passing
+ * `mergedHeadSha` and `authorizedHeadSha` as the *same* value is what the prior version of this
+ * function always did (the bug codex's review named, resume-composition.ts:426 -> lifecycle.ts:147)
+ * -- passing `undefined` here is what makes an honest "not authorized" report to Lifecycle
+ * possible at all; `LifecyclePipeline.#handleMerge` already has the correct downstream handling
+ * for that (out-of-process-merge pause + audit comment), so nothing in lifecycle.ts/
+ * lifecycle-model.ts needed to change for this ticket.
+ */
 async function finishMerged(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
   changeRequestId: string,
-  mergedHeadSha: string,
+  authorizedHeadSha: string | undefined,
 ): Promise<ResumeJobOutcome> {
   const outcome = await deps.lifecycle.run({
     project: deps.project,
     externalIssueId: record.externalIssueId,
     changeRequestId,
-    mergeAuthorizationHeadSha: mergedHeadSha,
+    ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
     idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
   });
   if (outcome.state !== "completed") {
@@ -980,10 +1255,18 @@ async function finishMerged(
           requiresManualCause("merge", "lifecycle_not_completed"),
         );
   }
-  return transitionOrReport(deps, record, { stage: { kind: "completed" } }, () => ({
-    jobId: record.jobId,
-    outcome: "completed",
-  }));
+  const completedOutcome = await transitionOrReport(
+    deps,
+    record,
+    { stage: { kind: "completed" } },
+    () => ({ jobId: record.jobId, outcome: "completed" as const }),
+  );
+  if (completedOutcome.outcome !== "completed") return completedOutcome;
+  const released = await releaseCompletedAdmission(record, deps);
+  if (!released.ok) {
+    return { jobId: record.jobId, outcome: "admission_release_failed", error: released.error };
+  }
+  return completedOutcome;
 }
 
 export function buildJobProgressStore(agentTeamHome: string): FileJobProgressStore {

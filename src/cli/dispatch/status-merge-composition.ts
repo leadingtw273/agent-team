@@ -18,10 +18,11 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import {
   AutoMergeGate,
   ReviewStatusCoordinator,
+  type MergeGateAutoMergeAttempt,
   type MergeGatePorts,
 } from "../../application/pipelines/index.js";
 import { ok, type Result, type DomainError } from "../../domain/foundation/index.js";
-import type { ChangeRequestRef, ChangeRequestSnapshot } from "../../application/ports/index.js";
+import type { ChangeRequestRef } from "../../application/ports/index.js";
 
 export type StatusMergeCompositionBlockedReason = "github_authentication_unavailable";
 
@@ -48,13 +49,20 @@ export type BuildStatusMergePipelinesResult =
  * try `enableAutoMerge` first; on failure, re-read the change request; only if that re-read state
  * is unambiguously safe attempt a direct `squashMergeChangeRequest`; on any other outcome, return
  * the *original* `enableAutoMerge` error untouched -- this fallback never invents a new failure
- * reason of its own. The outer wrapper is built fresh here (rather than reused) because it targets
- * `SourceControlPort.enableAutoMerge`'s own return shape (`ChangeRequestSnapshot`), not
- * `RegistrationSetupSquashMergePort`'s custom state union -- but the actual "is this safe" decision
- * is the one piece that must never be allowed to drift between the two implementations, so it is
- * imported from `isSafeToSquashMergeDirectly` (src/adapters/github/squash-merge-fallback.ts)
- * rather than re-expressed here. See tests/unit/squash-merge-fallback-parity.test.ts for the
- * cross-implementation behavioral-parity test the acceptance review asked for.
+ * reason of its own. The actual "is this safe" decision is the one piece that must never be allowed
+ * to drift between the two implementations, so it is imported from `isSafeToSquashMergeDirectly`
+ * (src/adapters/github/squash-merge-fallback.ts) rather than re-expressed here. See
+ * tests/unit/squash-merge-fallback-parity.test.ts for the cross-implementation behavioral-parity
+ * test the acceptance review asked for.
+ *
+ * C015t decision 1: this function is the *only* place that knows whether the fallback squash was
+ * actually attempted and by whom -- so it is also the only place that can honestly distinguish
+ * "this exact call performed the merge" (`outcome: "merged_directly"`) from "the change request was
+ * already merged, by something else, by the time we looked" (`outcome: "merged_externally"`). That
+ * distinction is *why* `MergeGatePorts.sourceControl.enableAutoMerge` no longer returns a bare
+ * `ChangeRequestSnapshot` (see `MergeGateAutoMergeAttempt`'s own header, merge-gate-model.ts) --
+ * `AutoMergeGate.enable()` itself never reverse-infers provenance from head-SHA equality; it only
+ * ever forwards whatever this function decided.
  */
 export function buildMergeGateSourceControl(
   github: GitHubAdapter,
@@ -69,16 +77,36 @@ export function buildMergeGateSourceControl(
       reference: ChangeRequestRef,
       expectedHeadSha: string,
       options: Parameters<MergeGatePorts["sourceControl"]["enableAutoMerge"]>[2],
-    ): Promise<Result<ChangeRequestSnapshot, DomainError>> => {
+    ): Promise<Result<MergeGateAutoMergeAttempt, DomainError>> => {
       const enabled = await github.enableAutoMerge(reference, expectedHeadSha, options);
-      if (enabled.ok) return enabled;
+      if (enabled.ok) {
+        // GitHub's own mutation can itself return an already-merged snapshot (idempotently
+        // reporting reality rather than actually enabling anything) -- this call did not cause
+        // that, so it is external, never "directly_merged".
+        return ok(
+          enabled.value.state === "merged"
+            ? { outcome: "merged_externally" as const, changeRequest: enabled.value }
+            : { outcome: "enabled" as const, changeRequest: enabled.value },
+        );
+      }
 
       const current = await github.getChangeRequest(reference, options);
+      if (
+        current.ok &&
+        current.value.state === "merged" &&
+        current.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase()
+      ) {
+        // Someone/something else merged it between our first read and this fallback's own re-read
+        // -- again, this call did not cause it.
+        return ok({ outcome: "merged_externally" as const, changeRequest: current.value });
+      }
       if (!isSafeToSquashMergeDirectly(current, expectedHeadSha)) {
         return enabled;
       }
       const merged = await github.squashMergeChangeRequest(reference, expectedHeadSha, options);
-      return merged.ok ? ok(merged.value) : enabled;
+      return merged.ok
+        ? ok({ outcome: "merged_directly" as const, changeRequest: merged.value })
+        : enabled;
     },
   });
 }

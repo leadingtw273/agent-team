@@ -130,7 +130,10 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
 
     const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
 
-    expect(result).toMatchObject({ ok: true, value: { autoMergeEnabled: true } });
+    expect(result).toMatchObject({
+      ok: true,
+      value: { outcome: "enabled", changeRequest: { autoMergeEnabled: true } },
+    });
     transport.expectDone();
   });
 
@@ -147,7 +150,10 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
 
     const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
 
-    expect(result).toMatchObject({ ok: true, value: { state: "merged" } });
+    expect(result).toMatchObject({
+      ok: true,
+      value: { outcome: "merged_directly", changeRequest: { state: "merged" } },
+    });
     transport.expectDone();
   });
 
