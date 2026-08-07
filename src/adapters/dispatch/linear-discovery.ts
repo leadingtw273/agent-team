@@ -105,6 +105,7 @@ function toDomainIssue(
       : { estimatedMinutes: template.estimatedMinutes }),
     ...(template.constraints === undefined ? {} : { constraints: template.constraints }),
     ...(template.risks === undefined ? {} : { risks: template.risks }),
+    ...(template.changeRegions === undefined ? {} : { changeRegions: template.changeRegions }),
     ...(snapshot.priority === undefined ? {} : { priority: snapshot.priority }),
     ...(snapshot.agentRole === undefined ? {} : { agentRole: snapshot.agentRole }),
     ...(snapshot.reviewRequirement === undefined

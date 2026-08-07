@@ -1,10 +1,11 @@
 /**
  * C015b unit tests: `parseReadyGateTemplate` (src/adapters/linear/requirement-template.ts) --
  * the parser closing C015a's escalated "issue projection" gap. Covers: a fully-filled template
- * (every field extractable), a partially-filled template (only-required-fields), a description
- * that never used the template at all (everything absent, no crash), untouched placeholder text
- * treated as not-filled, the three-way `dependencies` outcome (none/unparsed/absent), and
- * estimatedMinutes extraction robustness (first integer wins, no digits leaves it absent).
+ * (every field extractable, including `changeRegions`), a partially-filled template
+ * (only-required-fields), a description that never used the template at all (everything absent,
+ * no crash), untouched placeholder text treated as not-filled, the three-way `dependencies`
+ * outcome (none/unparsed/absent), and estimatedMinutes extraction robustness (first integer wins,
+ * no digits leaves it absent).
  */
 import { describe, expect, it } from "vitest";
 
@@ -28,7 +29,7 @@ C015a 發現沒有解析器，C015b 補上。
 - 撰寫測試
 
 ## ${readyGateTemplateHeadings.outOfScope}
-- 不處理 changeRegions
+- 不修改引擎
 
 ## ${readyGateTemplateHeadings.dependencies}
 ${dependencies}
@@ -54,12 +55,30 @@ describe("parseReadyGateTemplate", () => {
       background: "C015a 發現沒有解析器，C015b 補上。",
       acceptanceCriteria: ["完整範本可以解析成功", "缺欄位不會讓整支程式崩潰"],
       inScope: ["撰寫解析器", "撰寫測試"],
-      outOfScope: ["不處理 changeRegions"],
+      outOfScope: ["不修改引擎"],
       estimatedMinutes: 30,
       constraints: ["不得修改引擎"],
       risks: ["範本格式漂移"],
+      changeRegions: [{ path: "src/adapters/linear/requirement-template.ts", coverage: "exact" }],
       dependencies: { kind: "none" },
     });
+  });
+
+  it("parses multiple changeRegions bullet lines, each as coverage:exact", () => {
+    const description = `## ${readyGateTemplateHeadings.changeRegions}
+- src/a.ts
+- src/b.ts`;
+    const result = parseReadyGateTemplate(description);
+    expect(result.changeRegions).toEqual([
+      { path: "src/a.ts", coverage: "exact" },
+      { path: "src/b.ts", coverage: "exact" },
+    ]);
+  });
+
+  it("leaves changeRegions absent when the section is empty or only the placeholder", () => {
+    const description = `## ${readyGateTemplateHeadings.changeRegions}
+- （請填寫）`;
+    expect(parseReadyGateTemplate(description).changeRegions).toBeUndefined();
   });
 
   it("leaves every optional field absent for a description that never used the template", () => {

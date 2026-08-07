@@ -169,6 +169,7 @@ C015a 發現沒有解析器；C015b 補上。
 ## ${readyGateTemplateHeadings.risks}
 
 ## ${readyGateTemplateHeadings.changeRegions}
+- src/adapters/dispatch/linear-discovery.ts
 `;
 }
 
@@ -230,6 +231,9 @@ describe("discoverReadyDispatchCandidates", () => {
     expect(candidate?.issue.outOfScope).toEqual(["引擎修改"]);
     expect(candidate?.issue.estimatedMinutes).toBe(30);
     expect(candidate?.issue.dependencies).toEqual({ kind: "none" });
+    expect(candidate?.issue.changeRegions).toEqual([
+      { path: "src/adapters/dispatch/linear-discovery.ts", coverage: "exact" },
+    ]);
   });
 
   it("C015b: skips (visibly, with its own reason) an issue whose dependencies section has unresolvable free text", async () => {

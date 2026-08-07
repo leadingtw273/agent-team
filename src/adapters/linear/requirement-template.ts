@@ -35,10 +35,20 @@
  *   asks for a minutes figure, so the first bare integer is the minutes count. Text with no
  *   integer at all is left absent, letting `evaluateEligibility`'s `missing_estimate` blocker
  *   catch it.
- * - `changeRegions` is intentionally never parsed here: the template's own "預期變更區域" field
- *   has no defined sub-structure (unlike the flat bullet lists for acceptance criteria/scope),
- *   and `Issue.changeRegions` requires `{path, coverage}` pairs this parser has no reliable way
- *   to derive from free text. It is optional and not an eligibility blocker on its own.
+ * - `changeRegions` uses the same bullet-list extraction as acceptance criteria/scope: each
+ *   `- <path>` line under "預期變更區域" becomes one `{path, coverage:"exact"}` entry. This was
+ *   revised after discovering `ImplementerPipeline.run()` (src/application/pipelines/
+ *   implementer.ts) hard-requires a non-empty `changeRegions` on the requirement snapshot's issue
+ *   before it will do anything at all (`requestShapeValid`) -- without this, no real candidate
+ *   could ever reach the pipeline stage even after clearing eligibility, a second silent
+ *   structural block in the same spirit as the one this whole parser exists to close. `"exact"`
+ *   (never `"subtree"`) is the deliberately stricter choice: it declares only the literal path
+ *   the human wrote as in-scope, so `GitPreflight`'s scope check flags anything else touched as
+ *   `outside_declared_region` (triggering the scope-overrun checkpoint) rather than silently
+ *   permitting an entire subtree the human never actually named. If a line is not a valid
+ *   repository-relative path, the resulting `Issue` fails domain schema validation as a whole
+ *   (the existing `issue_invalid` skip path in `discoverReadyDispatchCandidates` already handles
+ *   this -- this parser adds no new failure mode for it).
  */
 import {
   readyGateTemplateHeadings,
@@ -47,6 +57,11 @@ import {
 
 export type ReadyGateDependenciesField =
   Readonly<{ kind: "none" }> | Readonly<{ kind: "unparsed" }> | Readonly<{ kind: "absent" }>;
+
+export interface ReadyGateChangeRegion {
+  readonly path: string;
+  readonly coverage: "exact";
+}
 
 export interface ReadyGateTemplateFields {
   readonly goal?: string;
@@ -57,6 +72,7 @@ export interface ReadyGateTemplateFields {
   readonly estimatedMinutes?: number;
   readonly constraints?: readonly string[];
   readonly risks?: readonly string[];
+  readonly changeRegions?: readonly ReadyGateChangeRegion[];
   readonly dependencies: ReadyGateDependenciesField;
 }
 
@@ -117,6 +133,14 @@ function parseEstimatedMinutes(body: string | undefined): number | undefined {
   return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+function parseChangeRegions(
+  body: string | undefined,
+): readonly ReadyGateChangeRegion[] | undefined {
+  const paths = parseBulletList(body);
+  if (paths === undefined) return undefined;
+  return Object.freeze(paths.map((path) => Object.freeze({ path, coverage: "exact" as const })));
+}
+
 function parseDependencies(body: string | undefined): ReadyGateDependenciesField {
   if (body === undefined) return Object.freeze({ kind: "absent" as const });
   const trimmed = body.trim();
@@ -142,6 +166,7 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
   );
   const constraints = parseBulletList(sections.get(readyGateTemplateHeadings.constraints));
   const risks = parseBulletList(sections.get(readyGateTemplateHeadings.risks));
+  const changeRegions = parseChangeRegions(sections.get(readyGateTemplateHeadings.changeRegions));
   const dependencies = parseDependencies(sections.get(readyGateTemplateHeadings.dependencies));
 
   return Object.freeze({
@@ -153,6 +178,7 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
     ...(estimatedMinutes === undefined ? {} : { estimatedMinutes }),
     ...(constraints === undefined ? {} : { constraints }),
     ...(risks === undefined ? {} : { risks }),
+    ...(changeRegions === undefined ? {} : { changeRegions }),
     dependencies,
   });
 }
