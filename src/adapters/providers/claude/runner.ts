@@ -89,10 +89,53 @@ function waitWithSignal<Value>(
   });
 }
 
+/**
+ * C015h-1 (security-critical -- read this before changing either function below): `Bash` is
+ * deliberately absent from `--tools` here, and from `allowedToolsForRole`'s grant, for *every*
+ * role, including "implementer"/"integration_engineer" which otherwise get real file-write
+ * access. This is not an oversight or an unfinished TODO.
+ *
+ * A real-world experiment (see C015h-1's completion report and diagnosis) proved Claude Code's
+ * own `Bash(<pattern>)` allowlist syntax does not robustly reject shell-metacharacter chaining:
+ * granting `Bash(pnpm test)` -- an *exact*, zero-wildcard pattern -- still let
+ * `pnpm test ; whoami` execute the chained `whoami` with zero permission denial. `--safe-mode`
+ * (which this adapter always passes, and must keep passing -- it disables project CLAUDE.md,
+ * plugins, and MCP servers) also disables Claude Code's own hooks, so there is no CLI-side
+ * mechanism left to validate a Bash command's *shape* before it runs. By the time any of our own
+ * code observes anything, the command has already executed (or been denied) entirely inside the
+ * Claude CLI's own process, with no live interception point (see `ClaudeRun.respondToToolRequest`
+ * below). The task's own Linear issue description is untrusted external data -- exactly the kind
+ * of input a prompt-injection attack would use to smuggle a chained dangerous command past any
+ * allowlist pattern we might write. Zero attack surface ("this session has no Bash tool it can
+ * even try to invoke") is strictly safer than "Bash is available but every invocation is checked
+ * against a pattern," once that pattern check is known to be bypassable.
+ *
+ * Do not add "Bash" back to either `--tools` or an `allowedToolsForRole` grant without first
+ * re-proving this finding safe against whatever Claude CLI version is installed at the time --
+ * a future release may or may not still have this bypass, but that must be re-verified, not
+ * assumed away because "the pattern looks narrower now."
+ */
 function toolsForRole(role: ProviderRunRequest["role"]): string {
-  return role === "implementer" || role === "integration_engineer"
-    ? "Read,Write,Edit,Bash"
-    : "Read";
+  return role === "implementer" || role === "integration_engineer" ? "Read,Write,Edit" : "Read";
+}
+
+/**
+ * C015h-1: `--tools` (above) only controls which tools are *available* to load into the session
+ * -- it is not a grant. Claude Code's own default posture under `--permission-mode dontAsk` is to
+ * deny any operation that is not explicitly pre-approved, even for a tool that is available (this
+ * is exactly what caused E101's fourth real run to die at `stage:"tool_decision"` -- `--tools`
+ * alone let the session load `Write`/`Edit`, but every real write attempt was still denied).
+ * `--allowedTools` is the actual pre-approval mechanism, and it must use Claude Code's own
+ * `Tool(pattern)` syntax scoped to the working directory (`./**`), never a bare tool name -- a
+ * bare `Write`/`Edit` grant has no path boundary at all (proven: it can write anywhere the OS
+ * permits, not just inside the worktree `--workingDirectory` points at). Read-only roles get no
+ * `Write`/`Edit` grant at all, keeping their existing zero-mutation guarantee unchanged.
+ */
+function allowedToolsForRole(role: ProviderRunRequest["role"]): readonly string[] {
+  if (role === "implementer" || role === "integration_engineer") {
+    return Object.freeze(["Read", "Write(./*)", "Write(./**)", "Edit(./*)", "Edit(./**)"]);
+  }
+  return Object.freeze(["Read"]);
 }
 
 interface ParsedResult {
@@ -374,6 +417,8 @@ export class ClaudeRunner implements ProviderPort {
           "dontAsk",
           "--tools",
           toolsForRole(request.role),
+          "--allowedTools",
+          ...allowedToolsForRole(request.role),
           "--no-session-persistence",
           "--model",
           request.model,

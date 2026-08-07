@@ -21,7 +21,7 @@ import {
   type Result,
 } from "../../src/domain/foundation/index.js";
 import { jobSchema } from "../../src/domain/jobs/index.js";
-import { issueSchema } from "../../src/domain/project/index.js";
+import { agentRoleSchema, issueSchema } from "../../src/domain/project/index.js";
 import { createRequirementSnapshot } from "../../src/domain/review/index.js";
 import { Redactor } from "../../src/infrastructure/redaction/index.js";
 
@@ -276,6 +276,8 @@ describe("Claude stream-json runner", () => {
       "dontAsk",
       "--tools",
       "Read",
+      "--allowedTools",
+      "Read",
       "--no-session-persistence",
       "--model",
       "opus",
@@ -304,7 +306,10 @@ describe("Claude stream-json runner", () => {
       started.value.completion(),
     ]);
 
-    expect(process.request?.arguments).toContain("Read,Write,Edit,Bash");
+    // C015h-1: implementer's `--tools` never includes Bash (see toolsForRole's own header for
+    // why); the tool list is exactly "Read,Write,Edit".
+    expect(process.request?.arguments).toContain("Read,Write,Edit");
+    expect(process.request?.arguments).not.toContain("Read,Write,Edit,Bash");
     expect(events.map((event) => event.kind)).toEqual([
       "started",
       "output",
@@ -415,5 +420,121 @@ describe("Claude stream-json runner", () => {
 
     expect(events.map((event) => event.kind)).not.toContain("failed");
     expect(completion).toMatchObject({ ok: true, value: { outcome: "completed" } });
+  });
+
+  /**
+   * C015h-1 (security-critical): pins the exact `--tools`/`--allowedTools` argument shape this
+   * ticket exists to get right. See `toolsForRole`/`allowedToolsForRole`'s own header comments
+   * (src/adapters/providers/claude/runner.ts) for the full rationale -- summarized here as three
+   * hard requirements this test suite must never let regress:
+   *
+   * 1. Bash is never available (`--tools`) and never granted (`--allowedTools`) for *any* role.
+   *    A real-world experiment proved Claude Code's own `Bash(<pattern>)` allowlist syntax does
+   *    not reject shell-metacharacter chaining -- even the exact, zero-wildcard pattern
+   *    `Bash(pnpm test)` still let `pnpm test ; whoami` execute the chained `whoami` with zero
+   *    denial. `--safe-mode` (required, never removable) also disables Claude Code's own hooks,
+   *    so there is no CLI-side place left to validate a command's shape before it runs. The
+   *    task's own Linear issue description is untrusted external data -- a real prompt-injection
+   *    surface for smuggling a chained dangerous command past any allowlist pattern.
+   * 2. Every `Write`/`Edit` grant in `--allowedTools` uses Claude Code's own `Tool(pattern)`
+   *    syntax scoped to the working directory (`./*`, `./**`) -- never a bare tool name. A bare
+   *    grant has no path boundary at all (also proven experimentally: it can write anywhere the
+   *    OS permits, not just inside the worktree `--workingDirectory` points at).
+   * 3. Read-only roles (`team_lead`/`code_reviewer`/`visual_reviewer`) get no `Write`/`Edit`
+   *    grant of any kind -- their zero-mutation guarantee is unchanged from before this ticket.
+   */
+  describe("tool authorization shape (C015h-1)", () => {
+    const writeCapableRoles = ["implementer", "integration_engineer"] as const;
+    const readOnlyRoles = agentRoleSchema.options.filter(
+      (role) => !writeCapableRoles.includes(role as (typeof writeCapableRoles)[number]),
+    );
+
+    it.each(writeCapableRoles)(
+      "grants %s exactly Read + directory-scoped Write/Edit patterns, never Bash, never a bare Write/Edit",
+      async (role) => {
+        const process = new FakeProcessPort([
+          { type: "result", is_error: false, result: "ok", permission_denials: [] },
+        ]);
+        const started = await runner(process).start(runRequest(role));
+        if (!started.ok) throw new Error(started.error.code);
+        await started.value.completion();
+
+        expect(process.request?.arguments).toEqual([
+          "-p",
+          "--safe-mode",
+          "--verbose",
+          "--output-format",
+          "stream-json",
+          "--permission-mode",
+          "dontAsk",
+          "--tools",
+          "Read,Write,Edit",
+          "--allowedTools",
+          "Read",
+          "Write(./*)",
+          "Write(./**)",
+          "Edit(./*)",
+          "Edit(./**)",
+          "--no-session-persistence",
+          "--model",
+          "opus",
+        ]);
+        const arguments_ = process.request?.arguments ?? [];
+        expect(arguments_.join(" ")).not.toMatch(/\bBash\b/u);
+        expect(arguments_).not.toContain("Write");
+        expect(arguments_).not.toContain("Edit");
+      },
+    );
+
+    it.each(readOnlyRoles)(
+      "grants %s only Read -- no Write/Edit/Bash tool, no Write/Edit/Bash grant",
+      async (role) => {
+        const process = new FakeProcessPort([
+          { type: "result", is_error: false, result: "ok", permission_denials: [] },
+        ]);
+        const started = await runner(process).start(runRequest(role));
+        if (!started.ok) throw new Error(started.error.code);
+        await started.value.completion();
+
+        expect(process.request?.arguments).toEqual([
+          "-p",
+          "--safe-mode",
+          "--verbose",
+          "--output-format",
+          "stream-json",
+          "--permission-mode",
+          "dontAsk",
+          "--tools",
+          "Read",
+          "--allowedTools",
+          "Read",
+          "--no-session-persistence",
+          "--model",
+          "opus",
+        ]);
+      },
+    );
+
+    it("never emits a bare Write/Edit/Bash token in --allowedTools for any role", async () => {
+      for (const role of agentRoleSchema.options) {
+        const process = new FakeProcessPort([
+          { type: "result", is_error: false, result: "ok", permission_denials: [] },
+        ]);
+        const started = await runner(process).start(runRequest(role));
+        if (!started.ok) throw new Error(started.error.code);
+        await started.value.completion();
+
+        const arguments_ = process.request?.arguments ?? [];
+        const allowedToolsIndex = arguments_.indexOf("--allowedTools");
+        expect(allowedToolsIndex).toBeGreaterThanOrEqual(0);
+        const noSessionIndex = arguments_.indexOf("--no-session-persistence");
+        expect(noSessionIndex).toBeGreaterThan(allowedToolsIndex);
+        const grants = arguments_.slice(allowedToolsIndex + 1, noSessionIndex);
+        expect(grants.length).toBeGreaterThan(0);
+        for (const grant of grants) {
+          expect(["Write", "Edit", "Bash"]).not.toContain(grant);
+        }
+      }
+    });
   });
 });
