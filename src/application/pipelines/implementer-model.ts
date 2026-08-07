@@ -26,7 +26,13 @@ export type ImplementerPreflightFinding =
   | Readonly<{ code: "unsafe_symlink"; path: string }>
   | Readonly<{ code: "suspected_secret"; path: string }>
   | Readonly<{ code: "unscannable_file"; path: string }>
-  | Readonly<{ code: "overlapping_job_change"; path: string; otherJobId: string }>;
+  | Readonly<{ code: "overlapping_job_change"; path: string; otherJobId: string }>
+  /** C015m: mirrors `GitPreflightFinding`'s own new code (src/adapters/git/preflight.ts) --
+   * mechanical type-widening only. `ImplementerPipeline.run()`'s own decision logic already
+   * treats *any* non-empty findings list as `allowed:false` / `scope_overrun` uniformly,
+   * regardless of which specific codes appear, so this adds no new judgment/branching, only lets
+   * this existing generic path carry the new adapter-level finding through the port contract. */
+  | Readonly<{ code: "gitattributes_modified"; path: string }>;
 
 export interface ImplementerPreflightReport {
   readonly headSha: string;
