@@ -59,6 +59,12 @@
  *   repository-relative path, the resulting `Issue` fails domain schema validation as a whole
  *   (the existing `issue_invalid` skip path in `discoverReadyDispatchCandidates` already handles
  *   this -- this parser adds no new failure mode for it).
+ * - `parseBulletList` accepts all three CommonMark bullet markers (`- `, `* `, `+ `), not just
+ *   `- `. E101's first real Linear issue (LEA-14) surfaced this: Linear's own description editor
+ *   silently normalizes `- ` bullets to `* ` on save, so a human typing the template exactly as
+ *   documented still ends up with `* ` in the stored `description` -- the acceptance criteria/
+ *   in-scope/out-of-scope fields all came back `missing` despite being filled in. Numbered lists
+ *   are still not accepted: the template's own instruction asks for bullets, not an ordered list.
  */
 import {
   readyGateTemplateHeadings,
@@ -178,12 +184,18 @@ function nonEmptyText(body: string | undefined): string | undefined {
   return trimmed.length === 0 || trimmed === readyGateTemplatePlaceholder ? undefined : trimmed;
 }
 
+/** Matches a line beginning with any CommonMark bullet marker (`- `, `* `, `+ `) followed by a
+ * space -- see this file's header for why all three, not just `- `, must be accepted. Every
+ * marker is exactly one character, so `line.slice(2)` below still correctly strips "marker +
+ * space" regardless of which one matched. */
+const bulletMarkerPattern = /^[-*+] /u;
+
 function parseBulletList(body: string | undefined): readonly string[] | undefined {
   if (body === undefined) return undefined;
   const items = body
     .split(/\r\n|\r|\n/u)
     .map((line) => line.trim())
-    .filter((line) => line.startsWith("- "))
+    .filter((line) => bulletMarkerPattern.test(line))
     .map((line) => line.slice(2).trim())
     .filter((line) => line.length > 0 && line !== readyGateTemplatePlaceholder);
   return items.length === 0 ? undefined : Object.freeze(items);
