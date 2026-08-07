@@ -1,0 +1,406 @@
+/**
+ * C015b unit tests: `createDispatchCliHandlers`'s pipeline-driving branch (handlers.ts's
+ * `case "dispatched"`) -- covers every `ImplementerPipelineOutcome` mapping (`ci_waiting`/
+ * `paused`/`failed`), the `buildImplementerPipeline` composition itself being blocked (no real
+ * `gh` auth), and the non-`implementer`-role scope boundary (`pipeline:"not_applicable_role"`,
+ * where the pipeline is never even constructed). `discoverReadyDispatchCandidates` is mocked to
+ * return one directly-built, fully-eligible, `workKind:"model"` candidate (unlike
+ * dispatch-cli-handlers.test.ts's deliberately-`"mechanical"` fixture) so real model routing
+ * genuinely selects it -- this file's job is specifically the pipeline hand-off, so the real
+ * routing path matters here.
+ */
+import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { ok } from "../../src/domain/foundation/index.js";
+import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
+import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
+import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
+import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
+import type { ImplementerPipeline } from "../../src/application/pipelines/index.js";
+import type { ProcessPort } from "../../src/application/ports/index.js";
+import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
+import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
+import type { LinearReadModel } from "../../src/adapters/linear/read.js";
+
+const discoverSpy = vi.hoisted(() => vi.fn());
+/** Lets one test (the `not_applicable_role` scope-boundary case) swap in a differently-rolled
+ * candidate without duplicating the whole discovery-mocking setup. */
+const candidateRoleOverride = vi.hoisted(() => ({ current: undefined as string | undefined }));
+
+vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/adapters/dispatch/index.js")>();
+  return {
+    ...actual,
+    discoverReadyDispatchCandidates: (
+      ...args: Parameters<typeof actual.discoverReadyDispatchCandidates>
+    ) => {
+      discoverSpy(...args);
+      const candidate = eligibleCandidate(candidateRoleOverride.current);
+      return Promise.resolve(ok({ candidates: [candidate], skipped: [] }));
+    },
+  };
+});
+
+const { createDispatchCliHandlers } = await import("../../src/cli/dispatch/handlers.js");
+
+const run = promisify(execFile);
+async function git(cwd: string, arguments_: readonly string[]): Promise<string> {
+  const result = await run("git", arguments_, { cwd, encoding: "utf8" });
+  return result.stdout.trim();
+}
+
+const temporaryDirectories: string[] = [];
+afterEach(async () => {
+  discoverSpy.mockClear();
+  candidateRoleOverride.current = undefined;
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+async function temporaryStateRoot(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "agent-team-dispatch-run-pipeline-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+/**
+ * `handlers.ts`'s pipeline-driving branch resolves the project's real HEAD SHA via a real
+ * `LocalGitAdapter().inspectRepository(...)` before building the `ImplementerPipelineRequest`
+ * (see its own comment on why `baseRevision` must never be the branch name) -- there is no
+ * injection seam for that call, so `project.localRepositoryPath` must point at a real,
+ * initialized git repository for this handler-level test to get past it and reach the pipeline
+ * hand-off this file actually wants to exercise. The pipeline itself is fully faked (see
+ * `fakePipeline` below), so this repo is never staged/committed/pushed to -- read-only.
+ */
+async function temporaryRepository(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "agent-team-dispatch-run-pipeline-repo-"));
+  temporaryDirectories.push(directory);
+  await git(directory, ["init", "-b", "main"]);
+  await git(directory, ["config", "user.email", "agent-team@example.invalid"]);
+  await git(directory, ["config", "user.name", "Agent Team Fixture"]);
+  await run("git", ["commit", "--allow-empty", "-m", "initial"], { cwd: directory });
+  return directory;
+}
+
+const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+const issueId = "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+
+function project(repositoryPath: string) {
+  return projectSchema.parse({
+    schemaVersion: 1,
+    id: projectId,
+    displayName: "Sandbox",
+    localRepositoryPath: repositoryPath,
+    defaultBranch: "main",
+    workManagement: { provider: "linear", containerId: "team-1", projectId: "linear-proj-1" },
+    sourceControl: { provider: "github", repository: "owner/sandbox" },
+  });
+}
+
+function trustedConfigFixture() {
+  return trustedProjectConfigSchema.parse({
+    schemaVersion: 1,
+    projectId,
+    defaultBranch: "main",
+    platforms: {
+      workManagement: { provider: "linear", containerId: "team-1", projectId: "linear-proj-1" },
+      sourceControl: { provider: "github", repository: "owner/sandbox" },
+    },
+    projectRules: [],
+    roleInstructions: {},
+    commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
+  });
+}
+
+function registry(repositoryPath: string): ProjectRegistrySnapshot {
+  return {
+    ready: [
+      {
+        state: "ready",
+        project: project(repositoryPath),
+        config: trustedConfigFixture(),
+        revisionSha: "a".repeat(40),
+      },
+    ],
+    rejected: [],
+  };
+}
+
+/** A `workKind:"model"` candidate (unlike the mechanical-work trick used elsewhere) -- real model
+ * routing must select it, which needs a "ready" Claude capability observation (below). `role`
+ * defaults to `"implementer"`; the `not_applicable_role` test overrides it to prove the pipeline
+ * is never even constructed for other roles. */
+function eligibleIssue(role = "implementer"): Issue {
+  return issueSchema.parse({
+    schemaVersion: 1,
+    id: issueId,
+    projectId,
+    externalId: "linear-issue-1",
+    title: "Ship the thing",
+    goal: "Deliver the requested behavior.",
+    background: "Pipeline hand-off test needs a real model-routed dispatch.",
+    acceptanceCriteria: ["Pipeline outcome is mapped correctly."],
+    inScope: ["CLI handler wiring"],
+    outOfScope: ["Process execution"],
+    dependencies: { kind: "none" },
+    priority: "high",
+    agentRole: role,
+    reviewRequirement: "code_review",
+    estimatedMinutes: 30,
+    changeRegions: [{ path: "src/feature.ts", coverage: "exact" }],
+  });
+}
+
+function eligibleCandidate(role?: string) {
+  return Object.freeze({
+    issue: eligibleIssue(role),
+    readyAt: "2026-08-07T00:00:00.000Z",
+    stage: "implementation" as const,
+    workKind: "model" as const,
+  });
+}
+
+const routingConfig: ModelRoutingConfig = {
+  schemaVersion: 1,
+  routes: [
+    { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
+    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
+    // `code_reviewer` deliberately routes to claude/opus too (not the more realistic codex) --
+    // the fake Claude capability probe below only ever reports observations for
+    // `claude.config.models` ("opus"), so the `not_applicable_role` test (which overrides the
+    // candidate's role to "code_reviewer" to reach the dispatched-but-not-implementer branch)
+    // needs its route to actually resolve to "ready"; the point of that test is the CLI handler's
+    // role branch, not model routing, so this keeps it decoupled from a real codex observation
+    // this fixture has no way to provide.
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
+    { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
+    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+  ],
+};
+
+/** Reports the Claude capability probe as alive. */
+class ReadyProcessPort implements ProcessPort {
+  spawn(): ReturnType<ProcessPort["spawn"]> {
+    return Promise.resolve(
+      ok({
+        pid: 1,
+        output: (async function* () {
+          await Promise.resolve();
+        })(),
+        writeStdin: () => Promise.resolve(ok(undefined)),
+        closeStdin: () => Promise.resolve(ok(undefined)),
+        sendSignal: () => Promise.resolve(ok(undefined)),
+        wait: () =>
+          Promise.resolve(
+            ok({
+              exitCode: 0,
+              signal: null,
+              startedAt: "2026-08-07T00:00:00.000Z" as never,
+              exitedAt: "2026-08-07T00:00:00.000Z" as never,
+              outputTruncated: false,
+            }),
+          ),
+      }),
+    );
+  }
+}
+
+const unusedReadModel = {
+  readContext: () => Promise.reject(new Error("must never be called: discovery is mocked")),
+  readIssue: () => Promise.reject(new Error("must never be called: discovery is mocked")),
+  listIssueIdsInState: () => Promise.reject(new Error("must never be called: discovery is mocked")),
+} as unknown as LinearReadModel;
+
+function buildHandlers(
+  stateRoot: string,
+  repositoryPath: string,
+  buildImplementerPipeline: Parameters<
+    typeof createDispatchCliHandlers
+  >[0]["buildImplementerPipeline"],
+) {
+  const leases = new FileLeaseRepository(
+    join(stateRoot, "leases.json"),
+    join(stateRoot, "leases.lock"),
+  );
+  const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
+  const buildComposition = () =>
+    Promise.resolve({
+      state: "ready" as const,
+      value: {
+        leases,
+        jobs,
+        registry: registry(repositoryPath),
+        routingConfig,
+        discovery: {
+          teamId: "team-1",
+          linearProjectId: "linear-proj-1",
+          readModel: unusedReadModel,
+        },
+        project: project(repositoryPath),
+        trustedConfig: trustedConfigFixture(),
+        claude: {
+          config: { executable: "claude", models: ["opus"], account: "default" },
+          process: new ReadyProcessPort(),
+        },
+      },
+    });
+  return createDispatchCliHandlers({
+    agentTeamHome: stateRoot,
+    buildComposition,
+    ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
+  });
+}
+
+function fakePipeline(run: ImplementerPipeline["run"]): ImplementerPipeline {
+  return { ports: undefined as never, run } as unknown as ImplementerPipeline;
+}
+
+describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
+  it("maps a ci_waiting pipeline outcome to a success payload with the change request URL", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "ci_waiting",
+            worktree: {
+              repositoryRoot: "/tmp/sandbox",
+              path: "/tmp/wt",
+              branch: "b",
+              headSha: "a".repeat(40),
+            },
+            commit: { sha: "b".repeat(40), branch: "b" },
+            push: { sha: "b".repeat(40), branch: "b", remote: "origin" },
+            changeRequest: {
+              id: "PR_1",
+              number: 1,
+              url: "https://example.invalid/pull/1",
+              state: "open",
+              draft: true,
+              baseBranch: "main",
+              headBranch: "b",
+              headSha: "b".repeat(40),
+              mergeability: "unknown",
+              autoMergeEnabled: false,
+              updatedAt: "2026-08-07T00:00:00.000Z" as never,
+            },
+            checks: { headSha: "b".repeat(40), aggregate: "pending", checks: [] },
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      changeRequestUrl: string;
+    };
+    expect(payload.pipeline).toBe("ci_waiting");
+    expect(payload.changeRequestUrl).toBe("https://example.invalid/pull/1");
+  });
+
+  it("maps a paused pipeline outcome to a success payload (a pause is not an error)", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "paused",
+            reason: "scope_overrun",
+            worktree: {
+              repositoryRoot: "/tmp/sandbox",
+              path: "/tmp/wt",
+              branch: "b",
+              headSha: "a".repeat(40),
+            },
+            checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+            findings: [{ code: "outside_declared_region", path: "src/x.ts" }],
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pauseReason: string;
+      checkpointId: string;
+    };
+    expect(payload.pipeline).toBe("paused");
+    expect(payload.pauseReason).toBe("scope_overrun");
+    expect(payload.checkpointId).toBe("checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+  });
+
+  it("maps a failed pipeline outcome (e.g. the Claude process itself failing) to a failed payload, never crashing", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "failed",
+            stage: "provider_run",
+            error: {
+              kind: "domain_error",
+              code: "external_failure",
+              category: "external",
+              message: "The external operation failed.",
+              retryable: false,
+            },
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as { pipeline: string; stage: string };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.stage).toBe("provider_run");
+  });
+
+  it("maps a blocked pipeline composition (no gh auth) to a failed payload with the fixed message", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({ state: "blocked", reason: "github_authentication_unavailable" }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+    };
+    expect(payload.pipeline).toBe("blocked");
+    expect(payload.pipelineReason).toBe("github_authentication_unavailable");
+  });
+
+  it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role", async () => {
+    candidateRoleOverride.current = "code_reviewer";
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("must never be called for a non-implementer role")),
+    );
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline);
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as { state: string; pipeline: string };
+    expect(payload.state).toBe("dispatched");
+    expect(payload.pipeline).toBe("not_applicable_role");
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+  });
+});

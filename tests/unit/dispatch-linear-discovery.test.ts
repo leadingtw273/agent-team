@@ -37,6 +37,7 @@ import {
   type Project,
 } from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
+import { readyGateTemplateHeadings } from "../../src/application/registration/linear-provision-model.js";
 
 function project(): Project {
   return projectSchema.parse({
@@ -138,6 +139,40 @@ function snapshotWithoutAgentRole(): LinearIssueSnapshot {
   return Object.freeze({ ...baseSnapshotFields() });
 }
 
+/** A description that genuinely follows the Ready Gate template (C015b) with every field filled
+ * in, including an explicit "無" (no dependencies) -- the shape a real, fully-compliant Linear
+ * issue would carry. */
+function filledTemplateDescription(): string {
+  return `## ${readyGateTemplateHeadings.goal}
+讓真實 Linear 候選能通過 eligibility。
+
+## ${readyGateTemplateHeadings.background}
+C015a 發現沒有解析器；C015b 補上。
+
+## ${readyGateTemplateHeadings.acceptanceCriteria}
+- 候選欄位齊全
+
+## ${readyGateTemplateHeadings.inScope}
+- 解析器接線
+
+## ${readyGateTemplateHeadings.outOfScope}
+- 引擎修改
+
+## ${readyGateTemplateHeadings.dependencies}
+無
+
+## ${readyGateTemplateHeadings.estimatedMinutes}
+30
+
+## ${readyGateTemplateHeadings.constraints}
+
+## ${readyGateTemplateHeadings.risks}
+
+## ${readyGateTemplateHeadings.changeRegions}
+- src/adapters/dispatch/linear-discovery.ts
+`;
+}
+
 function fakeReadModel(
   overrides: Partial<LinearDiscoveryReadModel> = {},
 ): LinearDiscoveryReadModel {
@@ -173,6 +208,57 @@ describe("discoverReadyDispatchCandidates", () => {
     const expectedId = generateDeterministicIdentifier("issue", "linear-issue-1");
     expect(expectedId.ok).toBe(true);
     if (expectedId.ok) expect(candidate?.issue.id).toBe(expectedId.value);
+  });
+
+  it("C015b: projects every Ready Gate template field when the description genuinely follows it", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () => Promise.resolve(ok(snapshot({ description: filledTemplateDescription() }))),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.skipped).toHaveLength(0);
+    const candidate = result.value.candidates[0];
+    expect(candidate?.issue.goal).toBe("讓真實 Linear 候選能通過 eligibility。");
+    expect(candidate?.issue.background).toBe("C015a 發現沒有解析器；C015b 補上。");
+    expect(candidate?.issue.acceptanceCriteria).toEqual(["候選欄位齊全"]);
+    expect(candidate?.issue.inScope).toEqual(["解析器接線"]);
+    expect(candidate?.issue.outOfScope).toEqual(["引擎修改"]);
+    expect(candidate?.issue.estimatedMinutes).toBe(30);
+    expect(candidate?.issue.dependencies).toEqual({ kind: "none" });
+    expect(candidate?.issue.changeRegions).toEqual([
+      { path: "src/adapters/dispatch/linear-discovery.ts", coverage: "exact" },
+    ]);
+  });
+
+  it("C015b: skips (visibly, with its own reason) an issue whose dependencies section has unresolvable free text", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              description: `## ${readyGateTemplateHeadings.dependencies}\n依賴 ENG-42 先完成`,
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "dependencies_unparsed" } },
+    ]);
   });
 
   it("skips (and reports, never silently drops) an issue with no agent-role label", async () => {

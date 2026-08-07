@@ -5,11 +5,22 @@
  * (missing config -> exit code 3, zero external calls -- program.ts's `outcomeExitCode` maps
  * `state:"blocked"` to `cliExitCodes.blocked` unconditionally), and a `buildComposition` override
  * hook so tests can inject a fake composition without touching any real file/network.
+ *
+ * C015b item 5: once a candidate is genuinely `kind:"dispatched"` (never in `--dry-run`, which
+ * stays zero-mutation/zero-pipeline exactly as C015a left it), this same process drives the
+ * `ImplementerPipeline` to completion (`ci_waiting`/`paused`/`failed`) before this command exits
+ * -- there is no separate "start the pipeline" step or background process. Only `role ===
+ * "implementer"` candidates are driven; other roles' pipelines (reviewer, integration, ...) are
+ * not this ticket's job, so a dispatched non-implementer job is reported as `dispatched` with
+ * `pipeline: "not_applicable_role"`, exactly like before this ticket existed.
  */
 import { randomUUID } from "node:crypto";
 
 import type { CliHandlers } from "../program.js";
+import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
+import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import { createClock, type Clock } from "../../domain/foundation/index.js";
 import {
   buildDispatchComposition,
   dispatchOnce,
@@ -17,6 +28,11 @@ import {
   type DispatchCompositionBlockedReason,
 } from "./composition.js";
 import { InMemoryJobRepository, InMemoryLeaseRepository } from "./ephemeral-ports.js";
+import { buildImplementerPipelineRequest } from "./implementer-request.js";
+import {
+  buildImplementerPipeline,
+  type BuildImplementerPipelineResult,
+} from "./implementer-composition.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -30,7 +46,16 @@ export interface CreateDispatchCliHandlersOptions {
    * recorded on the persisted `Lease` itself (`Lease.holderId`), so C015b can always discover the
    * exact holder of an active lease by reading the lease file back. */
   readonly generateHolderId?: () => string;
+  /** Injectable for tests; production defaults to the real `buildImplementerPipeline`. */
+  readonly buildImplementerPipeline?: (
+    options: Parameters<typeof buildImplementerPipeline>[0],
+  ) => Promise<BuildImplementerPipelineResult>;
+  readonly clock?: Clock;
 }
+
+const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = Object.freeze({
+  github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
+});
 
 type DispatchHandlers = Pick<CliHandlers, "run">;
 
@@ -40,6 +65,8 @@ const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>
   linear_api_key_missing: "缺少 LINEAR_API_KEY 環境變數。",
   routing_config_unavailable:
     "找不到有效的 Model Routing 設定檔（${AGENT_TEAM_HOME}/config/dispatch/routing.json），或格式不符 schema。",
+  provider_config_unavailable:
+    "找不到有效的 Provider 設定檔（${AGENT_TEAM_HOME}/config/dispatch/providers.json），或格式不符 schema。",
   invalid_registry_entry: "專案設定物件本身不符合 Project schema。",
   trusted_config_missing: "專案 repository 內找不到 .agent-team/project.json。",
   trusted_config_unavailable: "讀取專案 repository 內 .agent-team/project.json 失敗。",
@@ -59,10 +86,37 @@ function outcome(state: "success" | "failed" | "blocked", payload: unknown) {
   return Object.freeze({ state, message: JSON.stringify(payload) });
 }
 
+function pipelineOutcomePayload(
+  outcome: ImplementerPipelineOutcome,
+): Readonly<Record<string, unknown>> {
+  switch (outcome.state) {
+    case "ci_waiting":
+      return Object.freeze({
+        pipeline: "ci_waiting",
+        changeRequestUrl: outcome.changeRequest.url,
+        commitSha: outcome.commit.sha,
+        ...(outcome.providerSessionId === undefined
+          ? {}
+          : { providerSessionId: outcome.providerSessionId }),
+      });
+    case "paused":
+      return Object.freeze({
+        pipeline: "paused",
+        pauseReason: outcome.reason,
+        ...(outcome.checkpointId === undefined ? {} : { checkpointId: outcome.checkpointId }),
+        ...(outcome.toolSummary === undefined ? {} : { toolSummary: outcome.toolSummary }),
+      });
+    case "failed":
+      return Object.freeze({ pipeline: "failed", stage: outcome.stage, error: outcome.error });
+  }
+}
+
 export function createDispatchCliHandlers(
   options: CreateDispatchCliHandlersOptions,
 ): DispatchHandlers {
   const generateHolderId = options.generateHolderId ?? (() => `cli-dispatch:${randomUUID()}`);
+  const clock = options.clock ?? createClock();
+  const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
 
   return Object.freeze({
     async run(input) {
@@ -132,8 +186,8 @@ export function createDispatchCliHandlers(
       }
 
       switch (result.kind) {
-        case "dispatched":
-          return outcome("success", {
+        case "dispatched": {
+          const dispatchedPayload = {
             operation: "dispatch_run",
             state: "dispatched",
             projectId: input.projectId,
@@ -143,7 +197,86 @@ export function createDispatchCliHandlers(
             holderId,
             skipped: result.skipped,
             discoverySkipped,
+          };
+
+          // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
+          // Reviewer/integration/etc. pipelines are separate, unbuilt C-series tickets.
+          if (result.decision.candidate.role !== "implementer") {
+            return outcome("success", {
+              ...dispatchedPayload,
+              pipeline: "not_applicable_role",
+            });
+          }
+
+          const issue = candidates.find(
+            (candidate) => candidate.issue.id === result.job.issueId,
+          )?.issue;
+          const model = result.decision.model?.candidate.model;
+          if (issue === undefined || model === undefined) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "implementer_request_invalid",
+            });
+          }
+
+          const pipelineComposition = await buildPipelineComposition({
+            agentTeamHome: options.agentTeamHome,
+            claudeConfig: build.value.claude.config,
           });
+          if (pipelineComposition.state !== "ready") {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "blocked",
+              pipelineReason: pipelineComposition.reason,
+              message: implementerCompositionBlockedMessages[pipelineComposition.reason],
+            });
+          }
+
+          // The worktree must be pinned to a real, resolved revision -- never the branch name
+          // itself (see implementer-request.ts's own comment on `baseRevision`). A fresh
+          // `LocalGitAdapter` here (rather than reaching into `pipelineComposition.value.ports.git`)
+          // is deliberate: `ImplementerPipelinePorts.git` is narrowed to
+          // `Pick<GitPort,"createWorktree"|"stagePaths"|"commit"|"inspectWorkingTree"|"push">`,
+          // which does not include `inspectRepository` -- `LocalGitAdapter` is a stateless CLI
+          // wrapper, so constructing a second instance is cheap and does not duplicate any state.
+          const repository = await new LocalGitAdapter().inspectRepository({
+            rootPath: build.value.project.localRepositoryPath,
+          });
+          if (!repository.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "base_revision_unavailable",
+              error: repository.error,
+            });
+          }
+
+          const request = buildImplementerPipelineRequest({
+            job: result.job,
+            issue,
+            project: build.value.project,
+            trustedConfig: build.value.trustedConfig,
+            model,
+            agentTeamHome: options.agentTeamHome,
+            clock,
+            baseRevision: repository.value.headSha,
+          });
+          if (!request.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "implementer_request_invalid",
+              error: request.error,
+            });
+          }
+
+          const pipelineOutcome = await pipelineComposition.value.run(request.value);
+          return outcome(pipelineOutcome.state === "failed" ? "failed" : "success", {
+            ...dispatchedPayload,
+            ...pipelineOutcomePayload(pipelineOutcome),
+          });
+        }
         case "waiting":
           return outcome("success", {
             operation: "dispatch_run",
