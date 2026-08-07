@@ -60,7 +60,10 @@ function expectedUntrackedPathsFrom(issue: Issue): readonly string[] | undefined
  * "team lead" stage in this minimal path (that is a separate, unbuilt role/pipeline), so this is
  * the closest equivalent: a plain restatement of exactly the structured fields eligibility already
  * required to be present, nothing invented beyond that. */
-function buildDirective(issue: Issue): string {
+/** Exported for C015c item 2's resume orchestration: `CiRecoveryPipelineRequest.
+ * controllerDirective` needs the identical text a resumed job's original `ImplementerPipelineRequest`
+ * carried, and this is a pure function of `Issue` -- no reason to duplicate it. */
+export function buildDirective(issue: Issue): string {
   const sections = [
     issue.goal === undefined ? undefined : `目標：${issue.goal}`,
     issue.background === undefined ? undefined : `背景：${issue.background}`,
