@@ -56,17 +56,22 @@ export class JobProgressLifecycleCancellationAdapter implements LifecycleCancell
       (record) => record.issueId === issueId.value && !terminalStages.has(record.stage.kind),
     );
     for (const record of mine) {
+      // Spread the existing record rather than re-listing every field by hand: this store's
+      // schema has already grown once since it was first written (C015c item 2 added
+      // `externalIssueId`/`model`), and a hand-copied field list would silently stop forwarding
+      // whatever is added next. Only `stage` actually changes here.
+      const {
+        schemaVersion: _schemaVersion,
+        revision: _revision,
+        updatedAt: _updatedAt,
+        ...rest
+      } = record;
+      void _schemaVersion;
+      void _revision;
+      void _updatedAt;
       const transitioned = await this.#progress.compareAndSwap(record.jobId, record.revision, {
-        jobId: record.jobId,
-        projectId: record.projectId,
-        issueId: record.issueId,
+        ...rest,
         stage: { kind: "requires_manual" },
-        branch: record.branch,
-        worktreePath: record.worktreePath,
-        ...(record.changeRequestId === undefined
-          ? {}
-          : { changeRequestId: record.changeRequestId }),
-        ...(record.headSha === undefined ? {} : { headSha: record.headSha }),
       });
       if (!transitioned.ok) return transitioned;
     }

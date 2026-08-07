@@ -91,6 +91,16 @@ export const jobProgressRecordSchema = z
     jobId: jobIdSchema,
     projectId: projectIdSchema,
     issueId: issueIdSchema,
+    /** C015c item 2: the raw Linear issue id (never the derived domain `issueId` above, which is
+     * a one-way `generateDeterministicIdentifier` hash -- unrecoverable from the domain id alone).
+     * A resume attempt in a *fresh process* has nothing else that can look the Linear issue back
+     * up to re-derive `Issue`/`RequirementSnapshot` for `CiRecoveryPipeline`/`ReviewerPipeline`. */
+    externalIssueId: z.string().trim().min(1).max(255),
+    /** C015c item 2: the model string the original dispatch decision selected. Not derivable from
+     * anything else a fresh process has on hand (it is a runtime routing decision, not a pure
+     * function of `Issue`) -- without this, a resumed job could not build a valid
+     * `CiRecoveryPipelineRequest`/`ReviewerPipelineRequest`. */
+    model: z.string().trim().min(1).max(255),
     stage: jobProgressStageSchema,
     branch: z.string().trim().min(1).max(255),
     worktreePath: z.string().startsWith("/").min(2).max(1024),
