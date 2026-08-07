@@ -114,6 +114,8 @@ function pull(
     headBranch: "agent-team/job-1",
     headSha: "a".repeat(40),
     mergeability: "mergeable",
+    mergeStateStatus: "clean",
+    baseSha: "2".repeat(40),
     autoMergeEnabled: false,
     updatedAt: "2026-08-08T00:00:00.000Z",
     ...overrides,

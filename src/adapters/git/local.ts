@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
 
 import type {
+  AuthoritativeBranchHead,
+  AuthoritativeBranchRequest,
   CreateWorktreeCommand,
   GitCommitCommand,
   GitCommitReceipt,
@@ -259,6 +261,36 @@ function safeRemoteUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** C015x decision 1: `expectedRepository` always originates from `Project.sourceControl.repository`,
+ * which is already validated upstream by the (deliberately looser) `projectSchema` -- this file
+ * never trusts a caller regardless, so it independently re-checks the exact two-segment
+ * "owner/repo" shape every GitHub repository identifier actually has. */
+const githubOwnerRepoPattern = /^[^/\s]+\/[^/\s]+$/u;
+
+/**
+ * C015x decision 1 step ②: extracts "owner/repo" from a `git remote get-url` result, covering the
+ * three URL forms `git` itself produces for a GitHub remote (HTTPS, the `git@` SSH shorthand, and
+ * the explicit `ssh://` form). Deliberately GitHub-only (mirrors `validRepository`'s own
+ * `github.com`-only assumption, src/adapters/github/adapter.ts) -- GitHub Enterprise/other hosts
+ * are out of this ticket's scope. Returns `undefined` (never throws) for anything that does not
+ * parse as one of these three forms, which the caller treats as a hard mismatch.
+ */
+function githubOwnerRepoFromRemoteUrl(url: string): string | undefined {
+  const patterns = [
+    /^https:\/\/(?:[^@/\s]+@)?github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/iu,
+    /^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/iu,
+    /^ssh:\/\/git@github\.com\/([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/iu,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(url.trim());
+    if (match === null) continue;
+    const [, owner, repo] = match;
+    if (owner === undefined || repo === undefined) continue;
+    return `${owner}/${repo}`;
+  }
+  return undefined;
 }
 
 function objectId(value: string): GitObjectId | undefined {
@@ -907,6 +939,68 @@ export class LocalGitAdapter implements GitPort {
       branch: branch.value.stdout.trim() || "(detached)",
       clean: status.value.stdout.length === 0,
     });
+  }
+
+  /**
+   * C015x decision 1 (steps ②-⑤): see `GitPort.resolveAuthoritativeBranch`'s own header
+   * (application/ports/git.ts) for the full rationale. `+refs/heads/<branch>:refs/remotes/
+   * <remote>/<branch>` is a *forced* refspec (the leading `+`) -- this must always land the
+   * remote's exact current tip into the local remote-tracking ref regardless of whatever that ref
+   * previously pointed to (a non-fast-forward local history for a force-pushed or rebased default
+   * branch must never be silently rejected here); it does not touch any other ref. `#resolveCommit`
+   * immediately after the fetch is what performs step ⑤ (confirms the object is genuinely present
+   * as a commit, not merely a claimed SHA) -- a fetch that reports success but somehow left the ref
+   * unresolvable still fails closed here, never silently trusted.
+   */
+  async resolveAuthoritativeBranch(
+    request: AuthoritativeBranchRequest,
+    options: MutationOptions,
+  ): Promise<Result<AuthoritativeBranchHead, DomainError>> {
+    if (
+      !mutationAllowed(options) ||
+      !remotePattern.test(request.remote) ||
+      request.branch.startsWith("-") ||
+      !githubOwnerRepoPattern.test(request.expectedRepository)
+    ) {
+      return failure("external_failure");
+    }
+    const root = await this.#repositoryRoot(request, options);
+    if (!root.ok) return root;
+
+    const branchCheck = await this.#run(root.value, [
+      "check-ref-format",
+      "--branch",
+      request.branch,
+    ]);
+    if (!branchCheck.ok) return failure("external_failure");
+
+    // Step ②: the local `origin` (or whatever `remote` names) must genuinely resolve to
+    // `expectedRepository` -- never assumed, per the coordinator's own root-cause finding that a
+    // stale/unverified local assumption is exactly what caused this ticket's incident.
+    const remoteUrl = await this.#run(root.value, ["remote", "get-url", request.remote], options);
+    if (!remoteUrl.ok) return remoteUrl;
+    const trimmedRemoteUrl = remoteUrl.value.stdout.trim();
+    if (!safeRemoteUrl(trimmedRemoteUrl)) return failure("external_failure");
+    const remoteRepository = githubOwnerRepoFromRemoteUrl(trimmedRemoteUrl);
+    if (remoteRepository?.toLowerCase() !== request.expectedRepository.toLowerCase()) {
+      return failure("conflict");
+    }
+
+    // Step ③: a real `git fetch` (never `ls-remote`) -- the resulting commit must be physically
+    // present in the local object store afterward, not merely known by SHA.
+    const trackingRef = `refs/remotes/${request.remote}/${request.branch}`;
+    const fetched = await this.#run(
+      root.value,
+      ["fetch", "--no-tags", "--quiet", request.remote, `+refs/heads/${request.branch}:${trackingRef}`],
+      options,
+    );
+    if (!fetched.ok) return fetched;
+
+    // Steps ④+⑤: resolve the just-fetched ref and confirm it is a real, locally-present commit.
+    const resolved = await this.#resolveCommit(root.value, trackingRef, options);
+    if (!resolved.ok) return resolved;
+
+    return ok({ remote: request.remote, branch: request.branch, sha: resolved.value });
   }
 
   /**

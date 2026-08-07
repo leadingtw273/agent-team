@@ -47,6 +47,7 @@ const sourceControl = {
 
 const git = {
   inspectRepository: unavailable,
+  resolveAuthoritativeBranch: unavailable,
   createWorktree: unavailable,
   inspectWorktree: unavailable,
   inspectWorkingTree: unavailable,
@@ -102,6 +103,7 @@ const requiredMethods = {
   ],
   git: [
     "inspectRepository",
+    "resolveAuthoritativeBranch",
     "createWorktree",
     "inspectWorktree",
     "inspectWorkingTree",

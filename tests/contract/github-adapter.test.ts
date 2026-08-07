@@ -13,6 +13,10 @@ import { projectSchema, type Project } from "../../src/domain/project/index.js";
 
 const sha = "0123456789abcdef0123456789abcdef01234567";
 const nextSha = "fedcba9876543210fedcba9876543210fedcba98";
+// C015x decision 2/3: `pull()`'s fixed default for the two new required projected fields --
+// distinct from `sha`/`nextSha` (both head SHAs) so a test that asserts on `baseSha` specifically
+// can never be confused with a head-SHA fixture value.
+const baseCommitSha = "2222222222222222222222222222222222222222";
 const timestamp = "2026-08-04T12:34:56Z";
 
 const project: Project = projectSchema.parse({
@@ -70,6 +74,8 @@ function pull(
     headBranch: "task/fixture",
     headSha: sha,
     mergeability: "mergeable",
+    mergeStateStatus: "clean",
+    baseSha: baseCommitSha,
     autoMergeEnabled: false,
     updatedAt: timestamp,
     ...overrides,
@@ -495,6 +501,35 @@ describe("GitHub source-control adapter", () => {
     expect(staleComment.ok ? "ok" : staleComment.error.code).toBe("conflict");
     expect(badSha.ok ? "ok" : badSha.error.code).toBe("external_failure");
     expect(emptyKey.ok ? "ok" : emptyKey.error.code).toBe("external_failure");
+    transport.expectDone();
+  });
+
+  it("C015x decision 1 step ①: reads GitHub's own live default_branch, adapter-only (never validates against project config itself)", async () => {
+    const transport = new ScriptedTransport([
+      {
+        assert: (arguments_) => {
+          expect(arguments_).toContain("api");
+          expect(arguments_.some((argument) => argument.includes("repos/owner/repository"))).toBe(
+            true,
+          );
+          expect(arguments_).not.toContain("PUT");
+          expect(arguments_).not.toContain("POST");
+        },
+        value: { defaultBranch: "main" },
+      },
+    ]);
+    const metadata = await new GitHubAdapter(transport).getRepositoryMetadata({ project });
+
+    expect(metadata).toEqual({ ok: true, value: { defaultBranch: "main" } });
+    transport.expectDone();
+  });
+
+  it("fails closed for a non-GitHub provider before ever calling the transport", async () => {
+    const gitlabProject = { ...project, sourceControl: { ...project.sourceControl, provider: "gitlab" } };
+    const transport = new ScriptedTransport([]);
+    const result = await new GitHubAdapter(transport).getRepositoryMetadata({ project: gitlabProject });
+
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
     transport.expectDone();
   });
 });

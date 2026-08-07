@@ -79,6 +79,8 @@ function fakeGithubTransport(pullRequest: FakePullRequest) {
           headBranch: pullRequest.headBranch,
           headSha: pullRequest.headSha,
           mergeability: "mergeable" as const,
+          mergeStateStatus: "clean" as const,
+          baseSha: "2".repeat(40),
           autoMergeEnabled: false,
           updatedAt: new Date().toISOString(),
         };

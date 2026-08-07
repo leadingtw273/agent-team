@@ -130,8 +130,40 @@ export const requiresManualReasonCodeSchema = z.enum([
   "auto_merge_not_enabled",
   // merge
   "lifecycle_not_completed",
+  // C015x decision 3: the change request's own authoritative `mergeStateStatus` reads `"behind"` --
+  // GitHub's own `strict` required-status-checks ruleset policy (O004) means this can never
+  // actually execute the merge no matter how long a job sits in `"merging"`; escalates immediately,
+  // never waits for `mergingNoProgressLimit` (resume-composition.ts).
+  "change_request_behind_base",
+  // C015x decision 3: `mergingNoProgressLimit` consecutive resumes observed the exact same
+  // authoritative readback fingerprint (head SHA, base SHA, mergeable state, merged) -- auto-merge
+  // was enabled, but GitHub has not moved the PR forward at all across every one of those resumes.
+  "auto_merge_stalled",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
+
+/**
+ * C015x decision 3: the persisted, restart-safe snapshot of the last authoritative GitHub readback
+ * a `"merging"` job observed -- `mergeStateStatus`/`baseSha` are deliberately loosely-validated
+ * bounded strings, not a re-declared strict enum/sha-format regex, for exactly the reason
+ * `lastErrorCodeSchema`'s own comment above gives for `DomainError.code`: this file must never need
+ * to import `ChangeRequestSnapshot["mergeStateStatus"]`'s enum just to stay in sync with it, and
+ * `ChangeRequestSnapshot.baseSha` is optional purely for pre-existing test-fixture back-compat (see
+ * that type's own header, source-control.ts) -- a fixture that omits it must still be representable
+ * here as an empty string, never rejected by this store's own schema. `headSha` is the change
+ * request's own head SHA on `ChangeRequestSnapshot` -- an unbranded plain `string` there (unlike
+ * this file's own top-level `JobProgressRecord.headSha`, which reuses the branded `headShaSchema`)
+ * -- so this reuses the same hex-hash shape without the brand, avoiding a pointless
+ * parse-or-throw just to satisfy a nominal type this fingerprint has no other use for. */
+const mergeReadbackFingerprintSchema = z
+  .object({
+    headSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u),
+    baseSha: z.string().max(128),
+    mergeStateStatus: z.string().trim().min(1).max(32),
+    merged: z.boolean(),
+  })
+  .strict();
+export type MergeReadbackFingerprint = z.infer<typeof mergeReadbackFingerprintSchema>;
 
 export const requiresManualCauseSchema = z
   .object({
@@ -143,6 +175,12 @@ export const requiresManualCauseSchema = z
         lastCategory: reportContractFailureCategorySchema.optional(),
       })
       .strict(),
+    // C015x decision 3: populated only for the two merge-stage reasonCodes this ticket adds
+    // (`change_request_behind_base`/`auto_merge_stalled`) -- the coordinator's explicit "保留當時
+    // head/base SHA 與狀態證據於 cause" requirement. Optional for every other reasonCode and for
+    // every pre-existing, un-migrated `cause` record (same backward-compatibility rationale as
+    // `cause` itself being optional on the stage below -- see this file's own header comment).
+    mergeEvidence: mergeReadbackFingerprintSchema.optional(),
   })
   .strict();
 export type RequiresManualCause = z.infer<typeof requiresManualCauseSchema>;
@@ -152,7 +190,24 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("ci_waiting") }).strict(),
   z.object({ kind: z.literal("awaiting_review") }).strict(),
   z.object({ kind: z.literal("fix_round") }).strict(),
-  z.object({ kind: z.literal("merging") }).strict(),
+  // C015x decision 3: previously the bare `{kind:"merging"}` below -- the coordinator's own
+  // diagnosis (this ticket) named this as having *zero* bound on how long a job may sit being
+  // resumed as `still_merging`: no retry count, no timestamp, nothing. `armedAt`/`fingerprint`/
+  // `noProgressCount` are all **optional**, for the exact same backward-compatibility reason
+  // `requires_manual`'s own `cause` field is optional (see this file's own header) -- this ticket
+  // is explicitly forbidden from editing or migrating any existing file under
+  // `~/.agent-team/state`, and a real, currently-stuck `"merging"` job-progress record already
+  // exists on disk with none of these fields. `resumeMergingStage` (resume-composition.ts) treats
+  // an absent `fingerprint` as "first observation since C015x", never as "zero prior progress" --
+  // it seeds a fresh baseline on that first read rather than guessing at history it never recorded.
+  z
+    .object({
+      kind: z.literal("merging"),
+      armedAt: instantSchema.optional(),
+      fingerprint: mergeReadbackFingerprintSchema.optional(),
+      noProgressCount: z.number().int().min(0).max(1_000).optional(),
+    })
+    .strict(),
   z.object({ kind: z.literal("completed") }).strict(),
   z.object({ kind: z.literal("failed") }).strict(),
   // References a real domain Checkpoint (src/domain/checkpoint/) -- checkpoint's own paused/

@@ -50,6 +50,28 @@ export interface CreateWorktreeCommand extends GitRepositoryRef {
   readonly startPoint: string;
 }
 
+/**
+ * C015x decision 1: request shape for resolving a branch's *authoritative* head -- the coordinator's
+ * own root-cause finding was that `handlers.ts` previously pinned a fresh dispatch's worktree
+ * `startPoint`/diff-digest `baseRevision` to whatever the *local* clone's checked-out `HEAD`
+ * happened to be (`inspectRepository(...).headSha`), which this project's own local clone never
+ * re-syncs on its own -- not to the remote's actual current state. `expectedRepository` ("owner/repo")
+ * is never assumed to match the local `origin` remote; `LocalGitAdapter.resolveAuthoritativeBranch`
+ * must verify it against the remote's own URL before ever fetching, and fail closed (`"conflict"`)
+ * if it does not.
+ */
+export interface AuthoritativeBranchRequest extends GitRepositoryRef {
+  readonly remote: string;
+  readonly branch: string;
+  readonly expectedRepository: string;
+}
+
+export interface AuthoritativeBranchHead {
+  readonly remote: string;
+  readonly branch: string;
+  readonly sha: string;
+}
+
 export interface GitCommitReceipt {
   readonly sha: string;
   readonly branch: string;
@@ -79,6 +101,20 @@ export interface GitPort {
     repository: GitRepositoryRef,
     options?: ReadOptions,
   ): AsyncPortResult<GitRepositorySnapshot>;
+  /**
+   * C015x decision 1: steps ②-⑤ of the coordinator's authoritative-base-resolution design --
+   * confirm the local `remote`'s URL genuinely resolves to `expectedRepository`, force-fetch
+   * `branch` into `refs/remotes/<remote>/<branch>` (a real `git fetch`, never `ls-remote` --
+   * `createWorktree`'s `startPoint` and `getEffectiveTreeDiff`'s `baseRevision` both need the
+   * commit object physically present locally, not merely known by SHA), then resolve and confirm
+   * that ref as a real, locally-present commit. Step ① (verifying GitHub's own `default_branch`
+   * against `expectedRepository`/`branch`) is the *caller's* job (this port has no GitHub access) --
+   * see `resolveAuthoritativeBaseRevision` (src/cli/dispatch/authoritative-base.ts).
+   */
+  resolveAuthoritativeBranch(
+    request: AuthoritativeBranchRequest,
+    options: MutationOptions,
+  ): AsyncPortResult<AuthoritativeBranchHead>;
   createWorktree(
     command: CreateWorktreeCommand,
     options: MutationOptions,

@@ -34,6 +34,32 @@ export interface ChangeRequestSnapshot {
   readonly headBranch: string;
   readonly headSha: string;
   readonly mergeability: "mergeable" | "conflicting" | "unknown";
+  /**
+   * C015x decision 2: GitHub's own `mergeable_state` (REST) -- before this ticket, `mergeability`
+   * above (derived only from `.mergeable`) could report `"mergeable"` for a PR that is genuinely
+   * `BEHIND` its base (no textual conflict, but this project's own `strictRequiredStatusChecksPolicy`
+   * ruleset, O004, still refuses to execute the merge) -- BEHIND was structurally invisible to this
+   * type. See resume-composition.ts's `resumeMergingStage` for the one place this actually changes
+   * behavior (an immediate `requires_manual` the instant this is `"behind"`, never a silent wait).
+   *
+   * Optional here -- and on {@link baseSha} below -- purely to avoid a mechanical, unrelated ripple
+   * across every pre-existing `ChangeRequestSnapshot` test fixture in the suite (30+ files as of
+   * this ticket) that predates this field and has no reason to ever construct a BEHIND scenario.
+   * The real `GitHubAdapter` (adapters/github/adapter.ts) always populates both via its own
+   * required, zod-validated projection; only test fakes may ever legitimately omit them.
+   */
+  readonly mergeStateStatus?:
+    | "clean"
+    | "behind"
+    | "blocked"
+    | "dirty"
+    | "draft"
+    | "unstable"
+    | "unknown";
+  /** C015x decision 3: GitHub's own current base-branch tip (`.base.sha`) -- needed to build the
+   * "has the base moved further since this job last observed it" fingerprint
+   * `resumeMergingStage` persists. Same optionality rationale as {@link mergeStateStatus} above. */
+  readonly baseSha?: string;
   readonly autoMergeEnabled: boolean;
   readonly updatedAt: Instant;
 }
