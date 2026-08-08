@@ -55,6 +55,7 @@ import {
   type ReconcilePorts,
   type ReconcileProcessPort,
   type ReconcileProviderPort,
+  type ReconcileTarget,
 } from "../../application/reconcile/index.js";
 import {
   domainError,
@@ -65,7 +66,11 @@ import {
 } from "../../domain/foundation/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
-import type { ManualReconcileUseCase } from "./index.js";
+import type {
+  ManualReconcileUseCase,
+  ReconcileCapabilityId,
+  ReconcileDisclosedScope,
+} from "./index.js";
 
 export interface BuildManualReconcileCompositionOptions {
   readonly agentTeamHome: string;
@@ -82,15 +87,31 @@ function reconcileStateDirectory(agentTeamHome: string): string {
  * so that changes elsewhere in `ReconcileCoordinator` still type-check against the real
  * `ReconcilePorts` contract, and so a future caller that *does* reach one of these gets a visible,
  * correctly-classified-retryable error instead of a silent lie.
+ *
+ * E010c: this exact function reference (not a fresh `() => unavailable()` wrapper per call site)
+ * is assigned directly as the port method below, and `describeDisclosedScope` (this file, further
+ * down) later checks each built port method's identity against it. That is the whole disclosed-scope
+ * mechanism for these five ports: "unwired" is derived from "is this literally the stub function",
+ * not from a second, hand-maintained true/false list that could drift out of sync with the wiring
+ * above it.
  */
 function unavailable<Value>(): Promise<Result<Value, DomainError>> {
   return Promise.resolve(err(domainError("unavailable")));
 }
 
+/**
+ * E010c: same disclosure mechanism as `unavailable` above, for the one gap that isn't an error --
+ * `jobs.listActive` fails *open* to an honest empty set (see this file's own module header for why)
+ * rather than failing closed, so it needs its own identity-checked sentinel.
+ */
+function noActiveJobs(): Promise<Result<readonly ReconcileTarget[], DomainError>> {
+  return Promise.resolve(ok(Object.freeze([])));
+}
+
 function buildJobsPort(jobRepository: FileJobRepository): ReconcileJobPort {
   return {
     // Disclosed, structural gap -- see this file's own module header.
-    listActive: () => Promise.resolve(ok(Object.freeze([]))),
+    listActive: noActiveJobs,
     async update(job, options) {
       const updated = await jobRepository.update(job, options);
       if (!updated.ok) return updated;
@@ -115,28 +136,90 @@ function buildLeasesPort(leaseCoordinator: LeaseCoordinator): ReconcileLeasePort
       );
     },
     // Unreachable while `jobs.listActive` returns `[]` -- see this file's own module header.
-    prepareRecovery: () => unavailable(),
-    releaseRecovery: () => unavailable(),
+    prepareRecovery: unavailable,
+    releaseRecovery: unavailable,
   };
 }
 
 function buildProvidersPort(): ReconcileProviderPort {
-  return { readBack: () => unavailable() };
+  return { readBack: unavailable };
 }
 
 function buildEventsPort(): ReconcileEventPort {
-  return { repairMissing: () => unavailable() };
+  return { repairMissing: unavailable };
 }
 
 function buildProcessesPort(): ReconcileProcessPort {
   return {
-    inspect: () => unavailable(),
-    resumeFromCheckpoint: () => unavailable(),
+    inspect: unavailable,
+    resumeFromCheckpoint: unavailable,
   };
 }
 
 function buildBlocksPort(): ReconcileBlockPort {
-  return { record: () => unavailable() };
+  return { record: unavailable };
+}
+
+/**
+ * E010c: one accessor per `ReconcileCapabilityId` (src/cli/reconcile/index.ts) -- the only
+ * hand-maintained list this mechanism needs, and it carries no wired/unwired judgment of its own,
+ * only "where does this capability's port method live". `describeDisclosedScope` below decides
+ * wired vs. unwired by checking, at the *built* `ReconcilePorts` object, whether that method is
+ * reference-identical to the `unavailable`/`noActiveJobs` stubs above. So the only way to make a
+ * capability report "wired" is to actually stop assigning it a stub in the builders above --
+ * there is no separate boolean to edit and forget.
+ *
+ * Every accessor below reads (never calls) a `ReconcilePorts` method declared with TypeScript's
+ * method-shorthand syntax (src/application/reconcile/model.ts, out of this ticket's scope), which
+ * `@typescript-eslint/unbound-method` always flags as potentially `this`-sensitive -- the same
+ * false positive already documented at src/application/pipelines/merge-gate-model.ts:61-65. None
+ * of these methods use `this` (the sentinels are plain functions; the two real ones close over
+ * repository/coordinator instances by closure, not `this`), so the read is safe.
+ */
+const reconcileCapabilityAccessors: readonly Readonly<{
+  id: ReconcileCapabilityId;
+  get: (ports: ReconcilePorts) => unknown;
+}>[] = Object.freeze([
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "lease_reclaim", get: (ports) => ports.leases.reclaimExpired },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "job_update", get: (ports) => ports.jobs.update },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "active_job_snapshot", get: (ports) => ports.jobs.listActive },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "provider_readback", get: (ports) => ports.providers.readBack },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "event_repair", get: (ports) => ports.events.repairMissing },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "process_inspect", get: (ports) => ports.processes.inspect },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "process_resume", get: (ports) => ports.processes.resumeFromCheckpoint },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "block_record", get: (ports) => ports.blocks.record },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "lease_recovery_prepare", get: (ports) => ports.leases.prepareRecovery },
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
+  { id: "lease_recovery_release", get: (ports) => ports.leases.releaseRecovery },
+]);
+
+const unwiredSentinels: ReadonlySet<unknown> = new Set([unavailable, noActiveJobs]);
+
+/**
+ * E010c: derives disclosed scope from the actual `ReconcilePorts` this composition built, rather
+ * than from a parallel hardcoded "here's what's wired" list -- see `reconcileCapabilityAccessors`'s
+ * own comment for why that avoids drift.
+ */
+function describeDisclosedScope(ports: ReconcilePorts): ReconcileDisclosedScope {
+  const wired: ReconcileCapabilityId[] = [];
+  const unwired: ReconcileCapabilityId[] = [];
+  for (const capability of reconcileCapabilityAccessors) {
+    const target = unwiredSentinels.has(capability.get(ports)) ? unwired : wired;
+    target.push(capability.id);
+  }
+  return Object.freeze({
+    wiredCapabilities: Object.freeze(wired),
+    unwiredCapabilities: Object.freeze(unwired),
+  });
 }
 
 export function buildManualReconcilePorts(
@@ -169,6 +252,10 @@ export function buildManualReconcilePorts(
 export function buildManualReconcileUseCase(
   options: BuildManualReconcileCompositionOptions,
 ): ManualReconcileUseCase {
-  const coordinator = new ReconcileCoordinator(buildManualReconcilePorts(options));
-  return { reconcileAll: (request) => coordinator.reconcileAll(request) };
+  const ports = buildManualReconcilePorts(options);
+  const coordinator = new ReconcileCoordinator(ports);
+  return {
+    reconcileAll: (request) => coordinator.reconcileAll(request),
+    disclosedScope: describeDisclosedScope(ports),
+  };
 }

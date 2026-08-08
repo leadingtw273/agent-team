@@ -19,8 +19,38 @@ export const manualReconcileEvidenceCodes = [
 
 export type ManualReconcileEvidenceCode = (typeof manualReconcileEvidenceCodes)[number];
 
+/**
+ * E010c: closed enum of every capability `ReconcilePorts` (src/application/reconcile/model.ts)
+ * exposes -- one entry per port method, no aggregation. A composition root (e.g.
+ * `composition.ts`'s `buildManualReconcileUseCase`) reports, per request, which of these it
+ * actually backed with production logic ("wired") versus which fail closed with an honest
+ * `"unavailable"` error today ("unwired"). This lets the CLI payload disclose scope honestly
+ * instead of letting a `completed` verdict be misread as "every reconcile capability ran".
+ */
+export const reconcileCapabilityIds = [
+  "lease_reclaim",
+  "job_update",
+  "active_job_snapshot",
+  "provider_readback",
+  "event_repair",
+  "process_inspect",
+  "process_resume",
+  "block_record",
+  "lease_recovery_prepare",
+  "lease_recovery_release",
+] as const;
+
+export type ReconcileCapabilityId = (typeof reconcileCapabilityIds)[number];
+
+export interface ReconcileDisclosedScope {
+  readonly wiredCapabilities: readonly ReconcileCapabilityId[];
+  readonly unwiredCapabilities: readonly ReconcileCapabilityId[];
+}
+
 export interface ManualReconcileUseCase {
   readonly reconcileAll: (request: ReconcileAllRequest) => Promise<ReconcileAllOutcome>;
+  /** E010c: which `ReconcilePorts` capabilities this use case's composition actually backed. */
+  readonly disclosedScope: ReconcileDisclosedScope;
 }
 
 export interface CreateManualReconcileHandlerOptions {
@@ -89,7 +119,10 @@ function failedEvidence(
   }
 }
 
-function renderReconcileOutcome(result: ReconcileAllOutcome): CliCommandOutcome {
+function renderReconcileOutcome(
+  result: ReconcileAllOutcome,
+  disclosedScope: ReconcileDisclosedScope,
+): CliCommandOutcome {
   if (result.state === "failed") {
     return outcome("failed", {
       operation: "manual_reconcile",
@@ -98,6 +131,9 @@ function renderReconcileOutcome(result: ReconcileAllOutcome): CliCommandOutcome 
     });
   }
 
+  // E010c: `completed`/`degraded` are the verdicts an operator is most likely to skim past --
+  // disclose scope here so `completed` reads as "the wired capabilities finished cleanly", never
+  // as "every reconcile capability ran". Verdict/evidenceCode/state are unchanged from E010b.
   const payload = {
     operation: "manual_reconcile",
     state: result.state,
@@ -108,6 +144,7 @@ function renderReconcileOutcome(result: ReconcileAllOutcome): CliCommandOutcome 
     reclaimedLeaseCount: result.reclaimedLeaseIds.length,
     targetCounts: countTargets(result.targets),
     modelResumeAttempts: result.modelResumeAttempts,
+    scopeDisclosure: disclosedScope,
   };
   return outcome(result.state === "completed" ? "success" : "blocked", payload);
 }
@@ -123,7 +160,10 @@ export function createManualReconcileHandler(
   const createRequest = options.createRequest ?? createDefaultRequest;
   return async () => {
     try {
-      return renderReconcileOutcome(await options.reconcile.reconcileAll(createRequest()));
+      return renderReconcileOutcome(
+        await options.reconcile.reconcileAll(createRequest()),
+        options.reconcile.disclosedScope,
+      );
     } catch {
       return outcome("failed", {
         operation: "manual_reconcile",

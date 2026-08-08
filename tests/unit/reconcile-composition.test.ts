@@ -11,6 +11,10 @@
  * always resolves to the empty set -- together these two facts are *why* a real reconcile run can
  * never spawn a model process (the coordinator's per-target loop, the only place any of those four
  * ports would ever be called, is structurally unreachable while `listActive` returns `[]`).
+ *
+ * E010c adds: `buildManualReconcileUseCase(...).disclosedScope` reports this same wired/unwired
+ * split as CLI-consumable data (see `describeDisclosedScope` in composition.ts), so the CLI output
+ * can say so instead of a `completed` verdict silently implying full coverage.
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -134,6 +138,41 @@ describe("E010b manual reconcile production composition", () => {
       reclaimedLeaseIds: [],
       targets: [],
       modelResumeAttempts: 0,
+    });
+  });
+
+  describe("E010c disclosed-scope derivation", () => {
+    it("reports exactly the two ports with real production backing as wired, everything else unwired", async () => {
+      const agentTeamHome = await temporaryHome();
+      const useCase = buildManualReconcileUseCase({ agentTeamHome });
+
+      expect(useCase.disclosedScope).toEqual({
+        wiredCapabilities: ["lease_reclaim", "job_update"],
+        unwiredCapabilities: [
+          "active_job_snapshot",
+          "provider_readback",
+          "event_repair",
+          "process_inspect",
+          "process_resume",
+          "block_record",
+          "lease_recovery_prepare",
+          "lease_recovery_release",
+        ],
+      });
+    });
+
+    it("derives from the actual built ports rather than a fixed literal: every id in the union is classified exactly once", async () => {
+      const agentTeamHome = await temporaryHome();
+      const useCase = buildManualReconcileUseCase({ agentTeamHome });
+      const { wiredCapabilities, unwiredCapabilities } = useCase.disclosedScope;
+
+      // No id is missing and none is double-counted -- the disclosure covers the whole
+      // `ReconcileCapabilityId` surface derived from `describeDisclosedScope`'s accessor table.
+      const all = [...wiredCapabilities, ...unwiredCapabilities];
+      expect(new Set(all).size).toBe(all.length);
+      expect(all).toHaveLength(10);
+      const overlap = wiredCapabilities.filter((id) => unwiredCapabilities.includes(id));
+      expect(overlap).toEqual([]);
     });
   });
 
