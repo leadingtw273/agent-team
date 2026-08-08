@@ -50,6 +50,25 @@ node spikes/claude/cli-probe.mjs permission "$probe_dir"
 node spikes/claude/cli-probe.mjs status "$probe_dir"
 ```
 
+### C023 (P0): `.github` write-exclusion scope probe
+
+再重跑 `scope` 模式前，probe repo 需要真的有 `.github/workflows/ci.yml` 與 `src/allowed.txt`：
+
+```bash
+scope_probe_dir="$(mktemp -d /tmp/agent-team-claude-probe.XXXXXX)"
+git -C "$scope_probe_dir" init -q
+mkdir -p "$scope_probe_dir/.github/workflows" "$scope_probe_dir/src"
+printf 'name: CI\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n' \
+  > "$scope_probe_dir/.github/workflows/ci.yml"
+printf 'ORIGINAL\n' > "$scope_probe_dir/src/allowed.txt"
+git -C "$scope_probe_dir" add -A
+git -C "$scope_probe_dir" -c user.email=t@t.com -c user.name=t commit -q -m init
+
+node spikes/claude/cli-probe.mjs scope "$scope_probe_dir"
+```
+
+用 `allowedToolsForRole('implementer')`（`src/adapters/providers/claude/runner.ts`）產生的完整 `--allowedTools` 清單，對真的 Claude CLI process 送出兩個 Write 嘗試：改寫 `.github/workflows/ci.yml`（必須被拒絕，且拒絕要出現在 `permission_denials`，檔案與 git status 不變）、改寫 `src/allowed.txt`（必須成功，零拒絕，內容與指示一致）。任一項不成立，probe 會以非零 exit code 失敗並印出診斷 JSON 到 stderr。`tests/contract/claude-spike.test.ts` 的 C023 測試讀的正是這隻 probe 產出、redact 過的 `fixtures/providers/claude/scope-github-excluded.json`。
+
 Probe 輸出已做 allowlist projection，不輸出 session、message、帳號或 Organization 識別資料。`review-resume` 會在本機 Claude session store 建立可續作 session；共享 Fixture 不保存 ID。
 
 ## R004／R007 採用邊界

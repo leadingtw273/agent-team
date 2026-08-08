@@ -458,6 +458,18 @@ describe("Claude stream-json runner", () => {
    *    untrusted external data (a prompt-injection surface), and `Redactor` only scrubs
    *    known-shaped secrets (`sk-ant-*`, `lin_api_*`, JWTs, ...) -- never a random-byte webhook
    *    secret. Removing Bash does not close this path; only scoping `Read` does.
+   * 5. (C023, P0) `Write`/`Edit` for `implementer`/`integration_engineer` are never a bare
+   *    `./**`, and never a bare root `./*` either -- they are an explicit per-directory whitelist
+   *    (`writableDirectories` in `runner.ts`, each as `dir/*` + `dir/**`), and that whitelist never
+   *    includes `.github` and has no root-level entry at all. A repo-wide `./**` grant let those
+   *    roles rewrite `.github/workflows/**`, forging the CI signal the pipeline gates merges on.
+   *    See `allowedToolsForRole`'s own header comment for why this had to be a directory whitelist
+   *    and not (a) a `./**` + `--disallowedTools(.github)` deny layer -- proven, empirically, to
+   *    bypass this codebase's own permission-denial detection -- or (b) a whitelist that still
+   *    includes a root-level `Write(./*)`/`Edit(./*)` -- proven, empirically, to behave exactly
+   *    like `./**` for Write/Edit specifically (unlike `Read(./*)`), i.e. to still leak into
+   *    `.github`. `spikes/claude/cli-probe.mjs scope` proves the shipped shape against a real
+   *    Claude CLI process, not just the argument shape pinned below.
    */
   describe("tool authorization shape (C015h-1)", () => {
     const writeCapableRoles = ["implementer", "integration_engineer"] as const;
@@ -488,10 +500,42 @@ describe("Claude stream-json runner", () => {
           "--allowedTools",
           "Read(./*)",
           "Read(./**)",
-          "Write(./*)",
-          "Write(./**)",
-          "Edit(./*)",
-          "Edit(./**)",
+          "Write(./docs/*)",
+          "Write(./docs/**)",
+          "Edit(./docs/*)",
+          "Edit(./docs/**)",
+          "Write(./fixtures/*)",
+          "Write(./fixtures/**)",
+          "Edit(./fixtures/*)",
+          "Edit(./fixtures/**)",
+          "Write(./roles/*)",
+          "Write(./roles/**)",
+          "Edit(./roles/*)",
+          "Edit(./roles/**)",
+          "Write(./schemas/*)",
+          "Write(./schemas/**)",
+          "Edit(./schemas/*)",
+          "Edit(./schemas/**)",
+          "Write(./scripts/*)",
+          "Write(./scripts/**)",
+          "Edit(./scripts/*)",
+          "Edit(./scripts/**)",
+          "Write(./spikes/*)",
+          "Write(./spikes/**)",
+          "Edit(./spikes/*)",
+          "Edit(./spikes/**)",
+          "Write(./src/*)",
+          "Write(./src/**)",
+          "Edit(./src/*)",
+          "Edit(./src/**)",
+          "Write(./systemd/*)",
+          "Write(./systemd/**)",
+          "Edit(./systemd/*)",
+          "Edit(./systemd/**)",
+          "Write(./tests/*)",
+          "Write(./tests/**)",
+          "Edit(./tests/*)",
+          "Edit(./tests/**)",
           "--no-session-persistence",
           "--model",
           "opus",
@@ -501,6 +545,31 @@ describe("Claude stream-json runner", () => {
         expect(arguments_).not.toContain("Write");
         expect(arguments_).not.toContain("Edit");
         expect(arguments_).not.toContain("Read");
+      },
+    );
+
+    it.each(writeCapableRoles)(
+      "C023 (P0): never grants %s a repo-wide Write(./**)/Edit(./**), and never grants any .github pattern",
+      async (role) => {
+        const process = new FakeProcessPort([
+          { type: "result", is_error: false, result: "ok", permission_denials: [] },
+        ]);
+        const started = await runner(process).start(runRequest(role));
+        if (!started.ok) throw new Error(started.error.code);
+        await started.value.completion();
+
+        const arguments_ = process.request?.arguments ?? [];
+        const allowedToolsIndex = arguments_.indexOf("--allowedTools");
+        const noSessionIndex = arguments_.indexOf("--no-session-persistence");
+        const grants = arguments_.slice(allowedToolsIndex + 1, noSessionIndex);
+
+        // The C015h-1 baseline this ticket replaced was exactly `Write(./**)`/`Edit(./**)` --
+        // that bare recursive-from-root pattern is what let `.github/workflows/**` be rewritten.
+        expect(grants).not.toContain("Write(./**)");
+        expect(grants).not.toContain("Edit(./**)");
+        for (const grant of grants) {
+          expect(grant.toLowerCase()).not.toContain(".github");
+        }
       },
     );
 
