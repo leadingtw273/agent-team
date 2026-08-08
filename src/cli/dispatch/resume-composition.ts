@@ -22,14 +22,9 @@
  *   is not handled -- this resume path never leaves a job sitting in a state where that could be
  *   reached (it drives straight from `"approved"` to the merge gate in the same cycle), so the
  *   branch below fails closed to `requires_manual` if it is somehow hit, rather than guessing.
- * - A `changes_requested`/`clarification_required` verdict that has *not* yet exhausted
- *   `reviewRuns` is recorded as `"fix_round"` and will simply be reviewed again on the next
- *   resume -- there is genuinely no pipeline anywhere that hands a review verdict back to the
- *   original implementer for a real code fix (the `reviewerFixRounds` gap, confirmed pre-existing
- *   and explicitly not to be fixed by this ticket). Repeated resumes of an unchanged diff will
- *   eventually exhaust the attempt budget and checkpoint, matching this ticket's own required
- *   "review-blocked -> attempt-limit -> checkpoint" scenario, but will not somehow start passing
- *   on their own.
+ * - A blocking `changes_requested` verdict is first recorded for traceability, then passed to the
+ *   original implementer through `ReviewerRecoveryPipeline`; only `clarification_required` keeps
+ *   the pre-existing `fix_round` transition because it does not carry a blocking repair request.
  */
 import { join } from "node:path";
 
@@ -37,6 +32,7 @@ import type { JobRepository } from "../../application/dispatch/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type {
   CiRecoveryPipeline,
+  ReviewerRecoveryPipeline,
   ReviewerPipeline,
   ReviewerPipelineOutcome,
   ReviewStatusCoordinator,
@@ -151,9 +147,9 @@ const resumeProviderDeadlineMs = watchdogHardStopMs;
  * retry would corrupt if it borrowed one:
  * - `reviewRuns` only increments once a *complete* reviewer report comes back; a provider that
  *   never started never produced one.
- * - `reviewerFixRounds` is not currently incremented by anything real (a separate, disclosed,
- *   pre-existing gap -- see this file's own header) and means "sent back to the implementer for a
- *   real code fix", an entirely different event.
+ * - `reviewerFixRounds` is incremented only after `ReviewerRecoveryPipeline` has staged,
+ *   committed, and pushed a reviewer-requested repair; it means "sent back to the implementer
+ *   for a real code fix", an entirely different event.
  * - `ciFixRounds` belongs exclusively to `CiRecoveryPipeline`'s own repair-and-repush attempts.
  * - `processRecoveries` is C013's cap on resuming an exited process from a mid-flight checkpoint,
  *   not a provider that failed before ever producing one.
@@ -341,6 +337,7 @@ export interface ResumeCycleDependencies {
   readonly project: Project;
   readonly trustedConfig: TrustedProjectConfig;
   readonly ciRecovery: Pick<CiRecoveryPipeline, "run">;
+  readonly reviewerRecovery: Pick<ReviewerRecoveryPipeline, "run">;
   readonly reviewer: Pick<ReviewerPipeline, "run">;
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
@@ -386,6 +383,7 @@ export type ResumeJobOutcome =
   // distinct, more accurate label for anyone reading `agent-team run`'s own output.
   | Readonly<{ jobId: string; outcome: "awaiting_review" }>
   | Readonly<{ jobId: string; outcome: "repair_pushed" }>
+  | Readonly<{ jobId: string; outcome: "reviewer_fix_pushed" }>
   | Readonly<{
       jobId: string;
       outcome: "fix_round";
@@ -1230,6 +1228,7 @@ async function resumeUnderLease(
 
   return resumeReview(record, deps, {
     job,
+    issue: issue.value,
     changeRequestId,
     requirementSnapshot: requirementSnapshot.value,
     worktree,
@@ -1299,6 +1298,7 @@ async function resumeReview(
   deps: ResumeCycleDependencies,
   context: {
     readonly job: Parameters<CiRecoveryPipeline["run"]>[0]["job"];
+    readonly issue: Parameters<typeof buildDirective>[0];
     readonly changeRequestId: string;
     readonly requirementSnapshot: Parameters<ReviewerPipeline["run"]>[0]["requirementSnapshot"];
     readonly worktree: Parameters<ReviewerPipeline["run"]>[0]["worktree"];
@@ -1450,7 +1450,6 @@ async function resumeReview(
         requiresManualCause("review", "review_provider_failed"),
       );
     }
-    case "changes_requested":
     case "clarification_required": {
       const record$ = await deps.reviewStatus.record({
         project: deps.project,
@@ -1471,8 +1470,107 @@ async function resumeReview(
       return transitionOrReport(deps, record, { stage: { kind: "fix_round" } }, () => ({
         jobId: record.jobId,
         outcome: "fix_round",
-        verdict: reviewOutcome.state,
+        verdict: "clarification_required",
       }));
+    }
+    case "changes_requested": {
+      const record$ = await deps.reviewStatus.record({
+        project: deps.project,
+        changeRequestId: context.changeRequestId,
+        expectedHeadSha,
+        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
+        decision: reviewOutcome,
+      });
+      if (record$.state === "failed") {
+        return requiresManualUnlessRetryable(
+          record,
+          deps,
+          "review_record_failed",
+          record$.error,
+          requiresManualCause("review", "review_record_failed"),
+        );
+      }
+      const recoveryDeadline = computeProviderDeadline(deps.clock);
+      if (recoveryDeadline === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "invalid_deadline",
+          requiresManualCause("review", "review_paused"),
+        );
+      }
+      const recoveryOutcome = await deps.reviewerRecovery.run({
+        job: context.job,
+        project: deps.project,
+        trustedConfig: deps.trustedConfig,
+        requirementSnapshot: context.requirementSnapshot,
+        worktree: context.worktree,
+        model: record.model,
+        remote: "origin",
+        commitMessage: `${context.issue.title} (${context.issue.externalId}) Review 修復`,
+        controllerDirective: buildDirective(context.issue),
+        findings: reviewOutcome.findings.filter((finding) => finding.severity === "blocking"),
+        externalData: Object.freeze([]),
+        deadlineAt: recoveryDeadline,
+        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:reviewer-recovery`,
+      });
+      switch (recoveryOutcome.state) {
+        case "repair_pushed": {
+          const headSha = parsedHeadSha(recoveryOutcome.push.sha);
+          if (headSha === undefined) {
+            return requiresManual(
+              record,
+              deps,
+              "invalid_head_sha",
+              requiresManualCause("review", "review_provider_failed"),
+            );
+          }
+          return transitionOrReport(
+            deps,
+            record,
+            { stage: { kind: "ci_waiting" }, headSha },
+            () => ({
+              jobId: record.jobId,
+              outcome: "reviewer_fix_pushed",
+            }),
+          );
+        }
+        case "checkpointed": {
+          const checkpointId = parsedCheckpointId(recoveryOutcome.checkpointId);
+          if (checkpointId === undefined) {
+            return requiresManual(
+              record,
+              deps,
+              "invalid_checkpoint_id",
+              requiresManualCause("review", "review_provider_failed"),
+            );
+          }
+          return transitionOrReport(
+            deps,
+            record,
+            { stage: { kind: "paused", checkpointId } },
+            () => ({
+              jobId: record.jobId,
+              outcome: "checkpointed",
+              checkpointId: recoveryOutcome.checkpointId,
+            }),
+          );
+        }
+        case "paused":
+          return requiresManual(
+            record,
+            deps,
+            `reviewer_recovery_paused:${recoveryOutcome.reason}`,
+            requiresManualCause("review", "review_paused"),
+          );
+        case "failed":
+          return requiresManual(
+            record,
+            deps,
+            `reviewer_recovery_failed:${recoveryOutcome.stage}:${recoveryOutcome.error.code}`,
+            requiresManualCause("review", "review_provider_failed"),
+          );
+      }
     }
     case "approved":
       break;

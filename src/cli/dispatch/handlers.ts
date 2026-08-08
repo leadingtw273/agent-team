@@ -398,6 +398,7 @@ export function createDispatchCliHandlers(
             project: build.value.project,
             trustedConfig: build.value.trustedConfig,
             ciRecovery: resumeComposition.value.ciRecovery,
+            reviewerRecovery: resumeComposition.value.reviewerRecovery,
             reviewer: resumeComposition.value.reviewer,
             reviewStatus: resumeComposition.value.reviewStatus,
             autoMerge: resumeComposition.value.autoMerge,

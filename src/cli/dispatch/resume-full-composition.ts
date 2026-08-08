@@ -15,6 +15,7 @@ import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ResumeCycleDependencies } from "./resume-composition.js";
 import { buildCiRecoveryPipeline } from "./ci-recovery-composition.js";
+import { buildReviewerRecoveryPipeline } from "./reviewer-recovery-composition.js";
 import { buildReviewerPipeline } from "./reviewer-composition.js";
 import { buildStatusMergePipelines } from "./status-merge-composition.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
@@ -41,7 +42,13 @@ export interface BuildResumeCompositionOptions {
 
 export type ResumePipelineComposition = Pick<
   ResumeCycleDependencies,
-  "sourceControl" | "ciRecovery" | "reviewer" | "reviewStatus" | "autoMerge" | "lifecycle"
+  | "sourceControl"
+  | "ciRecovery"
+  | "reviewerRecovery"
+  | "reviewer"
+  | "reviewStatus"
+  | "autoMerge"
+  | "lifecycle"
 >;
 
 export type BuildResumeCompositionResult =
@@ -59,6 +66,11 @@ export async function buildResumeComposition(
   if (ciRecovery.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: ciRecovery.reason });
   }
+  const reviewerRecovery = await buildReviewerRecoveryPipeline({
+    agentTeamHome: options.agentTeamHome,
+    claudeConfig: options.claudeConfig,
+    jobs: options.jobs,
+  });
   const reviewer = await buildReviewerPipeline({
     agentTeamHome: options.agentTeamHome,
     claudeConfig: options.claudeConfig,
@@ -86,6 +98,7 @@ export async function buildResumeComposition(
     value: Object.freeze({
       sourceControl: new GitHubAdapter(new GhTransport()),
       ciRecovery: ciRecovery.value,
+      reviewerRecovery: reviewerRecovery.value,
       reviewer: reviewer.value,
       reviewStatus: statusMerge.value.reviewStatus,
       autoMerge: statusMerge.value.autoMergeGate,
