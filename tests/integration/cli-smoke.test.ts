@@ -54,6 +54,21 @@ describe("compiled CLI smoke", () => {
       reclaimedLeaseCount: 0,
       targetCounts: { healthy: 0, resumed: 0, blocked: 0, failed: 0 },
       modelResumeAttempts: 0,
+      // E010c: the real production composition (src/cli/reconcile/composition.ts) only backs
+      // lease reclaim and job update today -- see that file's `describeDisclosedScope`.
+      scopeDisclosure: {
+        wiredCapabilities: ["lease_reclaim", "job_update"],
+        unwiredCapabilities: [
+          "active_job_snapshot",
+          "provider_readback",
+          "event_repair",
+          "process_inspect",
+          "process_resume",
+          "block_record",
+          "lease_recovery_prepare",
+          "lease_recovery_release",
+        ],
+      },
     });
   });
 
