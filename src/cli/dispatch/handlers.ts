@@ -421,6 +421,9 @@ export function createDispatchCliHandlers(
             ...(resumeComposition.value.visualEvidence === undefined
               ? {}
               : { visualEvidence: resumeComposition.value.visualEvidence }),
+            ...(resumeComposition.value.visualReviewModel === undefined
+              ? {}
+              : { visualReviewModel: resumeComposition.value.visualReviewModel }),
             clock,
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),

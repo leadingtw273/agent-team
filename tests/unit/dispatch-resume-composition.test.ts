@@ -434,6 +434,7 @@ async function harness(
     visualEvidenceBuild: (
       request: VisualEvidenceBuildRequest,
     ) => Promise<VisualEvidenceBuildResult>;
+    visualReviewModel: string;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -531,6 +532,9 @@ async function harness(
             },
           },
         }),
+    ...(overrides.visualReviewModel === undefined
+      ? {}
+      : { visualReviewModel: overrides.visualReviewModel }),
     reviewerRecovery: {
       run: () => {
         calls.push("reviewerRecovery.run");
@@ -2675,6 +2679,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
+      visualReviewModel: "gemini-2.5-pro",
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2685,7 +2690,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
     expect(calls.indexOf("visualEvidence.build")).toBeLessThan(calls.indexOf("reviewer.run"));
     expect(reviewerRequests).toHaveLength(1);
     const request = reviewerRequests[0] as Record<string, unknown>;
-    expect(request["models"]).toEqual({ code: "claude-opus", visual: "claude-opus" });
+    expect(request["models"]).toEqual({ code: "claude-opus", visual: "gemini-2.5-pro" });
     expect(request["visualManifest"]).toEqual(successfulVisualManifest());
     expect(request["evidence"]).toEqual([
       expect.objectContaining({ kind: "file", category: "visual_artifact" }),
@@ -2703,6 +2708,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
+      visualReviewModel: "gemini-2.5-pro",
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2710,7 +2716,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
 
     expect(result.ok).toBe(true);
     const request = reviewerRequests[0] as Record<string, unknown>;
-    expect(request["models"]).toEqual({ visual: "claude-opus" });
+    expect(request["models"]).toEqual({ visual: "gemini-2.5-pro" });
     expect(validAsAssembledByProduction(request)).toBe(true);
   });
 
@@ -2753,6 +2759,28 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
     expect(calls).not.toContain("reviewer.run");
   });
 
+  it("dual_review fails closed to requires_manual when no real visual review model is configured, even with the builder and commands wired", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      visualEvidenceBuild: () => Promise.reject(new Error("must not be called with no visual model")),
+      // visualReviewModel deliberately omitted -- no gemini config on this host.
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "visual_evidence_builder_unavailable" },
+      ]);
+    }
+    expect(calls).not.toContain("visualEvidence.build");
+    expect(calls).not.toContain("reviewer.run");
+  });
+
   it("dual_review fails closed to requires_manual when the project's commands.visualReview is empty, even with a builder wired", async () => {
     const { deps, progress, calls } = await harness({
       reviewRequirement: "dual_review",
@@ -2779,6 +2807,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       reviewRequirement: "dual_review",
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
+      visualReviewModel: "gemini-2.5-pro",
       visualEvidenceBuild: () =>
         Promise.resolve(
           Object.freeze({

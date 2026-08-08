@@ -358,6 +358,15 @@ export interface ResumeCycleDependencies {
    * needs a visual reviewer is resumed while this is undefined, rather than silently skipping
    * visual evidence or crashing. */
   readonly visualEvidence?: Pick<VisualEvidenceBuilder, "build">;
+  /** E102-2/E102-3: the real Gemini model `models.visual` should request, sourced from the host's
+   * optional `providers.json` `gemini.models` (provider-config-store.ts) -- E102-2 wired
+   * `visualReviewer` itself (`GeminiRunner`) but deliberately left this per-request model value to
+   * this ticket (see reviewer-composition.ts's own header and E102-2's PR description). Optional
+   * for the identical reason `visualEvidence` above is; `resumeReview` requires both together
+   * before ever attempting a `visual_review`/`dual_review` job -- a `GeminiRunner` wired without a
+   * model this host actually allowlists would fail the *provider's own* validation instead of
+   * this composition's, which is a worse failure to reach. */
+  readonly visualReviewModel?: string;
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
@@ -1396,7 +1405,11 @@ async function resumeReview(
 
   let visualEvidence: VisualEvidenceBuildSuccess | undefined;
   if (needsVisualReview) {
-    if (deps.visualEvidence === undefined || deps.trustedConfig.commands.visualReview.length === 0) {
+    if (
+      deps.visualEvidence === undefined ||
+      deps.visualReviewModel === undefined ||
+      deps.trustedConfig.commands.visualReview.length === 0
+    ) {
       return requiresManual(
         record,
         deps,
@@ -1423,12 +1436,6 @@ async function resumeReview(
     visualEvidence = built.value;
   }
 
-  // E102-3: `models.visual` has no dedicated config value yet -- `reviewer-composition.ts` (out of
-  // this ticket's scope, owned by E102-2) still wires `visualReviewer` to the identical runner
-  // instance as `codeReviewer`, so reusing `record.model` here is not a guess but the accurate
-  // value for *today's* composition; it is a placeholder only in the sense that E102-2's real
-  // Gemini wiring will replace it with that provider's own selected model, not in the sense that
-  // it is currently wrong.
   const reviewOutcome = await deps.reviewer.run({
     job: context.job,
     project: deps.project,
@@ -1440,7 +1447,11 @@ async function resumeReview(
     expectedHeadSha,
     models: {
       ...(needsCodeReview ? { code: record.model } : {}),
-      ...(needsVisualReview ? { visual: record.model } : {}),
+      // Guarded above: `needsVisualReview` only ever reaches here once `deps.visualReviewModel`
+      // has already been confirmed defined (E102-2's real `gemini.models`-sourced value, never
+      // this job's own Claude `record.model` -- a Gemini `GeminiRunner` would reject that model
+      // string outright, see gemini-factory.ts/reviewer-composition.ts's own headers).
+      ...(needsVisualReview ? { visual: deps.visualReviewModel } : {}),
     },
     evidence: visualEvidence?.evidence ?? Object.freeze([]),
     ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),

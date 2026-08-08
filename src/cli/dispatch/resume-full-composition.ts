@@ -64,6 +64,7 @@ export type ResumePipelineComposition = Pick<
   | "autoMerge"
   | "lifecycle"
   | "visualEvidence"
+  | "visualReviewModel"
 >;
 
 export type BuildResumeCompositionResult =
@@ -119,6 +120,11 @@ export async function buildResumeComposition(
     process: new ChildProcessRunner(),
     clock: createClock(),
   });
+  // E102-3: the real Gemini model `models.visual` should request -- see
+  // `ResumeCycleDependencies.visualReviewModel`'s own header (resume-composition.ts) for why this
+  // is `options.geminiConfig`'s own first allowlisted model, never `record.model` (that is this
+  // job's *code*-review Claude model, which a real `GeminiRunner` would reject outright).
+  const visualReviewModel = options.geminiConfig?.models[0];
 
   return Object.freeze({
     state: "ready",
@@ -131,6 +137,7 @@ export async function buildResumeComposition(
       autoMerge: statusMerge.value.autoMergeGate,
       lifecycle,
       visualEvidence,
+      ...(visualReviewModel === undefined ? {} : { visualReviewModel }),
     }),
   });
 }
