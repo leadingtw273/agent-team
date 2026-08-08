@@ -14,6 +14,9 @@ import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
+import { createClock } from "../../domain/foundation/index.js";
+import { VisualEvidenceBuilder } from "../../application/pipelines/index.js";
+import { ChildProcessRunner } from "../../adapters/process/index.js";
 import type { ResumeCycleDependencies } from "./resume-composition.js";
 import { buildCiRecoveryPipeline } from "./ci-recovery-composition.js";
 import { buildReviewerRecoveryPipeline } from "./reviewer-recovery-composition.js";
@@ -60,6 +63,8 @@ export type ResumePipelineComposition = Pick<
   | "reviewStatus"
   | "autoMerge"
   | "lifecycle"
+  | "visualEvidence"
+  | "visualReviewModel"
 >;
 
 export type BuildResumeCompositionResult =
@@ -107,6 +112,19 @@ export async function buildResumeComposition(
     leases: options.leases,
     autoMergePause: options.autoMergePause,
   });
+  // E102-3: zero-arg/no-shared-state construction, the same convention every other adapter in
+  // this function's own return value already follows (`new GitHubAdapter(new GhTransport())`
+  // just below) -- a fresh `ChildProcessRunner`/`Clock` per composition call, never a second,
+  // independently-drifting instance shared with anything else in this process.
+  const visualEvidence = new VisualEvidenceBuilder({
+    process: new ChildProcessRunner(),
+    clock: createClock(),
+  });
+  // E102-3: the real Gemini model `models.visual` should request -- see
+  // `ResumeCycleDependencies.visualReviewModel`'s own header (resume-composition.ts) for why this
+  // is `options.geminiConfig`'s own first allowlisted model, never `record.model` (that is this
+  // job's *code*-review Claude model, which a real `GeminiRunner` would reject outright).
+  const visualReviewModel = options.geminiConfig?.models[0];
 
   return Object.freeze({
     state: "ready",
@@ -118,6 +136,8 @@ export async function buildResumeComposition(
       reviewStatus: statusMerge.value.reviewStatus,
       autoMerge: statusMerge.value.autoMergeGate,
       lifecycle,
+      visualEvidence,
+      ...(visualReviewModel === undefined ? {} : { visualReviewModel }),
     }),
   });
 }
