@@ -21,8 +21,19 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import type {
+  FileJobProgressStore,
+  JobProgressRecordMutation,
+  RequiresManualReasonCode,
+} from "../../adapters/dispatch/job-progress-store.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
-import { createClock, type Clock } from "../../domain/foundation/index.js";
+import {
+  createClock,
+  ok,
+  type Clock,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
 import {
   resolveAuthoritativeBaseRevision,
@@ -39,7 +50,11 @@ import {
   InMemoryJobRepository,
   InMemoryLeaseRepository,
 } from "./ephemeral-ports.js";
-import { buildImplementerPipelineRequest } from "./implementer-request.js";
+import {
+  buildImplementerPipelineRequest,
+  implementerBranch,
+  implementerWorktreePath,
+} from "./implementer-request.js";
 import {
   buildImplementerPipeline,
   type BuildImplementerPipelineResult,
@@ -187,6 +202,48 @@ function pipelineOutcomePayload(
           : {}),
       });
   }
+}
+
+/**
+ * C018 fix: every `outcome("failed", ...)` return inside `case "dispatched"` below, once the
+ * per-issue admission claim already has `jobId` attached (`attachJob`, issue-admission-store.ts,
+ * called by `dispatchOnce`/composition.ts *before* it ever returns `kind:"dispatched"`) and a real
+ * `Job`/`Lease` already exist, used to leave that claim durably, permanently unreleasable -- the
+ * exact same defect class C016 already closed for `state:"paused"`, generalized here to every
+ * remaining exit (see job-progress-store.ts's own `requiresManualStageSchema`/`paused`-stage
+ * comments for the full invariant this now establishes).
+ *
+ * `not_dispatched` (issue-admission-store.ts's own release-reason enum) is deliberately never used
+ * for any of these exits: that reason is reserved for a claim that *never* had a `jobId` attached
+ * at all (a losing candidate in `dispatchOnce`'s own reconcile step, composition.ts) -- releasing
+ * a claim that already has this job's real `jobId` on it with `not_dispatched` would misrepresent
+ * a job that genuinely started (a domain `Job` + `Lease` both exist) as one that never did. Every
+ * exit this closes instead writes a `requires_manual` record (`cause.stage:"dispatch"`, a new,
+ * closed reasonCode per exit) -- `dispatch resolve` (resolve-handlers.ts) already knows how to
+ * transition any non-terminal job-progress record to `superseded`/`cancelled` and release the
+ * matching claim, so this reuses that exact mechanism rather than inventing a second one.
+ *
+ * Fails closed exactly like the pre-existing `ci_waiting`/`paused` writes further down (C016's own
+ * discipline, restated here so it is not just tribal knowledge at each of this function's several
+ * call sites): if *this* write itself fails, the caller must surface `job_progress_write_failed`
+ * and persist nothing partial -- never attempt a second, differently-shaped write. The store
+ * already failed once; a second attempt against the same store is not expected to fare any
+ * better, and a half-written record would be worse than none.
+ */
+async function writeDispatchRequiresManual(
+  progress: FileJobProgressStore,
+  reasonCode: RequiresManualReasonCode,
+  fields: Omit<JobProgressRecordMutation, "stage">,
+): Promise<Result<void, DomainError>> {
+  const written = await progress.compareAndSwap(fields.jobId, null, {
+    ...fields,
+    stage: {
+      kind: "requires_manual",
+      cause: { stage: "dispatch", reasonCode, attempts: { count: 1 } },
+    },
+  });
+  if (!written.ok) return written;
+  return ok(undefined);
 }
 
 export function createDispatchCliHandlers(
@@ -435,11 +492,61 @@ export function createDispatchCliHandlers(
             });
           }
 
+          // C018 fix: deterministic (a pure function of `result.job.id`, never dependent on
+          // `buildImplementerPipelineRequest` succeeding) -- every exit below this point that can
+          // fire *before* that call, or when it itself fails, still needs a schema-valid, non-empty
+          // `branch`/`worktreePath` pair for its own `requires_manual` fallback write. Reusing the
+          // exact same derivation `buildImplementerPipelineRequest` itself calls (implementer-
+          // request.ts) means a fallback record's `branch`/`worktreePath` can never silently drift
+          // from whatever a later successful dispatch for this same job id would have used.
+          const branch = implementerBranch(result.job.id);
+          const worktreePath = implementerWorktreePath(options.agentTeamHome, result.job.id);
+
           const issue = candidates.find(
             (candidate) => candidate.issue.id === result.job.issueId,
           )?.issue;
           const model = result.decision.model?.candidate.model;
           if (issue === undefined || model === undefined) {
+            // C018 fix: `DispatchCandidate` (application/dispatch/model.ts, the shape
+            // `result.decision.candidate` actually has) is deliberately a slim routing-only
+            // projection with no `Issue` field at all -- only `DispatcherCandidate`
+            // (dispatcher.ts's own internal shape, fed into `Dispatcher.dispatch()` but never
+            // returned from it) carries the full `Issue`. So when the `candidates.find(...)`
+            // lookup right above genuinely comes back empty, there is no *other* source of this
+            // job's real `externalIssueId` anywhere in this function's scope -- an actual
+            // discovery/decision inconsistency this defensive branch exists to catch, not merely
+            // a narrower way to reach the same data. `result.job.issueId` (the derived domain id,
+            // not the raw Linear id) is used as an honest fallback rather than blocking the write
+            // entirely: it is still enough for a human to correlate this record with the same
+            // invocation's own stdout/logs, and it keeps the actual invariant this ticket closes
+            // (a resolvable record exists) even in this narrower, worse-diagnostic-quality case.
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "implementer_request_invalid",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue?.externalId ?? result.job.issueId,
+                // `model` may genuinely be the undefined half of this branch's own condition --
+                // `JobProgressRecord.model` has no optional variant (every other write path
+                // always has a real one), so there is no schema-valid way to omit it. This fixed
+                // placeholder is never read back as a real model id by any code in this repo; it
+                // exists purely so this record can still be written at all, and `dispatch resolve`
+                // can still find and release the claim.
+                model: model ?? "unresolved",
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
@@ -452,6 +559,27 @@ export function createDispatchCliHandlers(
             claudeConfig: build.value.claude.config,
           });
           if (pipelineComposition.state !== "ready") {
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "implementer_composition_blocked",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "blocked",
@@ -483,6 +611,27 @@ export function createDispatchCliHandlers(
             { idempotencyKey: `cli-dispatch:${result.job.id}:authoritative-base` },
           );
           if (!authoritativeBase.ok) {
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "authoritative_base_unavailable",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
@@ -500,6 +649,27 @@ export function createDispatchCliHandlers(
           // short-circuit above).
           const worktreeDirectory = await ensureDispatchWorktreesDirectory(options.agentTeamHome);
           if (!worktreeDirectory.ok) {
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "worktree_directory_unavailable",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
@@ -519,6 +689,33 @@ export function createDispatchCliHandlers(
             baseRevision: authoritativeBase.value.baseRevision,
           });
           if (!request.ok) {
+            // C018 fix: `implementer_request_invalid` -- this file's grep-verified sixth exit
+            // (never separately enumerated by this ticket's own known-list, which named the
+            // sibling check right above the `pipelineComposition` build instead; both describe the
+            // identical human-facing situation -- "this job's `ImplementerPipelineRequest` could
+            // never be built" -- and already shared this exact CLI-JSON `pipelineReason` string
+            // before this fix, so reusing one reasonCode for both is not a new conflation).
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "implementer_request_invalid",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
@@ -552,11 +749,33 @@ export function createDispatchCliHandlers(
           if (pipelineOutcome.state === "ci_waiting") {
             const headSha = headShaSchema.safeParse(pipelineOutcome.commit.sha);
             if (!headSha.success) {
+              // C018 fix: unlike the `recorded.ok` guard further down (a genuine store failure,
+              // where attempting a second, differently-shaped write is not expected to fare any
+              // better -- see this function's own header on `writeDispatchRequiresManual`), this
+              // is a malformed *value*, not a broken store: the write itself is still worth
+              // attempting, just with a `requires_manual` shape that never needs the malformed
+              // `headSha` at all. `changeRequestId` is still real and worth keeping -- a human can
+              // find the actual Draft PR by number even without the SHA this process failed to
+              // trust.
+              const requiresManual = await writeDispatchRequiresManual(
+                progress,
+                "invalid_head_sha",
+                {
+                  jobId: result.job.id,
+                  projectId: build.value.project.id,
+                  issueId: result.job.issueId,
+                  externalIssueId: issue.externalId,
+                  model,
+                  branch: request.value.branch,
+                  worktreePath: request.value.worktreePath,
+                  changeRequestId: String(pipelineOutcome.changeRequest.number),
+                },
+              );
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: { code: "invariant_violation" },
+                error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
               });
             }
             // C015y decision A: the same authoritative SHA this dispatch just pinned the worktree
@@ -569,11 +788,31 @@ export function createDispatchCliHandlers(
               authoritativeBase.value.baseRevision,
             );
             if (!dispatchBaseRevision.success) {
+              // C018 fix: symmetric to the `headSha` guard right above -- `headSha` itself already
+              // parsed successfully here, so the fallback record keeps it (and `changeRequestId`),
+              // only `baseRevision` is omitted (optional on the schema; a legacy-shaped record
+              // establishing it for the first time is not the write-once invariant's concern --
+              // see `#compareAndSwapLocked`'s own comment, job-progress-store.ts).
+              const requiresManual = await writeDispatchRequiresManual(
+                progress,
+                "invalid_base_revision",
+                {
+                  jobId: result.job.id,
+                  projectId: build.value.project.id,
+                  issueId: result.job.issueId,
+                  externalIssueId: issue.externalId,
+                  model,
+                  branch: request.value.branch,
+                  worktreePath: request.value.worktreePath,
+                  changeRequestId: String(pipelineOutcome.changeRequest.number),
+                  headSha: headSha.data,
+                },
+              );
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: { code: "invariant_violation" },
+                error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
               });
             }
             const recorded = await progress.compareAndSwap(result.job.id, null, {
@@ -590,6 +829,11 @@ export function createDispatchCliHandlers(
               baseRevision: dispatchBaseRevision.data,
             });
             if (!recorded.ok) {
+              // C018 fix: a genuine store failure (disk full, permissions, ...), not a malformed
+              // value -- unlike the `headSha`/`dispatchBaseRevision` guards above, attempting a
+              // second, differently-shaped write against the exact same store here is not expected
+              // to fare any better, so this fails closed with nothing written at all (see this
+              // function's own `writeDispatchRequiresManual` header for the general rule).
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
@@ -610,11 +854,28 @@ export function createDispatchCliHandlers(
             if (pipelineOutcome.checkpointId !== undefined) {
               const checkpointId = checkpointIdSchema.safeParse(pipelineOutcome.checkpointId);
               if (!checkpointId.success) {
+                // C018 fix: symmetric to the `ci_waiting` branch's own `headSha`/
+                // `dispatchBaseRevision` guards above -- a malformed value, not a broken store, so
+                // still worth a `requires_manual` fallback write (which never needs the malformed
+                // `checkpointId` at all).
+                const requiresManual = await writeDispatchRequiresManual(
+                  progress,
+                  "invalid_checkpoint_id",
+                  {
+                    jobId: result.job.id,
+                    projectId: build.value.project.id,
+                    issueId: result.job.issueId,
+                    externalIssueId: issue.externalId,
+                    model,
+                    branch: request.value.branch,
+                    worktreePath: request.value.worktreePath,
+                  },
+                );
                 return outcome("failed", {
                   ...dispatchedPayload,
                   pipeline: "failed",
                   pipelineReason: "job_progress_write_failed",
-                  error: { code: "invariant_violation" },
+                  error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
                 });
               }
               parsedCheckpointId = checkpointId.data;
@@ -634,11 +895,45 @@ export function createDispatchCliHandlers(
               worktreePath: request.value.worktreePath,
             });
             if (!recorded.ok) {
+              // C018 fix: same "genuine store failure, do not attempt a second write" rule as the
+              // `ci_waiting` branch's own `recorded.ok` guard above.
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
                 error: recorded.error,
+              });
+            }
+          }
+          // C018 fix: the fifth exit this ticket's own packet named explicitly -- a genuine
+          // `ImplementerPipelineOutcome` of `state:"failed"` (the pipeline was actually invoked,
+          // unlike every `requires_manual` write above this comment, all of which fire *before*
+          // `pipelineComposition.value.run()` is ever called) used to `return` here with no
+          // job-progress record at all. Written *before* returning, same discipline as every other
+          // write in this function -- the full diagnostic (`stage`/`error`) is already carried in
+          // this same response's own `pipelineOutcomePayload(pipelineOutcome)` below for whoever is
+          // watching this one invocation; the durable record's job is only to make the still-active
+          // admission claim findable and resolvable by a *later* `dispatch resolve` invocation.
+          if (pipelineOutcome.state === "failed") {
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "implementer_pipeline_failed",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                branch: request.value.branch,
+                worktreePath: request.value.worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
               });
             }
           }
