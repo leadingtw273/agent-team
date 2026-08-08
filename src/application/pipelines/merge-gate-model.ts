@@ -2,6 +2,7 @@ import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type { ReviewIdentity, RequirementSnapshot } from "../../domain/review/index.js";
 import type {
+  AutoMergePauseQueryPort,
   ChangeRequestCommentReceipt,
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
@@ -51,6 +52,17 @@ export type MergeGateAutoMergeAttempt =
 
 export interface MergeGatePorts {
   readonly git: Pick<GitPort, "getEffectiveTreeDiff">;
+  /**
+   * E116cap: checked at the very top of `AutoMergeGate.enable()`, before any GitHub read at all --
+   * a project this port reports as paused must never even attempt to arm auto-merge, regardless of
+   * how clean the change request otherwise looks. This is the structural enforcement point; the
+   * CLI-side call site (`resumeUnderLease`, resume-composition.ts) only maps the resulting
+   * `not_ready:"auto_merge_paused"` outcome to a dedicated, human-readable `requires_manual`
+   * reasonCode -- it never re-derives or re-checks the pause decision itself. See
+   * `auto-merge-pause.ts`'s own header for why this is its own narrow port rather than folded into
+   * `SourceControlPort`/`LifecyclePolicyPort`.
+   */
+  readonly autoMergePause: AutoMergePauseQueryPort;
   readonly sourceControl: Pick<
     SourceControlPort,
     | "getChangeRequest"
@@ -132,7 +144,18 @@ export type RecordReviewOutcome =
   | Readonly<{ state: "failed"; stage: ReviewStatusFailureStage; error: DomainError }>;
 
 export type MergeGateFailureStage =
-  "request" | "change_request" | "checks" | "diff" | "comment" | "status" | "auto_merge";
+  | "request"
+  // E116cap: the one failure stage `autoMergePause.isPaused()` itself can produce (the port call
+  // returning `!ok`) -- distinct from `"request"` (a shape/invariant problem with the request
+  // itself) and from every other stage below, none of which are reachable until *after* this port
+  // has already reported `paused: false`.
+  | "policy"
+  | "change_request"
+  | "checks"
+  | "diff"
+  | "comment"
+  | "status"
+  | "auto_merge";
 
 /**
  * C015t decision 1: this union used to have a single `"enabled"` state whose own `changeRequest`
@@ -186,6 +209,11 @@ export type EnableAutoMergeOutcome =
         // very first readback and the immediately-pre-merge readback) -- never just one -- so a PR
         // that only becomes behind in the narrow window between them is still caught before this
         // gate ever calls `enableAutoMerge`.
-        | "behind";
+        | "behind"
+        // E116cap: `MergeGatePorts.autoMergePause.isPaused()` reported `paused: true` -- checked
+        // first, before any other readback in `enable()` (see `MergeGatePorts.autoMergePause`'s own
+        // header). Never reachable together with any other `not_ready` reason on the same call:
+        // this is an unconditional short-circuit, not one more condition ANDed with the rest.
+        | "auto_merge_paused";
     }>
   | Readonly<{ state: "failed"; stage: MergeGateFailureStage; error: DomainError }>;

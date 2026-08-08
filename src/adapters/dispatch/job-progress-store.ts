@@ -205,6 +205,13 @@ export const requiresManualReasonCodeSchema = z.enum([
   // `unknownCount`). The 30-minute absolute deadline (`auto_merge_stalled`'s own second OR-branch)
   // still applies independently and unconditionally even while this is flapping.
   "merge_state_unknown_timeout",
+  // E116cap: `AutoMergeGate.enable()` found the project's persisted auto-merge pause flag set
+  // (`FileAutoMergePauseStore`, auto-merge-pause-store.ts) -- a prior out-of-process merge on this
+  // project quarantined it against arming any *new* auto-merge until a human resolves it
+  // (`FileAutoMergePauseStore.resolve`). Never auto-cleared by a resume; see
+  // `resumeUnderLease`'s own `case "auto_merge_paused":` (resume-composition.ts) for why this is
+  // deliberately never treated as a wait-and-retry condition like `ci_pending` is.
+  "auto_merge_paused_out_of_process_merge",
   // C018 fix: `stage:"dispatch"` reasonCodes -- every one of handlers.ts's own fresh-dispatch
   // exits that used to `return` after the admission claim (and real `Job`/`Lease`) already
   // existed, with no job-progress record left behind for `dispatch resolve` to ever find (see

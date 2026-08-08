@@ -72,6 +72,7 @@ import {
   type RequiresManualStage,
   type RequiresManualStallTiming,
 } from "../../adapters/dispatch/job-progress-store.js";
+import { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
 import type { AuthoritativeBaseFailure, AuthoritativeBaseRevision } from "./authoritative-base.js";
 import {
   FileIssueAdmissionStore,
@@ -324,6 +325,13 @@ function currentRetries(
 
 export function defaultJobProgressDirectory(agentTeamHome: string): string {
   return join(agentTeamHome, "state", "dispatch", "progress");
+}
+
+/** E116cap: sibling directory to job-progress's own -- see `FileAutoMergePauseStore`'s own header
+ * (src/adapters/dispatch/auto-merge-pause-store.ts) for the composite key shape (one file per
+ * `projectId`, not per `jobId`). */
+export function defaultAutoMergePauseDirectory(agentTeamHome: string): string {
+  return join(agentTeamHome, "state", "dispatch", "auto-merge-pause");
 }
 
 export interface ResumeCycleDependencies {
@@ -1702,6 +1710,22 @@ async function resumeReview(
             "change_request_behind_base",
             requiresManualCause("merge", "change_request_behind_base"),
           );
+        case "auto_merge_paused":
+          // E116cap: `AutoMergeGate.enable()` found `MergeGatePorts.autoMergePause` reporting this
+          // project paused (checked before any other readiness condition -- see that outcome's own
+          // header, merge-gate-model.ts). Never waited on like `ci_pending`/`review_status_missing`
+          // above: a paused project stays paused until a human resolves it (see
+          // `FileAutoMergePauseStore.resolve`, auto-merge-pause-store.ts), so re-resuming this job
+          // on its own would only repeat the exact same `not_ready` outcome forever. Dedicated
+          // reasonCode (not folded into the generic `auto_merge_not_enabled` bucket right above) so
+          // a human reading `dispatch resolve`'s output can tell "this project is quarantined after
+          // an out-of-process merge" apart from every other reason auto-merge failed to arm.
+          return requiresManual(
+            record,
+            deps,
+            "auto_merge_paused_out_of_process_merge",
+            requiresManualCause("merge", "auto_merge_paused_out_of_process_merge"),
+          );
       }
     case "failed":
       return requiresManualUnlessRetryable(
@@ -1771,6 +1795,11 @@ async function finishMerged(
 
 export function buildJobProgressStore(agentTeamHome: string): FileJobProgressStore {
   return new FileJobProgressStore(defaultJobProgressDirectory(agentTeamHome));
+}
+
+/** E116cap: production default -- see `defaultAutoMergePauseDirectory`'s own comment. */
+export function buildAutoMergePauseStore(agentTeamHome: string): FileAutoMergePauseStore {
+  return new FileAutoMergePauseStore(defaultAutoMergePauseDirectory(agentTeamHome));
 }
 
 /** C015o decision 3: sibling directory to job-progress's own (`state/dispatch/admission`, not

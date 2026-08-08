@@ -1565,6 +1565,33 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     }
   });
 
+  it("E116cap: not_ready:auto_merge_paused maps to requires_manual with a dedicated reasonCode, never the generic auto_merge_not_enabled bucket", async () => {
+    const { deps, progress } = await harness({
+      enableOutcome: { state: "not_ready", reason: "auto_merge_paused" },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "auto_merge_paused_out_of_process_merge",
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "auto_merge_paused_out_of_process_merge" },
+      });
+    }
+  });
+
   it("⑤ a genuine auto_merge `failed` outcome writes cause.stage=merge, not review (the exact C015s mistag this ticket fixes)", async () => {
     const { deps, progress } = await harness({
       enableOutcome: {

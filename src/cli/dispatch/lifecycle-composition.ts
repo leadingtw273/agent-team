@@ -13,6 +13,16 @@
  * directory every other checkpoint-writing pipeline in this codebase already uses), and
  * `LeaseCoordinatorLifecycleLeaseReleaseAdapter` needs a real `LeaseCoordinator` to release a
  * cancelled issue's lease.
+ *
+ * E116cap: `policy` is now `FileAutoMergePauseAdapter` (lifecycle-policy-adapter.ts), not
+ * `NoOpAutoMergePauseAdapter` -- production finally has a real, durable project-level auto-merge
+ * pause capability to back an out-of-process merge's `pauseAutoMerge` call with (see that class's
+ * own header for exactly what changed). `autoMergePause` is the caller-supplied
+ * `FileAutoMergePauseStore` this adapter writes to -- threaded down the same way `progress` already
+ * is, rather than constructed here from `agentTeamHome` directly, so every composition root shares
+ * exactly one store instance per process (see resume-composition.ts's own
+ * `buildAutoMergePauseStore`/`defaultAutoMergePauseDirectory`, the sibling convention
+ * `buildJobProgressStore`/`defaultJobProgressDirectory` already established).
  */
 import { join } from "node:path";
 
@@ -21,12 +31,13 @@ import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { LifecyclePipeline } from "../../application/pipelines/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/index.js";
+import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import {
   JobProgressLifecycleCancellationAdapter,
   LeaseCoordinatorLifecycleLeaseReleaseAdapter,
 } from "./lifecycle-cancellation-adapter.js";
-import { NoOpAutoMergePauseAdapter } from "./lifecycle-policy-adapter.js";
+import { FileAutoMergePauseAdapter } from "./lifecycle-policy-adapter.js";
 import {
   LinearWorkManagementAdapter,
   type LinearWorkManagementMutationClient,
@@ -40,6 +51,7 @@ export interface BuildLifecyclePipelineOptions {
   readonly progress: FileJobProgressStore;
   readonly agentTeamHome: string;
   readonly leases: LeaseCoordinator;
+  readonly autoMergePause: Pick<FileAutoMergePauseStore, "pause">;
   /** Injectable for tests; production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport;
 }
@@ -55,7 +67,7 @@ export function buildLifecyclePipeline(options: BuildLifecyclePipelineOptions): 
       teamId: options.teamId,
       linearProjectId: options.linearProjectId,
     }),
-    policy: new NoOpAutoMergePauseAdapter(),
+    policy: new FileAutoMergePauseAdapter({ store: options.autoMergePause }),
     cancellation: new JobProgressLifecycleCancellationAdapter({
       progress: options.progress,
       store: new LocalYamlCheckpointStore(checkpointDirectory),

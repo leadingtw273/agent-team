@@ -354,6 +354,17 @@ export class AutoMergeGate {
     ) {
       return mergeFailure("request", domainError("invariant_violation"));
     }
+    // E116cap: checked before any GitHub read at all -- see `MergeGatePorts.autoMergePause`'s own
+    // header (merge-gate-model.ts) for why this is an unconditional short-circuit, never one more
+    // condition ANDed with the rest of this method's own readiness checks below.
+    const paused = await this.ports.autoMergePause.isPaused(
+      { project: request.project },
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (!paused.ok) return mergeFailure("policy", paused.error);
+    if (paused.value.paused) {
+      return Object.freeze({ state: "not_ready", reason: "auto_merge_paused" });
+    }
     const reference = { project: request.project, changeRequestId: request.changeRequestId };
     const current = await this.ports.sourceControl.getChangeRequest(
       reference,
