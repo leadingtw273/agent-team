@@ -231,6 +231,17 @@ export const requiresManualReasonCodeSchema = z.enum([
   // failing is, like those two, never expected outside an injected test fake -- but the same
   // "claim already active, so still leave a resolvable record" discipline applies.
   "invalid_base_revision",
+  // C019 fix (item 1): handlers.ts's own dispatched-but-non-implementer-role exit (the "10th
+  // exit" -- `result.decision.candidate.role !== "implementer"`) used to `return` a `success`
+  // CLI payload with zero store writes, even though `dispatchOnce`'s own `attachJob` call and the
+  // per-issue admission claim are both already real and active by that point -- the same
+  // LEA-16-shaped silent-claim leak every other `stage:"dispatch"` reasonCode above exists to
+  // close, just reachable through a role this file's own scope boundary (C015b item 5) never
+  // builds a pipeline for at all. Deliberately its own reasonCode, not reused from
+  // `implementer_request_invalid` or any other above: nothing here failed, so conflating it with
+  // an actual failure reasonCode would mislead whoever reads this record later via `dispatch
+  // resolve`.
+  "role_pipeline_unavailable",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 

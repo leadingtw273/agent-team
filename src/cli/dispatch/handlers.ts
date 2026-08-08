@@ -246,6 +246,24 @@ async function writeDispatchRequiresManual(
   return ok(undefined);
 }
 
+/**
+ * C019 fix (item 3): extracted out of both `requires_manual` fallback call sites that need it
+ * (the `role_pipeline_unavailable` and `implementer_request_invalid` writes below) so it is
+ * directly unit-testable on its own. This ticket's own review confirmed there is no way to reach
+ * `issue === undefined` through the public `createDispatchCliHandlers` composition: the
+ * `candidates.find(...)` lookup at each call site and the candidate `dispatchOnce` actually
+ * dispatched are both always derived from the exact same single `discoverReadyDispatchCandidates`
+ * call within one `dispatchOnce` invocation (composition.ts), so they can never diverge in
+ * production -- this is a defensive discovery/decision-inconsistency guard, not a reachable
+ * branch, and is tested directly here rather than via a fabricated end-to-end fixture.
+ */
+export function implementerRequestInvalidExternalIssueId(
+  issue: { readonly externalId: string } | undefined,
+  jobIssueId: string,
+): string {
+  return issue?.externalId ?? jobIssueId;
+}
+
 export function createDispatchCliHandlers(
   options: CreateDispatchCliHandlersOptions,
 ): DispatchHandlers {
@@ -483,15 +501,6 @@ export function createDispatchCliHandlers(
             admissionSkipped,
           };
 
-          // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
-          // Reviewer/integration/etc. pipelines are separate, unbuilt C-series tickets.
-          if (result.decision.candidate.role !== "implementer") {
-            return outcome("success", {
-              ...dispatchedPayload,
-              pipeline: "not_applicable_role",
-            });
-          }
-
           // C018 fix: deterministic (a pure function of `result.job.id`, never dependent on
           // `buildImplementerPipelineRequest` succeeding) -- every exit below this point that can
           // fire *before* that call, or when it itself fails, still needs a schema-valid, non-empty
@@ -499,6 +508,12 @@ export function createDispatchCliHandlers(
           // exact same derivation `buildImplementerPipelineRequest` itself calls (implementer-
           // request.ts) means a fallback record's `branch`/`worktreePath` can never silently drift
           // from whatever a later successful dispatch for this same job id would have used.
+          //
+          // C019 fix: hoisted above the role-scope check right below (previously computed further
+          // down, only on the implementer path) -- the non-implementer exit now needs the exact
+          // same `branch`/`worktreePath`/`issue`/`model` derivation for its own fallback write, and
+          // reusing this one computation keeps both paths' fallback records byte-for-byte
+          // consistent with whatever a real implementer dispatch for this same job id would use.
           const branch = implementerBranch(result.job.id);
           const worktreePath = implementerWorktreePath(options.agentTeamHome, result.job.id);
 
@@ -506,6 +521,54 @@ export function createDispatchCliHandlers(
             (candidate) => candidate.issue.id === result.job.issueId,
           )?.issue;
           const model = result.decision.model?.candidate.model;
+
+          // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
+          // Reviewer/integration/etc. pipelines are separate, unbuilt C-series tickets.
+          //
+          // C019 fix (item 1, codex-reviewed defect from C018's own acceptance sweep): this used
+          // to `return` success right here with zero store writes -- but by this point
+          // `dispatchOnce` has already called `attachJob` (composition.ts) and the per-issue
+          // admission claim is already active, exactly like every other exit this file's own
+          // `writeDispatchRequiresManual` header describes. A non-implementer role is not itself a
+          // failure (the pipeline is genuinely, deliberately never constructed for it -- the CLI's
+          // own `pipeline:"not_applicable_role"` string is kept verbatim for that reason), but the
+          // still-active claim is just as unreleasable as LEA-16's silent-claim deadlock unless a
+          // resolvable `requires_manual` record is left behind here too. `role_pipeline_unavailable`
+          // is a new, dedicated reasonCode (not reused from any implementer-path check) because the
+          // human-facing situation is genuinely different: nothing here failed, this role's
+          // pipeline simply does not exist yet.
+          if (result.decision.candidate.role !== "implementer") {
+            const requiresManual = await writeDispatchRequiresManual(
+              progress,
+              "role_pipeline_unavailable",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: implementerRequestInvalidExternalIssueId(
+                  issue,
+                  result.job.issueId,
+                ),
+                model: model ?? "unresolved",
+                branch,
+                worktreePath,
+              },
+            );
+            if (!requiresManual.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: requiresManual.error,
+              });
+            }
+            return outcome("success", {
+              ...dispatchedPayload,
+              pipeline: "not_applicable_role",
+              requiresManual: true,
+            });
+          }
+
           if (issue === undefined || model === undefined) {
             // C018 fix: `DispatchCandidate` (application/dispatch/model.ts, the shape
             // `result.decision.candidate` actually has) is deliberately a slim routing-only
@@ -527,7 +590,10 @@ export function createDispatchCliHandlers(
                 jobId: result.job.id,
                 projectId: build.value.project.id,
                 issueId: result.job.issueId,
-                externalIssueId: issue?.externalId ?? result.job.issueId,
+                externalIssueId: implementerRequestInvalidExternalIssueId(
+                  issue,
+                  result.job.issueId,
+                ),
                 // `model` may genuinely be the undefined half of this branch's own condition --
                 // `JobProgressRecord.model` has no optional variant (every other write path
                 // always has a real one), so there is no schema-valid way to omit it. This fixed
@@ -771,11 +837,26 @@ export function createDispatchCliHandlers(
                   changeRequestId: String(pipelineOutcome.changeRequest.number),
                 },
               );
+              // C019 fix (item 2, codex-reviewed defect from C018's own acceptance sweep): this
+              // used to report `pipelineReason:"job_progress_write_failed"` unconditionally, even
+              // when `requiresManual.ok` -- honestly meaning "the record you're about to go look
+              // for via `dispatch resolve` was never written," which is the exact opposite of what
+              // happened here. Only a genuine write failure (this store call itself coming back
+              // `!ok`) may ever use that reason; when the write succeeded, the honest reason is the
+              // malformed value that triggered this fallback in the first place.
+              if (!requiresManual.ok) {
+                return outcome("failed", {
+                  ...dispatchedPayload,
+                  pipeline: "failed",
+                  pipelineReason: "job_progress_write_failed",
+                  error: requiresManual.error,
+                });
+              }
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
-                pipelineReason: "job_progress_write_failed",
-                error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
+                pipelineReason: "invalid_head_sha",
+                error: { code: "invariant_violation" },
               });
             }
             // C015y decision A: the same authoritative SHA this dispatch just pinned the worktree
@@ -808,11 +889,22 @@ export function createDispatchCliHandlers(
                   headSha: headSha.data,
                 },
               );
+              // C019 fix (item 2): symmetric to the `headSha` guard's own fix right above -- only a
+              // genuine write failure may report `job_progress_write_failed`; a successful fallback
+              // write reports the honest `invalid_base_revision` reason instead.
+              if (!requiresManual.ok) {
+                return outcome("failed", {
+                  ...dispatchedPayload,
+                  pipeline: "failed",
+                  pipelineReason: "job_progress_write_failed",
+                  error: requiresManual.error,
+                });
+              }
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
-                pipelineReason: "job_progress_write_failed",
-                error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
+                pipelineReason: "invalid_base_revision",
+                error: { code: "invariant_violation" },
               });
             }
             const recorded = await progress.compareAndSwap(result.job.id, null, {
@@ -871,11 +963,23 @@ export function createDispatchCliHandlers(
                     worktreePath: request.value.worktreePath,
                   },
                 );
+                // C019 fix (item 2): symmetric to the `ci_waiting` branch's own `headSha`/
+                // `dispatchBaseRevision` fixes above -- only a genuine write failure may report
+                // `job_progress_write_failed`; a successful fallback write reports the honest
+                // `invalid_checkpoint_id` reason instead.
+                if (!requiresManual.ok) {
+                  return outcome("failed", {
+                    ...dispatchedPayload,
+                    pipeline: "failed",
+                    pipelineReason: "job_progress_write_failed",
+                    error: requiresManual.error,
+                  });
+                }
                 return outcome("failed", {
                   ...dispatchedPayload,
                   pipeline: "failed",
-                  pipelineReason: "job_progress_write_failed",
-                  error: requiresManual.ok ? { code: "invariant_violation" } : requiresManual.error,
+                  pipelineReason: "invalid_checkpoint_id",
+                  error: { code: "invariant_violation" },
                 });
               }
               parsedCheckpointId = checkpointId.data;

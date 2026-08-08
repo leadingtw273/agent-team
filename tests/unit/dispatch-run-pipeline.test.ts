@@ -10,7 +10,7 @@
  * routing path matters here.
  */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -48,6 +48,16 @@ const discoverSpy = vi.hoisted(() => vi.fn());
 /** Lets one test (the `not_applicable_role` scope-boundary case) swap in a differently-rolled
  * candidate without duplicating the whole discovery-mocking setup. */
 const candidateRoleOverride = vi.hoisted(() => ({ current: undefined as string | undefined }));
+/** C019 fix (item 3): lets one test naturally reach `result.decision.model === undefined` for an
+ * `implementer`-role candidate -- `decideNextDispatch` (application/dispatch/decision.ts) never
+ * attempts model routing for `workKind:"mechanical"` at all (`route = candidate.workKind ===
+ * "model" ? selectModelRoute(...) : undefined`), so this is a real, naturally-reachable trigger
+ * for the `model ?? "unresolved"` fallback in handlers.ts's `implementer_request_invalid` write --
+ * unlike the `issue === undefined` half of that same fallback, tested directly instead (see
+ * `implementerRequestInvalidExternalIssueId`'s own header, handlers.ts). */
+const candidateWorkKindOverride = vi.hoisted(() => ({
+  current: undefined as "model" | "mechanical" | undefined,
+}));
 
 vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/adapters/dispatch/index.js")>();
@@ -57,13 +67,17 @@ vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
       ...args: Parameters<typeof actual.discoverReadyDispatchCandidates>
     ) => {
       discoverSpy(...args);
-      const candidate = eligibleCandidate(candidateRoleOverride.current);
+      const candidate = eligibleCandidate(
+        candidateRoleOverride.current,
+        candidateWorkKindOverride.current,
+      );
       return Promise.resolve(ok({ candidates: [candidate], skipped: [] }));
     },
   };
 });
 
-const { createDispatchCliHandlers } = await import("../../src/cli/dispatch/handlers.js");
+const { createDispatchCliHandlers, implementerRequestInvalidExternalIssueId } =
+  await import("../../src/cli/dispatch/handlers.js");
 
 const run = promisify(execFile);
 async function git(cwd: string, arguments_: readonly string[]): Promise<string> {
@@ -75,6 +89,7 @@ const temporaryDirectories: string[] = [];
 afterEach(async () => {
   discoverSpy.mockClear();
   candidateRoleOverride.current = undefined;
+  candidateWorkKindOverride.current = undefined;
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -176,12 +191,16 @@ function eligibleIssue(role = "implementer"): Issue {
   });
 }
 
-function eligibleCandidate(role?: string) {
+function eligibleCandidate(role?: string, workKind: "model" | "mechanical" = "model") {
   return Object.freeze({
     issue: eligibleIssue(role),
     readyAt: "2026-08-07T00:00:00.000Z",
-    stage: "implementation" as const,
-    workKind: "model" as const,
+    // `dispatchCandidateSchema`'s own `superRefine` (application/dispatch/model.ts) requires
+    // mechanical work to be one of the `ci`/`webhook`/`health` stages -- `"ci"` here is
+    // otherwise-arbitrary, chosen only to satisfy that constraint when the C019 fix's own
+    // mechanical-workKind test overrides `workKind` below.
+    stage: workKind === "mechanical" ? ("ci" as const) : ("implementation" as const),
+    workKind,
   });
 }
 
@@ -444,7 +463,10 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       error: { code: string };
     };
     expect(payload.pipeline).toBe("failed");
-    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    // C019 fix (item 2): the write itself succeeded here -- reporting
+    // `job_progress_write_failed` would falsely tell an operator that nothing was persisted, when
+    // a resolvable `requires_manual` record (asserted below) genuinely exists.
+    expect(payload.pipelineReason).toBe("invalid_head_sha");
     expect(payload.error.code).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
@@ -462,6 +484,76 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       expect(records.value[0]?.headSha).toBeUndefined();
       expect(records.value[0]?.baseRevision).toBeUndefined();
     }
+  });
+
+  /**
+   * C019 fix (item 2, the honest-reason fix's own negative case): unlike the test right above
+   * (a malformed value where the fallback write itself genuinely succeeds), this test forces the
+   * `requires_manual` write itself to fail -- by revoking write permission on the real
+   * `FileJobProgressStore` directory `handlers.ts` builds internally (there is no injection seam
+   * for it; `progress`/`stateRoot` are shared with every other store this handler writes through,
+   * so a temporary root pointed only at this directory, chmod'd back before `afterEach`'s `rm`
+   * runs, is the only way to reach a genuine store failure without touching any other store).
+   * Confirms `job_progress_write_failed` is still reported *only* in this genuine-failure case,
+   * and that nothing partial was ever persisted.
+   */
+  it("C019: reports job_progress_write_failed (not invalid_head_sha) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const progressDirectory = defaultJobProgressDirectory(stateRoot);
+    await mkdir(progressDirectory, { recursive: true });
+    await chmod(progressDirectory, 0o500);
+    try {
+      const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+        Promise.resolve({
+          state: "ready",
+          value: fakePipeline(() =>
+            Promise.resolve({
+              state: "ci_waiting",
+              worktree: {
+                repositoryRoot: repositoryPath,
+                path: "/tmp/wt",
+                branch: "agent-team/job-1",
+                headSha: "a".repeat(40),
+              },
+              commit: { sha: "not-a-real-sha", branch: "agent-team/job-1" },
+              push: { sha: "not-a-real-sha", branch: "agent-team/job-1", remote: "origin" },
+              changeRequest: {
+                id: "PR_5",
+                number: 5,
+                url: "https://example.invalid/pull/5",
+                state: "open",
+                draft: true,
+                baseBranch: "main",
+                headBranch: "agent-team/job-1",
+                headSha: "not-a-real-sha",
+                mergeability: "unknown",
+                autoMergeEnabled: false,
+                updatedAt: "2026-08-07T00:00:00.000Z" as never,
+              },
+              checks: { headSha: "not-a-real-sha", aggregate: "pending", checks: [] },
+            }),
+          ),
+        }),
+      );
+      const outcome = await handlers.run({ projectId });
+      expect(outcome.state).toBe("failed");
+      const payload = JSON.parse(outcome.message ?? "{}") as {
+        pipeline: string;
+        pipelineReason: string;
+        error: { code: string };
+      };
+      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipelineReason).toBe("job_progress_write_failed");
+      expect(payload.error.code).toBe("permission_denied");
+    } finally {
+      await chmod(progressDirectory, 0o700);
+    }
+
+    const progress = new FileJobProgressStore(progressDirectory);
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toHaveLength(0);
   });
 
   it("maps a paused pipeline outcome to a success payload (a pause is not an error)", async () => {
@@ -633,7 +725,9 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       error: { code: string };
     };
     expect(payload.pipeline).toBe("failed");
-    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    // C019 fix (item 2): the write itself succeeded here -- see the sibling `invalid_head_sha`
+    // test's own comment above for the full rationale.
+    expect(payload.pipelineReason).toBe("invalid_checkpoint_id");
     expect(payload.error.code).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
@@ -648,6 +742,58 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         },
       });
     }
+  });
+
+  /**
+   * C019 fix (item 2, negative case): symmetric to the `invalid_head_sha` write-failure test
+   * above -- forces the `requires_manual` fallback write itself to genuinely fail (permission
+   * denied on the real progress directory), and confirms `job_progress_write_failed` is still
+   * reported only in that genuine-failure case, with nothing partial persisted.
+   */
+  it("C019: reports job_progress_write_failed (not invalid_checkpoint_id) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const progressDirectory = defaultJobProgressDirectory(stateRoot);
+    await mkdir(progressDirectory, { recursive: true });
+    await chmod(progressDirectory, 0o500);
+    try {
+      const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+        Promise.resolve({
+          state: "ready",
+          value: fakePipeline(() =>
+            Promise.resolve({
+              state: "paused",
+              reason: "scope_overrun",
+              worktree: {
+                repositoryRoot: repositoryPath,
+                path: "/tmp/wt",
+                branch: "agent-team/job-1",
+                headSha: "a".repeat(40),
+              },
+              // Deliberately not a real `checkpoint_<uuid>`-shaped identifier.
+              checkpointId: "not-a-real-checkpoint-id",
+            }),
+          ),
+        }),
+      );
+      const outcome = await handlers.run({ projectId });
+      expect(outcome.state).toBe("failed");
+      const payload = JSON.parse(outcome.message ?? "{}") as {
+        pipeline: string;
+        pipelineReason: string;
+        error: { code: string };
+      };
+      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipelineReason).toBe("job_progress_write_failed");
+      expect(payload.error.code).toBe("permission_denied");
+    } finally {
+      await chmod(progressDirectory, 0o700);
+    }
+
+    const progress = new FileJobProgressStore(progressDirectory);
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toHaveLength(0);
   });
 
   /**
@@ -792,7 +938,18 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     expect(resolution.admissionReleased).toBe("released");
   });
 
-  it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role", async () => {
+  /**
+   * C019 fix (item 1, codex-reviewed "10th exit" defect from C018's own acceptance sweep): before
+   * this ticket, this exact branch `return`ed a `success` payload with zero store writes, even
+   * though `dispatchOnce` had already `attachJob`'d a real `Job`/`Lease` and claimed the per-issue
+   * admission slot -- the same silent-claim-leak defect class C018 closed for every other exit in
+   * this function, just more dangerous here because the CLI's own JSON *also* reports `success`,
+   * giving an operator zero signal anything needs attention. Now persists a resolvable
+   * `requires_manual` record (`reasonCode:"role_pipeline_unavailable"`) first, and the CLI payload
+   * gains `requiresManual:true` so the still-`success`/`not_applicable_role` shape (kept verbatim,
+   * per this ticket's own packet) no longer implies "nothing to do here."
+   */
+  it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role, but persists a resolvable requires_manual record and flags it in the response", async () => {
     candidateRoleOverride.current = "code_reviewer";
     const buildImplementerPipeline = vi.fn(() =>
       Promise.reject(new Error("must never be called for a non-implementer role")),
@@ -802,10 +959,78 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline);
     const outcome = await handlers.run({ projectId });
     expect(outcome.state).toBe("success");
-    const payload = JSON.parse(outcome.message ?? "{}") as { state: string; pipeline: string };
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      state: string;
+      pipeline: string;
+      jobId: string;
+      requiresManual: boolean;
+    };
     expect(payload.state).toBe("dispatched");
     expect(payload.pipeline).toBe("not_applicable_role");
+    expect(payload.requiresManual).toBe(true);
     expect(buildImplementerPipeline).not.toHaveBeenCalled();
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "role_pipeline_unavailable" },
+        },
+      });
+    }
+
+    // Acceptance criterion (1): the still-active admission claim this exit used to leave durably
+    // stuck (a real `Job`+`Lease` already existed by the time this branch fired) is genuinely
+    // findable and releasable by a later `dispatch resolve`, exactly like every other C018 fallback
+    // record this file already round-trips.
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
+  });
+
+  /**
+   * C019 fix (item 1, negative case): forces the `requires_manual` fallback write for the
+   * non-implementer-role exit to genuinely fail (permission denied on the real progress
+   * directory) -- unlike the happy-path test above, this must now report `state:"failed"` (not
+   * `success`), since the claim is left durably active with nothing recorded for `dispatch
+   * resolve` to ever find.
+   */
+  it("C019: reports a failed outcome (not success) when the role_pipeline_unavailable fallback write itself genuinely fails", async () => {
+    candidateRoleOverride.current = "code_reviewer";
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const progressDirectory = defaultJobProgressDirectory(stateRoot);
+    await mkdir(progressDirectory, { recursive: true });
+    await chmod(progressDirectory, 0o500);
+    try {
+      const buildImplementerPipeline = vi.fn(() =>
+        Promise.reject(new Error("must never be called for a non-implementer role")),
+      );
+      const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline);
+      const outcome = await handlers.run({ projectId });
+      expect(outcome.state).toBe("failed");
+      const payload = JSON.parse(outcome.message ?? "{}") as {
+        pipeline: string;
+        pipelineReason: string;
+        error: { code: string };
+      };
+      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipelineReason).toBe("job_progress_write_failed");
+      expect(payload.error.code).toBe("permission_denied");
+      expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    } finally {
+      await chmod(progressDirectory, 0o700);
+    }
+
+    const progress = new FileJobProgressStore(progressDirectory);
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toHaveLength(0);
   });
 
   /**
@@ -1162,7 +1387,9 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       error: { code: string };
     };
     expect(payload.pipeline).toBe("failed");
-    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    // C019 fix (item 2): the write itself succeeded here -- see `invalid_head_sha`'s own sibling
+    // test comment above for the full rationale.
+    expect(payload.pipelineReason).toBe("invalid_base_revision");
     expect(payload.error.code).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
@@ -1180,5 +1407,148 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       });
       expect(records.value[0]?.baseRevision).toBeUndefined();
     }
+  });
+
+  /**
+   * C019 fix (item 2, negative case): symmetric to `invalid_head_sha`/`invalid_checkpoint_id`'s
+   * own write-failure tests above -- forces the `requires_manual` fallback write itself to
+   * genuinely fail (permission denied on the real progress directory), and confirms
+   * `job_progress_write_failed` is still reported only in that genuine-failure case, with nothing
+   * partial persisted.
+   */
+  it("C019: reports job_progress_write_failed (not invalid_base_revision) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const progressDirectory = defaultJobProgressDirectory(stateRoot);
+    await mkdir(progressDirectory, { recursive: true });
+    await chmod(progressDirectory, 0o500);
+    try {
+      const handlers = buildHandlers(
+        stateRoot,
+        repositoryPath,
+        () =>
+          Promise.resolve({
+            state: "ready",
+            value: fakePipeline(() =>
+              Promise.resolve({
+                state: "ci_waiting",
+                worktree: {
+                  repositoryRoot: repositoryPath,
+                  path: "/tmp/wt",
+                  branch: "agent-team/job-1",
+                  headSha: "a".repeat(40),
+                },
+                commit: { sha: "b".repeat(40), branch: "agent-team/job-1" },
+                push: { sha: "b".repeat(40), branch: "agent-team/job-1", remote: "origin" },
+                changeRequest: {
+                  id: "PR_6",
+                  number: 6,
+                  url: "https://example.invalid/pull/6",
+                  state: "open",
+                  draft: true,
+                  baseBranch: "main",
+                  headBranch: "agent-team/job-1",
+                  headSha: "b".repeat(40),
+                  mergeability: "unknown",
+                  autoMergeEnabled: false,
+                  updatedAt: "2026-08-07T00:00:00.000Z" as never,
+                },
+                checks: { headSha: "b".repeat(40), aggregate: "pending", checks: [] },
+              }),
+            ),
+          }),
+        // Deliberately not a well-formed 40/64-hex-char SHA.
+        () => Promise.resolve(ok({ baseRevision: "not-a-real-sha", defaultBranch: "main" })),
+      );
+      const outcome = await handlers.run({ projectId });
+      expect(outcome.state).toBe("failed");
+      const payload = JSON.parse(outcome.message ?? "{}") as {
+        pipeline: string;
+        pipelineReason: string;
+        error: { code: string };
+      };
+      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipelineReason).toBe("job_progress_write_failed");
+      expect(payload.error.code).toBe("permission_denied");
+    } finally {
+      await chmod(progressDirectory, 0o700);
+    }
+
+    const progress = new FileJobProgressStore(progressDirectory);
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toHaveLength(0);
+  });
+
+  /**
+   * C019 fix (item 3, coverage for the `model ?? "unresolved"` half of the
+   * `implementer_request_invalid` fallback, handlers.ts): a genuinely `workKind:"mechanical"`
+   * candidate routed to the `implementer` role naturally reaches this branch with `issue` defined
+   * but `result.decision.model` undefined -- `decideNextDispatch` never attempts model routing for
+   * mechanical work at all. Unlike `implementerRequestInvalidExternalIssueId`'s own `issue ===
+   * undefined` case (tested directly below, with a header explaining why it cannot be reached this
+   * way), this is a real end-to-end trigger through the public composition.
+   */
+  it('C019: falls back to model:"unresolved" and still persists a resolvable requires_manual record when a mechanical-work implementer candidate\'s decision carries no model at all', async () => {
+    candidateWorkKindOverride.current = "mechanical";
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("must never be called: no model means no pipeline request")),
+    );
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline);
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      jobId: string;
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("implementer_request_invalid");
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        model: "unresolved",
+        externalIssueId: "linear-issue-1",
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "implementer_request_invalid" },
+        },
+      });
+    }
+
+    // Acceptance criterion (3): the still-active admission claim is genuinely findable and
+    // releasable, exactly like every other C018/C019 fallback record this file round-trips.
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
+  });
+
+  /**
+   * C019 fix (item 3, direct unit coverage for the `issue === undefined` half of the same
+   * fallback): see `implementerRequestInvalidExternalIssueId`'s own header, handlers.ts, for why
+   * this specific half is tested directly rather than through an end-to-end fixture -- the
+   * discovery/decision inconsistency it guards against cannot be produced through the public
+   * `createDispatchCliHandlers` composition (`candidates.find(...)` and the dispatched candidate
+   * are both always derived from the same single discovery call within one `dispatchOnce`
+   * invocation).
+   */
+  describe("implementerRequestInvalidExternalIssueId", () => {
+    it("returns the real issue's externalId when the issue lookup succeeds", () => {
+      expect(
+        implementerRequestInvalidExternalIssueId({ externalId: "linear-issue-1" }, "issue_1"),
+      ).toBe("linear-issue-1");
+    });
+
+    it("falls back to the job's own derived issueId when the issue lookup comes back undefined", () => {
+      expect(implementerRequestInvalidExternalIssueId(undefined, "issue_1")).toBe("issue_1");
+    });
   });
 });
