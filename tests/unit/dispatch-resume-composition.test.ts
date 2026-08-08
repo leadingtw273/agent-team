@@ -1697,6 +1697,9 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       cancellation: {
         prepare: () => Promise.reject(new Error("must never be called: merge path only")),
       },
+      leaseRelease: {
+        release: () => Promise.reject(new Error("must never be called: merge path only")),
+      },
     });
 
     const result = await runResumeCycle({ ...deps, lifecycle: realLifecycle });

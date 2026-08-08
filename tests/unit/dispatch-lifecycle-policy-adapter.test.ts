@@ -32,6 +32,8 @@ import type { LinearWorkManagementMutationClient } from "../../src/cli/dispatch/
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
 import type { GhJsonTransport } from "../../src/adapters/github/index.js";
 import { LifecyclePipeline } from "../../src/application/pipelines/index.js";
+import { LeaseCoordinator } from "../../src/application/leases/index.js";
+import { InMemoryLeaseRepository } from "../../src/cli/dispatch/ephemeral-ports.js";
 import {
   domainError,
   err,
@@ -131,10 +133,14 @@ afterEach(async () => {
   );
 });
 
-async function temporaryProgressStore(): Promise<FileJobProgressStore> {
+async function temporaryAgentTeamHome(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "agent-team-lifecycle-seam-"));
   temporaryDirectories.push(directory);
-  return new FileJobProgressStore(directory);
+  return directory;
+}
+
+function temporaryProgressStore(agentTeamHome: string): FileJobProgressStore {
+  return new FileJobProgressStore(join(agentTeamHome, "state", "job-progress"));
 }
 
 describe("buildLifecyclePipeline production-composition seam (C015v decision 4)", () => {
@@ -195,7 +201,8 @@ describe("buildLifecyclePipeline production-composition seam (C015v decision 4)"
         );
       },
     };
-    const progress = await temporaryProgressStore();
+    const agentTeamHome = await temporaryAgentTeamHome();
+    const progress = temporaryProgressStore(agentTeamHome);
 
     const pipeline = buildLifecyclePipeline({
       readModel: readModel as never,
@@ -203,6 +210,8 @@ describe("buildLifecyclePipeline production-composition seam (C015v decision 4)"
       teamId: "team-1",
       linearProjectId: "proj-1",
       progress,
+      agentTeamHome,
+      leases: new LeaseCoordinator(new InMemoryLeaseRepository()),
       githubTransport,
     });
 
@@ -296,6 +305,9 @@ describe("LifecyclePipeline + real NoOpAutoMergePauseAdapter (hand-assembled por
       policy: new NoOpAutoMergePauseAdapter(),
       cancellation: {
         prepare: () => Promise.reject(new Error("must never be called")),
+      },
+      leaseRelease: {
+        release: () => Promise.reject(new Error("must never be called: merge path only")),
       },
     });
 

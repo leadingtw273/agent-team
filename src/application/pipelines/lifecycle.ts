@@ -163,7 +163,7 @@ export class LifecyclePipeline {
       return this.#handleMerge(request, issue.value, changeRequest.value.headSha);
     }
     if (issue.value.workStatus === "canceled") {
-      return this.#handleCancellation(request, changeRequest.value);
+      return this.#handleCancellation(request, changeRequest.value, issue.value);
     }
     if (issue.value.workStatus === "completed") {
       return Object.freeze({ state: "unchanged", reason: "terminal_issue" });
@@ -246,12 +246,14 @@ export class LifecyclePipeline {
   async #handleCancellation(
     request: LifecyclePipelineRequest,
     changeRequest: ChangeRequestSnapshot,
+    issue: WorkManagementIssueSnapshot,
   ): Promise<LifecyclePipelineOutcome> {
     const prepared = await this.ports.cancellation.prepare(
       {
         project: request.project,
         externalIssueId: request.externalIssueId,
         changeRequest,
+        issue: issue.issue,
         preserveBranchAndWorktree: true,
       },
       mutation(request, "prepare-cancellation"),
@@ -279,6 +281,14 @@ export class LifecyclePipeline {
         return failed("close_change_request", domainError("conflict"));
       }
     }
+    // E115cap: lease release is sequenced strictly after the checkpoint (already durable, via
+    // `prepared`, before this point) and after the PR close above -- never before either, so a
+    // crash here can never leave a released lease with no checkpoint/closed-PR evidence behind it.
+    const leaseReleased = await this.ports.leaseRelease.release(
+      { project: request.project, externalIssueId: request.externalIssueId },
+      mutation(request, "release-lease"),
+    );
+    if (!leaseReleased.ok) return failed("lease_release", leaseReleased.error);
     const comment = await this.ports.workManagement.appendComment(
       { project: request.project, externalIssueId: request.externalIssueId },
       cancellationComment(request, prepared.value.checkpoint, prepared.value.checkpointId),
