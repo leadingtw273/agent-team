@@ -206,6 +206,59 @@ describe("createDispatchResolveHandler", () => {
     expect(reclaimed.ok).toBe(true);
   });
 
+  /**
+   * C016: the real-world case this whole ticket exists for -- a `paused` job-progress record
+   * (written by `handlers.ts`'s new fix, job-progress-store.ts's own `checkpointId`-optional
+   * `pauseReason`-carrying variant) must be resolvable by this handler exactly like
+   * `requires_manual` already is: `paused` is not in `terminalStageKinds`, so nothing about this
+   * handler needed to change for this to work -- this test is the end-to-end proof that the
+   * ticket's fix (a `paused` record now actually existing) reconnects to this pre-existing escape
+   * hatch, closing the loop the incident (`issue_78bf4038`/LEA-16) got stuck in.
+   */
+  it("--as cancelled resolves a paused-stage record (with checkpointId+pauseReason) exactly like requires_manual, releasing the claim and allowing re-admission", async () => {
+    const { progress, admission } = await setup();
+    await progress.compareAndSwap(
+      jobA,
+      null,
+      baseRecord({
+        stage: {
+          kind: "paused",
+          checkpointId: id("checkpoint", "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab"),
+          pauseReason: "scope_overrun",
+        },
+      }),
+    );
+    const claimed = await admission.claim(projectId, issueId);
+    if (!claimed.ok) throw new Error(claimed.error.code);
+    await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
+
+    const handler = createDispatchResolveHandler({
+      progress,
+      admission,
+      stdin: stdinOf(dispatchResolveConfirmationPhrase),
+    });
+    const result = await handler({ jobId: jobA, as: "cancelled" });
+    expect(result.state).toBe("success");
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      state: "resolved",
+      as: "cancelled",
+      admissionReleased: "released",
+    });
+
+    const record = await progress.load(jobA);
+    expect(record).toMatchObject({ ok: true, value: { stage: { kind: "cancelled" } } });
+    const claim = await admission.load(projectId, issueId);
+    expect(claim).toMatchObject({
+      ok: true,
+      value: { state: "released", releaseReason: "cancelled" },
+    });
+
+    // Same proof as the `requires_manual` case above: the issue can be claimed again -- the
+    // exact liveness property the incident this ticket closes was missing entirely.
+    const reclaimed = await admission.claim(projectId, issueId);
+    expect(reclaimed.ok).toBe(true);
+  });
+
   it("--as superseded --superseded-by writes {kind:superseded, supersededByJobId} and releases the claim with reason superseded", async () => {
     const { progress, admission } = await setup();
     await progress.compareAndSwap(jobA, null, baseRecord());

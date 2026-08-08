@@ -79,6 +79,25 @@ const providerRetryCountSchema = z.number().int().min(0).max(100);
 const lastErrorCodeSchema = z.string().trim().min(1).max(64);
 
 /**
+ * C016 fix: mirrors `ImplementerPipelineOutcome`'s own `paused` `reason` union
+ * (application/pipelines/implementer-model.ts) *by value*, not by import -- same rationale as
+ * `lastErrorCodeSchema` right above: this adapter file must never need to import the application
+ * layer's union just to stay in sync with it. Optional on the stage below for two independent
+ * reasons: (1) `resume-composition.ts`'s own two `"checkpointed"` transitions (CiRecoveryPipeline/
+ * ReviewerPipeline) write this same `paused` stage with no comparable "reason" concept at all --
+ * that outcome is `state:"checkpointed"`, a different shape from `ImplementerPipelineOutcome`'s
+ * `state:"paused"` entirely, and always has been; (2) every `paused` record ever written before
+ * this ticket has no such field at all and must keep reading back successfully (this ticket, like
+ * every prior one touching this store, is forbidden from editing or migrating any existing file
+ * under `~/.agent-team/state`). */
+const pauseReasonSchema = z.enum([
+  "scope_overrun",
+  "safety_approval_required",
+  "provider_interrupted",
+  "no_changes",
+]);
+
+/**
  * C015r decision 1: `requires_manual` used to be the bare `{kind:"requires_manual"}` below --
  * C015q's diagnosis (`/home/markchou/.claude/jobs/6152588f/tmp/c015q-diagnose.md`, item 5) proved
  * this loses every diagnostic signal the instant a job lands there: the only place the *reason* ever
@@ -293,7 +312,32 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   // References a real domain Checkpoint (src/domain/checkpoint/) -- checkpoint's own paused/
   // human-handoff semantics are unchanged; this is only a pointer so a resume attempt knows one
   // exists, per the decision layer's "進度檔與 checkpoint 並存不互斥" instruction.
-  z.object({ kind: z.literal("paused"), checkpointId: checkpointIdSchema }).strict(),
+  //
+  // C016 fix: `checkpointId` used to be required here -- correct for `resume-composition.ts`'s
+  // own two `"checkpointed"` transitions (which always have one), but wrong for the case this
+  // ticket closes: `handlers.ts`'s dispatch-time write of `ImplementerPipelineOutcome`'s own
+  // `state:"paused"` (`reason: "safety_approval_required"|"provider_interrupted"|"no_changes"`)
+  // explicitly may have *no* checkpoint at all -- only `"scope_overrun"` (via
+  // `ImplementerPreflightPort`) ever captures one. Making it optional is exactly why `pauseReason`
+  // exists right above: without it, a human reading this record back would have no way to tell
+  // "no checkpoint because none was ever taken" apart from "a checkpoint write silently failed."
+  //
+  // Codex's own corrected framing of the invariant this write establishes (see this ticket's own
+  // packet): **not** "every active admission claim has a job-progress record" -- claim writes
+  // happen before the job (and its progress record) even exists, and `attachJob`
+  // (issue-admission-store.ts) is itself best-effort, a disclosed crash window that this ticket
+  // does not (and cannot) close. The actual invariant is narrower and absolute: *every `paused`
+  // pipeline outcome this process itself produces must be durably persisted here before the
+  // handler that produced it ever returns to its caller* -- see `handlers.ts`'s own comment on its
+  // `state === "paused"` write for why (the durable-claim `dispatch resolve` escape hatch is
+  // useless against a job it can never find).
+  z
+    .object({
+      kind: z.literal("paused"),
+      checkpointId: checkpointIdSchema.optional(),
+      pauseReason: pauseReasonSchema.optional(),
+    })
+    .strict(),
   // A resume attempt found the recorded state did not match live reality (branch/head SHA/open
   // status mismatch) -- fail-closed: never guessed at, never auto-corrected, left for a human.
   // C015r decision 1: `cause` is optional -- see this file's own comment right above

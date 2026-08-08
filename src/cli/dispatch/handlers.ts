@@ -21,6 +21,7 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import { createClock, type Clock } from "../../domain/foundation/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
 import {
@@ -56,6 +57,7 @@ import {
   type BuildResumeCompositionResult,
 } from "./resume-full-composition.js";
 import { createDispatchResolveHandler } from "./resolve-handlers.js";
+import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 
 export interface CreateDispatchCliHandlersOptions {
@@ -92,7 +94,7 @@ const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = 
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
 
-type DispatchHandlers = Pick<CliHandlers, "run" | "dispatchResolve">;
+type DispatchHandlers = Pick<CliHandlers, "run" | "dispatchResolve" | "dispatchResolveLegacyClaim">;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
   draft_unavailable:
@@ -202,8 +204,17 @@ export function createDispatchCliHandlers(
     admission: buildIssueAdmissionStore(options.agentTeamHome),
   });
 
+  // C016: same "no --dry-run concept" rationale as `dispatchResolve` right above -- this is
+  // itself a manual, human-confirmed repair of a real durable claim; a dry-run version would have
+  // nothing meaningful to predict.
+  const dispatchResolveLegacyClaim = createDispatchResolveLegacyClaimHandler({
+    progress: buildJobProgressStore(options.agentTeamHome),
+    admission: buildIssueAdmissionStore(options.agentTeamHome),
+  });
+
   return Object.freeze({
     dispatchResolve,
+    dispatchResolveLegacyClaim,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
         return outcome("blocked", {
@@ -523,6 +534,21 @@ export function createDispatchCliHandlers(
           // `agent-team run` (item 2's resume path) has no other way to find this job again.
           // Written before returning, not best-effort afterward: a `ci_waiting` outcome with no
           // corresponding progress record would be silently unresumable forever.
+          //
+          // C016 fix: the exact same "written before returning" discipline now also applies to
+          // `state:"paused"` right below -- this branch used to not exist at all, which is the
+          // root cause this ticket closes. The per-issue admission claim
+          // (issue-admission-store.ts) is claimed *before* this job was even created (C015o
+          // decision 3) and is never released automatically for a non-terminal stage (that
+          // store's own header, deliberately unchanged by this ticket). `dispatch resolve`
+          // (resolve-handlers.ts) is the *only* CLI path that can ever release it, and it always
+          // looks the job up by this exact progress record first -- so a `paused` outcome that
+          // returned here without ever persisting one left that claim durably, permanently
+          // unreleasable: no CLI command could find the job to resolve it, and
+          // issue-admission-store.ts's own conservative "never auto-release a non-terminal stage"
+          // policy correctly refuses to help either (this is the real incident that produced
+          // this ticket, `issue_78bf4038`/LEA-16). See job-progress-store.ts's own comment on the
+          // `paused` stage variant for the precise invariant this write establishes.
           if (pipelineOutcome.state === "ci_waiting") {
             const headSha = headShaSchema.safeParse(pipelineOutcome.commit.sha);
             if (!headSha.success) {
@@ -562,6 +588,50 @@ export function createDispatchCliHandlers(
               changeRequestId: String(pipelineOutcome.changeRequest.number),
               headSha: headSha.data,
               baseRevision: dispatchBaseRevision.data,
+            });
+            if (!recorded.ok) {
+              return outcome("failed", {
+                ...dispatchedPayload,
+                pipeline: "failed",
+                pipelineReason: "job_progress_write_failed",
+                error: recorded.error,
+              });
+            }
+          }
+          // C016 fix: see this branch's sibling comment above (right before the `ci_waiting`
+          // write) for the full incident this closes. `checkpointId` is genuinely optional on
+          // `ImplementerPipelineOutcome`'s own `paused` variant (only `"scope_overrun"` ever
+          // carries one) -- parsed here, not trusted verbatim, for the same reason the
+          // `ci_waiting` branch above never trusts `pipelineOutcome.commit.sha` verbatim: a
+          // malformed value from this process's own pipeline is an internal invariant violation,
+          // not something a resume attempt should ever have to guard against later.
+          if (pipelineOutcome.state === "paused") {
+            let parsedCheckpointId: ReturnType<typeof checkpointIdSchema.parse> | undefined;
+            if (pipelineOutcome.checkpointId !== undefined) {
+              const checkpointId = checkpointIdSchema.safeParse(pipelineOutcome.checkpointId);
+              if (!checkpointId.success) {
+                return outcome("failed", {
+                  ...dispatchedPayload,
+                  pipeline: "failed",
+                  pipelineReason: "job_progress_write_failed",
+                  error: { code: "invariant_violation" },
+                });
+              }
+              parsedCheckpointId = checkpointId.data;
+            }
+            const recorded = await progress.compareAndSwap(result.job.id, null, {
+              jobId: result.job.id,
+              projectId: build.value.project.id,
+              issueId: result.job.issueId,
+              externalIssueId: issue.externalId,
+              model,
+              stage: {
+                kind: "paused",
+                pauseReason: pipelineOutcome.reason,
+                ...(parsedCheckpointId === undefined ? {} : { checkpointId: parsedCheckpointId }),
+              },
+              branch: request.value.branch,
+              worktreePath: request.value.worktreePath,
             });
             if (!recorded.ok) {
               return outcome("failed", {

@@ -39,6 +39,7 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
   return {
     run: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
+    dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     health: vi.fn(() => Promise.resolve(outcome)),

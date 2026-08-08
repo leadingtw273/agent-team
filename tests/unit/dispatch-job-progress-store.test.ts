@@ -170,6 +170,12 @@ describe("FileJobProgressStore", () => {
       { kind: "completed" as const },
       { kind: "failed" as const },
       { kind: "paused" as const, checkpointId },
+      // C016 fix: `checkpointId` is now optional (`ImplementerPipelineOutcome`'s own `paused`
+      // outcome may have no checkpoint at all) and `pauseReason` is a new optional field --
+      // every combination must still parse, including the bare pre-C016 shape above.
+      { kind: "paused" as const },
+      { kind: "paused" as const, pauseReason: "scope_overrun" as const },
+      { kind: "paused" as const, checkpointId, pauseReason: "no_changes" as const },
       // C015r decision 1: `cause` stays optional -- a bare pre-C015r record must still parse.
       { kind: "requires_manual" as const },
       {
@@ -212,6 +218,60 @@ describe("FileJobProgressStore", () => {
       });
       expect(parsed.success).toBe(true);
     }
+  });
+
+  describe("C016: paused stage carries pauseReason, checkpointId genuinely optional", () => {
+    it("round-trips a paused stage with both checkpointId and pauseReason through a real compareAndSwap/load", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const checkpointId = id("checkpoint", "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+      await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ stage: { kind: "paused", checkpointId, pauseReason: "scope_overrun" } }),
+      );
+      const loaded = await store.load(jobId);
+      expect(loaded.ok).toBe(true);
+      if (loaded.ok) {
+        expect(loaded.value?.stage).toEqual({
+          kind: "paused",
+          checkpointId,
+          pauseReason: "scope_overrun",
+        });
+      }
+    });
+
+    it("round-trips a paused stage with pauseReason but no checkpointId at all -- the exact shape ImplementerPipelineOutcome's own `provider_interrupted`/`no_changes`/`safety_approval_required` reasons produce", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ stage: { kind: "paused", pauseReason: "provider_interrupted" } }),
+      );
+      const loaded = await store.load(jobId);
+      expect(loaded.ok).toBe(true);
+      if (loaded.ok) {
+        expect(loaded.value?.stage).toEqual({
+          kind: "paused",
+          pauseReason: "provider_interrupted",
+        });
+      }
+    });
+
+    it("still round-trips a pre-C016 paused record shape -- checkpointId only, no pauseReason at all", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const checkpointId = id("checkpoint", "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+      await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ stage: { kind: "paused", checkpointId } }),
+      );
+      const loaded = await store.load(jobId);
+      expect(loaded.ok).toBe(true);
+      if (loaded.ok) expect(loaded.value?.stage).toEqual({ kind: "paused", checkpointId });
+    });
   });
 
   it("listForProject returns every record for that project regardless of stage, and none for another project", async () => {

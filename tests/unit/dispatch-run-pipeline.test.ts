@@ -380,6 +380,143 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     expect(payload.checkpointId).toBe("checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab");
   });
 
+  /**
+   * C016 fix: before this ticket, `handlers.ts` never persisted a job-progress record for a
+   * `paused` pipeline outcome at all -- only the CLI's own JSON stdout (asserted above) carried
+   * the checkpoint/reason, gone the instant the process exits. This is the exact defect that left
+   * the per-issue admission claim (issue-admission-store.ts) durably, permanently unreleasable:
+   * `dispatch resolve` (resolve-handlers.ts) always looks the job up by this record first, and
+   * with none ever written, it can never find it. Reads the record back through a real
+   * `FileJobProgressStore`, mirroring the `ci_waiting`-record test above (P0-5) that already
+   * covers the sibling write this ticket's fix is symmetric with.
+   */
+  it("C016: persists a durable job-progress record for a paused pipeline outcome, with pauseReason and checkpointId both preserved -- the write dispatch resolve depends on to ever find this job again", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "paused",
+            reason: "scope_overrun",
+            worktree: {
+              repositoryRoot: repositoryPath,
+              path: "/tmp/wt",
+              branch: "agent-team/job-1",
+              headSha: "a".repeat(40),
+            },
+            checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        stage: {
+          kind: "paused",
+          pauseReason: "scope_overrun",
+          checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+        },
+      });
+    }
+  });
+
+  /**
+   * C016 fix: `ImplementerPipelineOutcome`'s own `paused` variant explicitly allows *no*
+   * checkpoint at all -- only `reason:"scope_overrun"` (via `ImplementerPreflightPort`) ever
+   * captures one; `provider_interrupted`/`no_changes`/`safety_approval_required` never do. The
+   * job-progress record must still be written (this is the entire point of this ticket's fix),
+   * just with no `checkpointId` field at all rather than some placeholder value.
+   */
+  it("C016: persists a paused job-progress record with no checkpointId at all when the pipeline outcome carries none", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "paused",
+            reason: "provider_interrupted",
+            worktree: {
+              repositoryRoot: repositoryPath,
+              path: "/tmp/wt",
+              branch: "agent-team/job-1",
+              headSha: "a".repeat(40),
+            },
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]?.stage).toEqual({
+        kind: "paused",
+        pauseReason: "provider_interrupted",
+      });
+    }
+  });
+
+  /**
+   * C016 fix: symmetric to the existing `ci_waiting` fail-closed test below (P0-5) -- a malformed
+   * `checkpointId` on the pipeline's own outcome (never expected in production; `checkpointIdSchema`
+   * is this process's own internal invariant, not external input) must fail closed to
+   * `job_progress_write_failed` and leave *no* progress record at all, never a partial or
+   * malformed one that a later `dispatch resolve` could misread.
+   */
+  it("C016: fails closed to job_progress_write_failed, writing no progress record at all, when the paused outcome's own checkpointId fails checkpointIdSchema's guard", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "paused",
+            reason: "scope_overrun",
+            worktree: {
+              repositoryRoot: repositoryPath,
+              path: "/tmp/wt",
+              branch: "agent-team/job-1",
+              headSha: "a".repeat(40),
+            },
+            // Deliberately not a real `checkpoint_<uuid>`-shaped identifier.
+            checkpointId: "not-a-real-checkpoint-id",
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      error: { code: string };
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    expect(payload.error.code).toBe("invariant_violation");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toEqual([]);
+  });
+
   it("maps a failed pipeline outcome (e.g. the Claude process itself failing) to a failed payload, never crashing", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();

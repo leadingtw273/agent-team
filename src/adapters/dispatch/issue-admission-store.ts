@@ -73,9 +73,25 @@ export const issueAdmissionReleaseReasonSchema = z.enum([
   "cancelled",
   "superseded",
   "not_dispatched",
+  // C016 fix: the *only* release reason not reachable through `dispatch resolve`'s normal
+  // "resolve a job-progress record" model -- see `createDispatchResolveLegacyClaimHandler`
+  // (legacy-claim-handlers.ts) for the full rationale. Exists solely for a claim that has *no*
+  // job-progress record to resolve against at all (the exact bug this ticket closes: a `paused`
+  // outcome that returned without ever persisting one). Deliberately never written by anything
+  // other than that one handler, and always requires `releaseNote` below (a human-authored audit
+  // trail of *why* this claim was recovered outside the normal model) -- this is a controlled
+  // repair path, not a second, quieter way to release an ordinary stuck claim.
+  "legacy_recovered",
 ]);
 
 export type IssueAdmissionReleaseReason = z.infer<typeof issueAdmissionReleaseReasonSchema>;
+
+/** C016 fix: required exactly when `releaseReason === "legacy_recovered"` (enforced below) --
+ * the durable, on-disk audit trail `createDispatchResolveLegacyClaimHandler` leaves behind
+ * instead of silently deleting or rewriting the claim file. Bounded the same way every other
+ * free-text-ish field in this codebase's adapters layer is (never unbounded, never the reason to
+ * reject a legitimate note). */
+const releaseNoteSchema = z.string().trim().min(1).max(2000);
 
 export const issueAdmissionRecordSchema = z
   .object({
@@ -96,6 +112,11 @@ export const issueAdmissionRecordSchema = z
      * actually owns this issue going forward. Required exactly when superseded, absent otherwise
      * (enforced below, not left to convention). */
     supersededByJobId: jobIdSchema.optional(),
+    /** C016 fix: set by `createDispatchResolveLegacyClaimHandler` when
+     * `releaseReason === "legacy_recovered"` -- see that field's own schema comment. Required
+     * exactly when legacy-recovered, absent otherwise (enforced below, the same pairing
+     * discipline `supersededByJobId` above already established). */
+    releaseNote: releaseNoteSchema.optional(),
     claimedAt: instantSchema,
     updatedAt: instantSchema,
   })
@@ -127,6 +148,20 @@ export const issueAdmissionRecordSchema = z
         code: "custom",
         message: "supersededByJobId is only meaningful for a superseded release",
         path: ["supersededByJobId"],
+      });
+    }
+    if (record.releaseReason === "legacy_recovered" && record.releaseNote === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "a legacy-recovered release must carry an audit note",
+        path: ["releaseNote"],
+      });
+    }
+    if (record.releaseReason !== "legacy_recovered" && record.releaseNote !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "releaseNote is only meaningful for a legacy-recovered release",
+        path: ["releaseNote"],
       });
     }
   });
@@ -163,6 +198,9 @@ export interface IssueAdmissionPort {
     expectedRevision: number,
     reason: IssueAdmissionReleaseReason,
     supersededByJobId?: string,
+    /** C016 fix: required exactly when `reason === "legacy_recovered"` -- see
+     * `releaseNoteSchema`'s own comment. */
+    note?: string,
   ): Promise<Result<IssueAdmissionRecord, DomainError>>;
 }
 
@@ -301,14 +339,18 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
     expectedRevision: number,
     reason: IssueAdmissionReleaseReason,
     supersededByJobId?: string,
+    note?: string,
     options: ReadOptions = {},
   ): Promise<Result<IssueAdmissionRecord, DomainError>> {
     const parsedSupersededBy =
       supersededByJobId === undefined ? undefined : jobIdSchema.safeParse(supersededByJobId);
+    const parsedNote = note === undefined ? undefined : releaseNoteSchema.safeParse(note);
     if (
       !isValidCompositeKey(projectId, issueId) ||
       (reason === "superseded") !== (supersededByJobId !== undefined) ||
+      (reason === "legacy_recovered") !== (note !== undefined) ||
       (parsedSupersededBy !== undefined && !parsedSupersededBy.success) ||
+      (parsedNote !== undefined && !parsedNote.success) ||
       options.signal?.aborted === true
     ) {
       return err(domainError("invariant_violation"));
@@ -327,6 +369,7 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
         ...(parsedSupersededBy?.success === true
           ? { supersededByJobId: parsedSupersededBy.data }
           : {}),
+        ...(parsedNote?.success === true ? { releaseNote: parsedNote.data } : {}),
       });
     });
     const released = await acquired.value.release();
