@@ -17,7 +17,8 @@
 | 欄位 | 從哪個 commit 開始寫入 | 回滾到早於該 commit 前必須先處理 |
 |---|---|---|
 | `JobProgressRecord.stage.paused.pauseReason` | C016（`edcef59` 之前不存在） | 是 |
-| `RequiresManualStage` 新增 `"dispatch"` 值、`RequiresManualReasonCode` 新增 `implementer_request_invalid`／`implementer_composition_blocked`／`authoritative_base_unavailable`／`worktree_directory_unavailable`／`implementer_pipeline_failed`／`invalid_base_revision` | C018（本次變更） | 是 |
+| `RequiresManualStage` 新增 `"dispatch"` 值、`RequiresManualReasonCode` 新增 `implementer_request_invalid`／`implementer_composition_blocked`／`authoritative_base_unavailable`／`worktree_directory_unavailable`／`implementer_pipeline_failed`／`invalid_base_revision` | C018（`d056a38`） | 是 |
+| `RequiresManualReasonCode` 新增 `role_pipeline_unavailable`（非 implementer 角色出口）；`IssueAdmissionRecord.releaseReason` 新增 `legacy_recovered` 與 `releaseNote` 欄位 | C019（`943bd75`）／C016（`edcef59`） | 是 |
 
 ### 裁決
 
@@ -28,7 +29,8 @@
 **回滾到 pre-C016（早於 `edcef59`）或 pre-C018 版本之前，必須先清理或遷移 `state/dispatch/progress/` 與 `state/dispatch/admission/` 下所有含以下內容的 record：**
 
 - `stage.kind === "paused"` 且帶 `pauseReason` 欄位的 record（C016 起才會寫入）。
-- `stage.kind === "requires_manual"` 且 `cause.stage === "dispatch"`，或 `cause.reasonCode` 為上表列出的 C018 新增值的 record。
+- `stage.kind === "requires_manual"` 且 `cause.stage === "dispatch"`，或 `cause.reasonCode` 為上表列出的 C018／C019 新增值（含 `role_pipeline_unavailable`）的 record。
+- `state/dispatch/admission/` 下 `releaseReason === "legacy_recovered"` 或帶 `releaseNote` 欄位的 record（C016 起才會寫入）。
 
 清理方式（任一即可）：
 
