@@ -255,4 +255,96 @@ describe("FileJobProgressStore", () => {
   it("fails closed on a relative directory path", () => {
     expect(() => new FileJobProgressStore("relative/path")).toThrow();
   });
+
+  /**
+   * C015z decision (P0-5): `baseRevision`'s own field header (this file) documents write-once
+   * immutability as an invariant this store enforces directly, at `#compareAndSwapLocked` -- not
+   * merely a convention every caller has to remember (which is exactly the shape of bug class
+   * C015y/C015z's `resolveLegacyBaseRevision` history demonstrated: nothing at the store layer
+   * would have stopped a future caller from silently overwriting or dropping an already-persisted
+   * value). These four tests exercise that mechanism directly, independent of any CLI-layer caller.
+   */
+  describe("baseRevision write-once immutability (C015z decision P0-5)", () => {
+    it("a mutation that attempts to change an already-persisted baseRevision is rejected, fail-closed, leaving the record untouched", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const original = headSha("a".repeat(40));
+      const created = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ baseRevision: original }),
+      );
+      expect(created.ok).toBe(true);
+
+      const changed = await store.compareAndSwap(
+        jobId,
+        0,
+        baseRecord({ baseRevision: headSha("b".repeat(40)), stage: { kind: "awaiting_review" } }),
+      );
+      expect(changed.ok).toBe(false);
+      if (!changed.ok) expect(changed.error.code).toBe("invariant_violation");
+
+      const reloaded = await store.load(jobId);
+      expect(reloaded.ok).toBe(true);
+      if (reloaded.ok) {
+        expect(reloaded.value?.baseRevision).toBe(original);
+        expect(reloaded.value?.revision).toBe(0);
+        expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      }
+    });
+
+    it("a mutation that omits a previously-persisted baseRevision is rejected, not silently dropped", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const original = headSha("a".repeat(40));
+      await store.compareAndSwap(jobId, null, baseRecord({ baseRevision: original }));
+
+      const dropped = await store.compareAndSwap(
+        jobId,
+        0,
+        baseRecord({ stage: { kind: "awaiting_review" } }), // no `baseRevision` at all
+      );
+      expect(dropped.ok).toBe(false);
+      if (!dropped.ok) expect(dropped.error.code).toBe("invariant_violation");
+
+      const reloaded = await store.load(jobId);
+      expect(reloaded.ok).toBe(true);
+      if (reloaded.ok) {
+        expect(reloaded.value?.baseRevision).toBe(original);
+        expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+      }
+    });
+
+    it("a mutation that repeats the exact same baseRevision (the normal case -- every real caller carries it forward unchanged) is accepted", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const original = headSha("a".repeat(40));
+      await store.compareAndSwap(jobId, null, baseRecord({ baseRevision: original }));
+
+      const advanced = await store.compareAndSwap(
+        jobId,
+        0,
+        baseRecord({ baseRevision: original, stage: { kind: "awaiting_review" } }),
+      );
+      expect(advanced.ok).toBe(true);
+      if (advanced.ok) {
+        expect(advanced.value.baseRevision).toBe(original);
+        expect(advanced.value.stage).toEqual({ kind: "awaiting_review" });
+      }
+    });
+
+    it("a legacy record with no baseRevision yet is unaffected by this invariant -- one can still be established for the first time", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      await store.compareAndSwap(jobId, null, baseRecord()); // no baseRevision
+
+      const written = await store.compareAndSwap(
+        jobId,
+        0,
+        baseRecord({ baseRevision: headSha("c".repeat(40)) }),
+      );
+      expect(written.ok).toBe(true);
+      if (written.ok) expect(written.value.baseRevision).toBe("c".repeat(40));
+    });
+  });
 });

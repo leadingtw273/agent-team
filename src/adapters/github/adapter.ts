@@ -69,20 +69,46 @@ const projectedChangeRequestSchema = z
       "unstable",
       "unknown",
     ]),
-    // C015x decision 3: GitHub's own current base-branch tip (`.base.sha`).
+    // GitHub's own `.base.sha` -- the base commit SHA frozen at PR-readback time, *not* the base
+    // branch's live tip (see `ChangeRequestSnapshot.baseSha`'s own header, source-control.ts, for
+    // why the prior comment here calling it "current base-branch tip" was wrong -- C015z decision Q3).
     baseSha: z.string().regex(shaPattern),
     autoMergeEnabled: z.boolean(),
     updatedAt: z.string(),
   })
   .strict();
 const repositoryMetadataSchema = z.object({ defaultBranch: z.string().min(1) }).strict();
+/**
+ * C015z decision (Q1): the list endpoint (`GET /repos/{owner}/{repo}/pulls`) returns GitHub's
+ * `pull-request-simple` shape, which -- unlike the single-PR/create/patch endpoints' full
+ * `pull-request` shape `projectedChangeRequestSchema` above validates -- has **no**
+ * `mergeable`/`mergeable_state` field at all. Before this ticket, `draftCandidateProjection`
+ * embedded the exact same `changeRequestProjection` string the detail endpoints use, and
+ * `draftCandidateSchema` required `snapshot: projectedChangeRequestSchema` on every candidate --
+ * `mergeStateStatus` being schema-`required` (C015y decision B) turned every list-endpoint call
+ * into a guaranteed `external_failure`, breaking `createDraftChangeRequest`'s idempotent-reuse
+ * path (an existing open draft PR for this exact base/head) the instant it was reached in
+ * production. See `tests/contract/github-adapter-draft-candidate-projection.test.ts` for the real-jq
+ * proof against GitHub's actual `pull-request-simple` shape.
+ *
+ * This schema is therefore deliberately narrow: only the four fields `createDraftChangeRequest`'s
+ * own idempotency check needs (`number`, to re-fetch the full detail snapshot; `title`/`body`/
+ * `draft`, to verify the candidate is genuinely the same logical PR this call intended to create).
+ * It has **no** `mergeStateStatus` field -- not optional, structurally absent -- so any code that
+ * tried to read BEHIND-ness off a raw list candidate fails to typecheck, it does not merely fail at
+ * runtime. Once a candidate matches, `createDraftChangeRequest` always re-fetches the full,
+ * required-`mergeStateStatus` snapshot via `getChangeRequest` (the single-PR detail endpoint)
+ * before ever returning -- a list-shaped object is never smuggled out of this adapter disguised as
+ * a `ChangeRequestSnapshot`.
+ */
 const draftCandidateSchema = z
   .array(
     z
       .object({
+        number: z.number().int().positive(),
         title: z.string(),
         body: z.string(),
-        snapshot: projectedChangeRequestSchema,
+        draft: z.boolean(),
       })
       .strict(),
   )
@@ -268,8 +294,13 @@ function typedField(name: string, value: string): readonly string[] {
   return ["-F", `${name}=${value}`];
 }
 
+/** C015z decision (Q1): projects only `{number,title,body,draft}` -- the list (`pull-request-simple`)
+ * shape has no `mergeable`/`mergeable_state` field to project in the first place. Never embeds
+ * `changeRequestProjection` (that string is bound to the full `pull-request` shape the detail/
+ * create/patch endpoints return -- see `draftCandidateSchema`'s own header on why sharing one
+ * projection string across two differently-shaped endpoints was the root cause here). */
 function draftCandidateProjection(baseBranch: string, headBranch: string): string {
-  return `[.[] | select(.base.ref == ${JSON.stringify(baseBranch)} and .head.ref == ${JSON.stringify(headBranch)}) | {title,body:(.body // ""),snapshot:${changeRequestProjection}}][:2]`;
+  return `[.[] | select(.base.ref == ${JSON.stringify(baseBranch)} and .head.ref == ${JSON.stringify(headBranch)}) | {number,title,body:(.body // ""),draft}][:2]`;
 }
 
 function commentsProjection(marker: string): string {
@@ -340,11 +371,17 @@ export class GitHubAdapter implements SourceControlPort {
         existing.value.length !== 1 ||
         candidate?.title !== command.title ||
         candidate.body !== command.body ||
-        !candidate.snapshot.draft
+        !candidate.draft
       ) {
         return failure("conflict");
       }
-      return snapshotFromProjection(candidate.snapshot);
+      // C015z decision (Q1): `candidate` is the narrow list-shaped projection (no
+      // `mergeStateStatus`) -- it is never returned as-is. Re-fetch the full detail snapshot by PR
+      // number before ever handing a `ChangeRequestSnapshot` back to the caller.
+      return this.getChangeRequest(
+        { project: command.project, changeRequestId: String(candidate.number) },
+        options,
+      );
     }
     const created = await this.transport.requestJson(
       [

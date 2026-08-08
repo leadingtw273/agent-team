@@ -50,9 +50,26 @@ export interface ChangeRequestSnapshot {
    */
   readonly mergeStateStatus?:
     "clean" | "behind" | "blocked" | "dirty" | "draft" | "unstable" | "unknown";
-  /** C015x decision 3: GitHub's own current base-branch tip (`.base.sha`) -- needed to build the
-   * "has the base moved further since this job last observed it" fingerprint
-   * `resumeMergingStage` persists. Same optionality rationale as {@link mergeStateStatus} above. */
+  /**
+   * GitHub's own `.base.sha` -- the base commit SHA the PR's `base` ref pointed to at PR-creation
+   * (readback) time. **Not** the base branch's live tip: `.base.sha` is a value GitHub freezes
+   * once and never updates as the base branch advances (a PR opened against `main` yesterday still
+   * reports yesterday's `main` tip here today, however far `main` has moved since).
+   *
+   * C015z decision (Q3): the prior header here (C015x decision 3) called this "GitHub's own
+   * current base-branch tip" and `resolveLegacyBaseRevision` (resume-composition.ts) cross-checked
+   * it against a freshly re-resolved *live* tip on that false premise -- the two are structurally
+   * guaranteed to differ the instant the base branch advances past PR-creation time, which is
+   * exactly the situation that repair path existed to handle. See that function's own header for
+   * the corrected behavior (legacy records now fail closed to `requires_manual` unconditionally,
+   * never attempting to reconcile this field against anything).
+   *
+   * C015z decision (Q4): for the same reason, this field carries no discriminating "did the merge
+   * make progress" signal either -- `mergeFingerprintOf` (resume-composition.ts) no longer reads
+   * it. Still present here (optional, as before) purely for pre-existing test-fixture back-compat
+   * and because it remains genuine evidence worth recording on a `requires_manual` cause for a
+   * human to read.
+   */
   readonly baseSha?: string;
   readonly autoMergeEnabled: boolean;
   readonly updatedAt: Instant;
