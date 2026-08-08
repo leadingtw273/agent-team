@@ -10,6 +10,13 @@
 import { GhTransport, GitHubAdapter } from "../../adapters/github/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
 import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
+import { LinearVisualPublicationCoordinator } from "../../adapters/dispatch/linear-publication.js";
+import {
+  FileLinearPublicationStore,
+  defaultLinearPublicationDirectory,
+} from "../../adapters/dispatch/linear-publication-store.js";
+import type { LinearGraphqlTransport } from "../../adapters/linear/transport.js";
+import { LinearUploadClient } from "../../adapters/linear/upload.js";
 import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
@@ -43,6 +50,10 @@ export interface BuildResumeCompositionOptions {
   readonly teamId: string;
   readonly linearProjectId: string;
   readonly progress: FileJobProgressStore;
+  /** E102-5: the same transport `readModel`/`mutationClient` above already share -- used only to
+   * construct a real `LinearUploadClient` (upload.ts) for `LinearVisualPublicationCoordinator`,
+   * never a second, independently-configured connection. */
+  readonly linearTransport: LinearGraphqlTransport;
   /** E115cap: threaded through to `buildLifecyclePipeline` so a Linear cancellation can release
    * the cancelled issue's lease -- see `lifecycle-composition.ts`'s own header. */
   readonly leases: LeaseCoordinator;
@@ -65,6 +76,7 @@ export type ResumePipelineComposition = Pick<
   | "lifecycle"
   | "visualEvidence"
   | "visualReviewModel"
+  | "linearPublication"
 >;
 
 export type BuildResumeCompositionResult =
@@ -125,6 +137,17 @@ export async function buildResumeComposition(
   // is `options.geminiConfig`'s own first allowlisted model, never `record.model` (that is this
   // job's *code*-review Claude model, which a real `GeminiRunner` would reject outright).
   const visualReviewModel = options.geminiConfig?.models[0];
+  // E102-5: `LinearUploadClient` (A004, upload.ts) shares `options.linearTransport` with
+  // `options.mutationClient` -- never a second, independently-configured connection --
+  // `options.mutationClient` itself already satisfies `LinearCommentWriter` (its own
+  // `appendComment` matches that interface exactly, see `LinearVisualPublicationCoordinator`'s own
+  // constructor). `FileLinearPublicationStore` is rooted at the same `agentTeamHome` every other
+  // adapter in this function's return value is.
+  const linearPublication = new LinearVisualPublicationCoordinator(
+    new LinearUploadClient(options.linearTransport, options.mutationClient),
+    options.mutationClient,
+    new FileLinearPublicationStore(defaultLinearPublicationDirectory(options.agentTeamHome)),
+  );
 
   return Object.freeze({
     state: "ready",
@@ -137,6 +160,7 @@ export async function buildResumeComposition(
       autoMerge: statusMerge.value.autoMergeGate,
       lifecycle,
       visualEvidence,
+      linearPublication,
       ...(visualReviewModel === undefined ? {} : { visualReviewModel }),
     }),
   });
