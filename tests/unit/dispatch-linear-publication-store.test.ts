@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   FileLinearPublicationStore,
+  aggregateLinearPublicationDigest,
   canonicalLinearPublicationReceipt,
   linearPublicationReceiptDigest,
   type NewLinearPublicationReceipt,
@@ -184,5 +185,40 @@ describe("canonicalLinearPublicationReceipt / linearPublicationReceiptDigest", (
     expect(linearPublicationReceiptDigest(created.value)).not.toBe(
       linearPublicationReceiptDigest(createdOther.value),
     );
+  });
+});
+
+describe("aggregateLinearPublicationDigest", () => {
+  it("is independent of receipt order and changes when receipt content changes", async () => {
+    const store = new FileLinearPublicationStore(await temporaryDirectory());
+    const first = await store.create(receipt());
+    const second = await store.create(
+      receipt({
+        headSha: (() => {
+          const parsed = headShaSchema.safeParse("e".repeat(40));
+          if (!parsed.success) throw new Error("fixture invariant violated");
+          return parsed.data;
+        })(),
+        artifacts: [
+          {
+            path: `.agent-team/evidence/${issueId}/${"e".repeat(40)}/status-none.png`,
+            sha256: "f".repeat(64),
+            assetUrl: "https://uploads.linear.app/asset-2",
+            commentId: "comment-artifact-2",
+          },
+        ],
+      }),
+    );
+    expect(first.ok && second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+
+    const aggregate = aggregateLinearPublicationDigest([first.value, second.value]);
+    expect(aggregate).toBe(aggregateLinearPublicationDigest([second.value, first.value]));
+    expect(
+      aggregateLinearPublicationDigest([
+        { ...first.value, manifestDigest: "9".repeat(64) },
+        second.value,
+      ]),
+    ).not.toBe(aggregate);
   });
 });

@@ -4,7 +4,11 @@ import type { VisualManifest } from "../../domain/checkpoint/index.js";
 import type { DomainError, Instant } from "../../domain/foundation/index.js";
 import type { Job } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
-import type { ReviewIdentity, RequirementSnapshot } from "../../domain/review/index.js";
+import type {
+  CanonicalVisualManifestInput,
+  ReviewIdentity,
+  RequirementSnapshot,
+} from "../../domain/review/index.js";
 import { repositoryRelativePathSchema } from "../../domain/project/index.js";
 import type { TrustedProjectConfig } from "../projects/index.js";
 import type {
@@ -142,6 +146,8 @@ export const reviewerReportSchema = z
     requirementsDigest: sha256Schema,
     headSha: headShaSchema,
     diffDigest: sha256Schema,
+    evidenceDigest: sha256Schema.optional(),
+    publicationDigest: sha256Schema.optional(),
     summary: nonEmptyTextSchema,
     acceptanceCriteria: z.array(acceptanceCriterionReviewSchema).min(1).max(100),
     qualityChecks: z.array(qualityCheckSchema).min(1).max(100),
@@ -165,6 +171,32 @@ export const reviewerReportSchema = z
     }
   });
 export type ReviewerReport = z.infer<typeof reviewerReportSchema>;
+
+export function canonicalVisualManifestInput(
+  manifest: VisualManifest,
+): CanonicalVisualManifestInput {
+  return {
+    schemaVersion: manifest.schemaVersion,
+    issueId: manifest.issueId,
+    commitSha: manifest.commitSha,
+    environment: {
+      runner: manifest.environment.runner,
+      operatingSystem: manifest.environment.operatingSystem,
+      ...(manifest.environment.applicationVersion === undefined
+        ? {}
+        : { applicationVersion: manifest.environment.applicationVersion }),
+      ...(manifest.environment.viewport === undefined
+        ? {}
+        : { viewport: { ...manifest.environment.viewport } }),
+    },
+    artifacts: manifest.artifacts.map((artifact) => ({
+      path: artifact.path,
+      sha256: artifact.sha256,
+      mediaType: artifact.mediaType,
+      acceptanceCriteria: artifact.acceptanceCriteria,
+    })),
+  };
+}
 
 /**
  * C015r decision 4 (failure-reason propagation, deliberately *not* a policy/verdict change): the
@@ -246,6 +278,7 @@ export interface ReviewerPipelineRequest {
   readonly models: Readonly<{ code?: string; visual?: string }>;
   readonly evidence: readonly ReviewEvidenceBlock[];
   readonly visualManifest?: VisualManifest;
+  readonly publicationDigest?: string;
   readonly deadlineAt: Instant;
   readonly idempotencyKeyPrefix: string;
   readonly signal?: AbortSignal;

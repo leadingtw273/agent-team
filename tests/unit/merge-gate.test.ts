@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  aggregateLinearPublicationDigest,
+  type LinearPublicationReceiptRecord,
+} from "../../src/adapters/dispatch/linear-publication-store.js";
+import {
   AutoMergeGate,
   REVIEW_STATUS_CONTEXT,
   ReviewStatusCoordinator,
@@ -11,6 +15,7 @@ import {
   type ReviewerReport,
   type ReviewStatusPorts,
 } from "../../src/application/pipelines/index.js";
+import { canonicalVisualManifestInput } from "../../src/application/pipelines/reviewer-model.js";
 import type {
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
@@ -24,12 +29,15 @@ import {
   type Instant,
 } from "../../src/domain/foundation/index.js";
 import { jobSchema } from "../../src/domain/jobs/index.js";
+import { visualManifestSchema } from "../../src/domain/checkpoint/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
 import {
   createRequirementSnapshot,
   createReviewIdentity,
+  evidenceDigestOf,
   type EffectiveTreeChange,
   type RequirementSnapshot,
+  type ReviewIdentity,
 } from "../../src/domain/review/index.js";
 
 const headSha = "a".repeat(40);
@@ -318,6 +326,105 @@ function mergeRequest(
   };
 }
 
+const dualIssue = issueSchema.parse({
+  ...issue,
+  id: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ac",
+  externalId: "ENG-124",
+  reviewRequirement: "dual_review",
+});
+const dualSnapshotResult = createRequirementSnapshot(dualIssue, now);
+if (!dualSnapshotResult.ok) throw new Error(dualSnapshotResult.error.code);
+const dualSnapshot = dualSnapshotResult.value;
+const dualAcceptanceCriterion =
+  dualIssue.acceptanceCriteria?.[0] ??
+  (() => {
+    throw new Error("Missing dual acceptance criterion.");
+  })();
+
+function dualManifest(artifactSha: string) {
+  return visualManifestSchema.parse({
+    schemaVersion: 1,
+    issueId: dualIssue.id,
+    commitSha: headSha,
+    generatedAt: now,
+    environment: { runner: "playwright", operatingSystem: "linux", applicationVersion: "1.2.3" },
+    artifacts: [
+      {
+        path: ".agent-team/evidence/ENG-124/status.png",
+        sha256: artifactSha,
+        mediaType: "image/png",
+        title: "Visual evidence",
+        acceptanceCriteria: [dualAcceptanceCriterion],
+      },
+    ],
+  });
+}
+
+function dualReceipt(manifest: ReturnType<typeof dualManifest>): LinearPublicationReceiptRecord {
+  return {
+    schemaVersion: 1,
+    projectId: project.id,
+    issueId: dualIssue.id,
+    externalIssueId: dualIssue.externalId,
+    headSha: identity.headSha,
+    manifestDigest: "b".repeat(64),
+    manifestComment: { id: "manifest-comment", sha256: "c".repeat(64) },
+    artifacts: manifest.artifacts.map((artifact) => ({
+      path: artifact.path,
+      sha256: artifact.sha256,
+      assetUrl: "https://uploads.linear.app/asset-1",
+      commentId: "artifact-comment",
+    })),
+    createdAt: now,
+  };
+}
+
+function dualReport(dualIdentity: ReviewIdentity, role: ReviewerReport["role"]): ReviewerReport {
+  return {
+    ...report,
+    role,
+    requirementsDigest: dualIdentity.requirementsDigest,
+    headSha: dualIdentity.headSha,
+    diffDigest: dualIdentity.diffDigest,
+    ...(dualIdentity.evidenceDigest === undefined
+      ? {}
+      : { evidenceDigest: dualIdentity.evidenceDigest }),
+    ...(dualIdentity.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: dualIdentity.publicationDigest }),
+    acceptanceCriteria: report.acceptanceCriteria.map((criterion) => ({
+      ...criterion,
+      criterion: dualAcceptanceCriterion,
+    })),
+  };
+}
+
+function dualApproval(dualIdentity: ReviewIdentity, reports: readonly ReviewerReport[]) {
+  return {
+    changeRequestId: "42",
+    identity: dualIdentity,
+    reports,
+    evidenceComment: {
+      id: "100",
+      url: "https://github.com/owner/repository/pull/42#issuecomment-100",
+      createdAt: now,
+    },
+  } as const;
+}
+
+function dualMergeRequest(
+  dualApprovalValue: ReturnType<typeof dualApproval>,
+  currentVisualManifest: ReturnType<typeof dualManifest>,
+  currentPublicationDigest: string,
+) {
+  return {
+    ...mergeRequest(headSha, dualSnapshot),
+    approval: dualApprovalValue,
+    currentVisualManifest,
+    currentPublicationDigest,
+  };
+}
+
 describe("review commit status coordination", () => {
   it("sets pending only after exact-Head successful CI and allows the PR to remain Draft", async () => {
     const calls: string[] = [];
@@ -478,6 +585,107 @@ describe("auto-merge gate", () => {
     expect(outcome).toMatchObject({ state: "failed", stage: "request" });
     expect(ports.sourceControl.getChangeRequest).not.toHaveBeenCalled();
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("keeps code_review-only approvals without evidence digests eligible for auto-merge", async () => {
+    const outcome = await new AutoMergeGate(mergePorts()).enable(mergeRequest());
+    expect(outcome).toMatchObject({ state: "auto_merge_enabled", identity });
+  });
+
+  it("requires matching evidence and publication digests on every dual-review report", async () => {
+    const manifest = dualManifest("d".repeat(64));
+    const publicationDigest = aggregateLinearPublicationDigest([dualReceipt(manifest)]);
+    const created = createReviewIdentity(dualSnapshot, headSha, diff, {
+      visualManifest: canonicalVisualManifestInput(manifest),
+      publicationDigest,
+    });
+    if (!created.ok) throw new Error(created.error.code);
+    const codeReport = dualReport(created.value, "code_reviewer");
+    const visualReport = dualReport(created.value, "visual_reviewer");
+    const valid = dualMergeRequest(
+      dualApproval(created.value, [codeReport, visualReport]),
+      manifest,
+      publicationDigest,
+    );
+
+    expect(await new AutoMergeGate(mergePorts()).enable(valid)).toMatchObject({
+      state: "auto_merge_enabled",
+    });
+    for (const invalidReports of [
+      [{ ...codeReport, evidenceDigest: undefined }, visualReport],
+      [{ ...codeReport, evidenceDigest: "f".repeat(64) }, visualReport],
+      [{ ...codeReport, publicationDigest: undefined }, visualReport],
+      [{ ...codeReport, publicationDigest: "f".repeat(64) }, visualReport],
+    ] as const) {
+      expect(
+        await new AutoMergeGate(mergePorts()).enable({
+          ...valid,
+          approval: dualApproval(created.value, invalidReports),
+        }),
+      ).toMatchObject({ state: "failed", stage: "request" });
+    }
+  });
+
+  it("invalidates an approved dual review and blocks merge when a visual artifact's SHA-256 changes", async () => {
+    const manifestV1 = dualManifest("d".repeat(64));
+    const receiptV1 = dualReceipt(manifestV1);
+    const publicationDigestV1 = aggregateLinearPublicationDigest([receiptV1]);
+    const approved = createReviewIdentity(dualSnapshot, headSha, diff, {
+      visualManifest: canonicalVisualManifestInput(manifestV1),
+      publicationDigest: publicationDigestV1,
+    });
+    if (!approved.ok) throw new Error(approved.error.code);
+    const approvalValue = dualApproval(approved.value, [
+      dualReport(approved.value, "code_reviewer"),
+      dualReport(approved.value, "visual_reviewer"),
+    ]);
+    const controlPorts = mergePorts();
+    expect(
+      await new AutoMergeGate(controlPorts).enable(
+        dualMergeRequest(approvalValue, manifestV1, publicationDigestV1),
+      ),
+    ).toMatchObject({ state: "auto_merge_enabled" });
+
+    const manifestV2 = dualManifest("e".repeat(64));
+    const evidenceDigestV1 = evidenceDigestOf(canonicalVisualManifestInput(manifestV1));
+    const evidenceDigestV2 = evidenceDigestOf(canonicalVisualManifestInput(manifestV2));
+    if (!evidenceDigestV1.ok || !evidenceDigestV2.ok) throw new Error("fixture invariant violated");
+    expect(evidenceDigestV2.value).not.toBe(evidenceDigestV1.value);
+    const driftPorts = mergePorts();
+    expect(
+      await new AutoMergeGate(driftPorts).enable(
+        dualMergeRequest(approvalValue, manifestV2, publicationDigestV1),
+      ),
+    ).toMatchObject({ state: "re_review_required" });
+    expect(driftPorts.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("invalidates an approved dual review and blocks merge when a Linear receipt's content changes", async () => {
+    const manifestV1 = dualManifest("d".repeat(64));
+    const receiptV1 = dualReceipt(manifestV1);
+    const publicationDigestV1 = aggregateLinearPublicationDigest([receiptV1]);
+    const approved = createReviewIdentity(dualSnapshot, headSha, diff, {
+      visualManifest: canonicalVisualManifestInput(manifestV1),
+      publicationDigest: publicationDigestV1,
+    });
+    if (!approved.ok) throw new Error(approved.error.code);
+    const approvalValue = dualApproval(approved.value, [
+      dualReport(approved.value, "code_reviewer"),
+      dualReport(approved.value, "visual_reviewer"),
+    ]);
+    const receiptV2: LinearPublicationReceiptRecord = {
+      ...receiptV1,
+      manifestComment: { ...receiptV1.manifestComment, sha256: "e".repeat(64) },
+    };
+    const publicationDigestV2 = aggregateLinearPublicationDigest([receiptV2]);
+    expect(publicationDigestV2).not.toBe(publicationDigestV1);
+    const driftPorts = mergePorts();
+    expect(
+      await new AutoMergeGate(driftPorts).enable(
+        dualMergeRequest(approvalValue, manifestV1, publicationDigestV2),
+      ),
+    ).toMatchObject({ state: "re_review_required" });
+    expect(driftPorts.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
   });
 
   it.each([

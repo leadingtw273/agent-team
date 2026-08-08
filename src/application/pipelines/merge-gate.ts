@@ -20,7 +20,7 @@ import {
   type ReviewStatusFailureStage,
   type ReviewStatusPorts,
 } from "./merge-gate-model.js";
-import { reviewerReportSchema } from "./reviewer-model.js";
+import { canonicalVisualManifestInput, reviewerReportSchema } from "./reviewer-model.js";
 
 function sameSha(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
@@ -95,6 +95,9 @@ function decisionMatchesRequest(request: RecordReviewRequest): boolean {
 }
 
 function validApproval(request: EnableAutoMergeRequest): boolean {
+  const requiresEvidence =
+    request.requirementSnapshot.issue.reviewRequirement === "dual_review" ||
+    request.requirementSnapshot.issue.reviewRequirement === "visual_review";
   const requiredRoles: readonly ("code_reviewer" | "visual_reviewer")[] =
     request.requirementSnapshot.issue.reviewRequirement === "code_review"
       ? ["code_reviewer"]
@@ -116,7 +119,15 @@ function validApproval(request: EnableAutoMergeRequest): boolean {
         sameSha(report.headSha, request.approval.identity.headSha) &&
         report.requirementsDigest === request.approval.identity.requirementsDigest &&
         report.diffDigest === request.approval.identity.diffDigest,
-    )
+    ) &&
+    (!requiresEvidence ||
+      (request.approval.identity.evidenceDigest !== undefined &&
+        request.approval.identity.publicationDigest !== undefined &&
+        request.approval.reports.every(
+          (report) =>
+            report.evidenceDigest === request.approval.identity.evidenceDigest &&
+            report.publicationDigest === request.approval.identity.publicationDigest,
+        )))
   );
 }
 
@@ -424,6 +435,14 @@ export class AutoMergeGate {
       request.requirementSnapshot,
       request.expectedHeadSha,
       diff.value,
+      {
+        ...(request.currentVisualManifest === undefined
+          ? {}
+          : { visualManifest: canonicalVisualManifestInput(request.currentVisualManifest) }),
+        ...(request.currentPublicationDigest === undefined
+          ? {}
+          : { publicationDigest: request.currentPublicationDigest }),
+      },
     );
     if (!identity.ok) return mergeFailure("diff", identity.error);
     const reuse = compareReviewIdentity(request.approval.identity, identity.value);

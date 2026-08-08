@@ -4,11 +4,14 @@ import { parseInstant } from "../../src/domain/foundation/index.js";
 import { issueSchema, type Issue } from "../../src/domain/project/index.js";
 import {
   canonicalSerialize,
+  canonicalVisualManifest,
   compareReviewIdentity,
   createDiffDigest,
   createRequirementSnapshot,
   createReviewIdentity,
+  evidenceDigestOf,
   effectiveTreeDiffSchema,
+  type CanonicalVisualManifestInput,
   type EffectiveTreeChange,
   type GitFileMode,
 } from "../../src/domain/review/index.js";
@@ -203,5 +206,123 @@ describe("effective tree diff digest", () => {
       ok: false,
       error: { code: "invariant_violation" },
     });
+  });
+});
+
+describe("review identity v2 — evidence and publication digests", () => {
+  const artifactZ = {
+    path: "evidence/z.png",
+    sha256: "d".repeat(64),
+    mediaType: "image/png",
+    acceptanceCriteria: ["Second criterion", "First criterion"],
+  } as const;
+  const artifactA = {
+    path: "evidence/a.png",
+    sha256: "e".repeat(64),
+    mediaType: "image/png",
+    acceptanceCriteria: ["Fourth criterion", "Third criterion"],
+  } as const;
+  const manifest: CanonicalVisualManifestInput = {
+    schemaVersion: 1,
+    issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    commitSha: sha1A,
+    environment: {
+      runner: "playwright",
+      operatingSystem: "linux",
+      applicationVersion: "1.2.3",
+      viewport: { width: 1440, height: 900, deviceScaleFactor: 2 },
+    },
+    artifacts: [artifactZ, artifactA],
+  };
+
+  it("canonicalizes visual manifests independently of artifact and criterion input order", () => {
+    const reordered: CanonicalVisualManifestInput = {
+      ...manifest,
+      artifacts: [...manifest.artifacts].reverse().map((artifact) => ({
+        ...artifact,
+        acceptanceCriteria: [...artifact.acceptanceCriteria].reverse(),
+      })),
+    };
+    expect(canonicalVisualManifest(manifest)).toEqual(canonicalVisualManifest(reordered));
+    const digest = evidenceDigestOf(manifest);
+    expect(digest.ok).toBe(true);
+    if (!digest.ok) return;
+    expect(digest.value).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  it("changes the evidence digest when one artifact SHA-256 or acceptance criterion changes", () => {
+    const original = valueOf(evidenceDigestOf(manifest));
+    const changedSha = {
+      ...manifest,
+      artifacts: [{ ...artifactZ, sha256: "f".repeat(64) }, artifactA],
+    };
+    const changedCriterion = {
+      ...manifest,
+      artifacts: [
+        { ...artifactZ, acceptanceCriteria: ["Changed criterion", "First criterion"] },
+        artifactA,
+      ],
+    };
+    expect(valueOf(evidenceDigestOf(changedSha))).not.toBe(original);
+    expect(valueOf(evidenceDigestOf(changedCriterion))).not.toBe(original);
+  });
+
+  it("keeps diffDigest pure while evidence and publication digests vary", () => {
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
+    const withoutEvidence = valueOf(createReviewIdentity(snapshot, sha1A, [change()]));
+    const withEvidence = valueOf(
+      createReviewIdentity(snapshot, sha1A, [change()], {
+        visualManifest: manifest,
+        publicationDigest: "b".repeat(64),
+      }),
+    );
+    expect(withoutEvidence.diffDigest).toBe(withEvidence.diffDigest);
+    expect(withoutEvidence.requirementsDigest).toBe(withEvidence.requirementsDigest);
+    expect(withoutEvidence.evidenceDigest).toBeUndefined();
+    expect(withoutEvidence.publicationDigest).toBeUndefined();
+    expect(withEvidence.evidenceDigest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(withEvidence.publicationDigest).toBe("b".repeat(64));
+  });
+
+  it("requires a full review when only evidence or publication digests differ", () => {
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
+    const approved = valueOf(
+      createReviewIdentity(snapshot, sha1A, [change()], {
+        visualManifest: manifest,
+        publicationDigest: "b".repeat(64),
+      }),
+    );
+    const evidenceChanged = valueOf(
+      createReviewIdentity(snapshot, sha1A, [change()], {
+        visualManifest: {
+          ...manifest,
+          artifacts: [{ ...artifactZ, sha256: "c".repeat(64) }, artifactA],
+        },
+        publicationDigest: "b".repeat(64),
+      }),
+    );
+    const publicationChanged = valueOf(
+      createReviewIdentity(snapshot, sha1A, [change()], {
+        visualManifest: manifest,
+        publicationDigest: "c".repeat(64),
+      }),
+    );
+    const noEvidence = valueOf(createReviewIdentity(snapshot, sha1A, [change()]));
+    expect(compareReviewIdentity(approved, evidenceChanged)).toBe("full_review");
+    expect(compareReviewIdentity(approved, publicationChanged)).toBe("full_review");
+    expect(compareReviewIdentity(noEvidence, noEvidence)).toBe("unchanged");
+  });
+
+  it("rejects malformed publication digests", () => {
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
+    expect(
+      createReviewIdentity(snapshot, sha1A, [change()], { publicationDigest: "not-hex" }),
+    ).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
   });
 });
