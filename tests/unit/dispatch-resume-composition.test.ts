@@ -11,7 +11,7 @@
  *
  * Covers: the happy path (ci_waiting -> CI green -> approved -> merged -> Lifecycle completed,
  * in one resume cycle); CI-red -> checkpointed (the "attempt-count" scenario); review-blocked,
- * not yet at the attempt limit -> fix_round; review-blocked, attempt limit reached ->
+ * not yet at the attempt limit -> implementer repair push; review-blocked, attempt limit reached ->
  * checkpointed (the "attempt-limit-checkpoint" scenario); lease conflict; exact-readback mismatch
  * -> requires_manual; a `"merging"`-staged job that re-checks merge status without re-running
  * CI/Review; a still-pending CI leaves the job at `ci_waiting` untouched.
@@ -38,6 +38,7 @@ import { LeaseCoordinator } from "../../src/application/leases/index.js";
 import {
   LifecyclePipeline,
   type CiRecoveryPipelineOutcome,
+  type ReviewerRecoveryPipelineOutcome,
   type ReviewerPipelineOutcome,
   type BeginReviewOutcome,
   type RecordReviewOutcome,
@@ -393,6 +394,7 @@ async function harness(
     changeRequestState: Readonly<Record<string, unknown>>;
     ciRecoveryOutcome: CiRecoveryPipelineOutcome;
     reviewerOutcome: ReviewerPipelineOutcome;
+    reviewerRecoveryOutcome: ReviewerRecoveryPipelineOutcome;
     beginOutcome: BeginReviewOutcome;
     recordOutcome: RecordReviewOutcome;
     enableOutcome: EnableAutoMergeOutcome;
@@ -461,6 +463,20 @@ async function harness(
         return Promise.resolve(
           overrides.reviewerOutcome ??
             ({ state: "approved", job: job(), changeRequest: changeRequest() } as never),
+        );
+      },
+    },
+    reviewerRecovery: {
+      run: () => {
+        calls.push("reviewerRecovery.run");
+        return Promise.resolve(
+          overrides.reviewerRecoveryOutcome ??
+            ({
+              state: "repair_pushed",
+              job: job(),
+              commit: { sha: "b".repeat(40), branch: "agent-team/job-1" },
+              push: { sha: "b".repeat(40), branch: "agent-team/job-1" },
+            } as ReviewerRecoveryPipelineOutcome),
         );
       },
     },
@@ -631,8 +647,8 @@ describe("runResumeCycle", () => {
     }
   });
 
-  it("review-blocked, attempt limit not yet reached -> stage fix_round", async () => {
-    const { deps, progress } = await harness({
+  it("review-blocked, attempt limit not yet reached -> reviewer recovery pushes repair", async () => {
+    const { deps, progress, calls } = await harness({
       reviewerOutcome: {
         state: "changes_requested",
         job: job(),
@@ -648,11 +664,80 @@ describe("runResumeCycle", () => {
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.value).toEqual([{ jobId, outcome: "fix_round", verdict: "changes_requested" }]);
+      expect(result.value).toEqual([{ jobId, outcome: "reviewer_fix_pushed" }]);
     }
+    expect(calls).toContain("reviewerRecovery.run");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("clarification_required keeps the existing fix_round transition without reviewer recovery", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewerOutcome: {
+        state: "clarification_required",
+        job: job(),
+        changeRequest: changeRequest(),
+        checks: {} as never,
+        identity: {} as never,
+        reports: [],
+        findings: [],
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "fix_round", verdict: "clarification_required" },
+      ]);
+    }
+    expect(calls).not.toContain("reviewerRecovery.run");
     const reloaded = await progress.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "fix_round" });
+  });
+
+  it("reviewer recovery checkpoint maps to a paused stage with its checkpoint id", async () => {
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "changes_requested",
+        job: job(),
+        changeRequest: changeRequest(),
+        checks: {} as never,
+        identity: {} as never,
+        reports: [],
+        findings: [],
+      },
+      reviewerRecoveryOutcome: {
+        state: "checkpointed",
+        reason: "attempt_limit_reached",
+        job: job(),
+        checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-2123456789ab",
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "checkpointed",
+          checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-2123456789ab",
+        },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "paused",
+        checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-2123456789ab",
+      });
+    }
   });
 
   it("review-blocked, attempt limit reached -> ReviewerPipeline checkpoints (attempt-limit-checkpoint scenario)", async () => {

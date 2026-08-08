@@ -11,3 +11,5 @@ export * from "./merge-gate-model.js";
 export * from "./merge-gate.js";
 export * from "./reviewer-model.js";
 export * from "./reviewer.js";
+export * from "./reviewer-recovery-model.js";
+export * from "./reviewer-recovery.js";
