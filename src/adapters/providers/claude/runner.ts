@@ -146,11 +146,89 @@ function toolsForRole(role: ProviderRunRequest["role"]): string {
  * alone does not close this -- `Read` by itself is sufficient to exfiltrate. Do not go back to a
  * bare `Read` grant for any role, including read-only ones (a reviewer has no legitimate need to
  * read outside the change request's own worktree either).
+ *
+ * C023 (P0 -- read this in full before touching `writableDirectories`, before re-introducing a
+ * bare `./**` grant, and *especially* before adding back a root-level `Write(./*)`/`Edit(./*)`
+ * grant): the `Write(./*)`/`Write(./**)`/`Edit(./*)`/`Edit(./**)` grant this ticket replaced
+ * covered the *entire* worktree recursively, including `.github/workflows/**` -- a provider
+ * running as `implementer`/`integration_engineer` could rewrite the repo's own CI/required-check
+ * definitions (delete a lint step, make a check always pass, ...) and thereby forge the very
+ * signal the pipeline relies on to gate merges.
+ *
+ * Two things were proven empirically against a real Claude CLI 2.1.223 process (not just read
+ * from docs -- `spikes/claude/cli-probe.mjs scope` reproduces both):
+ *
+ * 1. `--disallowedTools` is the *wrong* tool for excluding `.github`. Layering a directory-scoped
+ *    deny pattern (e.g. `Write(./.github/**)`) on top of a broad allow does block the write, but
+ *    the denial never reaches `permission_denials` -- it surfaces only as an in-band
+ *    `tool_result` error, so `ClaudeRun.#execute`'s existing `resultEvent.permissionDenials.length
+ *    > 0` check (the thing that turns a blocked write into `outcome: "interrupted"` plus a
+ *    checkpoint) never fires, and the run silently reports `completed` even though the specific
+ *    write it was asked to do was blocked.
+ * 2. A *root-level* bare-wildcard grant -- `Write(./*)`/`Edit(./*)`, with nothing before the
+ *    final `*` -- is not scoped to top-level files the way `Read(./*)` is. It was proven to grant
+ *    write access to `.github/workflows/ci.yml` (two directories deep) with zero denial, i.e. for
+ *    the Write/Edit tools specifically, a root-level `./*` behaves exactly like `./**`. This is
+ *    genuinely different from `Read(./*)`'s behavior (kept as-is below) and from a
+ *    directory-prefixed grant like `Write(./src/*)` (which *does* stay properly scoped to `src`
+ *    and was proven not to leak to `.github`) -- it is specific to an *empty* directory prefix on
+ *    Write/Edit. A handful of alternate root-scoping shapes were also tried and found to silently
+ *    grant *nothing* (denied exactly as if ungranted): an exact literal path with no wildcard
+ *    (`Write(./package.json)`) and a suffix-glob (`Write(./*.json)`) -- unlike `Read`, whose
+ *    literal-path form (`Read(./package.json)`) *does* work. There is therefore no proven-safe
+ *    `--allowedTools` syntax, in this CLI build, that grants Write/Edit on root-level files
+ *    (`package.json`, `tsconfig*.json`, ...) without also granting the entire tree including
+ *    `.github`. Given that root-level build/tooling files (`package.json` scripts, lint/tsconfig)
+ *    are *themselves* a CI-forging vector nearly as direct as editing the workflow file, the safe
+ *    choice under an explicit P0 security ticket is to accept that limitation rather than work
+ *    around it: `implementer`/`integration_engineer` get no root-level Write/Edit grant at all,
+ *    only the directory whitelist below. A follow-up ticket can revisit root-file writes (e.g. a
+ *    narrower mechanism outside `--allowedTools`) if that turns out to block real work in
+ *    practice; do not "fix" it by reintroducing `Write(./*)`/`Edit(./*)`.
+ *
+ * The proven-safe shape is therefore: an explicit allow-list of directories -- granting
+ * `Write`/`Edit` only under the specific top-level directories real tickets legitimately touch
+ * (`writableDirectories` below), each as `dir/*` + `dir/**`, never a repo-wide `./**` and never a
+ * bare root `./*`. This was proven, against the same real CLI, to route a `.github` write attempt
+ * through the *classic* permission-denial path (it shows up in `permission_denials` exactly like
+ * any other undeclared-tool denial), while writes inside a whitelisted directory still succeed
+ * with zero denial.
+ *
+ * `Read` is deliberately left unscoped-by-directory (still just `Read(./*)`/`Read(./**)`, the
+ * whole worktree, including root-level files -- `Read`'s root-level `./*` was not part of this
+ * finding and was not re-tested for the same leak, but the attack this ticket closes is *mutating*
+ * `.github/workflows/**` to forge a green check, not reading it or reading root config, and an
+ * implementer legitimately needs to read CI config/logs and root config to understand why a
+ * required check is failing). Narrowing `Read` here would block that with no corresponding
+ * security gain.
+ *
+ * `writableDirectories` must stay in sync with the repo's actual top-level layout. Adding a new
+ * top-level directory that real tickets need to write into means adding it here, deliberately --
+ * that is expected whitelist maintenance, not a matcher-syntax problem. Never widen this back to
+ * `./**`, never add `.github` to it, and never add a bare root `Write(./*)`/`Edit(./*)`.
  */
+const writableDirectories = Object.freeze([
+  "docs",
+  "fixtures",
+  "roles",
+  "schemas",
+  "scripts",
+  "spikes",
+  "src",
+  "systemd",
+  "tests",
+]);
+
 function allowedToolsForRole(role: ProviderRunRequest["role"]): readonly string[] {
   const scopedRead = Object.freeze(["Read(./*)", "Read(./**)"]);
   if (role === "implementer" || role === "integration_engineer") {
-    return Object.freeze([...scopedRead, "Write(./*)", "Write(./**)", "Edit(./*)", "Edit(./**)"]);
+    const scopedWriteEdit = writableDirectories.flatMap((directory) => [
+      `Write(./${directory}/*)`,
+      `Write(./${directory}/**)`,
+      `Edit(./${directory}/*)`,
+      `Edit(./${directory}/**)`,
+    ]);
+    return Object.freeze([...scopedRead, ...scopedWriteEdit]);
   }
   return scopedRead;
 }

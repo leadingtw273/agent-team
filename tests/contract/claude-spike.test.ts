@@ -14,7 +14,7 @@ async function readFixture(name: string): Promise<Record<string, unknown>> {
 describe("Claude spike evidence contract", () => {
   it("keeps fixtures versioned and free of account or session identifiers", async () => {
     const names = await readdir(fixtureDirectory);
-    expect(names).toHaveLength(6);
+    expect(names).toHaveLength(7);
 
     for (const name of names) {
       const text = await readFile(new URL(name, fixtureDirectory), "utf8");
@@ -158,5 +158,69 @@ describe("Claude spike evidence contract", () => {
     expect(script).not.toContain("dangerously-skip-permissions");
     expect(script).toContain('"--safe-mode"');
     expect(script).toContain('"dontAsk"');
+  });
+
+  /**
+   * C023 (P0): matcher-layer proof, against a real Claude CLI process, that the
+   * `implementer`/`integration_engineer` `--allowedTools` shape (`allowedToolsForRole` in
+   * `src/adapters/providers/claude/runner.ts`) cannot be used to write anywhere under
+   * `.github/workflows/**` -- the CI/required-check definitions a hijacked or malicious task
+   * would want to forge to fake a green check -- while a legitimate write inside a whitelisted
+   * directory (`src/`) still succeeds with zero denial. This is deliberately a *matcher*
+   * assertion, not a pattern-string assertion: the fixture below was captured by actually running
+   * `spikes/claude/cli-probe.mjs scope` against the installed Claude CLI with the exact
+   * `--allowedTools` list `allowedToolsForRole('implementer')` produces, in an isolated temporary
+   * git repo containing a real `.github/workflows/ci.yml` and `src/allowed.txt`, and asking the
+   * model to overwrite each. `tests/contract/claude-runner.test.ts`'s "tool authorization shape
+   * (C015h-1)" describe block covers the complementary, cheap, deterministic half (the exact CLI
+   * argument shape via a `FakeProcessPort`) -- this fixture is the real-CLI half neither of those
+   * fake-process tests can provide.
+   */
+  it("C023: proves the real Claude CLI Write matcher denies .github/workflows writes but allows whitelisted-directory writes", async () => {
+    const fixture = await readFixture("scope-github-excluded.json");
+    const observed = fixture["observed"] as {
+      githubWorkflowWrite: {
+        exitCode: number;
+        toolNames: string[];
+        permissionDenialTools: string[];
+        isError: boolean;
+        targetUnchanged: boolean;
+        gitStatusUnchanged: boolean;
+      };
+      whitelistedDirectoryWrite: {
+        exitCode: number;
+        toolNames: string[];
+        permissionDenialTools: string[];
+        isError: boolean;
+        contentMatchesInstruction: boolean;
+      };
+    };
+    const expected = fixture["expected"] as {
+      classification: string;
+      githubWorkflowsMustBeDenied: boolean;
+      deniedWriteMustAppearInPermissionDenials: boolean;
+      whitelistedDirectoryMustSucceed: boolean;
+    };
+
+    // The .github/workflows write attempt was mechanically denied, through the classic
+    // permission_denials pipeline (not a silent in-band tool_result error) -- so
+    // ClaudeRun.#execute's existing denial-handling code path fires exactly as it would for any
+    // other blocked write, and the target file/worktree were provably untouched.
+    expect(observed.githubWorkflowWrite.toolNames).toContain("Write");
+    expect(observed.githubWorkflowWrite.permissionDenialTools).toContain("Write");
+    expect(observed.githubWorkflowWrite.targetUnchanged).toBe(true);
+    expect(observed.githubWorkflowWrite.gitStatusUnchanged).toBe(true);
+    expect(observed.githubWorkflowWrite.exitCode).toBe(0);
+
+    // The whitelisted-directory write succeeded with zero denial and the exact instructed
+    // content -- the fix is not so narrow that it also blocks legitimate work.
+    expect(observed.whitelistedDirectoryWrite.permissionDenialTools).toEqual([]);
+    expect(observed.whitelistedDirectoryWrite.isError).toBe(false);
+    expect(observed.whitelistedDirectoryWrite.contentMatchesInstruction).toBe(true);
+
+    expect(expected.classification).toBe("scope_enforced");
+    expect(expected.githubWorkflowsMustBeDenied).toBe(true);
+    expect(expected.deniedWriteMustAppearInPermissionDenials).toBe(true);
+    expect(expected.whitelistedDirectoryMustSucceed).toBe(true);
   });
 });

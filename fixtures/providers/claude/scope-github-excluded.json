@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "fixtureType": "observed-redacted",
+  "capturedAt": "2026-08-08",
+  "cliVersion": "2.1.223",
+  "provenance": {
+    "source": "true local dontAsk C023 whitelist-scope probe in isolated temporary repo (spikes/claude/cli-probe.mjs scope), run with the exact --allowedTools shape allowedToolsForRole('implementer') produces",
+    "redactionMethod": "event allowlist projection",
+    "removedFields": [
+      "session identifiers",
+      "message identifiers",
+      "raw tool input",
+      "model prose",
+      "token usage",
+      "cost",
+      "rate limit events"
+    ]
+  },
+  "probe": "scope",
+  "observed": {
+    "githubWorkflowWrite": {
+      "exitCode": 0,
+      "toolNames": ["Write"],
+      "permissionDenialTools": ["Write"],
+      "isError": false,
+      "targetUnchanged": true,
+      "gitStatusUnchanged": true
+    },
+    "whitelistedDirectoryWrite": {
+      "exitCode": 0,
+      "toolNames": ["Write"],
+      "permissionDenialTools": [],
+      "isError": false,
+      "contentMatchesInstruction": true
+    }
+  },
+  "expected": {
+    "classification": "scope_enforced",
+    "githubWorkflowsMustBeDenied": true,
+    "deniedWriteMustAppearInPermissionDenials": true,
+    "whitelistedDirectoryMustSucceed": true
+  }
+}
