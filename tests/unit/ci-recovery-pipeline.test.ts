@@ -206,11 +206,15 @@ function fixture(
     readonly pauseTool?: boolean;
     readonly ciLogOutcome?: CiFailureLogOutcome;
     readonly ciLogErrorCode?: DomainError["code"];
+    readonly observabilityThrows?: boolean;
   } = {},
 ) {
   const calls: string[] = [];
   const persistedJobs: ReturnType<typeof job>[] = [];
   const checkpoints: string[] = [];
+  const observabilityCalls: Parameters<
+    NonNullable<CiRecoveryPipelinePorts["observability"]>["recordCiLogExcerpt"]
+  >[0][] = [];
   const handle = runHandle(options.events);
   let checkRead = 0;
   let lastProviderRequest: ProviderRunRequest | undefined;
@@ -318,6 +322,12 @@ function fixture(
         return Promise.resolve(ok({ remote: "origin", branch: worktree.branch, sha: repairSha }));
       },
     },
+    observability: {
+      recordCiLogExcerpt: (record) => {
+        observabilityCalls.push(record);
+        if (options.observabilityThrows === true) throw new Error("observability adapter blew up");
+      },
+    },
   };
   return {
     pipeline: new CiRecoveryPipeline(ports),
@@ -326,6 +336,7 @@ function fixture(
     checkpoints,
     handle,
     lastProviderRequest: () => lastProviderRequest,
+    observabilityCalls,
   };
 }
 
@@ -558,7 +569,12 @@ describe("CiRecoveryPipeline", () => {
         ciLogOutcome: {
           available: true,
           excerpts: [
-            { checkName: "test", text: "error: assertion failed at line 12", truncated: false },
+            {
+              checkName: "test",
+              text: "error: assertion failed at line 12",
+              truncated: false,
+              sourceBytes: 4_096,
+            },
           ],
         },
       });
@@ -573,6 +589,88 @@ describe("CiRecoveryPipeline", () => {
         "error: assertion failed at line 12",
       );
       expect(block?.kind === "text" ? block.content : "").toContain("Check: test");
+    });
+
+    // C017b (D2): the coordinator's decision required a minimal, non-backlog observability signal
+    // -- without it, a job that keeps failing repair after repair gives no way to tell "the log
+    // was never attached" apart from "the log was attached and the model still couldn't fix it".
+    describe("D2: ciLogExcerpt observability", () => {
+      it("records available:true with source/excerpt byte counts, never the excerpt text itself", async () => {
+        const canary = "sk-ant-canary-should-never-appear-in-observability";
+        const setup = fixture({
+          ciLogOutcome: {
+            available: true,
+            excerpts: [
+              {
+                checkName: "test",
+                text: `error: ${canary}`,
+                truncated: false,
+                sourceBytes: 9_000,
+              },
+            ],
+          },
+        });
+        const outcome = await setup.pipeline.run(request());
+
+        expect(outcome.state).toBe("repair_pushed");
+        expect(setup.observabilityCalls).toHaveLength(1);
+        expect(setup.observabilityCalls[0]).toEqual({
+          jobId: job().id,
+          available: true,
+          sourceBytes: 9_000,
+          excerptBytes: Buffer.byteLength(`error: ${canary}`, "utf8"),
+        });
+        expect(JSON.stringify(setup.observabilityCalls)).not.toContain(canary);
+      });
+
+      it("records available:false with the port's own reason when the log is unavailable (read path)", async () => {
+        const setup = fixture({ ciLogOutcome: { available: false, reason: "no_failing_checks" } });
+        const outcome = await setup.pipeline.run(request());
+
+        expect(outcome.state).toBe("repair_pushed");
+        expect(setup.observabilityCalls).toEqual([
+          { jobId: job().id, available: false, reason: "no_failing_checks" },
+        ]);
+      });
+
+      it("records available:false with a ci_log_port_error reason when the port hard-fails", async () => {
+        const setup = fixture({ ciLogErrorCode: "unavailable" });
+        const outcome = await setup.pipeline.run(request());
+
+        expect(outcome.state).toBe("repair_pushed");
+        expect(setup.observabilityCalls).toEqual([
+          { jobId: job().id, available: false, reason: "ci_log_port_error:unavailable" },
+        ]);
+      });
+
+      it("never lets a throwing observability adapter turn a diagnostic into a repair-blocking failure", async () => {
+        const setup = fixture({
+          ciLogOutcome: { available: false, reason: "log_fetch_failed" },
+          observabilityThrows: true,
+        });
+        const outcome = await setup.pipeline.run(request());
+
+        expect(outcome.state).toBe("repair_pushed");
+        expect(setup.observabilityCalls).toHaveLength(1);
+      });
+
+      it("is never called at all when the pipeline never reaches the repair-attempt path (CI already green)", async () => {
+        const setup = fixture({ initialChecks: successfulChecks });
+        const outcome = await setup.pipeline.run(request());
+
+        expect(outcome.state).toBe("ready_for_review");
+        expect(setup.observabilityCalls).toEqual([]);
+      });
+
+      it("tolerates ports.observability being entirely absent (backward compatible with pre-C017b ports)", async () => {
+        const setup = fixture({ ciLogOutcome: { available: false, reason: "log_fetch_failed" } });
+        const { observability, ...portsWithoutObservability } = setup.pipeline.ports;
+        void observability; // deliberately discarded -- see this test's own name
+        const bareBonesPipeline = new CiRecoveryPipeline(portsWithoutObservability);
+        const outcome = await bareBonesPipeline.run(request());
+
+        expect(outcome.state).toBe("repair_pushed");
+      });
     });
 
     it("keeps repairing when the log port reports the log unavailable, with an explicit marker instead of silence", async () => {
@@ -605,7 +703,9 @@ describe("CiRecoveryPipeline", () => {
       const setup = fixture({
         ciLogOutcome: {
           available: true,
-          excerpts: [{ checkName: "test", text: `error: ${canary}`, truncated: false }],
+          excerpts: [
+            { checkName: "test", text: `error: ${canary}`, truncated: false, sourceBytes: 256 },
+          ],
         },
       });
       const outcome = await setup.pipeline.run(request());
@@ -621,7 +721,12 @@ describe("CiRecoveryPipeline", () => {
       const block = ciFailureLogExternalData({
         available: true,
         excerpts: [
-          { checkName: "test", text: `error: token=${secret}\n${injection}`, truncated: false },
+          {
+            checkName: "test",
+            text: `error: token=${secret}\n${injection}`,
+            truncated: false,
+            sourceBytes: 512,
+          },
         ],
       });
       const built = buildProviderJobContext(
