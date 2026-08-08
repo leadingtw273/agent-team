@@ -214,6 +214,11 @@ describe("aggregateLinearPublicationDigest", () => {
 
     const aggregate = aggregateLinearPublicationDigest([first.value, second.value]);
     expect(aggregate).toBe(aggregateLinearPublicationDigest([second.value, first.value]));
-    expect(aggregateLinearPublicationDigest([{ ...first.value, manifestDigest: "9".repeat(64) }, second.value])).not.toBe(aggregate);
+    expect(
+      aggregateLinearPublicationDigest([
+        { ...first.value, manifestDigest: "9".repeat(64) },
+        second.value,
+      ]),
+    ).not.toBe(aggregate);
   });
 });

@@ -237,19 +237,14 @@ function request(
 }
 
 function identityForRequest(input: ReviewerPipelineRequest): ReviewIdentity {
-  const created = createReviewIdentity(
-    input.requirementSnapshot,
-    input.expectedHeadSha,
-    diff,
-    {
-      ...(input.visualManifest === undefined
-        ? {}
-        : { visualManifest: canonicalVisualManifestInput(input.visualManifest) }),
-      ...(input.publicationDigest === undefined
-        ? {}
-        : { publicationDigest: input.publicationDigest }),
-    },
-  );
+  const created = createReviewIdentity(input.requirementSnapshot, input.expectedHeadSha, diff, {
+    ...(input.visualManifest === undefined
+      ? {}
+      : { visualManifest: canonicalVisualManifestInput(input.visualManifest) }),
+    ...(input.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: input.publicationDigest }),
+  });
   if (!created.ok) throw new Error(created.error.code);
   return created.value;
 }
@@ -375,7 +370,8 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
       );
       if (identityBlock?.kind !== "text") throw new Error("Missing review identity evidence.");
       const output =
-        options.reports?.[role] ?? report(role, JSON.parse(identityBlock.content) as ReviewIdentity);
+        options.reports?.[role] ??
+        report(role, JSON.parse(identityBlock.content) as ReviewIdentity);
       return Promise.resolve(ok(handle(output)));
     },
   });
@@ -596,9 +592,12 @@ describe("ReviewerPipeline", () => {
     };
     const setup = fixture(input, {
       reports: {
-        visual_reviewer: report("visual_reviewer", identityForRequest(input.value), "changes_requested", [
-          blocking,
-        ]),
+        visual_reviewer: report(
+          "visual_reviewer",
+          identityForRequest(input.value),
+          "changes_requested",
+          [blocking],
+        ),
       },
     });
     const outcome = await setup.pipeline.run(input.value);

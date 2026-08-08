@@ -335,9 +335,11 @@ const dualIssue = issueSchema.parse({
 const dualSnapshotResult = createRequirementSnapshot(dualIssue, now);
 if (!dualSnapshotResult.ok) throw new Error(dualSnapshotResult.error.code);
 const dualSnapshot = dualSnapshotResult.value;
-const dualAcceptanceCriterion = dualIssue.acceptanceCriteria?.[0] ?? (() => {
-  throw new Error("Missing dual acceptance criterion.");
-})();
+const dualAcceptanceCriterion =
+  dualIssue.acceptanceCriteria?.[0] ??
+  (() => {
+    throw new Error("Missing dual acceptance criterion.");
+  })();
 
 function dualManifest(artifactSha: string) {
   return visualManifestSchema.parse({
@@ -377,10 +379,7 @@ function dualReceipt(manifest: ReturnType<typeof dualManifest>): LinearPublicati
   };
 }
 
-function dualReport(
-  dualIdentity: ReviewIdentity,
-  role: ReviewerReport["role"],
-): ReviewerReport {
+function dualReport(dualIdentity: ReviewIdentity, role: ReviewerReport["role"]): ReviewerReport {
   return {
     ...report,
     role,
@@ -400,10 +399,7 @@ function dualReport(
   };
 }
 
-function dualApproval(
-  dualIdentity: ReviewIdentity,
-  reports: readonly ReviewerReport[],
-) {
+function dualApproval(dualIdentity: ReviewIdentity, reports: readonly ReviewerReport[]) {
   return {
     changeRequestId: "42",
     identity: dualIdentity,

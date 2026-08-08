@@ -238,12 +238,10 @@ describe("review identity v2 — evidence and publication digests", () => {
   it("canonicalizes visual manifests independently of artifact and criterion input order", () => {
     const reordered: CanonicalVisualManifestInput = {
       ...manifest,
-      artifacts: [...manifest.artifacts]
-        .reverse()
-        .map((artifact) => ({
-          ...artifact,
-          acceptanceCriteria: [...artifact.acceptanceCriteria].reverse(),
-        })),
+      artifacts: [...manifest.artifacts].reverse().map((artifact) => ({
+        ...artifact,
+        acceptanceCriteria: [...artifact.acceptanceCriteria].reverse(),
+      })),
     };
     expect(canonicalVisualManifest(manifest)).toEqual(canonicalVisualManifest(reordered));
     const digest = evidenceDigestOf(manifest);
@@ -270,7 +268,9 @@ describe("review identity v2 — evidence and publication digests", () => {
   });
 
   it("keeps diffDigest pure while evidence and publication digests vary", () => {
-    const snapshot = valueOf(createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")));
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
     const withoutEvidence = valueOf(createReviewIdentity(snapshot, sha1A, [change()]));
     const withEvidence = valueOf(
       createReviewIdentity(snapshot, sha1A, [change()], {
@@ -287,7 +287,9 @@ describe("review identity v2 — evidence and publication digests", () => {
   });
 
   it("requires a full review when only evidence or publication digests differ", () => {
-    const snapshot = valueOf(createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")));
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
     const approved = valueOf(
       createReviewIdentity(snapshot, sha1A, [change()], {
         visualManifest: manifest,
@@ -316,7 +318,9 @@ describe("review identity v2 — evidence and publication digests", () => {
   });
 
   it("rejects malformed publication digests", () => {
-    const snapshot = valueOf(createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")));
+    const snapshot = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
     expect(
       createReviewIdentity(snapshot, sha1A, [change()], { publicationDigest: "not-hex" }),
     ).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
