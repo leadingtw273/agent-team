@@ -22,6 +22,7 @@
     "test": "pnpm run build && vitest run",
     "test:contract": "vitest run tests/contract --passWithNoTests",
     "test:integration": "vitest run tests/integration --passWithNoTests",
+    "test:e2e": "vitest run tests/e2e --passWithNoTests",
     "test:browser": "playwright test",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit"
   },
