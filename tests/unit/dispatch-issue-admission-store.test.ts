@@ -108,6 +108,60 @@ describe("FileIssueAdmissionStore", () => {
     });
   });
 
+  /**
+   * C016: `legacy_recovered` is the release reason `createDispatchResolveLegacyClaimHandler`
+   * (legacy-claim-handlers.ts) writes -- deliberately requires an audit `note` exactly the same
+   * way `superseded` requires `supersededByJobId` right above (this store's own pairing
+   * discipline, enforced by `issueAdmissionRecordSchema`'s `superRefine`, not left to convention).
+   */
+  it("release requires a releaseNote exactly when legacy_recovered, mirroring superseded/supersededByJobId", async () => {
+    const store = new FileIssueAdmissionStore(await temporaryDirectory());
+    const claimed = await store.claim(projectId, issueId);
+    if (!claimed.ok) throw new Error(claimed.error.code);
+
+    const withoutNote = await store.release(
+      projectId,
+      issueId,
+      claimed.value.revision,
+      "legacy_recovered",
+    );
+    expect(withoutNote.ok ? "ok" : withoutNote.error.code).toBe("invariant_violation");
+
+    const released = await store.release(
+      projectId,
+      issueId,
+      claimed.value.revision,
+      "legacy_recovered",
+      undefined,
+      "job_5601c115-99ad-4f8b-a918-e7bb5b4c437e's paused outcome never persisted a progress record (C016) -- verified claim.jobId matches before release.",
+    );
+    expect(released).toMatchObject({
+      ok: true,
+      value: {
+        state: "released",
+        releaseReason: "legacy_recovered",
+        releaseNote:
+          "job_5601c115-99ad-4f8b-a918-e7bb5b4c437e's paused outcome never persisted a progress record (C016) -- verified claim.jobId matches before release.",
+      },
+    });
+  });
+
+  it("release rejects a releaseNote carried by any reason other than legacy_recovered", async () => {
+    const store = new FileIssueAdmissionStore(await temporaryDirectory());
+    const claimed = await store.claim(projectId, issueId);
+    if (!claimed.ok) throw new Error(claimed.error.code);
+
+    const invalid = await store.release(
+      projectId,
+      issueId,
+      claimed.value.revision,
+      "cancelled",
+      undefined,
+      "this note should never be accepted on a cancelled release",
+    );
+    expect(invalid.ok ? "ok" : invalid.error.code).toBe("invariant_violation");
+  });
+
   it("release is a genuine CAS -- a stale expectedRevision fails closed, never releasing twice", async () => {
     const store = new FileIssueAdmissionStore(await temporaryDirectory());
     const claimed = await store.claim(projectId, issueId);

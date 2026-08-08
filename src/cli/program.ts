@@ -52,6 +52,12 @@ export interface CliHandlers {
   readonly dispatchResolve: (
     input: Readonly<{ jobId: string; as: "superseded" | "cancelled"; supersededByJobId?: string }>,
   ) => Promise<CliCommandOutcome>;
+  /** C016: the controlled repair path for an admission claim with no job-progress record to
+   * resolve against at all -- see src/cli/dispatch/legacy-claim-handlers.ts's own header for the
+   * full rationale. Never a substitute for `dispatchResolve` above. */
+  readonly dispatchResolveLegacyClaim: (
+    input: Readonly<{ jobId: string; projectId: string; issueId: string; note: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -92,6 +98,7 @@ const defaultRegistrationHandlers: RegistrationCliHandlers = Object.freeze({
 export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
   dispatchResolve: () => blocked("dispatch resolve"),
+  dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   health: () => blocked("health"),
@@ -196,6 +203,35 @@ export function createProgram(
             ...(options.supersededBy === undefined
               ? {}
               : { supersededByJobId: options.supersededBy }),
+          }),
+        )(),
+    );
+
+  dispatch
+    .command("resolve-legacy-claim")
+    .description(
+      "C016：受控復原一個沒有對應 job-progress 記錄的既有 admission claim" +
+        "（僅限本工具自身缺陷造成的舊 claim，不是 dispatch resolve 的替代品，" +
+        "後者才是正常情況下唯一該用的收斂方式）。以 stdin 確認字串驗證" +
+        " claim.jobId 與所給 --job 完全相符後才釋放，並在 claim 檔留下帶 --note 的稽核紀錄。",
+    )
+    .requiredOption("--job <job-id>", "宣稱擁有此 claim 的 job id（本命令的驗證主體）")
+    .requiredOption("--project <project-id>", "claim 所屬的 project id")
+    .requiredOption("--issue <issue-id>", "claim 所屬的 issue id（admission 檔案名稱的組成部分）")
+    .requiredOption("--note <text>", "稽核用途的復原原因說明（必填，原文寫入 claim 檔）")
+    .action(
+      (options: {
+        readonly job: string;
+        readonly project: string;
+        readonly issue: string;
+        readonly note: string;
+      }) =>
+        action(state, io, () =>
+          handlers.dispatchResolveLegacyClaim({
+            jobId: options.job,
+            projectId: options.project,
+            issueId: options.issue,
+            note: options.note,
           }),
         )(),
     );
