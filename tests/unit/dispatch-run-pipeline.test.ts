@@ -199,7 +199,7 @@ function eligibleCandidate(role?: string, workKind: "model" | "mechanical" = "mo
     // mechanical work to be one of the `ci`/`webhook`/`health` stages -- `"ci"` here is
     // otherwise-arbitrary, chosen only to satisfy that constraint when the C019 fix's own
     // mechanical-workKind test overrides `workKind` below.
-    stage: (workKind === "mechanical" ? "ci" : "implementation") as const,
+    stage: workKind === "mechanical" ? ("ci" as const) : ("implementation" as const),
     workKind,
   });
 }
