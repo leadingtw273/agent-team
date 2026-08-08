@@ -361,6 +361,7 @@ export function createDispatchCliHandlers(
           )({
             agentTeamHome: options.agentTeamHome,
             claudeConfig: build.value.claude.config,
+            ...(build.value.gemini === undefined ? {} : { geminiConfig: build.value.gemini }),
             jobs: build.value.jobs,
             readModel: build.value.discovery.readModel,
             mutationClient: build.value.discovery.mutationClient,

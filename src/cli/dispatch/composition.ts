@@ -150,6 +150,15 @@ export interface DispatchCompositionReady {
     /** Injectable for tests; production defaults to a real `ChildProcessRunner` (R001). */
     readonly process: ProcessPort;
   };
+  /** E102-2: the same host provider config file's optional `gemini` key, read alongside `claude`
+   * above -- `undefined`/absent when this host has no real visual-review provider configured.
+   * Optional here (not merely a possibly-`undefined`-valued required field) so every pre-existing
+   * fake `DispatchCompositionReady` in this repo's tests -- built before Gemini config existed --
+   * keeps type-checking unchanged. Threaded by the CLI (`handlers.ts`) into
+   * `buildResumeComposition` -> `buildReviewerPipeline` (reviewer-composition.ts); see that file's
+   * own header for why an absent `gemini` key fails closed per-job rather than blocking this
+   * composition. */
+  readonly gemini?: DispatchProviderConfig["gemini"];
 }
 
 export type BuildDispatchCompositionResult =
@@ -400,6 +409,7 @@ export async function buildDispatchComposition(
         config: providerConfig.value.claude,
         process: options.claudeProcessPort ?? new ChildProcessRunner(),
       }),
+      gemini: providerConfig.value.gemini,
     }),
   });
 }
