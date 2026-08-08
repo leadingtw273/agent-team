@@ -197,11 +197,15 @@ export class GhTransport {
     this.#environment = { ...process.env, ...(options.environment ?? {}) };
   }
 
-  async requestJson<Output>(
+  /**
+   * Shared `execFile` plumbing behind `requestJson`/`requestVoid`/`requestText` -- argv safety,
+   * abort/timeout/env wiring, and `gh` failure-code mapping are identical across all three; only
+   * what happens to a *successful* stdout differs (JSON-parsed, discarded, or returned verbatim).
+   */
+  async #exec(
     arguments_: readonly string[],
-    schema: z.ZodType<Output>,
-    options: ReadOptions = {},
-  ): Promise<Result<Output, DomainError>> {
+    options: ReadOptions,
+  ): Promise<Result<string, DomainError>> {
     if (!validArguments(arguments_)) return failure("external_failure");
     if (options.signal?.aborted === true) return failure("interrupted");
     return new Promise((resolveResult) => {
@@ -221,15 +225,25 @@ export class GhTransport {
             resolveResult(err(mapGhError(error, stderr)));
             return;
           }
-          try {
-            const parsed = schema.safeParse(JSON.parse(stdout) as unknown);
-            resolveResult(parsed.success ? ok(parsed.data) : failure("external_failure"));
-          } catch {
-            resolveResult(failure("external_failure"));
-          }
+          resolveResult(ok(stdout));
         },
       );
     });
+  }
+
+  async requestJson<Output>(
+    arguments_: readonly string[],
+    schema: z.ZodType<Output>,
+    options: ReadOptions = {},
+  ): Promise<Result<Output, DomainError>> {
+    const executed = await this.#exec(arguments_, options);
+    if (!executed.ok) return executed;
+    try {
+      const parsed = schema.safeParse(JSON.parse(executed.value) as unknown);
+      return parsed.success ? ok(parsed.data) : failure("external_failure");
+    } catch {
+      return failure("external_failure");
+    }
   }
 
   /**
@@ -241,29 +255,24 @@ export class GhTransport {
     arguments_: readonly string[],
     options: ReadOptions = {},
   ): Promise<Result<void, DomainError>> {
-    if (!validArguments(arguments_)) return failure("external_failure");
-    if (options.signal?.aborted === true) return failure("interrupted");
-    return new Promise((resolveResult) => {
-      execFile(
-        this.#executable,
-        [...arguments_],
-        {
-          encoding: "utf8",
-          env: this.#environment,
-          maxBuffer: this.#maxOutputBytes,
-          timeout: this.#timeoutMs,
-          windowsHide: true,
-          ...(options.signal === undefined ? {} : { signal: options.signal }),
-        },
-        (error, _stdout, stderr) => {
-          if (error !== null) {
-            resolveResult(err(mapGhError(error, stderr)));
-            return;
-          }
-          resolveResult(ok(undefined));
-        },
-      );
-    });
+    const executed = await this.#exec(arguments_, options);
+    return executed.ok ? ok(undefined) : executed;
+  }
+
+  /**
+   * C017: like `requestJson`, but for endpoints that do not return JSON at all -- GitHub's
+   * `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` (the only current caller, via
+   * `GitHubAdapter.getFailedCheckLogExcerpts`) returns the raw plain-text job log, one
+   * Actions-timestamped line at a time. Returns stdout verbatim; the caller (never this
+   * transport-level method) is responsible for bounding/redacting/interpreting that text --
+   * this method's only job is the same safe-argv, abort/timeout, and `gh`-failure-code mapping
+   * every other method here already gives every other endpoint.
+   */
+  async requestText(
+    arguments_: readonly string[],
+    options: ReadOptions = {},
+  ): Promise<Result<string, DomainError>> {
+    return this.#exec(arguments_, options);
   }
 
   async inspectAuthentication(

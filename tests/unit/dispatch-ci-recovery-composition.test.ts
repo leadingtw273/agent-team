@@ -77,6 +77,10 @@ describe("buildCiRecoveryPipeline", () => {
     expect(capabilities.ok).toBe(true);
     if (capabilities.ok) expect(capabilities.value.provider).toBe("claude");
     expect(result.value.ports.sourceControl).toBeDefined();
+    expect(result.value.ports.ciLog).toBeDefined();
+    // C017: `sourceControl` and `ciLog` are the same underlying `GitHubAdapter` instance -- one
+    // read-only GitHub Checks/Actions capability set, no reason to construct the adapter twice.
+    expect(result.value.ports.ciLog).toBe(result.value.ports.sourceControl);
     expect(result.value.ports.jobs).toBeDefined();
     expect(result.value.ports.checkpoint).toBeDefined();
     expect(result.value.ports.toolDecisions).toBeDefined();

@@ -14,6 +14,10 @@ import type {
   SourceControlPort,
   SourceControlRepositoryRef,
 } from "../../application/ports/source-control.js";
+import type {
+  CiFailureLogExcerpt,
+  CiFailureLogOutcome,
+} from "../../application/pipelines/ci-recovery-model.js";
 import type { MutationOptions, ReadOptions } from "../../application/ports/common.js";
 import {
   domainError,
@@ -24,6 +28,7 @@ import {
   type Instant,
   type Result,
 } from "../../domain/foundation/index.js";
+import { defaultCiFailureLogExcerptMaxBytes, extractFailureKeyLines } from "./ci-log-excerpt.js";
 import { GhTransport } from "./transport.js";
 
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/u;
@@ -195,6 +200,38 @@ const repositoryMetadataProjection = "{defaultBranch:.default_branch}";
 const checkProjection =
   '{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),url:.html_url}';
 const checksProjection = `{totalCount:.total_count,checks:[.check_runs[] | ${checkProjection}]}`;
+/**
+ * C017: a separate, narrower projection from `checkProjection` above -- adds `id`, which
+ * `CommitCheck` (the shared, provider-agnostic port type `checksProjection` feeds) deliberately
+ * does not carry. Empirically confirmed against this repository's own real CI (2026-08-08): for a
+ * GitHub-Actions-created check run, `.id` on `GET .../check-runs` *is* the same numeric id
+ * `GET /repos/{owner}/{repo}/actions/jobs/{id}/logs` expects -- both `check_run.id` and the
+ * `/job/{id}` segment of that same check run's own `details_url`/`html_url` matched on a live
+ * run. Kept entirely private to `getFailedCheckLogExcerpts`; never exposed on `CommitCheck`.
+ */
+const checkRunIdProjection = `{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),id}`;
+const checkRunIdPageProjection = `{totalCount:.total_count,checks:[.check_runs[] | ${checkRunIdProjection}]}`;
+const projectedCheckRunIdPageSchema = z
+  .object({
+    totalCount: z.number().int().nonnegative(),
+    checks: z.array(
+      z
+        .object({
+          name: z.string().min(1),
+          status: z.enum(["queued", "in_progress", "completed"]),
+          conclusion: z.enum(["success", "failure", "cancelled", "skipped"]).nullable(),
+          id: z.number().int().positive(),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+/** C017: bounds how many failing check runs a single `getFailedCheckLogExcerpts` call will ever
+ * fetch a log for -- a job-log request is comparatively expensive (can be megabytes), and the
+ * combined excerpt budget (`defaultCiFailureLogExcerptMaxBytes` in ci-log-excerpt.ts) is spent
+ * across whichever checks are inspected first regardless, so inspecting more than a handful buys
+ * nothing once the budget is already exhausted by the first one or two. */
+const maxFailingChecksInspected = 3;
 const statusesProjection =
   "{sha,statuses:[.statuses[] | {context,state,description,targetUrl:.target_url}]}";
 const commentProjection = "{id:(.id|tostring),url:.html_url,createdAt:.created_at,body}";
@@ -217,6 +254,21 @@ export interface GhJsonTransport {
     schema: z.ZodType<Output>,
     options?: ReadOptions,
   ): Promise<Result<Output, DomainError>>;
+}
+
+/**
+ * C017: kept as its own interface, deliberately never folded into `GhJsonTransport` -- every
+ * pre-existing test double across this codebase that constructs a `GitHubAdapter` already
+ * implements only `GhJsonTransport`, and none of them need to change for this ticket. See
+ * `GitHubAdapter`'s constructor: the real `GhTransport` satisfies both, but a transport lacking
+ * `requestText` is a legitimate, fully-typed input -- `getFailedCheckLogExcerpts` degrades to
+ * `available: false` rather than requiring every caller to grow a fake method it will never use.
+ */
+export interface GhTextTransport {
+  requestText(
+    arguments_: readonly string[],
+    options?: ReadOptions,
+  ): Promise<Result<string, DomainError>>;
 }
 
 function failure<Value>(
@@ -308,7 +360,7 @@ function commentsProjection(marker: string): string {
 }
 
 export class GitHubAdapter implements SourceControlPort {
-  constructor(readonly transport: GhJsonTransport = new GhTransport()) {}
+  constructor(readonly transport: GhJsonTransport & Partial<GhTextTransport> = new GhTransport()) {}
 
   async getChangeRequest(
     reference: ChangeRequestRef,
@@ -462,6 +514,85 @@ export class GitHubAdapter implements SourceControlPort {
         ? "success"
         : "pending";
     return ok({ headSha: headSha.toLowerCase(), aggregate, checks });
+  }
+
+  /**
+   * C017: adapter-only capability (never added to `SourceControlPort` -- see this method's own
+   * type header, ci-recovery-model.ts) that closes the "recovery flies blind" gap: fetches a
+   * bounded, heuristically-extracted excerpt of each failing check run's GitHub Actions job log,
+   * for `CiRecoveryPipeline.run()` to attach as external data right before starting a repair
+   * attempt. Every failure mode here -- a transport with no `requestText`, no failing check at
+   * all, or the log endpoint itself erroring -- is a *read* result, never a hard `err`; only a
+   * structurally invalid `repository`/`headSha` input fails closed, matching every other method
+   * on this adapter.
+   */
+  async getFailedCheckLogExcerpts(
+    repository: SourceControlRepositoryRef,
+    headSha: string,
+    options: ReadOptions = {},
+  ): Promise<Result<CiFailureLogOutcome, DomainError>> {
+    if (!validRepository(repository) || !shaPattern.test(headSha)) return failure();
+    // Bound explicitly: `this.transport.requestText` is a class method, not an arrow-function
+    // property -- calling it detached from `this.transport` (e.g. `const f = obj.method; f()`)
+    // would lose its receiver and break on the real `GhTransport`, whose implementation reads its
+    // own private fields.
+    const requestText = this.transport.requestText?.bind(this.transport);
+    if (requestText === undefined) {
+      return ok({ available: false, reason: "log_transport_unavailable" });
+    }
+
+    const runs: z.infer<typeof projectedCheckRunIdPageSchema>["checks"] = [];
+    let totalCount: number | undefined;
+    for (let page = 1; page <= 100; page += 1) {
+      const result = await this.transport.requestJson(
+        [
+          "api",
+          `repos/${repositoryPath(repository)}/commits/${headSha}/check-runs?per_page=100&page=${String(page)}`,
+          "-H",
+          "Accept: application/vnd.github+json",
+          "--jq",
+          checkRunIdPageProjection,
+        ],
+        projectedCheckRunIdPageSchema,
+        options,
+      );
+      if (!result.ok) return ok({ available: false, reason: "check_runs_unavailable" });
+      if (totalCount !== undefined && totalCount !== result.value.totalCount) {
+        return ok({ available: false, reason: "check_runs_unavailable" });
+      }
+      totalCount = result.value.totalCount;
+      runs.push(...result.value.checks);
+      if (runs.length >= totalCount) break;
+      if (page === 100 || result.value.checks.length === 0) {
+        return ok({ available: false, reason: "check_runs_unavailable" });
+      }
+    }
+    if (totalCount === undefined || runs.length !== totalCount) {
+      return ok({ available: false, reason: "check_runs_unavailable" });
+    }
+
+    const failing = runs.filter(
+      (run) =>
+        run.status === "completed" && run.conclusion !== "success" && run.conclusion !== "skipped",
+    );
+    if (failing.length === 0) return ok({ available: false, reason: "no_failing_checks" });
+
+    const excerpts: CiFailureLogExcerpt[] = [];
+    let remainingBudget = defaultCiFailureLogExcerptMaxBytes;
+    for (const run of failing.slice(0, maxFailingChecksInspected)) {
+      if (remainingBudget <= 0) break;
+      const logText = await requestText(
+        ["api", `repos/${repositoryPath(repository)}/actions/jobs/${String(run.id)}/logs`],
+        options,
+      );
+      if (!logText.ok) continue;
+      const excerpt = extractFailureKeyLines(logText.value, remainingBudget);
+      if (excerpt.text.trim().length === 0) continue;
+      excerpts.push({ checkName: run.name, text: excerpt.text, truncated: excerpt.truncated });
+      remainingBudget -= Buffer.byteLength(excerpt.text, "utf8");
+    }
+    if (excerpts.length === 0) return ok({ available: false, reason: "log_fetch_failed" });
+    return ok({ available: true, excerpts });
   }
 
   async setCommitStatus(

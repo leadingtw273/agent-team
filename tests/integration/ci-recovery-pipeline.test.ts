@@ -201,6 +201,10 @@ describe("CI Recovery Pipeline with a real temporary Git repository", () => {
           );
         },
       },
+      ciLog: {
+        getFailedCheckLogExcerpts: () =>
+          Promise.resolve(ok({ available: false, reason: "not_exercised_by_this_fixture" })),
+      },
       checkpoint: {
         preserve: () => Promise.resolve(ok({ checkpointId: "unused" })),
       },

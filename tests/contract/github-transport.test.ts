@@ -39,6 +39,7 @@ case " $* " in
     fi
     exit 1
     ;;
+  *" repos/"*"/actions/jobs/"*) printf '2026-08-08T01:21:23.0000000Z log line one\n2026-08-08T01:21:23.1000000Z log line two\n' ;;
   *" repos/"*) printf '{"visibility":"public","private":false,"defaultBranch":"main","allowAutoMerge":true,"deleteBranchOnMerge":false,"permissions":{"admin":true,"maintain":true,"pull":true,"push":true}}' ;;
   *) printf '{"ok":true}' ;;
 esac
@@ -192,5 +193,36 @@ describe("gh transport", () => {
       z.unknown(),
     );
     expect(unavailable.ok ? "ok" : unavailable.error.code).toBe("unavailable");
+  });
+
+  it("requestText returns raw stdout verbatim, with no JSON parsing attempted", async () => {
+    const executable = await fakeGh();
+    const result = await new GhTransport({ executable }).requestText([
+      "api",
+      "repos/owner/repository/actions/jobs/1/logs",
+    ]);
+    expect(result).toEqual({
+      ok: true,
+      value:
+        "2026-08-08T01:21:23.0000000Z log line one\n2026-08-08T01:21:23.1000000Z log line two\n",
+    });
+  });
+
+  it("requestText maps gh failures through the same error mapping as requestJson", async () => {
+    const executable = await fakeGh();
+    const result = await new GhTransport({
+      executable,
+      environment: { FAKE_GH_BEHAVIOR: "error:HTTP 404: Not Found" },
+    }).requestText(["api", "repos/owner/repository/actions/jobs/1/logs"]);
+    expect(result.ok ? "ok" : result.error.code).toBe("not_found");
+  });
+
+  it("requestText rejects unsafe argv the same way requestJson does", async () => {
+    const executable = await fakeGh();
+    const result = await new GhTransport({ executable }).requestText([
+      "api",
+      "repos/owner/repository/actions/jobs/1/logs\n--show-token",
+    ]);
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
   });
 });

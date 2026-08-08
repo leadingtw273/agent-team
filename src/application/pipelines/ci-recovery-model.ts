@@ -8,8 +8,9 @@ import type {
   GitWorktree,
   ProviderPort,
   SourceControlPort,
+  SourceControlRepositoryRef,
 } from "../ports/index.js";
-import type { AsyncPortResult, MutationOptions } from "../ports/common.js";
+import type { AsyncPortResult, MutationOptions, ReadOptions } from "../ports/common.js";
 import type { DomainError, Instant } from "../../domain/foundation/index.js";
 import type { Job } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
@@ -27,6 +28,41 @@ export interface CiRecoveryJobWriteReceipt {
 
 export interface CiRecoveryJobPort {
   update(job: Job, options: MutationOptions): AsyncPortResult<CiRecoveryJobWriteReceipt>;
+}
+
+/**
+ * C017: closes the "recovery flies blind" gap -- before this ticket, the repair prompt carried
+ * only the check name/status/conclusion/URL (`CommitCheck`, source-control.ts), never a single
+ * line of *why* the check failed. This is the narrow, adapter-provided capability
+ * `CiRecoveryPipeline.run()` uses right before starting a repair attempt to attach a bounded,
+ * boundary-wrapped log excerpt as `externalData` (see that file's own module header). Adapter-only
+ * precedent (never added to the shared `SourceControlPort`) mirrors `GitHubAdapter`'s existing
+ * `getRepositoryMetadata`/`squashMergeChangeRequest` -- a capability specific to what GitHub
+ * Actions exposes, not something every source-control provider can equally offer.
+ */
+export interface CiFailureLogExcerpt {
+  readonly checkName: string;
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+/**
+ * Deliberately never a hard port failure for anything the pipeline must survive: a missing
+ * `requestText` capability, an unauthenticated/rate-limited/404 log endpoint, or simply no
+ * Actions-backed failing check at all, all collapse to `available: false` with a `reason` string
+ * for the repair prompt to state plainly ("log unavailable, diagnose from check metadata only") --
+ * never to a pipeline-level `failed()`. See `CiRecoveryPipeline.run()`'s own call site.
+ */
+export type CiFailureLogOutcome =
+  | Readonly<{ available: true; excerpts: readonly CiFailureLogExcerpt[] }>
+  | Readonly<{ available: false; reason: string }>;
+
+export interface CiRecoveryCiLogPort {
+  getFailedCheckLogExcerpts(
+    repository: SourceControlRepositoryRef,
+    headSha: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<CiFailureLogOutcome>;
 }
 
 export type CiRecoveryCheckpointReason = "attempt_limit_reached" | "scope_overrun";
@@ -51,6 +87,7 @@ export interface CiRecoveryPipelinePorts {
   readonly preflight: ImplementerPreflightPort;
   readonly provider: ProviderPort;
   readonly sourceControl: Pick<SourceControlPort, "getCommitChecks">;
+  readonly ciLog: CiRecoveryCiLogPort;
   readonly jobs: CiRecoveryJobPort;
   readonly checkpoint: CiRecoveryCheckpointPort;
   readonly toolDecisions: ProviderToolDecisionPort;

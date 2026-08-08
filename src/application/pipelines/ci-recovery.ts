@@ -3,13 +3,57 @@ import { attemptLimits, consumeAttempt, jobSchema, type Job } from "../../domain
 import { projectSchema } from "../../domain/project/index.js";
 import { requirementSnapshotSchema } from "../../domain/review/index.js";
 import { trustedProjectConfigSchema } from "../projects/index.js";
-import type { CommitChecksSnapshot, MutationOptions, ProviderRunHandle } from "../ports/index.js";
 import type {
+  CommitChecksSnapshot,
+  ExternalDataBlock,
+  MutationOptions,
+  ProviderRunHandle,
+} from "../ports/index.js";
+import type {
+  CiFailureLogOutcome,
   CiRecoveryFailureStage,
   CiRecoveryPipelineOutcome,
   CiRecoveryPipelinePorts,
   CiRecoveryPipelineRequest,
 } from "./ci-recovery-model.js";
+
+/**
+ * C017: the source string of the single external-data block this pipeline attaches to the repair
+ * prompt -- see `ciFailureLogExternalData` below. Distinct from any block already present in
+ * `request.externalData` (currently always empty at every call site, but kept generic in case
+ * that changes), so it never collides with something else during redaction/logging.
+ */
+const ciFailureLogSource = "ci_check_logs";
+
+/**
+ * C017: turns whatever `ports.ciLog.getFailedCheckLogExcerpts` reported (success, "no log for
+ * this provider", or a hard port failure) into exactly one `ExternalDataBlock`, always -- the
+ * repair prompt always gets a clear signal either way, never silence. This block flows into
+ * `ports.provider.start`'s `externalData`, which every real `ProviderPort` implementation
+ * (`buildProviderJobContext`, provider-job/context.ts) already wraps in the
+ * `=== BEGIN/END EXTERNAL DATA ===` boundary and passes through the configured `Redactor` before
+ * it ever reaches a model -- this function only builds the untrusted *content*, it does not
+ * itself apply the boundary or redaction.
+ *
+ * Exported so a dedicated test can assert, end to end, that the resulting block really does come
+ * out boundary-wrapped and redacted once handed to the real `buildProviderJobContext`.
+ */
+export function ciFailureLogExternalData(outcome: CiFailureLogOutcome): ExternalDataBlock {
+  const content = outcome.available
+    ? outcome.excerpts
+        .map(
+          (excerpt) =>
+            `Check: ${excerpt.checkName}${excerpt.truncated ? " (truncated)" : ""}\n${excerpt.text}`,
+        )
+        .join("\n---\n")
+    : `CI failure log is unavailable (reason: ${outcome.reason}). Diagnose using only the check name/status/conclusion/URL already provided above -- do not guess at log contents.`;
+  return Object.freeze({
+    kind: "text" as const,
+    source: ciFailureLogSource,
+    mediaType: "text/plain",
+    content,
+  });
+}
 
 const idempotencyPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:/@+-]{0,254}$/u;
 const shaPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
@@ -169,6 +213,27 @@ export class CiRecoveryPipeline {
       return failed("request", domainError("invariant_violation"), request.job);
     }
 
+    // C017: fetch a bounded CI failure log excerpt for the repair prompt -- the whole point of
+    // this ticket. `ciLog.getFailedCheckLogExcerpts` is contractually a *read* (see its own
+    // header, ci-recovery-model.ts): it never returns a hard `err` for anything survivable
+    // (missing capability, no Actions-backed failing check, log endpoint failure). The `!ok`
+    // branch below is defense in depth for a nonconforming port, not the expected path -- either
+    // way, a log-fetch problem must never turn into a `failed()` result; it only ever degrades
+    // the one external-data block below to its "unavailable" content.
+    const failureLog = await this.ports.ciLog.getFailedCheckLogExcerpts(
+      { project: request.project },
+      authoritative.value.headSha,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    const externalData = Object.freeze([
+      ...request.externalData,
+      ciFailureLogExternalData(
+        failureLog.ok
+          ? failureLog.value
+          : { available: false, reason: `ci_log_port_error:${failureLog.error.code}` },
+      ),
+    ]);
+
     const started = await this.ports.provider.start(
       {
         job: request.job,
@@ -181,7 +246,7 @@ export class CiRecoveryPipeline {
           ...request.trustedConfig.projectRules,
           ...(request.trustedConfig.roleInstructions.implementer ?? []),
         ]),
-        externalData: request.externalData,
+        externalData,
         deadlineAt: request.deadlineAt,
       },
       request.signal === undefined ? {} : { signal: request.signal },
