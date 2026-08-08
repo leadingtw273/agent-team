@@ -60,6 +60,7 @@ import {
   type BuildImplementerPipelineResult,
 } from "./implementer-composition.js";
 import {
+  buildAutoMergePauseStore,
   buildIssueAdmissionStore,
   buildJobProgressStore,
   buildReviewReportDiagnosticsSidecar,
@@ -73,6 +74,7 @@ import {
 } from "./resume-full-composition.js";
 import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
+import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 
 export interface CreateDispatchCliHandlersOptions {
@@ -109,7 +111,10 @@ const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = 
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
 
-type DispatchHandlers = Pick<CliHandlers, "run" | "dispatchResolve" | "dispatchResolveLegacyClaim">;
+type DispatchHandlers = Pick<
+  CliHandlers,
+  "run" | "dispatchResolve" | "dispatchResolveLegacyClaim" | "dispatchAutoMergeResume"
+>;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
   draft_unavailable:
@@ -287,9 +292,17 @@ export function createDispatchCliHandlers(
     admission: buildIssueAdmissionStore(options.agentTeamHome),
   });
 
+  // E116cap: shared across this handler's own `dispatchAutoMergeResume` (the write side, a human
+  // resolving a pause) and the `run` handler's resume cycle below (the read side, threaded into
+  // `buildResumeComposition` -> `AutoMergeGate`'s gate check) -- exactly one store instance per
+  // process, mirroring `progress`'s own single-instance-per-process convention just above.
+  const autoMergePause = buildAutoMergePauseStore(options.agentTeamHome);
+  const dispatchAutoMergeResume = createDispatchAutoMergeResumeHandler({ store: autoMergePause });
+
   return Object.freeze({
     dispatchResolve,
     dispatchResolveLegacyClaim,
+    dispatchAutoMergeResume,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
         return outcome("blocked", {
@@ -357,6 +370,7 @@ export function createDispatchCliHandlers(
             // E115cap: a real `LeaseCoordinator` over this run's own `LeaseRepository` -- so a
             // Linear cancellation observed by `LifecyclePipeline` can release the lease it holds.
             leases: new LeaseCoordinator(build.value.leases),
+            autoMergePause,
           });
           if (resumeComposition.state !== "ready") {
             return outcome("blocked", {

@@ -9,6 +9,7 @@
  */
 import { GhTransport, GitHubAdapter } from "../../adapters/github/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
+import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
 import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
@@ -38,6 +39,12 @@ export interface BuildResumeCompositionOptions {
   /** E115cap: threaded through to `buildLifecyclePipeline` so a Linear cancellation can release
    * the cancelled issue's lease -- see `lifecycle-composition.ts`'s own header. */
   readonly leases: LeaseCoordinator;
+  /** E116cap: the single, shared `FileAutoMergePauseStore` instance for this process -- threaded
+   * into both `buildStatusMergePipelines` (the read side, `AutoMergeGate`'s gate check) and
+   * `buildLifecyclePipeline` (the write side, `FileAutoMergePauseAdapter`). See
+   * `lifecycle-composition.ts`'s own header for why this is threaded rather than each composition
+   * root constructing its own store from `agentTeamHome`. */
+  readonly autoMergePause: Pick<FileAutoMergePauseStore, "load" | "pause">;
 }
 
 export type ResumePipelineComposition = Pick<
@@ -79,7 +86,9 @@ export async function buildResumeComposition(
   if (reviewer.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: reviewer.reason });
   }
-  const statusMerge = await buildStatusMergePipelines({});
+  const statusMerge = await buildStatusMergePipelines({
+    autoMergePauseStore: options.autoMergePause,
+  });
   if (statusMerge.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: statusMerge.reason });
   }
@@ -91,6 +100,7 @@ export async function buildResumeComposition(
     progress: options.progress,
     agentTeamHome: options.agentTeamHome,
     leases: options.leases,
+    autoMergePause: options.autoMergePause,
   });
 
   return Object.freeze({

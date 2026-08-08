@@ -7,6 +7,13 @@
  * getEffectiveTreeDiff` (also satisfied directly by `LocalGitAdapter`) -- but `enableAutoMerge`
  * itself needs the O009d squash-merge fallback (see `buildMergeGateSourceControl` below), so it is
  * not a bare pass-through of `GitHubAdapter.enableAutoMerge`.
+ *
+ * E116cap: `MergeGatePorts` also needs `autoMergePause` (`AutoMergePauseQueryPort`,
+ * application/ports/auto-merge-pause.ts) as of this ticket -- `buildAutoMergePauseQuery` below is
+ * the thin read-only wrapper over the caller-supplied `FileAutoMergePauseStore` (the same store
+ * instance `FileAutoMergePauseAdapter`, lifecycle-policy-adapter.ts, writes to), mirroring
+ * `buildMergeGateSourceControl`'s own "adapt the concrete store/adapter to the exact port shape
+ * this composition root needs" convention.
  */
 import {
   GhTransport,
@@ -15,20 +22,43 @@ import {
   type GhJsonTransport,
 } from "../../adapters/github/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
+import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
 import {
   AutoMergeGate,
   ReviewStatusCoordinator,
   type MergeGateAutoMergeAttempt,
   type MergeGatePorts,
 } from "../../application/pipelines/index.js";
-import { ok, type Result, type DomainError } from "../../domain/foundation/index.js";
-import type { ChangeRequestRef } from "../../application/ports/index.js";
+import { err, ok, type Result, type DomainError } from "../../domain/foundation/index.js";
+import type { AutoMergePauseQueryPort, ChangeRequestRef } from "../../application/ports/index.js";
 
 export type StatusMergeCompositionBlockedReason = "github_authentication_unavailable";
 
 export interface BuildStatusMergePipelinesOptions {
+  readonly autoMergePauseStore: Pick<FileAutoMergePauseStore, "load">;
   /** Injectable for tests; production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+}
+
+/** E116cap: read-only `AutoMergePauseQueryPort` adapter over a `FileAutoMergePauseStore` -- see
+ * this file's own header. A store read failure fails closed (`policy` stage,
+ * `mergeFailure("policy", ...)` in merge-gate.ts) rather than defaulting to `paused: false`, which
+ * would silently defeat the whole gate on exactly the failure mode it exists to be robust against.
+ * `store` is `Pick<FileAutoMergePauseStore, "load">`, the same "Pick over a concrete class"
+ * testability convention `FileAutoMergePauseAdapter` uses (lifecycle-policy-adapter.ts). */
+export function buildAutoMergePauseQuery(
+  store: Pick<FileAutoMergePauseStore, "load">,
+): AutoMergePauseQueryPort {
+  return Object.freeze({
+    isPaused: async (
+      request: Parameters<AutoMergePauseQueryPort["isPaused"]>[0],
+      options: Parameters<AutoMergePauseQueryPort["isPaused"]>[1],
+    ) => {
+      const loaded = await store.load(request.project.id, options);
+      if (!loaded.ok) return err(loaded.error);
+      return ok(Object.freeze({ paused: loaded.value?.status.state === "paused" }));
+    },
+  });
 }
 
 export interface StatusMergePipelines {
@@ -133,6 +163,7 @@ export async function buildStatusMergePipelines(
   const autoMergeGate = new AutoMergeGate({
     git: new LocalGitAdapter(),
     sourceControl: buildMergeGateSourceControl(github),
+    autoMergePause: buildAutoMergePauseQuery(options.autoMergePauseStore),
   });
 
   return Object.freeze({ state: "ready", value: Object.freeze({ reviewStatus, autoMergeGate }) });

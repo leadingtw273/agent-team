@@ -16,7 +16,13 @@ import type {
   CommitChecksSnapshot,
   CommitStatusesSnapshot,
 } from "../../src/application/ports/index.js";
-import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  parseInstant,
+  type Instant,
+} from "../../src/domain/foundation/index.js";
 import { jobSchema } from "../../src/domain/jobs/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
 import {
@@ -235,12 +241,22 @@ function mergePorts(
     diff?: readonly EffectiveTreeChange[];
     calls?: string[];
     enableAutoMergeAttempt?: MergeGateAutoMergeAttempt;
+    /** E116cap: defaults to `false` -- every pre-existing test in this file exercises the ordinary
+     * (never-paused) path, unaffected by the new gate check. */
+    paused?: boolean;
+    isPausedResult?: Awaited<ReturnType<MergeGatePorts["autoMergePause"]["isPaused"]>>;
   } = {},
 ): MergeGatePorts {
   const sha = options.sha ?? headSha;
   const calls = options.calls ?? [];
   return {
     git: { getEffectiveTreeDiff: vi.fn(() => Promise.resolve(ok(options.diff ?? diff))) },
+    autoMergePause: {
+      isPaused: vi.fn(() => {
+        calls.push("auto_merge_pause_check");
+        return Promise.resolve(options.isPausedResult ?? ok({ paused: options.paused ?? false }));
+      }),
+    },
     sourceControl: {
       getChangeRequest: vi.fn(() => Promise.resolve(ok(options.cr ?? changeRequest(sha)))),
       getCommitChecks: vi.fn(() => Promise.resolve(ok(options.checks ?? checks(sha)))),
@@ -389,7 +405,7 @@ describe("auto-merge gate", () => {
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
 
     expect(outcome).toMatchObject({ state: "auto_merge_enabled", reuse: "unchanged", identity });
-    expect(calls).toEqual(["auto_merge"]);
+    expect(calls).toEqual(["auto_merge_pause_check", "auto_merge"]);
     expect(ports.sourceControl.getChangeRequest).toHaveBeenCalledTimes(2);
     expect(ports.sourceControl.enableAutoMerge).toHaveBeenCalledWith(
       expect.anything(),
@@ -404,7 +420,7 @@ describe("auto-merge gate", () => {
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest(rebasedHeadSha));
 
     expect(outcome).toMatchObject({ state: "auto_merge_enabled", reuse: "ci_revalidation" });
-    expect(calls).toEqual(["comment", "status", "auto_merge"]);
+    expect(calls).toEqual(["auto_merge_pause_check", "comment", "status", "auto_merge"]);
     const append = vi.mocked(ports.sourceControl.appendChangeRequestComment);
     expect(append.mock.calls[0]?.[0].body).toContain("ci_revalidated_without_new_reviewer_run");
     expect(ports.sourceControl.appendChangeRequestComment).toHaveBeenCalledWith(
@@ -432,7 +448,7 @@ describe("auto-merge gate", () => {
       state: "re_review_required",
       reason: "effective_diff_changed",
     });
-    expect(calls).toEqual(["comment", "status"]);
+    expect(calls).toEqual(["auto_merge_pause_check", "comment", "status"]);
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
   });
 
@@ -497,6 +513,44 @@ describe("auto-merge gate", () => {
 });
 
 /**
+ * E116cap: `MergeGatePorts.autoMergePause` gates `AutoMergeGate.enable()` before any other
+ * readiness check -- the structural enforcement point behind `resume-composition.ts`'s own
+ * `case "auto_merge_paused":` (which only maps the outcome to a dedicated `requires_manual`
+ * reasonCode, never re-derives the decision itself). See `merge-gate-model.ts`'s own header on
+ * `MergeGatePorts.autoMergePause` for why this is an unconditional short-circuit.
+ */
+describe("auto-merge gate: E116cap project pause gate", () => {
+  it("never even reads the change request when the project is paused", async () => {
+    const calls: string[] = [];
+    const ports = mergePorts({ calls, paused: true });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toEqual({ state: "not_ready", reason: "auto_merge_paused" });
+    expect(calls).toEqual(["auto_merge_pause_check"]);
+    expect(ports.sourceControl.getChangeRequest).not.toHaveBeenCalled();
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("fails closed (stage:policy) when the pause query port itself errors, never defaulting to unpaused", async () => {
+    const ports = mergePorts({ isPausedResult: err(domainError("external_failure")) });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "policy" });
+    expect(ports.sourceControl.getChangeRequest).not.toHaveBeenCalled();
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("proceeds exactly as before this ticket when the project is not paused (no regression)", async () => {
+    const calls: string[] = [];
+    const ports = mergePorts({ calls, paused: false });
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({ state: "auto_merge_enabled" });
+    expect(calls).toEqual(["auto_merge_pause_check", "auto_merge"]);
+  });
+});
+
+/**
  * C015t decision 1 acceptance criterion ①: each of the union's newly-introduced/renamed branches
  * gets its own dedicated test -- `auto_merge_enabled` is already covered above (renamed from
  * `"enabled"`); this block covers `directly_merged` and both ways `already_merged_external` can be
@@ -519,7 +573,7 @@ describe("auto-merge gate: C015t decision 1 merge outcomes", () => {
       state: "directly_merged",
       changeRequest: { state: "merged", headSha },
     });
-    expect(calls).toEqual(["auto_merge"]);
+    expect(calls).toEqual(["auto_merge_pause_check", "auto_merge"]);
   });
 
   it("already_merged_external: the enableAutoMerge port call found it already merged by something else", async () => {
@@ -563,7 +617,7 @@ describe("auto-merge gate: C015t decision 1 merge outcomes", () => {
       changeRequest: { state: "merged", headSha },
     });
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(["auto_merge_pause_check"]);
   });
 
   it("rejects a merged_directly/merged_externally attempt whose head SHA does not match (fails closed, never assumed authorized)", async () => {

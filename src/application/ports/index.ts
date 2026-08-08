@@ -1,3 +1,4 @@
+export * from "./auto-merge-pause.js";
 export * from "./common.js";
 export * from "./git.js";
 export * from "./process.js";

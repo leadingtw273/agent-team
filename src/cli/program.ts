@@ -58,6 +58,11 @@ export interface CliHandlers {
   readonly dispatchResolveLegacyClaim: (
     input: Readonly<{ jobId: string; projectId: string; issueId: string; note: string }>,
   ) => Promise<CliCommandOutcome>;
+  /** E116cap: the human-issued escape hatch out of a project-level auto-merge pause -- see
+   * src/cli/dispatch/auto-merge-pause-handlers.ts's own header for the full rationale. */
+  readonly dispatchAutoMergeResume: (
+    input: Readonly<{ projectId: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -99,6 +104,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
   dispatchResolve: () => blocked("dispatch resolve"),
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
+  dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   health: () => blocked("health"),
@@ -234,6 +240,18 @@ export function createProgram(
             note: options.note,
           }),
         )(),
+    );
+
+  dispatch
+    .command("auto-merge-resume")
+    .description(
+      "E116cap：以 stdin 確認字串解除一個因流程外合併而被暫停的專案層級 Auto-merge 旗標" +
+        "（該旗標永不自動解除，唯一的解除方式）。專案原本就未暫停時，回報" +
+        " already_active，不視為錯誤。",
+    )
+    .requiredOption("--project <project-id>", "被暫停的專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.dispatchAutoMergeResume({ projectId: options.project }))(),
     );
 
   program

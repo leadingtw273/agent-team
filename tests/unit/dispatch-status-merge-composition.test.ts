@@ -19,6 +19,7 @@ import {
   buildMergeGateSourceControl,
 } from "../../src/cli/dispatch/status-merge-composition.js";
 import { GitHubAdapter, type GhJsonTransport } from "../../src/adapters/github/index.js";
+import { FileAutoMergePauseStore } from "../../src/adapters/dispatch/auto-merge-pause-store.js";
 import {
   domainError,
   err,
@@ -26,6 +27,14 @@ import {
   type DomainError,
   type Result,
 } from "../../src/domain/foundation/index.js";
+
+/** E116cap: `buildStatusMergePipelines` now always requires an `autoMergePauseStore` -- these tests
+ * never exercise the gate's own pause check (that lives in tests/unit/merge-gate.test.ts and
+ * tests/unit/dispatch-resume-composition.test.ts), so a throwaway, never-touched-on-disk store
+ * pointed at a fixed absolute path is enough here. */
+function autoMergePauseStore(): FileAutoMergePauseStore {
+  return new FileAutoMergePauseStore("/tmp/agent-team-status-merge-composition-test-unused");
+}
 
 const sha = "0123456789abcdef0123456789abcdef01234567";
 const otherSha = "fedcba9876543210fedcba9876543210fedcba98";
@@ -94,6 +103,7 @@ function pull(
 describe("buildStatusMergePipelines", () => {
   it("blocks with github_authentication_unavailable before constructing any port", async () => {
     const result = await buildStatusMergePipelines({
+      autoMergePauseStore: autoMergePauseStore(),
       githubTransport: {
         requestJson: () => Promise.reject(new Error("must never be called")),
         inspectAuthentication: () => Promise.resolve(err(domainError("permission_denied"))),
@@ -104,6 +114,7 @@ describe("buildStatusMergePipelines", () => {
 
   it("reaches state:ready with both coordinators constructed once GitHub auth succeeds", async () => {
     const result = await buildStatusMergePipelines({
+      autoMergePauseStore: autoMergePauseStore(),
       githubTransport: {
         requestJson: () => Promise.reject(new Error("unused in this test")),
         inspectAuthentication: () =>
