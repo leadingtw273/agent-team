@@ -19,6 +19,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
+import { FileJobProgressStore } from "../../src/adapters/dispatch/index.js";
+import { defaultJobProgressDirectory } from "../../src/cli/dispatch/resume-composition.js";
 import {
   issueSchema,
   projectSchema,
@@ -610,5 +612,139 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     expect(payload.pipelineReason).toBe("authoritative_base_unavailable");
     expect(payload.reason).toBe("default_branch_mismatch");
     expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  /**
+   * C015z decision (P0-5): `handlers.ts:553-565`'s CAS write of the new job-progress record --
+   * including `baseRevision: dispatchBaseRevision.data`, the same authoritative SHA this dispatch
+   * just pinned the worktree to -- had zero dedicated test coverage before this ticket (a resume
+   * reading this record back has its own extensive coverage in dispatch-resume-composition.test.ts,
+   * but nothing exercised the dispatch-time *write* itself). This reads the record back through a
+   * real `FileJobProgressStore` against `stateRoot`, not merely asserting on `handlers.run`'s own
+   * return payload.
+   */
+  it("persists the dispatch-time authoritative baseRevision durably on the new ci_waiting job-progress record -- a later resume must read this exact SHA back, never re-derive it", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const distinctiveBaseRevision = "9".repeat(40);
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      () =>
+        Promise.resolve({
+          state: "ready",
+          value: fakePipeline(() =>
+            Promise.resolve({
+              state: "ci_waiting",
+              worktree: {
+                repositoryRoot: repositoryPath,
+                path: "/tmp/wt",
+                branch: "agent-team/job-1",
+                headSha: distinctiveBaseRevision,
+              },
+              commit: { sha: "b".repeat(40), branch: "agent-team/job-1" },
+              push: { sha: "b".repeat(40), branch: "agent-team/job-1", remote: "origin" },
+              changeRequest: {
+                id: "PR_3",
+                number: 3,
+                url: "https://example.invalid/pull/3",
+                state: "open",
+                draft: true,
+                baseBranch: "main",
+                headBranch: "agent-team/job-1",
+                headSha: "b".repeat(40),
+                mergeability: "unknown",
+                autoMergeEnabled: false,
+                updatedAt: "2026-08-07T00:00:00.000Z" as never,
+              },
+              checks: { headSha: "b".repeat(40), aggregate: "pending", checks: [] },
+            }),
+          ),
+        }),
+      () => Promise.resolve(ok({ baseRevision: distinctiveBaseRevision, defaultBranch: "main" })),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        stage: { kind: "ci_waiting" },
+        changeRequestId: "3",
+        headSha: "b".repeat(40),
+        baseRevision: distinctiveBaseRevision,
+      });
+    }
+  });
+
+  /**
+   * C015z decision (P0-5): the `headShaSchema.safeParse(authoritativeBase.value.baseRevision)`
+   * guard (handlers.ts:542-552) -- `resolveAuthoritativeBaseRevision`'s own contract guarantees a
+   * real git SHA in production, so this branch's own comment says it is "never expected to fail in
+   * production"; this test is what exercises the one case that comment discloses (a malformed
+   * *injected test fake*). Confirms the failure surfaces the fixed `job_progress_write_failed`
+   * reason and, just as importantly, that no progress record is ever written at all -- not a
+   * partial or malformed one.
+   */
+  it("fails closed to job_progress_write_failed, writing no progress record at all, when the authoritative base SHA fails headShaSchema's guard", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      () =>
+        Promise.resolve({
+          state: "ready",
+          value: fakePipeline(() =>
+            Promise.resolve({
+              state: "ci_waiting",
+              worktree: {
+                repositoryRoot: repositoryPath,
+                path: "/tmp/wt",
+                branch: "agent-team/job-1",
+                headSha: "a".repeat(40),
+              },
+              commit: { sha: "b".repeat(40), branch: "agent-team/job-1" },
+              push: { sha: "b".repeat(40), branch: "agent-team/job-1", remote: "origin" },
+              changeRequest: {
+                id: "PR_4",
+                number: 4,
+                url: "https://example.invalid/pull/4",
+                state: "open",
+                draft: true,
+                baseBranch: "main",
+                headBranch: "agent-team/job-1",
+                headSha: "b".repeat(40),
+                mergeability: "unknown",
+                autoMergeEnabled: false,
+                updatedAt: "2026-08-07T00:00:00.000Z" as never,
+              },
+              checks: { headSha: "b".repeat(40), aggregate: "pending", checks: [] },
+            }),
+          ),
+        }),
+      // Deliberately not a well-formed 40/64-hex-char SHA.
+      () => Promise.resolve(ok({ baseRevision: "not-a-real-sha", defaultBranch: "main" })),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      error: { code: string };
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    expect(payload.error.code).toBe("invariant_violation");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) expect(records.value).toEqual([]);
   });
 });

@@ -561,6 +561,13 @@ async function seedProgressRecord(
     worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
     changeRequestId: "42",
     headSha,
+    // C015z decision (Q3): a legacy (no-`baseRevision`) record now fails closed unconditionally to
+    // `requires_manual(legacy_base_revision_unrecoverable)` instead of being transparently
+    // repaired -- every test in this file *except* the dedicated "C015y decision A" describe block
+    // (which builds its own records directly via `compareAndSwap`, bypassing this helper, precisely
+    // to exercise the legacy path on purpose) needs a real `baseRevision` here to reach whatever
+    // behavior it actually means to test.
+    baseRevision,
   });
 }
 
@@ -575,9 +582,9 @@ describe("runResumeCycle", () => {
     expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
     expect(calls).toEqual([
       "getChangeRequest",
-      // C015y decision A: this record is legacy (no `baseRevision`) -- `resolveLegacyBaseRevision`
-      // runs once, cross-checks, and CAS-writes a baseline before the rest of the resume proceeds.
-      "resolveAuthoritativeBase",
+      // C015y decision A: this record already carries a `baseRevision` (`seedProgressRecord`'s own
+      // default, C015z) -- `resolveAuthoritativeBase` is never called; that seam is now exercised
+      // only by the dedicated "C015y decision A" describe block below.
       "ciRecovery.run",
       "reviewStatus.begin",
       "reviewer.run",
@@ -615,6 +622,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "paused",
@@ -643,6 +651,7 @@ describe("runResumeCycle", () => {
       expect(result.value).toEqual([{ jobId, outcome: "fix_round", verdict: "changes_requested" }]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "fix_round" });
   });
 
@@ -670,6 +679,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "paused",
@@ -686,6 +696,7 @@ describe("runResumeCycle", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "lease_conflict" }]);
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
   });
 
@@ -703,6 +714,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -727,6 +739,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -749,6 +762,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -797,7 +811,7 @@ describe("runResumeCycle", () => {
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
-    expect(calls).toEqual(["getChangeRequest", "resolveAuthoritativeBase", "ciRecovery.run"]);
+    expect(calls).toEqual(["getChangeRequest", "ciRecovery.run"]);
   });
 
   it("does nothing when there is no resumable record for the project", async () => {
@@ -840,6 +854,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "review_pending_retry",
@@ -879,6 +894,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "review_pending_retry",
@@ -912,6 +928,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -947,6 +964,7 @@ describe("runResumeCycle", () => {
         ]);
       }
       const reloaded = await progress.load(jobId);
+      expect(reloaded.ok).toBe(true);
       if (reloaded.ok) {
         expect(reloaded.value?.stage).toEqual({
           kind: "review_report_pending_retry",
@@ -990,6 +1008,7 @@ describe("runResumeCycle", () => {
         ]);
       }
       const reloaded = await progress.load(jobId);
+      expect(reloaded.ok).toBe(true);
       if (reloaded.ok) {
         expect(reloaded.value?.stage).toEqual({
           kind: "requires_manual",
@@ -1062,6 +1081,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -1098,6 +1118,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "ci_pending_retry",
@@ -1131,6 +1152,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -1212,6 +1234,7 @@ describe("runResumeCycle", () => {
     // Stage is untouched -- still ci_waiting, not requires_manual, not even a written revision
     // bump.
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
       expect(reloaded.value?.revision).toBe(0);
@@ -1237,6 +1260,7 @@ describe("runResumeCycle", () => {
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok)
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -1289,6 +1313,7 @@ describe("runResumeCycle", () => {
     // (ci_waiting, revision 1) -- never requires_manual, which this attempt only *intended* but
     // never durably achieved.
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
       expect(reloaded.value?.revision).toBe(1);
@@ -1320,6 +1345,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(lifecycleRequests[0]).toMatchObject({ mergeAuthorizationHeadSha: headSha });
 
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
 
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
@@ -1344,6 +1370,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(lifecycleRequests[0]).not.toHaveProperty("mergeAuthorizationHeadSha");
 
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
   });
@@ -1368,13 +1395,15 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     // `armedAt`/`fingerprint`/`noProgressCount` are all still schema-optional (back-compat with a
     // real, un-migrated `~/.agent-team/state` record this ticket is forbidden from touching), even
     // though every *new* write (this one included) always populates them.
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "merging",
         armedAt: now,
+        // C015z decision (Q4): the fingerprint no longer carries `baseSha` at all -- see
+        // `mergeFingerprintOf`'s own header (resume-composition.ts).
         fingerprint: {
           headSha,
-          baseSha: baseRevisionValue,
           mergeStateStatus: "unknown",
           merged: false,
         },
@@ -1395,6 +1424,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
   });
 
@@ -1412,6 +1442,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "awaiting_review" }]);
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "awaiting_review" });
   });
 
@@ -1440,6 +1471,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       ]);
     }
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -1460,6 +1492,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
 
     await runResumeCycle(deps);
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -1581,6 +1614,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     });
 
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
   });
@@ -1674,6 +1708,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(commentBody).not.toContain("已暫停此專案新的 Auto-merge");
 
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
     const claim = await admission.load(projectId, issueId);
     expect(claim).toMatchObject({
@@ -1728,6 +1763,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "merge_reconciled" }]);
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
   });
 });
@@ -1789,6 +1825,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     }
 
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "requires_manual",
@@ -1796,9 +1833,10 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
           stage: "merge",
           reasonCode: "change_request_behind_base",
           attempts: { count: 1 },
+          // C015z decision (Q4): `mergeEvidence` comes from `mergeFingerprintOf`, which no longer
+          // carries `baseSha` -- see that function's own header.
           mergeEvidence: {
             headSha,
-            baseSha: "b".repeat(40),
             mergeStateStatus: "behind",
             merged: false,
           },
@@ -1823,6 +1861,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       expect(result.ok).toBe(true);
       if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
       const reloaded = await base.progress.load(jobId);
+      expect(reloaded.ok).toBe(true);
       if (reloaded.ok) {
         expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: attempt });
       }
@@ -1852,6 +1891,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       expect(result.ok).toBe(true);
       if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
       const reloaded = await base.progress.load(jobId);
+      expect(reloaded.ok).toBe(true);
       if (reloaded.ok) {
         expect(reloaded.value?.stage).toMatchObject({
           kind: "merging",
@@ -1883,6 +1923,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       ]);
     }
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "requires_manual",
@@ -1890,9 +1931,9 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
           stage: "merge",
           reasonCode: "auto_merge_stalled",
           attempts: { count: 5 },
+          // C015z decision (Q4): no `baseSha` -- see `mergeFingerprintOf`'s own header.
           mergeEvidence: {
             headSha,
-            baseSha: "c".repeat(40),
             mergeStateStatus: "clean",
             merged: false,
           },
@@ -1907,33 +1948,76 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     }
   });
 
-  it("a changed fingerprint resets noProgressCount to 0 rather than escalating, even after prior no-progress resumes", async () => {
+  it("a changed mergeStateStatus (a genuine progress signal -- e.g. checks resolving from unstable to clean) resets noProgressCount to 0 rather than escalating, even after prior no-progress resumes", async () => {
+    // `headSha` cannot serve as this test's changing quantity: `resumeUnderLease`'s own
+    // exact-readback pre-check (this file's module header; the `record.headSha !== undefined &&
+    // currentChangeRequest.value.headSha !== record.headSha` branch) fails the resume closed to
+    // `change_request_state_mismatch` *before* `resumeMergingStage` is ever reached the instant the
+    // live head SHA differs from the one the record was armed against -- a moved head is never
+    // observed as "still merging, but with progress" by this code path at all. `mergeStateStatus`
+    // is the one field codex's own review named that genuinely can (and, in reality, does) change
+    // between resumes while a `"merging"` job's head/base stay fixed (e.g. required checks settling
+    // from `"unstable"` to `"clean"`).
     const base = await harness();
-    let baseSha = "d".repeat(40);
+    let observedStatus: "unstable" | "clean" = "unstable";
     await seedProgressRecord(base.progress, {
       kind: "merging",
       armedAt: now,
-      fingerprint: { headSha, baseSha, mergeStateStatus: "clean", merged: false },
+      fingerprint: { headSha, mergeStateStatus: observedStatus, merged: false },
       noProgressCount: 0,
     });
-    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha }));
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: observedStatus }));
 
     await runResumeCycle(deps);
     await runResumeCycle(deps);
     const beforeChange = await base.progress.load(jobId);
+    expect(beforeChange.ok).toBe(true);
     if (beforeChange.ok) {
       expect(beforeChange.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 2 });
     }
 
-    // The base branch's own tip moved (a real progress signal, e.g. a future E105 update-branch
-    // action, or simply the base being re-observed differently) -- this must reset, not escalate.
-    baseSha = "e".repeat(40);
+    observedStatus = "clean";
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 0 });
+    }
+  });
+
+  it("C015z decision (Q4): a changed baseSha ALONE (GitHub's frozen, PR-creation-time `.base.sha` -- never a live signal, see source-control.ts's corrected header) does NOT reset noProgressCount -- the exact false-progress signal this ticket removes from the fingerprint", async () => {
+    const base = await harness();
+    let currentBaseSha = "d".repeat(40);
+    await seedProgressRecord(base.progress, {
+      kind: "merging",
+      armedAt: now,
+      // Deliberately seeded *without* `baseSha` in the fingerprint -- matching what a fresh write
+      // from this ticket onward actually produces (`mergeFingerprintOf` no longer populates it).
+      fingerprint: { headSha, mergeStateStatus: "clean", merged: false },
+      noProgressCount: 0,
+    });
+    const deps = readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: currentBaseSha }));
+
+    await runResumeCycle(deps);
+    const afterFirst = await base.progress.load(jobId);
+    expect(afterFirst.ok).toBe(true);
+    if (afterFirst.ok) {
+      expect(afterFirst.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 1 });
+    }
+
+    // Before C015z, this would have reset `noProgressCount` to 0 (the exact bug: `baseSha` was
+    // part of the fingerprint equality check, so a changed base tip -- which never happens on its
+    // own between resumes anyway, since it is frozen at PR-creation time -- looked like progress).
+    currentBaseSha = "e".repeat(40);
+    const result = await runResumeCycle(deps);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
+    const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 2 });
     }
   });
 
@@ -1949,13 +2033,14 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toEqual({
         kind: "merging",
         armedAt: now,
+        // C015z decision (Q4): no `baseSha` -- see `mergeFingerprintOf`'s own header.
         fingerprint: {
           headSha,
-          baseSha: "f".repeat(40),
           mergeStateStatus: "clean",
           merged: false,
         },
@@ -1971,36 +2056,43 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     await seedProgressRecord(base.progress, {
       kind: "merging",
       armedAt: now,
-      fingerprint: { headSha, baseSha: "a".repeat(40), mergeStateStatus: "clean", merged: false },
+      fingerprint: { headSha, mergeStateStatus: "clean", merged: false },
       noProgressCount: 0,
       lastProgressAt: now,
     });
     const clock = mutableClock(now);
-    let currentBaseSha = "a".repeat(40);
+    // C015z decision (Q4): `headSha` cannot serve as a "real progress every time" signal here --
+    // `resumeUnderLease`'s own exact-readback pre-check fails closed the instant the live head SHA
+    // differs from the record's own, before `resumeMergingStage` is ever reached (see the sibling
+    // test above for the full explanation). `baseSha` is gone from the fingerprint entirely. A
+    // genuinely changing `mergeStateStatus` (excluding `"behind"`, which escalates immediately, and
+    // `"unknown"`, tracked entirely separately) is the one field left that can actually vary here.
+    let currentStatus: "clean" | "unstable" | "blocked" | "dirty" | "draft" = "clean";
     const deps: ResumeCycleDependencies = {
-      ...readbackDeps(base, () => ({ mergeStateStatus: "clean", baseSha: currentBaseSha })),
+      ...readbackDeps(base, () => ({ mergeStateStatus: currentStatus })),
       clock: clock.clock,
     };
 
     // Three resumes, 5 minutes apart (15 minutes cumulative -- still under the 30-minute deadline),
-    // each observing a genuinely *different* base SHA (real progress every time) -- noProgressCount
-    // would stay at 0 forever under the first OR-branch alone.
-    for (const nextSha of ["b".repeat(40), "c".repeat(40), "d".repeat(40)]) {
+    // each observing a genuinely *different* concrete mergeStateStatus (real progress every time)
+    // -- noProgressCount would stay at 0 forever under the first OR-branch alone.
+    for (const next of ["unstable", "blocked", "dirty"] as const) {
       clock.advanceMinutes(5);
-      currentBaseSha = nextSha;
+      currentStatus = next;
       const result = await runResumeCycle(deps);
       expect(result.ok).toBe(true);
       if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_merging" }]);
       const reloaded = await base.progress.load(jobId);
+      expect(reloaded.ok).toBe(true);
       if (reloaded.ok) {
         expect(reloaded.value?.stage).toMatchObject({ kind: "merging", noProgressCount: 0 });
       }
     }
 
     // A 4th resume, 20 minutes later -- 35 minutes total since `armedAt`, still with fresh progress
-    // (a new base SHA again) -- must still escalate on elapsed time alone.
+    // (a new concrete status again) -- must still escalate on elapsed time alone.
     clock.advanceMinutes(20);
-    currentBaseSha = "e".repeat(40);
+    currentStatus = "draft";
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -2009,6 +2101,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       ]);
     }
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -2041,6 +2134,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     expect(first.ok).toBe(true);
     if (first.ok) expect(first.value).toEqual([{ jobId, outcome: "still_merging" }]);
     const afterFirst = await base.progress.load(jobId);
+    expect(afterFirst.ok).toBe(true);
     if (afterFirst.ok) {
       // `noProgressCount`/`lastProgressAt`/`fingerprint` all stay exactly as they were before this
       // "unknown" observation -- only `unknownSince`/`unknownCount` move.
@@ -2058,6 +2152,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     expect(second.ok).toBe(true);
     if (second.ok) expect(second.value).toEqual([{ jobId, outcome: "still_merging" }]);
     const afterSecond = await base.progress.load(jobId);
+    expect(afterSecond.ok).toBe(true);
     if (afterSecond.ok) {
       expect(afterSecond.value?.stage).toMatchObject({
         kind: "merging",
@@ -2100,6 +2195,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
       ]);
     }
     const reloaded = await base.progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
@@ -2133,6 +2229,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     clock.advanceMinutes(1);
     await runResumeCycle(deps);
     const afterUnknown = await base.progress.load(jobId);
+    expect(afterUnknown.ok).toBe(true);
     if (afterUnknown.ok) {
       expect(afterUnknown.value?.stage).toMatchObject({ kind: "merging", unknownCount: 1 });
     }
@@ -2143,6 +2240,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     clock.advanceMinutes(1);
     await runResumeCycle(deps);
     const afterClean = await base.progress.load(jobId);
+    expect(afterClean.ok).toBe(true);
     if (afterClean.ok) {
       expect(afterClean.value?.stage).not.toHaveProperty("unknownSince");
       expect(afterClean.value?.stage).not.toHaveProperty("unknownCount");
@@ -2156,6 +2254,7 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
     expect(third.ok).toBe(true);
     if (third.ok) expect(third.value).toEqual([{ jobId, outcome: "still_merging" }]);
     const afterRestart = await base.progress.load(jobId);
+    expect(afterRestart.ok).toBe(true);
     if (afterRestart.ok) {
       expect(afterRestart.value?.stage).toMatchObject({ unknownCount: 1 });
     }
@@ -2165,10 +2264,16 @@ describe("C015x decision 3: bounded still_merging (BEHIND visibility + persisted
 /**
  * C015y decision A (acceptance criterion ①): dispatch resolves the authoritative base exactly
  * once and persists it as `baseRevision`; resume must read it back, never re-derive it. Every
- * other test in this file relies on the *legacy* repair path implicitly (via `seedProgressRecord`
- * never setting `baseRevision` and the harness's own default `resolveAuthoritativeBase` fake
- * agreeing with `changeRequest()`'s default `baseSha`) -- these tests instead exercise the
- * persisted-value and failure paths directly.
+ * other test in this file gives `seedProgressRecord` a real `baseRevision` by default (C015z) so
+ * it reaches whatever behavior it actually means to test -- this describe block is the one place
+ * that deliberately builds *legacy* (no-`baseRevision`) records directly, via `compareAndSwap`,
+ * bypassing that helper, to exercise the persisted-value path and the legacy-record failure path
+ * on purpose.
+ *
+ * C015z decision (Q3): the legacy failure path no longer *repairs* anything -- see
+ * `resolveLegacyBaseRevision`'s own header (resume-composition.ts) for why the prior cross-check
+ * heuristic's premise was false. It fails closed to `requires_manual(legacy_base_revision_unrecoverable)`
+ * unconditionally, `resolveAuthoritativeBase` is never called, and `baseRevision` is never written.
  */
 describe("C015y decision A: persisted baseRevision is authoritative -- resume reads it back, never re-derives it", () => {
   const persistedBaseRevisionValue = "9".repeat(40);
@@ -2221,42 +2326,46 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
     expect(reviewerRequests[0]).toMatchObject({ baseRevision: persistedBaseRevisionValue });
   });
 
-  it("a legacy record (no baseRevision) whose freshly re-resolved base does not match the fresh PR readback's own baseSha fails closed to requires_manual(legacy_base_revision_mismatch), leaving the record's stage untouched", async () => {
-    const mismatchedBaseRevision = "8".repeat(40);
-    const parsedMismatch = headShaSchema.safeParse(mismatchedBaseRevision);
-    if (!parsedMismatch.success) throw new Error("fixture invariant violated");
-    const { deps, progress } = await harness({
-      resolveAuthoritativeBaseOutcome: ok({
-        baseRevision: parsedMismatch.data,
-        defaultBranch: "main",
-      }),
-    });
+  it("a legacy record (no baseRevision) fails closed unconditionally to requires_manual(legacy_base_revision_unrecoverable) -- resolveAuthoritativeBase is never called, and no baseRevision is ever written", async () => {
+    const { deps, progress, calls } = await harness();
     await seedLegacyCiWaiting(progress);
-    const before = await progress.load(jobId);
 
     const result = await runResumeCycle(deps);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value).toEqual([
-        { jobId, outcome: "requires_manual", reason: "legacy_base_revision_mismatch" },
+        { jobId, outcome: "requires_manual", reason: "legacy_base_revision_unrecoverable" },
       ]);
     }
+    // C015z decision (Q3): unconditional -- the prior repair heuristic's own cross-check premise
+    // was false (see `resolveLegacyBaseRevision`'s own header, resume-composition.ts); this
+    // dependency is never even reached any more.
+    expect(calls).not.toContain("resolveAuthoritativeBase");
+
+    // P0-4 fix: the assertion this replaces checked the *pre-cycle* snapshot (trivially always
+    // true -- a record that was never given one obviously does not have one yet). This checks the
+    // *post-cycle* snapshot -- the one this exact resume attempt just durably wrote -- to prove the
+    // write itself never smuggled a guessed `baseRevision` in.
     const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
+      expect(reloaded.value?.baseRevision).toBeUndefined();
       expect(reloaded.value?.stage).toMatchObject({
         kind: "requires_manual",
-        cause: { stage: "setup", reasonCode: "legacy_base_revision_mismatch" },
+        cause: {
+          stage: "setup",
+          reasonCode: "legacy_base_revision_unrecoverable",
+          // The fresh PR readback's own evidence, for a human to act on via `dispatch resolve`.
+          // `changeRequest()`'s own default fixture never sets `mergeStateStatus` explicitly, so it
+          // falls back to `"unknown"` here -- same fallback `mergeFingerprintOf` uses.
+          mergeEvidence: { headSha, baseSha: baseRevisionValue, mergeStateStatus: "unknown" },
+        },
       });
     }
-    // Never silently claims to have restored the *original* dispatch baseline -- see this
-    // describe block's own header and `resolveLegacyBaseRevision`'s own header
-    // (resume-composition.ts) for why a mismatch can only ever fail closed, never guess which
-    // side (if either) is correct.
-    expect(before.ok && before.value?.baseRevision).toBeUndefined();
   });
 
-  it("a legacy record whose resolveAuthoritativeBase call fails with a retryable error surfaces as transient_failure, not requires_manual", async () => {
-    const { deps, progress } = await harness({
+  it("a legacy record's fate is unaffected by whatever resolveAuthoritativeBase would have returned (even a failure) -- it is never invoked any more", async () => {
+    const { deps, progress, calls } = await harness({
       resolveAuthoritativeBaseOutcome: err({
         reason: "authoritative_branch_unavailable",
         error: domainError("timeout"),
@@ -2268,46 +2377,17 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value).toEqual([
-        expect.objectContaining({ jobId, outcome: "transient_failure" }),
+        { jobId, outcome: "requires_manual", reason: "legacy_base_revision_unrecoverable" },
       ]);
     }
+    expect(calls).not.toContain("resolveAuthoritativeBase");
   });
 
-  it("a legacy record whose resolveAuthoritativeBase call fails with a non-retryable default_branch_mismatch fails closed to requires_manual(base_revision_unavailable)", async () => {
-    const { deps, progress } = await harness({
-      resolveAuthoritativeBaseOutcome: err({
-        reason: "default_branch_mismatch",
-        githubDefaultBranch: "trunk",
-        configuredDefaultBranch: "main",
-      }),
-    });
-    await seedLegacyCiWaiting(progress);
-
-    const result = await runResumeCycle(deps);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.value).toEqual([
-        {
-          jobId,
-          outcome: "requires_manual",
-          reason: "legacy_base_revision_unavailable:default_branch_mismatch",
-        },
-      ]);
-    }
-    const reloaded = await progress.load(jobId);
-    if (reloaded.ok) {
-      expect(reloaded.value?.stage).toMatchObject({
-        kind: "requires_manual",
-        cause: { stage: "setup", reasonCode: "base_revision_unavailable" },
-      });
-    }
-  });
-
-  it("a legacy record whose repair CAS write itself fails (concurrent writer) surfaces as progress_write_failed, never silently proceeding on an unpersisted base", async () => {
+  it("a legacy record whose requires_manual CAS write itself fails (concurrent writer) surfaces as progress_write_failed, never falsely reporting requires_manual without a durable write", async () => {
     /** Intercepts *only* the one CAS write `resolveLegacyBaseRevision` makes (the mutation whose
-     * `next` includes `baseRevision`) and reports a conflict exactly once -- every other write in
-     * this test (the initial seed above) goes through untouched. */
-    class ConflictOnceOnBaseRevisionWrite extends FileJobProgressStore {
+     * `next.stage.kind` is `"requires_manual"`) and reports a conflict exactly once -- every other
+     * write in this test (the initial seed above) goes through untouched. */
+    class ConflictOnceOnRequiresManualWrite extends FileJobProgressStore {
       #triggered = false;
       override async compareAndSwap(
         conflictJobId: string,
@@ -2315,7 +2395,7 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
         next: Parameters<FileJobProgressStore["compareAndSwap"]>[2],
         options?: Parameters<FileJobProgressStore["compareAndSwap"]>[3],
       ) {
-        if (!this.#triggered && "baseRevision" in next) {
+        if (!this.#triggered && next.stage.kind === "requires_manual") {
           this.#triggered = true;
           return err(domainError("conflict"));
         }
@@ -2324,7 +2404,7 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
     }
     const { deps, progress: realProgress, progressDirectory } = await harness();
     await seedLegacyCiWaiting(realProgress);
-    const conflictingProgress = new ConflictOnceOnBaseRevisionWrite(progressDirectory);
+    const conflictingProgress = new ConflictOnceOnRequiresManualWrite(progressDirectory);
     const wrapped: ResumeCycleDependencies = { ...deps, progress: conflictingProgress };
 
     const result = await runResumeCycle(wrapped);

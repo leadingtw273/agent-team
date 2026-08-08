@@ -136,15 +136,17 @@ describe("GitHub source-control adapter", () => {
         value: pull({ draft: true }),
       },
       { value: pull({ draft: true }) },
+      // C015z decision (Q1): the list (idempotent-reuse) call now projects only the narrow
+      // `{number,title,body,draft}` shape -- no `mergeable`/`mergeable_state`, matching GitHub's
+      // real `pull-request-simple` list response (see
+      // tests/contract/github-adapter-draft-candidate-projection.test.ts for the real-jq proof).
       {
-        value: [
-          {
-            title: command.title,
-            body: command.body,
-            snapshot: pull({ draft: true }),
-          },
-        ],
+        value: [{ number: 42, title: command.title, body: command.body, draft: true }],
       },
+      // C015z decision (Q1): once a candidate matches, `createDraftChangeRequest` always re-fetches
+      // the full detail snapshot by PR number before returning -- never hands back the narrow list
+      // shape disguised as a `ChangeRequestSnapshot`.
+      { value: pull({ draft: true }) },
     ]);
     const adapter = new GitHubAdapter(transport);
 
@@ -153,6 +155,7 @@ describe("GitHub source-control adapter", () => {
 
     expect(created.ok && created.value.draft).toBe(true);
     expect(reused.ok && reused.value.number).toBe(42);
+    expect(reused.ok && reused.value.mergeStateStatus).toBe("clean");
     expect(transport.calls.filter((call) => call.includes("POST"))).toHaveLength(1);
     transport.expectDone();
   });

@@ -114,15 +114,19 @@ export const requiresManualReasonCodeSchema = z.enum([
   "invalid_deadline",
   "invalid_head_sha",
   "invalid_checkpoint_id",
-  // C015y decision A: a *legacy* (pre-C015y) record has no persisted `baseRevision` --
-  // `resolveLegacyBaseRevision` (resume-composition.ts) re-resolves the authoritative base and
-  // cross-checks it against this exact resume's own fresh PR readback (`baseSha`) before ever
-  // trusting it. This reasonCode covers that cross-check failing (mismatch, or the freshly
-  // resolved value not even being a well-formed SHA) -- never the resolution call itself failing,
-  // which reuses `base_revision_unavailable` below (the same reasonCode fresh dispatch already
-  // uses for that failure mode, via `requiresManualUnlessRetryable`). Fail-closed by design: this
-  // never guesses which of the two conflicting values (if either) is actually correct.
-  "legacy_base_revision_mismatch",
+  // C015z decision (Q3, replacing C015y decision A's `legacy_base_revision_mismatch`): a *legacy*
+  // (pre-C015y) record has no persisted `baseRevision`, and there is no safe way to reconstruct
+  // what the original dispatch actually used -- the prior repair heuristic cross-checked a freshly
+  // re-resolved *live* base tip against the PR's own frozen `.base.sha` (see that field's corrected
+  // header, source-control.ts) on the false premise that the two describe the same thing; they
+  // structurally diverge the instant the base branch advances past PR-creation time, which is
+  // exactly the situation the repair path existed to handle. `resolveLegacyBaseRevision`
+  // (resume-composition.ts) therefore never attempts recovery any more -- every legacy record
+  // fails closed to this reasonCode unconditionally, carrying the fresh PR readback's own evidence
+  // for a human to act on via `agent-team dispatch resolve`. Removed (never written again):
+  // `legacy_base_revision_mismatch` -- confirmed absent from every record on disk as of this
+  // ticket, safe to drop from the enum outright rather than keep as a dead, unreachable case.
+  "legacy_base_revision_unrecoverable",
   // ci_recovery
   "ci_recovery_paused",
   "ci_recovery_failed",
@@ -167,21 +171,28 @@ export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSc
 
 /**
  * C015x decision 3: the persisted, restart-safe snapshot of the last authoritative GitHub readback
- * a `"merging"` job observed -- `mergeStateStatus`/`baseSha` are deliberately loosely-validated
- * bounded strings, not a re-declared strict enum/sha-format regex, for exactly the reason
- * `lastErrorCodeSchema`'s own comment above gives for `DomainError.code`: this file must never need
- * to import `ChangeRequestSnapshot["mergeStateStatus"]`'s enum just to stay in sync with it, and
- * `ChangeRequestSnapshot.baseSha` is optional purely for pre-existing test-fixture back-compat (see
- * that type's own header, source-control.ts) -- a fixture that omits it must still be representable
- * here as an empty string, never rejected by this store's own schema. `headSha` is the change
- * request's own head SHA on `ChangeRequestSnapshot` -- an unbranded plain `string` there (unlike
- * this file's own top-level `JobProgressRecord.headSha`, which reuses the branded `headShaSchema`)
- * -- so this reuses the same hex-hash shape without the brand, avoiding a pointless
- * parse-or-throw just to satisfy a nominal type this fingerprint has no other use for. */
+ * a `"merging"` job observed -- `mergeStateStatus` is deliberately a loosely-validated bounded
+ * string, not a re-declared strict enum, for exactly the reason `lastErrorCodeSchema`'s own comment
+ * above gives for `DomainError.code`: this file must never need to import
+ * `ChangeRequestSnapshot["mergeStateStatus"]`'s enum just to stay in sync with it. `headSha` is the
+ * change request's own head SHA on `ChangeRequestSnapshot` -- an unbranded plain `string` there
+ * (unlike this file's own top-level `JobProgressRecord.headSha`, which reuses the branded
+ * `headShaSchema`) -- so this reuses the same hex-hash shape without the brand, avoiding a
+ * pointless parse-or-throw just to satisfy a nominal type this fingerprint has no other use for.
+ *
+ * C015z decision (Q4): `baseSha` is deliberately **not** part of the no-progress comparison any
+ * more -- `mergeFingerprintOf`/`mergeFingerprintsEqual` (resume-composition.ts) no longer read it
+ * at all. GitHub's `.base.sha` is a value frozen at PR-creation time (see
+ * `ChangeRequestSnapshot.baseSha`'s corrected header, source-control.ts), not a live signal of
+ * anything changing -- keeping it in the equality check gave it zero discriminating power for
+ * "did the merge make progress" while still being real evidence worth recording on a
+ * `requires_manual` cause (`mergeEvidence` below may still carry it). Optional here purely so a
+ * record written by C015x/C015y (which always populated it) still reads back successfully; a
+ * *new* write from this ticket onward never includes it, and no code compares it. */
 const mergeReadbackFingerprintSchema = z
   .object({
     headSha: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u),
-    baseSha: z.string().max(128),
+    baseSha: z.string().max(128).optional(),
     mergeStateStatus: z.string().trim().min(1).max(32),
     merged: z.boolean(),
   })
@@ -217,9 +228,12 @@ export const requiresManualCauseSchema = z
         lastCategory: reportContractFailureCategorySchema.optional(),
       })
       .strict(),
-    // C015x decision 3: populated only for the merge-stage reasonCodes this ticket (and C015y)
-    // add (`change_request_behind_base`/`auto_merge_stalled`/`merge_state_unknown_timeout`) -- the
-    // coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause" requirement. Optional for
+    // C015x decision 3: populated for the merge-stage reasonCodes that ticket (and C015y) add
+    // (`change_request_behind_base`/`auto_merge_stalled`/`merge_state_unknown_timeout`) -- the
+    // coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause" requirement. C015z decision
+    // (Q3) reuses this same evidence slot for `legacy_base_revision_unrecoverable` (a `setup`-stage
+    // reasonCode) -- the fresh PR readback's head/base SHA and merge state at the moment a legacy
+    // record was found unrecoverable, for whoever runs `dispatch resolve` to act on. Optional for
     // every other reasonCode and for every pre-existing, un-migrated `cause` record (same
     // backward-compatibility rationale as `cause` itself being optional on the stage below -- see
     // this file's own header comment).
@@ -367,10 +381,16 @@ export const jobProgressRecordSchema = z
      * for why that mattered: a floating base makes the reviewer/merge-gate diff digest computed
      * against a moving target). Optional purely for backward compatibility with records written by
      * C015x and earlier (this ticket, like every prior one touching this store, is forbidden from
-     * editing or migrating any existing file under `~/.agent-team/state`) -- `resolveLegacyBaseRevision`
-     * (resume-composition.ts) is what repairs a legacy record missing this field, itself CAS-writing
-     * this exact field once it has cross-checked a freshly re-resolved value against this exact
-     * resume's own fresh PR readback. */
+     * editing or migrating any existing file under `~/.agent-team/state`).
+     *
+     * C015z decision (P0-5): "never overwritten afterward" above used to be only a convention every
+     * caller had to remember -- `#compareAndSwapLocked` below now enforces it directly: once a
+     * record has a `baseRevision`, no mutation may change or omit it, fail-closed with
+     * `invariant_violation`. A legacy record with none may still have one written for the first
+     * time (nothing to protect yet) -- but as of C015z, `resolveLegacyBaseRevision`
+     * (resume-composition.ts) itself no longer does this; a legacy record now always fails closed to
+     * `requires_manual(legacy_base_revision_unrecoverable)` instead (see that reasonCode's own
+     * header, and `resolveLegacyBaseRevision`'s). */
     baseRevision: headShaSchema.optional(),
     updatedAt: instantSchema,
   })
@@ -461,6 +481,20 @@ export class FileJobProgressStore {
       if (normalizedCurrent.value !== undefined) return err(domainError("conflict"));
     } else if (normalizedCurrent.value?.revision !== expectedRevision) {
       return err(domainError("conflict"));
+    }
+
+    // C015z decision (P0-5): `baseRevision`'s own field header above documents this as a
+    // write-once invariant -- enforced here, the one place every CAS write funnels through,
+    // rather than left as a convention each call site must remember (which is exactly how
+    // C015y/C015z's `resolveLegacyBaseRevision` bug class happened: nothing would have stopped a
+    // future caller from silently overwriting or dropping an already-authoritative value). Only
+    // applies once a prior record genuinely has the field -- a legacy record establishing it for
+    // the first time is not a violation, there is nothing yet to protect.
+    if (
+      normalizedCurrent.value?.baseRevision !== undefined &&
+      next.baseRevision !== normalizedCurrent.value.baseRevision
+    ) {
+      return err(domainError("invariant_violation"));
     }
 
     const candidate = {

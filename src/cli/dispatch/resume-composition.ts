@@ -47,7 +47,6 @@ import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { ChangeRequestSnapshot, SourceControlPort } from "../../application/ports/index.js";
 import {
   domainError,
-  err,
   instantFromDate,
   ok,
   type Clock,
@@ -225,7 +224,9 @@ function currentReportContractRetries(record: JobProgressRecord): number {
  * only the `review_report_contract` reasonCode's own call site passes a real, larger count (the
  * report-contract retry counter's value at exhaustion) and a `lastCategory`. C015x decision 3 adds
  * `mergeEvidence` -- the coordinator's explicit "保留當時 head/base SHA 與狀態證據於 cause"
- * requirement -- passed only by `resumeMergingStage`'s call sites. C015y decision C adds
+ * requirement -- originally passed only by `resumeMergingStage`'s call sites; C015z decision Q3
+ * also passes it from `resolveLegacyBaseRevision` (a `setup`-stage reasonCode reusing the same
+ * evidence slot). C015y decision C adds
  * `stallTiming` -- the wall-clock evidence codex's review named as missing -- passed only by the
  * two `resumeMergingStage` call sites that actually escalate on a timing condition
  * (`auto_merge_stalled`/`merge_state_unknown_timeout`), never `change_request_behind_base` (that
@@ -270,29 +271,35 @@ function stallTimingOf(
   });
 }
 
-/** C015x decision 3: derives the persisted readback fingerprint from a fresh, authoritative
- * `ChangeRequestSnapshot` -- the exact four observables codex's own review named ("PR head SHA、
- * base SHA、mergeable state、merge commit／merged 狀態") as what "no progress" must be judged
- * against, never a local retry counter alone. `mergeStateStatus`/`baseSha` are optional on
+/** C015x decision 3, revised by C015z decision (Q4): derives the persisted readback fingerprint
+ * from a fresh, authoritative `ChangeRequestSnapshot`. Originally the four observables codex's own
+ * review named ("PR head SHA、base SHA、mergeable state、merge commit／merged 狀態") -- C015z drops
+ * `baseSha` from this fingerprint entirely: GitHub's `.base.sha` is frozen at PR-creation time (see
+ * `ChangeRequestSnapshot.baseSha`'s corrected header, source-control.ts), so it carried zero actual
+ * discriminating power for "did the merge make progress" while still being able to falsely *look*
+ * like progress the one time it happened to differ from a prior observation. `headSha`/
+ * `mergeStateStatus`/`merged` remain the live signal; `mergeStateStatus` is optional on
  * `ChangeRequestSnapshot` only for pre-existing test-fixture back-compat (see that type's own
- * header, source-control.ts) -- the real `GitHubAdapter` always populates both, so `"unknown"`/the
- * empty-string fallback below is only ever reached by a fake that does not care about this path. */
+ * header) -- the real `GitHubAdapter` always populates it, so the `"unknown"` fallback below is
+ * only ever reached by a fake that does not care about this path. */
 function mergeFingerprintOf(snapshot: ChangeRequestSnapshot): MergeReadbackFingerprint {
   return Object.freeze({
     headSha: snapshot.headSha,
-    baseSha: snapshot.baseSha ?? "",
     mergeStateStatus: snapshot.mergeStateStatus ?? "unknown",
     merged: snapshot.state === "merged",
   });
 }
 
+/** C015z decision (Q4): deliberately never compares `baseSha` -- see `mergeFingerprintOf`'s own
+ * header. A record persisted by C015x/C015y still carries a `baseSha` value (schema back-compat,
+ * job-progress-store.ts), but this equality check ignores it unconditionally, on both sides,
+ * regardless of whether either fingerprint happens to have it. */
 function mergeFingerprintsEqual(
   left: MergeReadbackFingerprint,
   right: MergeReadbackFingerprint,
 ): boolean {
   return (
     left.headSha === right.headSha &&
-    left.baseSha === right.baseSha &&
     left.mergeStateStatus === right.mergeStateStatus &&
     left.merged === right.merged
   );
@@ -340,14 +347,17 @@ export interface ResumeCycleDependencies {
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
   readonly clock: Clock;
   readonly holderId: string;
-  /** C015y decision A: resolves the authoritative base revision when repairing a *legacy*
-   * (pre-C015y) job-progress record that has no persisted `baseRevision` -- see
-   * `resolveLegacyBaseRevision`'s own header. This is a thin, already-ports-bound wrapper around
-   * the *same* `resolveAuthoritativeBaseRevision` (authoritative-base.ts) a fresh dispatch uses
-   * (handlers.ts), never a second, independently-drifting implementation of "what counts as
-   * authoritative" -- keeping this module itself free of any direct `GitHubAdapter`/
-   * `LocalGitAdapter` construction (see this file's own module header on staying free of
-   * GitHub-authentication wiring concerns; handlers.ts/resume-full-composition.ts own that). */
+  /** C015y decision A: originally used by `resolveLegacyBaseRevision` to re-resolve the
+   * authoritative base when repairing a *legacy* (pre-C015y) job-progress record. C015z decision
+   * Q3 removed that repair path outright (a legacy record now always fails closed to
+   * `requires_manual` without ever calling this) -- kept on this interface, currently unused by
+   * this module, rather than removing it and rippling through every composition/test call site
+   * that wires it (handlers.ts, resume-full-composition.ts, and this file's own test suite); a
+   * dedicated cleanup ticket may retire it later if nothing else ever needs it. Still a thin,
+   * already-ports-bound wrapper around the *same* `resolveAuthoritativeBaseRevision`
+   * (authoritative-base.ts) a fresh dispatch uses (handlers.ts) -- never a second,
+   * independently-drifting implementation of "what counts as authoritative" -- keeping this module
+   * itself free of any direct `GitHubAdapter`/`LocalGitAdapter` construction. */
   readonly resolveAuthoritativeBase: (
     project: Project,
     options: Readonly<{ idempotencyKey: string; signal?: AbortSignal }>,
@@ -913,70 +923,56 @@ async function resumeMergingStage(
 }
 
 /**
- * C015y decision A: repairs a *legacy* (pre-C015y) job-progress record that has no persisted
- * `baseRevision` -- runs entirely inside the caller's already-held lease (`resumeUnderLease` is
- * only ever reached after `resumeOneJob` acquires one; see this file's own module header for why
- * every mutation here is already lease-guarded). Re-resolves the authoritative base the exact same
- * way a fresh dispatch does (`deps.resolveAuthoritativeBase`, wired to
- * `resolveAuthoritativeBaseRevision` -- see authoritative-base.ts), then cross-checks that result
- * against *this exact resume's own* fresh PR readback (`current.baseSha` -- already in hand from
- * `resumeUnderLease`'s own pre-flight `getChangeRequest` call, never a second, separate GitHub
- * call) before ever trusting it. Any mismatch, resolution failure, or CAS write failure fails
- * closed -- `requires_manual` for the first two, `progress_write_failed` for the third (the same
- * convention every other CAS write in this file follows via `transitionOrReport`).
+ * C015z decision (Q3, option b -- replacing C015y decision A's repair heuristic outright): a
+ * *legacy* (pre-C015y) job-progress record has no persisted `baseRevision`, and there is no safe
+ * way to reconstruct what the original dispatch actually used as its base. The prior version of
+ * this function re-resolved the authoritative base the same way a fresh dispatch does
+ * (`deps.resolveAuthoritativeBase`) and cross-checked that *live* result against the PR's own
+ * `.base.sha` -- but `.base.sha` is a value GitHub freezes at PR-creation time, never the base
+ * branch's live tip (see `ChangeRequestSnapshot.baseSha`'s corrected header, source-control.ts).
+ * The two values are structurally guaranteed to differ the instant the base branch advances past
+ * PR-creation time -- exactly the situation this repair path existed to handle -- so the old check
+ * could never succeed in the one case it was built for; it only ever coincidentally passed because
+ * this project's own serialized workflow rarely lets `main` advance between a legacy PR's creation
+ * and its resume.
  *
- * This can only ever *establish* a legacy record's new baseline going forward -- it cannot and
- * does not claim to reconstruct whatever base the original dispatch actually used. That
- * information was never persisted anywhere and no longer exists; guessing at it would be exactly
- * the kind of "trust local state as if it were authoritative" mistake this whole ticket exists to
- * close.
+ * This function therefore never attempts recovery any more: every legacy record fails closed to
+ * `requires_manual(legacy_base_revision_unrecoverable)` unconditionally, carrying *this exact
+ * resume's own* fresh PR readback (`current`) as evidence for whoever runs
+ * `agent-team dispatch resolve` to requeue it. No CAS write of a guessed `baseRevision` ever
+ * happens here -- `deps.resolveAuthoritativeBase` is not even called.
  */
 async function resolveLegacyBaseRevision(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
   current: ChangeRequestSnapshot,
-): Promise<
-  Result<Readonly<{ record: JobProgressRecord; baseRevision: HeadSha }>, ResumeJobOutcome>
-> {
-  const resolved = await deps.resolveAuthoritativeBase(deps.project, {
-    idempotencyKey: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:legacy-base`,
+): Promise<ResumeJobOutcome> {
+  return requiresManual(
+    record,
+    deps,
+    "legacy_base_revision_unrecoverable",
+    requiresManualCause(
+      "setup",
+      "legacy_base_revision_unrecoverable",
+      1,
+      undefined,
+      legacyBaseRevisionEvidence(current),
+    ),
+  );
+}
+
+/** C015z decision (Q3): the fresh PR readback's own head/base SHA and merge state, captured as
+ * evidence on a `legacy_base_revision_unrecoverable` cause -- deliberately *not*
+ * `mergeFingerprintOf` (that helper exists for the `"merging"`-stage no-progress comparison, Q4,
+ * and no longer carries `baseSha` at all); this evidence is for a human reading the cause, so it
+ * keeps `baseSha` when the fresh readback actually has one. */
+function legacyBaseRevisionEvidence(snapshot: ChangeRequestSnapshot): MergeReadbackFingerprint {
+  return Object.freeze({
+    headSha: snapshot.headSha,
+    ...(snapshot.baseSha === undefined ? {} : { baseSha: snapshot.baseSha }),
+    mergeStateStatus: snapshot.mergeStateStatus ?? "unknown",
+    merged: snapshot.state === "merged",
   });
-  if (!resolved.ok) {
-    return err(
-      await requiresManualUnlessRetryable(
-        record,
-        deps,
-        `legacy_base_revision_unavailable:${resolved.error.reason}`,
-        resolved.error.reason === "default_branch_mismatch" ? undefined : resolved.error.error,
-        requiresManualCause("setup", "base_revision_unavailable"),
-      ),
-    );
-  }
-  // Cross-check against *this exact resume's own* fresh PR readback -- never guessed, never
-  // trusted alone. `current.baseSha` is optional purely for pre-existing test-fixture back-compat
-  // (see `ChangeRequestSnapshot.baseSha`'s own header) -- a fixture/live PR that omits or malforms
-  // it can never pass this check, by design (fail closed, not "assume it's fine").
-  const resolvedBaseSha = headShaSchema.safeParse(resolved.value.baseRevision);
-  const freshPrBaseSha = headShaSchema.safeParse(current.baseSha ?? "");
-  if (
-    !resolvedBaseSha.success ||
-    !freshPrBaseSha.success ||
-    resolvedBaseSha.data.toLowerCase() !== freshPrBaseSha.data.toLowerCase()
-  ) {
-    return err(
-      await requiresManual(
-        record,
-        deps,
-        "legacy_base_revision_mismatch",
-        requiresManualCause("setup", "legacy_base_revision_mismatch"),
-      ),
-    );
-  }
-  const written = await transition(deps.progress, record, { baseRevision: resolvedBaseSha.data });
-  if (!written.ok) {
-    return err({ jobId: record.jobId, outcome: "progress_write_failed", error: written.error });
-  }
-  return ok({ record: written.value, baseRevision: resolvedBaseSha.data });
 }
 
 async function resumeUnderLease(
@@ -1096,19 +1092,13 @@ async function resumeUnderLease(
 
   // C015y decision A: the authoritative base is read from the durable record, never re-derived
   // from the local git checkout -- see this file's own module header and job-progress-store.ts's
-  // `baseRevision` field header for why. `record` is reassigned (not merely read) when the legacy
-  // repair path CAS-writes a new revision -- every subsequent `transition`/`transitionOrReport`
-  // call in this function (and in `resumeReview` below, which receives this exact `record`) must
-  // use that fresh revision, never the stale one this function started with.
-  let baseRevision: HeadSha;
-  if (record.baseRevision !== undefined) {
-    baseRevision = record.baseRevision;
-  } else {
-    const repaired = await resolveLegacyBaseRevision(record, deps, currentChangeRequest.value);
-    if (!repaired.ok) return repaired.error;
-    record = repaired.value.record;
-    baseRevision = repaired.value.baseRevision;
+  // `baseRevision` field header for why. C015z decision Q3: a legacy record (no `baseRevision` at
+  // all) is no longer repaired -- `resolveLegacyBaseRevision` always fails closed to
+  // `requires_manual`, so this branch always returns from here; `record` is never reassigned.
+  if (record.baseRevision === undefined) {
+    return resolveLegacyBaseRevision(record, deps, currentChangeRequest.value);
   }
+  const baseRevision: HeadSha = record.baseRevision;
 
   const worktree = {
     repositoryRoot: deps.project.localRepositoryPath,
