@@ -45,12 +45,17 @@ export async function buildCiRecoveryPipeline(
 
   const git = new LocalGitAdapter();
   const checkpointDirectory = join(options.agentTeamHome, "state", "checkpoints");
+  // C017: one GitHubAdapter instance serves both `sourceControl` (the pre-existing
+  // `getCommitChecks`) and `ciLog` (the new `getFailedCheckLogExcerpts`) -- both are read-only
+  // GitHub Checks/Actions capabilities on the same repository, no reason to construct twice.
+  const github = new GitHubAdapter(githubTransport);
 
   const pipeline = new CiRecoveryPipeline({
     git,
     preflight: new GitPreflight(git),
     provider: buildClaudeRunner(options.claudeConfig),
-    sourceControl: new GitHubAdapter(githubTransport),
+    sourceControl: github,
+    ciLog: github,
     jobs: new FileJobUpdateAdapter(options.jobs),
     checkpoint: new CiRecoveryCheckpointAdapter({
       store: new LocalYamlCheckpointStore(checkpointDirectory),
