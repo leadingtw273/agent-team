@@ -16,6 +16,12 @@ import type {
 } from "../../src/application/ports/index.js";
 import { Redactor } from "../../src/infrastructure/redaction/index.js";
 import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import {
+  fixtureCanary,
+  fixtureFakeTokens,
+  fixtureForgedBoundaryInjection,
+  fixtureForgedEndBoundary,
+} from "../e2e/security/e118-fixtures.js";
 import { jobSchema, type JobAttemptCounters } from "../../src/domain/jobs/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
 import { createRequirementSnapshot } from "../../src/domain/review/index.js";
@@ -294,5 +300,87 @@ describe("ReviewerRecoveryPipeline", () => {
     expect(built.value.context.match(/=== END EXTERNAL DATA ===/gu)).toHaveLength(1);
     expect(built.value.context).toContain("Missing validation");
     expect(built.value.context).not.toContain(secret);
+  });
+
+  // E118a: the reviewer-finding path is the second (and last) real, already-wired external-data
+  // entry point this ticket's threat model names -- same deterministic matrix as
+  // `ci-recovery-pipeline.test.ts`'s own E118a describe block, exercised here through
+  // `reviewFindingsExternalData` instead of the CI-log path.
+  describe("E118a: injection deterministic matrix (shared canary/fake-token fixtures)", () => {
+    it("keeps a forged END-boundary injection in a reviewer finding's description strictly inert once boundary-wrapped", () => {
+      const block = reviewFindingsExternalData([
+        { ...finding, description: fixtureForgedBoundaryInjection() },
+      ]);
+      const built = buildProviderJobContext(
+        {
+          job: job(),
+          role: "implementer",
+          model: "gpt-balanced",
+          workingDirectory: worktree.path,
+          requirementSnapshot,
+          controllerDirective: "Fix the finding.",
+          projectRules: [],
+          externalData: [block],
+          deadlineAt: deadline,
+        },
+        new Redactor(),
+      );
+      if (!built.ok) throw new Error(built.error.code);
+      const { context } = built.value;
+      const begin = context.indexOf("=== BEGIN EXTERNAL DATA ===");
+      const end = context.lastIndexOf("=== END EXTERNAL DATA ===");
+
+      expect(context.match(/=== BEGIN EXTERNAL DATA ===/gu)).toHaveLength(1);
+      expect(context.match(/=== END EXTERNAL DATA ===/gu)).toHaveLength(1);
+      const canaryIndex = context.indexOf(fixtureCanary);
+      expect(canaryIndex).toBeGreaterThan(begin);
+      expect(canaryIndex).toBeLessThan(end);
+      expect(context.slice(0, begin)).not.toContain(fixtureForgedEndBoundary);
+    });
+
+    it.each(fixtureFakeTokens)(
+      "masks a %s-shaped fake token embedded in a reviewer finding's description with no registered secret needed",
+      (fakeToken) => {
+        const block = reviewFindingsExternalData([
+          { ...finding, description: `Evidence shows token=${fakeToken} marker:${fixtureCanary}` },
+        ]);
+        const built = buildProviderJobContext(
+          {
+            job: job(),
+            role: "implementer",
+            model: "gpt-balanced",
+            workingDirectory: worktree.path,
+            requirementSnapshot,
+            controllerDirective: "Fix the finding.",
+            projectRules: [],
+            externalData: [block],
+            deadlineAt: deadline,
+          },
+          new Redactor(),
+        );
+        if (!built.ok) throw new Error(built.error.code);
+        expect(built.value.context).not.toContain(fakeToken);
+        expect(built.value.context).toContain(fixtureCanary);
+      },
+    );
+
+    it("never lets the canary or any fake token leak into the pipeline outcome, running the full pipeline end to end", async () => {
+      const setup = fixture();
+      const outcome = await setup.pipeline.run(
+        request({
+          findings: [
+            {
+              ...finding,
+              description: `Evidence shows token=${fixtureFakeTokens[0]} marker:${fixtureCanary}`,
+            },
+          ],
+        }),
+      );
+
+      expect(outcome.state).toBe("repair_pushed");
+      const serialized = JSON.stringify(outcome);
+      expect(serialized).not.toContain(fixtureCanary);
+      for (const fakeToken of fixtureFakeTokens) expect(serialized).not.toContain(fakeToken);
+    });
   });
 });

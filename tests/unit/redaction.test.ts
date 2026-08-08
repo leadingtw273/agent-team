@@ -7,6 +7,12 @@ import {
   redactedValue,
   truncatedValue,
 } from "../../src/infrastructure/redaction/index.js";
+import {
+  fixtureFakeTokens,
+  fixtureGhpFakeToken,
+  fixtureGithubPatFakeToken,
+  fixtureSkFakeToken,
+} from "../e2e/security/e118-fixtures.js";
 
 function joined(...parts: readonly string[]): string {
   return parts.join("");
@@ -282,6 +288,42 @@ describe("structured redaction", () => {
       second: 2,
       [truncatedValue]: truncatedValue,
     });
+  });
+});
+
+describe("E118a: injection-defense fixture tokens are actually masked by the patterns this ticket relies on", () => {
+  // E118's threat model (buildProviderJobContext/ci-recovery/reviewer-recovery, exercised in the
+  // deterministic matrix elsewhere) leans on exactly two things to keep a fake credential shape
+  // out of every sink: this Redactor's pattern list, and the ticket's own explicit scope decision
+  // to only ever plant `ghp_`/`github_pat_`/`sk-`-shaped fake tokens (never `AKIA`, which the
+  // task's own instructions flag as *not* guaranteed to be recognized). This test is the one place
+  // that actually proves that decision was correct, rather than assumed.
+  it("masks a ghp_-shaped token with no registered secret needed (pattern alone is enough)", () => {
+    expect(new Redactor().redactText(fixtureGhpFakeToken)).toBe(redactedValue);
+  });
+
+  it("masks a github_pat_-shaped token with no registered secret needed", () => {
+    expect(new Redactor().redactText(fixtureGithubPatFakeToken)).toBe(redactedValue);
+  });
+
+  it("masks a sk--shaped token with no registered secret needed", () => {
+    expect(new Redactor().redactText(fixtureSkFakeToken)).toBe(redactedValue);
+  });
+
+  it("every E118 fixture fake token round-trips through redactUnknown fully masked, embedded in structured data", () => {
+    for (const token of fixtureFakeTokens) {
+      const output = new Redactor().redactUnknown({ note: `leaked: ${token}` });
+      expect(output).toEqual({ note: `leaked: ${redactedValue}` });
+    }
+  });
+
+  it("honestly documents that an AKIA-shaped AWS key is NOT a pattern this Redactor recognizes (real finding, not an assumption)", () => {
+    // This is exactly why E118's own instructions say never to plant an AKIA-shaped fake token as
+    // this ticket's proof of masking -- it would not be proof of anything. Recorded here as a
+    // real, checked finding: an AKIA-style literal survives redactText untouched.
+    const awsLookingKey = joined("AKIA", "ABCDEFGHIJKLMNOPQR");
+    expect(new Redactor().redactText(awsLookingKey)).toBe(awsLookingKey);
+    expect(containsSensitiveValue(awsLookingKey)).toBe(false);
   });
 });
 

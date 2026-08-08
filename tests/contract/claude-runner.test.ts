@@ -24,6 +24,11 @@ import { jobSchema } from "../../src/domain/jobs/index.js";
 import { agentRoleSchema, issueSchema } from "../../src/domain/project/index.js";
 import { createRequirementSnapshot } from "../../src/domain/review/index.js";
 import { Redactor } from "../../src/infrastructure/redaction/index.js";
+import {
+  fixtureCanary,
+  fixtureFakeTokens,
+  fixtureForgedBoundaryInjection,
+} from "../e2e/security/e118-fixtures.js";
 
 function instant(value: string): Instant {
   const parsed = parseInstant(value);
@@ -549,6 +554,106 @@ describe("Claude stream-json runner", () => {
           expect(["Read", "Write", "Edit", "Bash"]).not.toContain(grant);
         }
       }
+    });
+  });
+
+  /**
+   * E118a deterministic matrix: `ClaudeRunner` is the real provider adapter that
+   * `buildProviderJobContext` feeds stdin through and that redacts every field it emits back
+   * (`output` text, `tool_request` payload built from `permission_denials`) -- this describe block
+   * proves the shared E118 canary/fake-token fixtures survive (inertly, for the canary) or
+   * disappear (for the fake tokens) once run through this *real* adapter, not just the pure
+   * `buildProviderJobContext` function tested elsewhere.
+   */
+  describe("E118a: injection deterministic matrix (shared canary/fake-token fixtures)", () => {
+    it("keeps a forged END-boundary + canary injection strictly inert in the real rendered stdin", async () => {
+      const process = new FakeProcessPort([
+        { type: "result", is_error: false, result: "ok", permission_denials: [] },
+      ]);
+      const request = {
+        ...runRequest("implementer"),
+        externalData: [
+          {
+            kind: "text" as const,
+            source: "untrusted-pr-comment",
+            mediaType: "text/plain",
+            content: fixtureForgedBoundaryInjection(),
+          },
+        ],
+      };
+      const started = await runner(process).start(request);
+      if (!started.ok) throw new Error(started.error.code);
+      await started.value.completion();
+
+      const stdin = Buffer.from(process.request?.stdin ?? []).toString("utf8");
+      expect(stdin.match(/=== BEGIN EXTERNAL DATA ===/gu)).toHaveLength(1);
+      expect(stdin.match(/=== END EXTERNAL DATA ===/gu)).toHaveLength(1);
+      const begin = stdin.indexOf("=== BEGIN EXTERNAL DATA ===");
+      const end = stdin.lastIndexOf("=== END EXTERNAL DATA ===");
+      const canaryIndex = stdin.indexOf(fixtureCanary);
+      expect(canaryIndex).toBeGreaterThan(begin);
+      expect(canaryIndex).toBeLessThan(end);
+    });
+
+    it.each(fixtureFakeTokens)(
+      "masks a %s-shaped fake token in the real rendered stdin with no registered secret needed",
+      async (fakeToken) => {
+        const process = new FakeProcessPort([
+          { type: "result", is_error: false, result: "ok", permission_denials: [] },
+        ]);
+        const request = {
+          ...runRequest("implementer"),
+          externalData: [
+            {
+              kind: "text" as const,
+              source: "reviewer_findings",
+              mediaType: "text/plain",
+              content: `token=${fakeToken} marker:${fixtureCanary}`,
+            },
+          ],
+        };
+        const started = await runner(process).start(request);
+        if (!started.ok) throw new Error(started.error.code);
+        await started.value.completion();
+
+        const stdin = Buffer.from(process.request?.stdin ?? []).toString("utf8");
+        expect(stdin).not.toContain(fakeToken);
+        expect(stdin).toContain(fixtureCanary);
+      },
+    );
+
+    it("masks a fake token surfaced through a tool_request built from permission_denials, without leaking it into the event stream", async () => {
+      const process = new FakeProcessPort([
+        { type: "assistant", message: { content: [{ type: "text", text: "Attempted tool" }] } },
+        {
+          type: "result",
+          is_error: false,
+          result: "looks successful",
+          permission_denials: [
+            {
+              tool_name: "Bash",
+              authorization: `Bearer ${fixtureFakeTokens[0]}`,
+              note: fixtureCanary,
+            },
+          ],
+        },
+      ]);
+      const started = await runner(process).start(runRequest("implementer", true));
+      if (!started.ok) throw new Error(started.error.code);
+      const [events, completion] = await Promise.all([
+        collect(started.value.events),
+        started.value.completion(),
+      ]);
+
+      const serialized = JSON.stringify(events);
+      // The fake credential shape must be fully masked -- pattern-based redaction of
+      // `permission_denials` fields, defense in depth on top of the boundary/redaction
+      // `buildProviderJobContext` already applies to stdin.
+      expect(serialized).not.toContain(fixtureFakeTokens[0]);
+      // The canary (not a credential shape) is unaffected -- proving the token's disappearance
+      // above is real masking, not the whole denial payload being dropped or truncated.
+      expect(serialized).toContain(fixtureCanary);
+      expect(completion).toMatchObject({ ok: true, value: { outcome: "interrupted" } });
     });
   });
 });
