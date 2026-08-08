@@ -121,7 +121,27 @@ const pauseReasonSchema = z.enum([
  * one of this file's own closed enums or a bounded integer, by construction (see decision 1's own
  * explicit "不得存 provider 原始文字" requirement).
  */
-export const requiresManualStageSchema = z.enum(["setup", "ci_recovery", "review", "merge"]);
+/**
+ * C018 fix: `"dispatch"` is this enum's fifth member -- deliberately distinct from `"setup"`
+ * despite the surface-level similarity ("pre-pipeline reads/validation that failed"). `"setup"`
+ * (and `"ci_recovery"`/`"review"`/`"merge"`) are exclusively resume-composition.ts's own vocabulary
+ * for phases of *resuming* an already-`ci_waiting`-or-later job in a fresh process; every one of
+ * this file's existing `requiresManualCause` call sites (grep confirms) is in that one file.
+ * `"dispatch"` instead names handlers.ts's own fresh-dispatch attempt (`case "dispatched"` in
+ * `createDispatchCliHandlers`'s `run` handler) -- the phase *before* any resume cycle could ever
+ * exist, where a real `Job`+`Lease`+admission claim (with `jobId` already attached, per
+ * `dispatchOnce`'s `attachJob` call, composition.ts) already exist, but the `ImplementerPipeline`
+ * itself either never got invoked at all (composition/base/worktree/request-building failed first)
+ * or ran and returned `state:"failed"`. Conflating the two would make a human reading a
+ * `requires_manual` record's `cause.stage` guess wrong about which file/code path to go look at.
+ */
+export const requiresManualStageSchema = z.enum([
+  "setup",
+  "ci_recovery",
+  "review",
+  "merge",
+  "dispatch",
+]);
 export type RequiresManualStage = z.infer<typeof requiresManualStageSchema>;
 
 export const requiresManualReasonCodeSchema = z.enum([
@@ -185,6 +205,32 @@ export const requiresManualReasonCodeSchema = z.enum([
   // `unknownCount`). The 30-minute absolute deadline (`auto_merge_stalled`'s own second OR-branch)
   // still applies independently and unconditionally even while this is flapping.
   "merge_state_unknown_timeout",
+  // C018 fix: `stage:"dispatch"` reasonCodes -- every one of handlers.ts's own fresh-dispatch
+  // exits that used to `return` after the admission claim (and real `Job`/`Lease`) already
+  // existed, with no job-progress record left behind for `dispatch resolve` to ever find (see
+  // this file's own `requiresManualStageSchema` comment on why these are a distinct `stage` from
+  // resume-composition.ts's `"setup"`). `"implementer_request_invalid"` covers *both* of
+  // handlers.ts's two distinct checks that already shared this exact string as their CLI-JSON
+  // `pipelineReason` before this ticket (the eligible-candidate/model lookup coming back
+  // undefined, and `buildImplementerPipelineRequest` itself returning an error) -- both describe
+  // the identical situation from a human's perspective: "this job's `ImplementerPipelineRequest`
+  // could never be built," so one reasonCode for both is not a new conflation, it mirrors a
+  // conflation the CLI-JSON output already had.
+  "implementer_request_invalid",
+  "implementer_composition_blocked",
+  "authoritative_base_unavailable",
+  "worktree_directory_unavailable",
+  // The pipeline was genuinely invoked and itself returned `state:"failed"` -- distinct from every
+  // reasonCode above, which all fire *before* `pipelineComposition.value.run()` is ever called.
+  "implementer_pipeline_failed",
+  // Symmetric to the pre-existing `"invalid_head_sha"`/`"invalid_checkpoint_id"` above (reused
+  // here under `stage:"dispatch"` rather than duplicated -- both already mean exactly "this
+  // process's own internal invariant on a SHA-shaped field was violated," and `cause.stage`
+  // disambiguates which phase found it): `resolveAuthoritativeBaseRevision`'s own contract
+  // guarantees a real git SHA, so `headShaSchema.safeParse(authoritativeBase.value.baseRevision)`
+  // failing is, like those two, never expected outside an injected test fake -- but the same
+  // "claim already active, so still leave a resolvable record" discipline applies.
+  "invalid_base_revision",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 
@@ -326,11 +372,23 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   // packet): **not** "every active admission claim has a job-progress record" -- claim writes
   // happen before the job (and its progress record) even exists, and `attachJob`
   // (issue-admission-store.ts) is itself best-effort, a disclosed crash window that this ticket
-  // does not (and cannot) close. The actual invariant is narrower and absolute: *every `paused`
-  // pipeline outcome this process itself produces must be durably persisted here before the
-  // handler that produced it ever returns to its caller* -- see `handlers.ts`'s own comment on its
-  // `state === "paused"` write for why (the durable-claim `dispatch resolve` escape hatch is
-  // useless against a job it can never find).
+  // does not (and cannot) close. The actual invariant (as of C016) was narrower and absolute:
+  // *every `paused` pipeline outcome this process itself produces must be durably persisted here
+  // before the handler that produced it ever returns to its caller* -- see `handlers.ts`'s own
+  // comment on its `state === "paused"` write for why (the durable-claim `dispatch resolve` escape
+  // hatch is useless against a job it can never find).
+  //
+  // C018 fix: generalizes C016's invariant to every outcome, not just `paused` -- *once a job's
+  // admission claim has `jobId` attached (`attachJob`, issue-admission-store.ts, called before
+  // `dispatchOnce` ever returns `kind:"dispatched"`), every `agent-team run` code path that can
+  // still return for that job must, before returning, either durably persist a job-progress
+  // record `dispatch resolve` can find and act on, or -- never applicable to any code past this
+  // point, since `jobId` is already attached -- release the claim directly.* C016 only closed the
+  // gap for the one outcome shape (`paused`) the real incident that ticket investigated happened
+  // to hit; C018 closes every other `return` in `handlers.ts`'s `case "dispatched"` block that
+  // used to leave the claim with nothing to resolve against (`requires_manual`, `stage:"dispatch"`
+  // above, is what those exits now write -- see `handlers.ts`'s own header comment on this same
+  // invariant for the full enumerated list).
   z
     .object({
       kind: z.literal("paused"),

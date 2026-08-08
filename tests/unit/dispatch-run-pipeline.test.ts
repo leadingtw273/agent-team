@@ -10,7 +10,7 @@
  * routing path matters here.
  */
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -20,7 +20,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/index.js";
-import { defaultJobProgressDirectory } from "../../src/cli/dispatch/resume-composition.js";
+import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
+import {
+  createDispatchResolveHandler,
+  dispatchResolveConfirmationPhrase,
+} from "../../src/cli/dispatch/resolve-handlers.js";
+import {
+  defaultIssueAdmissionDirectory,
+  defaultJobProgressDirectory,
+} from "../../src/cli/dispatch/resume-composition.js";
 import {
   issueSchema,
   projectSchema,
@@ -280,6 +288,41 @@ function fakePipeline(run: ImplementerPipeline["run"]): ImplementerPipeline {
   return { ports: undefined as never, run } as unknown as ImplementerPipeline;
 }
 
+async function* stdinOf(phrase: string): AsyncIterable<string> {
+  await Promise.resolve();
+  yield phrase;
+}
+
+/**
+ * C018 fix: proves a `requires_manual` fallback record this ticket's fix leaves behind is not
+ * merely schema-valid but genuinely *usable* -- `dispatch resolve --as cancelled` (the same real
+ * `createDispatchResolveHandler`, resolve-handlers.ts, an operator would run) must find the job,
+ * transition it to `cancelled`, and release the still-active admission claim so the issue becomes
+ * dispatchable again. Constructs the handler directly against `stateRoot`'s own real
+ * `FileJobProgressStore`/`FileIssueAdmissionStore` (mirroring dispatch-resolve-handlers.test.ts's
+ * own pattern) rather than through `createDispatchCliHandlers`'s own `dispatchResolve` (which has
+ * no stdin-injection seam of its own and always reads real `process.stdin`).
+ */
+async function resolveJob(
+  stateRoot: string,
+  jobId: string,
+): Promise<{ resolved: string; admissionReleased: string }> {
+  const resolve = createDispatchResolveHandler({
+    progress: new FileJobProgressStore(defaultJobProgressDirectory(stateRoot)),
+    admission: new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(stateRoot)),
+    stdin: stdinOf(dispatchResolveConfirmationPhrase),
+  });
+  const outcome = await resolve({ jobId, as: "cancelled" });
+  const payload = JSON.parse(outcome.message ?? "{}") as {
+    state?: string;
+    admissionReleased?: string;
+  };
+  return {
+    resolved: outcome.state === "success" ? (payload.state ?? "") : outcome.state,
+    admissionReleased: payload.admissionReleased ?? "",
+  };
+}
+
 /**
  * C015x decision 1: this file's whole point is the pipeline hand-off *after* the worktree base is
  * resolved, not the resolution itself (that has its own dedicated unit tests,
@@ -344,6 +387,81 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     };
     expect(payload.pipeline).toBe("ci_waiting");
     expect(payload.changeRequestUrl).toBe("https://example.invalid/pull/1");
+  });
+
+  /**
+   * C018 fix: `headShaSchema.safeParse(pipelineOutcome.commit.sha)` (handlers.ts) -- like its two
+   * siblings elsewhere in this file (`baseRevision`/`checkpointId`), this is this process's own
+   * internal invariant guard, never expected to fail against a real `ImplementerPipeline`, but had
+   * zero dedicated test coverage before this ticket even though its old behavior (fail closed,
+   * leave *no* progress record at all) was the exact same silent-no-op defect class as every other
+   * exit this ticket closes. This is the one malformed-value branch of the three where the pipeline
+   * outcome carries no valid SHA-shaped evidence *at all* (unlike the `baseRevision` sibling test,
+   * which still has a real `headSha`) -- the fallback record can still keep the real
+   * `changeRequestId`, since `pipelineOutcome.changeRequest.number` never depends on `commit.sha`.
+   */
+  it("C018: fails closed to job_progress_write_failed in this invocation's own response, but persists a resolvable requires_manual record (keeping the real changeRequestId) when the pipeline outcome's own commit.sha fails headShaSchema's guard", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({
+        state: "ready",
+        value: fakePipeline(() =>
+          Promise.resolve({
+            state: "ci_waiting",
+            worktree: {
+              repositoryRoot: repositoryPath,
+              path: "/tmp/wt",
+              branch: "agent-team/job-1",
+              headSha: "a".repeat(40),
+            },
+            // Deliberately not a well-formed 40/64-hex-char SHA.
+            commit: { sha: "not-a-real-sha", branch: "agent-team/job-1" },
+            push: { sha: "not-a-real-sha", branch: "agent-team/job-1", remote: "origin" },
+            changeRequest: {
+              id: "PR_2",
+              number: 2,
+              url: "https://example.invalid/pull/2",
+              state: "open",
+              draft: true,
+              baseBranch: "main",
+              headBranch: "agent-team/job-1",
+              headSha: "not-a-real-sha",
+              mergeability: "unknown",
+              autoMergeEnabled: false,
+              updatedAt: "2026-08-07T00:00:00.000Z" as never,
+            },
+            checks: { headSha: "not-a-real-sha", aggregate: "pending", checks: [] },
+          }),
+        ),
+      }),
+    );
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      error: { code: string };
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("job_progress_write_failed");
+    expect(payload.error.code).toBe("invariant_violation");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "invalid_head_sha" },
+        },
+        changeRequestId: "2",
+      });
+      expect(records.value[0]?.headSha).toBeUndefined();
+      expect(records.value[0]?.baseRevision).toBeUndefined();
+    }
   });
 
   it("maps a paused pipeline outcome to a success payload (a pause is not an error)", async () => {
@@ -472,13 +590,20 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
   });
 
   /**
-   * C016 fix: symmetric to the existing `ci_waiting` fail-closed test below (P0-5) -- a malformed
-   * `checkpointId` on the pipeline's own outcome (never expected in production; `checkpointIdSchema`
-   * is this process's own internal invariant, not external input) must fail closed to
-   * `job_progress_write_failed` and leave *no* progress record at all, never a partial or
-   * malformed one that a later `dispatch resolve` could misread.
+   * C016 fix (superseded by C018 below): a malformed `checkpointId` on the pipeline's own outcome
+   * (never expected in production; `checkpointIdSchema` is this process's own internal invariant,
+   * not external input) must fail closed to `job_progress_write_failed` in this same invocation's
+   * own response.
+   *
+   * C018 fix: before this ticket, this branch left *no* progress record at all -- the exact same
+   * silent-no-op-with-an-active-claim defect class C016 closed for the normal `paused` write right
+   * above, just reachable through this one malformed-value edge instead. This process still
+   * cannot trust the malformed `checkpointId`, but it now writes a `requires_manual` fallback
+   * record (`cause.reasonCode:"invalid_checkpoint_id"`) so the still-active admission claim (a real
+   * `Job`+`Lease` already exist by this point) remains findable and resolvable via `dispatch
+   * resolve`, rather than durably stuck forever.
    */
-  it("C016: fails closed to job_progress_write_failed, writing no progress record at all, when the paused outcome's own checkpointId fails checkpointIdSchema's guard", async () => {
+  it("C018: fails closed to job_progress_write_failed in this invocation's own response, but persists a resolvable requires_manual record, when the paused outcome's own checkpointId fails checkpointIdSchema's guard", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const handlers = buildHandlers(stateRoot, repositoryPath, () =>
@@ -514,10 +639,27 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const records = await progress.listForProject(projectId);
     expect(records.ok).toBe(true);
-    if (records.ok) expect(records.value).toEqual([]);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "invalid_checkpoint_id" },
+        },
+      });
+    }
   });
 
-  it("maps a failed pipeline outcome (e.g. the Claude process itself failing) to a failed payload, never crashing", async () => {
+  /**
+   * C018 fix: this ticket's own packet names this the fifth, "normal failed path" exit --
+   * `pipelineOutcome.state === "failed"` is the one branch among all five where the
+   * `ImplementerPipeline` was genuinely invoked (every other exit this ticket closes fires
+   * *before* `pipelineComposition.value.run()` is ever called). Before this ticket, `handlers.ts`
+   * returned this exact payload with no job-progress record at all, leaving the already-attached
+   * admission claim durably stuck -- this is the real defect `dispatch resolve` is now proven
+   * (via `resolveJob` below) to be able to recover from.
+   */
+  it("maps a failed pipeline outcome (e.g. the Claude process itself failing) to a failed payload, never crashing, and persists a resolvable requires_manual record", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const handlers = buildHandlers(stateRoot, repositoryPath, () =>
@@ -540,9 +682,34 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     );
     const outcome = await handlers.run({ projectId });
     expect(outcome.state).toBe("failed");
-    const payload = JSON.parse(outcome.message ?? "{}") as { pipeline: string; stage: string };
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      stage: string;
+      jobId: string;
+    };
     expect(payload.pipeline).toBe("failed");
     expect(payload.stage).toBe("provider_run");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "implementer_pipeline_failed" },
+        },
+      });
+    }
+
+    // Acceptance criterion (4): `dispatch resolve` can genuinely find this record, transition it
+    // to a terminal stage, and release the admission claim that would otherwise have stayed
+    // durably, permanently stuck.
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
   });
 
   /**
@@ -583,7 +750,14 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     expect(payload.error.code).toBe("invariant_violation");
   });
 
-  it("maps a blocked pipeline composition (no gh auth) to a failed payload with the fixed message", async () => {
+  /**
+   * C018 fix: before this ticket, a blocked `buildImplementerPipeline` composition (a real `Job`+
+   * `Lease`+admission claim already exist by this point -- only the pipeline's own port wiring,
+   * e.g. missing `gh` auth, is what actually blocked) left no job-progress record at all, so the
+   * claim could never be found by `dispatch resolve` once `gh` auth was fixed. Now persists a
+   * `requires_manual` fallback record first.
+   */
+  it("maps a blocked pipeline composition (no gh auth) to a failed payload with the fixed message, and persists a resolvable requires_manual record", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const handlers = buildHandlers(stateRoot, repositoryPath, () =>
@@ -594,9 +768,28 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as {
       pipeline: string;
       pipelineReason: string;
+      jobId: string;
     };
     expect(payload.pipeline).toBe("blocked");
     expect(payload.pipelineReason).toBe("github_authentication_unavailable");
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "implementer_composition_blocked" },
+        },
+      });
+    }
+
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
   });
 
   it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role", async () => {
@@ -670,6 +863,68 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
   });
 
   /**
+   * C018 fix: forces `ensureDispatchWorktreesDirectory` itself to fail (a plain *file*, not a
+   * directory, pre-exists at `${stateRoot}/state` -- `mkdir(..., {recursive:true})` throws
+   * `ENOTDIR` there) to reach this exit -- a real `Job`+`Lease`+admission claim already exist by
+   * this point, only the worktree parent directory could not be created. Before this ticket, this
+   * left no job-progress record at all; the pipeline's own `run()` must never even be reached
+   * (mirrors the sibling `authoritative_base_unavailable` test's `runSpy` assertion).
+   */
+  it("fails closed with pipelineReason:worktree_directory_unavailable when ensureDispatchWorktreesDirectory itself fails, and persists a resolvable requires_manual record", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    // `${stateRoot}/state/dispatch` is a real, pre-existing directory (the fallback
+    // `requires_manual` write below needs its own sibling `${stateRoot}/state/dispatch/progress`
+    // subdirectory, via the exact same `mkdir(..., {recursive:true})` `AtomicFileStore` itself
+    // uses -- breaking `${stateRoot}/state` itself, as opposed to specifically `.../worktrees`,
+    // would take that down too, and this test would no longer isolate the one failure it wants).
+    // A plain *file*, not a directory, sits at `.../worktrees` itself: `mkdir(path,
+    // {recursive:true})` throws `ENOTDIR` when the target path itself (not just an ancestor)
+    // already exists as a non-directory.
+    await mkdir(join(stateRoot, "state", "dispatch"), { recursive: true });
+    await writeFile(join(stateRoot, "state", "dispatch", "worktrees"), "not a directory");
+    const runSpy = vi.fn(() =>
+      Promise.reject(new Error("must never run once the worktree directory fails")),
+    );
+    const handlers = buildHandlers(stateRoot, repositoryPath, () =>
+      Promise.resolve({ state: "ready", value: fakePipeline(runSpy) }),
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("failed");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      pipeline: string;
+      pipelineReason: string;
+      jobId: string;
+    };
+    expect(payload.pipeline).toBe("failed");
+    expect(payload.pipelineReason).toBe("worktree_directory_unavailable");
+    expect(runSpy).not.toHaveBeenCalled();
+
+    // The job-progress store's own directory lives under `${stateRoot}/state/dispatch/progress`
+    // -- reading it back needs the *store*, not the same broken `state` path handlers.ts tried
+    // (and failed) to create; `FileJobProgressStore` creates its own directory lazily on write, so
+    // the fallback write itself must have separately succeeded for this read to find anything.
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "worktree_directory_unavailable" },
+        },
+      });
+    }
+
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
+  });
+
+  /**
    * C015x decision 1: the pipeline hand-off's `baseRevision` must be whatever
    * `resolveAuthoritativeBase` (injected here, deliberately different from
    * `fakeResolveAuthoritativeBase`'s own "read the real local repo HEAD" default) returned -- never
@@ -714,8 +969,12 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * C015x decision 1: a failure at any of the five authoritative-base-resolution steps must fail
    * closed to `pipeline:"failed"`, never silently fall back to the local repo's own (possibly
    * stale) HEAD -- exactly the root-cause behavior this ticket exists to close.
+   *
+   * C018 fix: before this ticket, this exit (a real `Job`+`Lease`+admission claim already exist,
+   * only `resolveAuthoritativeBase` itself failed) left no job-progress record at all. Now
+   * persists a `requires_manual` fallback record first, proven resolvable via `resolveJob`.
    */
-  it("fails closed with pipelineReason:authoritative_base_unavailable when resolveAuthoritativeBase fails, never falling back to a local HEAD read", async () => {
+  it("fails closed with pipelineReason:authoritative_base_unavailable when resolveAuthoritativeBase fails, never falling back to a local HEAD read, and persists a resolvable requires_manual record", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     // The pipeline *composition* builder still succeeds (handlers.ts builds it before resolving
@@ -744,11 +1003,30 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       pipeline: string;
       pipelineReason: string;
       reason: string;
+      jobId: string;
     };
     expect(payload.pipeline).toBe("failed");
     expect(payload.pipelineReason).toBe("authoritative_base_unavailable");
     expect(payload.reason).toBe("default_branch_mismatch");
     expect(runSpy).not.toHaveBeenCalled();
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const records = await progress.listForProject(projectId);
+    expect(records.ok).toBe(true);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        jobId: payload.jobId,
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "authoritative_base_unavailable" },
+        },
+      });
+    }
+
+    const resolution = await resolveJob(stateRoot, payload.jobId);
+    expect(resolution.resolved).toBe("resolved");
+    expect(resolution.admissionReleased).toBe("released");
   });
 
   /**
@@ -819,15 +1097,23 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
   });
 
   /**
-   * C015z decision (P0-5): the `headShaSchema.safeParse(authoritativeBase.value.baseRevision)`
-   * guard (handlers.ts:542-552) -- `resolveAuthoritativeBaseRevision`'s own contract guarantees a
-   * real git SHA in production, so this branch's own comment says it is "never expected to fail in
-   * production"; this test is what exercises the one case that comment discloses (a malformed
-   * *injected test fake*). Confirms the failure surfaces the fixed `job_progress_write_failed`
-   * reason and, just as importantly, that no progress record is ever written at all -- not a
-   * partial or malformed one.
+   * C015z decision (P0-5, superseded by C018 below): the
+   * `headShaSchema.safeParse(authoritativeBase.value.baseRevision)` guard --
+   * `resolveAuthoritativeBaseRevision`'s own contract guarantees a real git SHA in production, so
+   * this branch's own comment says it is "never expected to fail in production"; this test is
+   * what exercises the one case that comment discloses (a malformed *injected test fake*).
+   * Confirms the failure surfaces the fixed `job_progress_write_failed` reason in this
+   * invocation's own response.
+   *
+   * C018 fix: before this ticket, this branch left *no* progress record at all -- the pipeline had
+   * genuinely already produced a real Draft PR (`headSha`/`changeRequestId` both valid) by the
+   * time only `baseRevision` failed to parse, yet the admission claim (a real `Job`+`Lease` already
+   * exist) was left durably stuck with nothing to resolve against. This now writes a
+   * `requires_manual` fallback record (`cause.reasonCode:"invalid_base_revision"`) that still keeps
+   * the real `headSha`/`changeRequestId` -- a human resolving this later can still find the actual
+   * PR even though this dispatch's own `baseRevision` bookkeeping failed.
    */
-  it("fails closed to job_progress_write_failed, writing no progress record at all, when the authoritative base SHA fails headShaSchema's guard", async () => {
+  it("C018: fails closed to job_progress_write_failed in this invocation's own response, but persists a resolvable requires_manual record (keeping the real changeRequestId/headSha) when the authoritative base SHA fails headShaSchema's guard", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const handlers = buildHandlers(
@@ -882,6 +1168,17 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const records = await progress.listForProject(projectId);
     expect(records.ok).toBe(true);
-    if (records.ok) expect(records.value).toEqual([]);
+    if (records.ok) {
+      expect(records.value).toHaveLength(1);
+      expect(records.value[0]).toMatchObject({
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "dispatch", reasonCode: "invalid_base_revision" },
+        },
+        changeRequestId: "4",
+        headSha: "b".repeat(40),
+      });
+      expect(records.value[0]?.baseRevision).toBeUndefined();
+    }
   });
 });

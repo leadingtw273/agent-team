@@ -109,6 +109,24 @@ export interface BuildImplementerPipelineRequestOptions {
   readonly baseRevision: string;
 }
 
+/**
+ * C018 fix: extracted (no behavior change -- callers below still get identical values) so
+ * `handlers.ts` can compute the exact same deterministic branch name for its own `requires_manual`
+ * fallback job-progress writes on the several exits that can be reached *before*
+ * `buildImplementerPipelineRequest` ever runs (or after it fails) -- those exits still need a
+ * schema-valid, non-empty `branch` field, and re-deriving a *different* formula there would risk
+ * silently drifting from whatever a later successful dispatch for the same job id would have used.
+ */
+export function implementerBranch(jobId: string): string {
+  return `agent-team/${jobId}`;
+}
+
+/** C018 fix: see `implementerBranch`'s own comment right above -- same rationale, same
+ * no-behavior-change extraction, for the worktree path half of the same pair. */
+export function implementerWorktreePath(agentTeamHome: string, jobId: string): string {
+  return join(agentTeamHome, "state", "dispatch", "worktrees", jobId);
+}
+
 export function buildImplementerPipelineRequest(
   options: BuildImplementerPipelineRequestOptions,
 ): Result<ImplementerPipelineRequest, DomainError> {
@@ -120,14 +138,8 @@ export function buildImplementerPipelineRequest(
   );
   if (!deadlineAt.ok) return err(domainError("invariant_violation"));
 
-  const branch = `agent-team/${options.job.id}`;
-  const worktreePath = join(
-    options.agentTeamHome,
-    "state",
-    "dispatch",
-    "worktrees",
-    options.job.id,
-  );
+  const branch = implementerBranch(options.job.id);
+  const worktreePath = implementerWorktreePath(options.agentTeamHome, options.job.id);
   const directive = buildDirective(options.issue);
   const expectedUntrackedPaths = expectedUntrackedPathsFrom(options.issue);
 
