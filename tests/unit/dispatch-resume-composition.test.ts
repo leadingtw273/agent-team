@@ -81,6 +81,7 @@ import type {
   VisualEvidenceBuildRequest,
   VisualEvidenceBuildResult,
 } from "../../src/application/pipelines/visual-evidence-builder.js";
+import type { LinearPublicationResult } from "../../src/adapters/dispatch/linear-publication.js";
 import type { ProjectCommand } from "../../src/application/projects/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
 import {
@@ -312,6 +313,9 @@ interface Harness {
   /** C015r decision 4: every request this test run's fake `reviewer.run` received, in order -- lets
    * a test assert `reportRetryFeedback` was (or was not) threaded in. */
   readonly reviewerRequests: unknown[];
+  /** E102-5: every request this test run's fake `linearPublication.publish` received, in order --
+   * lets a test assert the exact `visualManifest`/`worktreePath`/`externalIssueId` threaded to it. */
+  readonly linearPublicationRequests: unknown[];
   /** C015t decision 1/3: every request this test run's fake `lifecycle.run` received, in order --
    * lets a test assert `mergeAuthorizationHeadSha` is present (or deliberately absent) and inspect
    * `idempotencyKeyPrefix`. */
@@ -435,6 +439,9 @@ async function harness(
       request: VisualEvidenceBuildRequest,
     ) => Promise<VisualEvidenceBuildResult>;
     visualReviewModel: string;
+    // E102-5: drives the fake `deps.linearPublication.publish` -- omitted means
+    // `deps.linearPublication` itself stays undefined (the composition-root-gap fixture).
+    linearPublish: (request: unknown) => Promise<LinearPublicationResult>;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -458,10 +465,12 @@ async function harness(
   const sidecarRecords: Readonly<{ jobId: string; category: string; rejectedOutput: string }>[] =
     [];
   const reviewerRequests: unknown[] = [];
+  const linearPublicationRequests: unknown[] = [];
   const lifecycleRequests: unknown[] = [];
   const admission = new InMemoryAdmissionFake();
   admission.seedActive(projectId, issueId, jobId);
   const visualEvidenceBuild = overrides.visualEvidenceBuild;
+  const linearPublish = overrides.linearPublish;
   const deps: ResumeCycleDependencies = {
     progress,
     jobRepository,
@@ -535,6 +544,17 @@ async function harness(
     ...(overrides.visualReviewModel === undefined
       ? {}
       : { visualReviewModel: overrides.visualReviewModel }),
+    ...(linearPublish === undefined
+      ? {}
+      : {
+          linearPublication: {
+            publish: (request: unknown) => {
+              calls.push("linearPublication.publish");
+              linearPublicationRequests.push(request);
+              return linearPublish(request);
+            },
+          },
+        }),
     reviewerRecovery: {
       run: () => {
         calls.push("reviewerRecovery.run");
@@ -625,6 +645,7 @@ async function harness(
     repositoryPath,
     sidecarRecords,
     reviewerRequests,
+    linearPublicationRequests,
     lifecycleRequests,
     admission,
     progressDirectory,
@@ -2676,6 +2697,42 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       );
   }
 
+  /** E102-5: every pre-existing dual/visual-review *success*-path test in this describe block now
+   * also needs `deps.linearPublication` wired -- `resumeReview` gates `reviewer.run()` on a
+   * successful publish, so without this these tests would land in `requires_manual` before ever
+   * reaching the assertions they actually mean to make (models/visualManifest/evidence threading).
+   * The dedicated "E102-5: Linear publication gate" describe block below is what actually tests
+   * this coordinator's own wiring/fail-closed behavior. */
+  function successfulLinearPublish(): () => Promise<LinearPublicationResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            receipt: {
+              schemaVersion: 1 as const,
+              projectId,
+              issueId,
+              externalIssueId,
+              headSha,
+              manifestDigest: "e".repeat(64),
+              manifestComment: { id: "comment-manifest", sha256: "f".repeat(64) },
+              artifacts: [
+                {
+                  path: artifactPath,
+                  sha256: "d".repeat(64),
+                  assetUrl: "https://uploads.linear.app/asset-1",
+                  commentId: "comment-artifact-1",
+                },
+              ],
+              createdAt: now,
+            },
+            reused: false,
+          }),
+        }),
+      );
+  }
+
   it("dual_review threads models.visual + visualManifest + visual_artifact evidence, and the assembled request satisfies validReviewerRequest", async () => {
     const { deps, progress, calls, reviewerRequests } = await harness({
       reviewRequirement: "dual_review",
@@ -2683,6 +2740,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
       visualReviewModel: "gemini-2.5-pro",
+      linearPublish: successfulLinearPublish(),
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2712,6 +2770,7 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
       visualReviewModel: "gemini-2.5-pro",
+      linearPublish: successfulLinearPublish(),
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2839,5 +2898,228 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
     }
     expect(calls).toContain("visualEvidence.build");
     expect(calls).not.toContain("reviewer.run");
+  });
+});
+
+describe("E102-5: Linear publication gate (resumeReview requires a successful publish before reviewer.run)", () => {
+  const evidenceCriterion = "畫面在健康狀態下正確顯示 status-none.png";
+  const visualReviewCommand: ProjectCommand = {
+    executable: "node",
+    arguments: ["dist/scripts/screenshot.js", "--mode=none", "--out={{evidenceDir}}"],
+  };
+  const artifactPath = `.agent-team/evidence/${issueId}/${headSha}/status-none.png`;
+
+  function successfulVisualManifest() {
+    return {
+      schemaVersion: 1 as const,
+      issueId,
+      commitSha: headSha,
+      generatedAt: now,
+      environment: { runner: "fixture", operatingSystem: "linux" },
+      artifacts: [
+        {
+          path: artifactPath,
+          mediaType: "image/png",
+          sha256: "d".repeat(64),
+          title: "Status page (healthy)",
+          acceptanceCriteria: [evidenceCriterion],
+        },
+      ],
+    };
+  }
+
+  function successfulVisualEvidenceBuild(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: false,
+          }),
+        }),
+      );
+  }
+
+  function successfulReceipt() {
+    return {
+      schemaVersion: 1 as const,
+      projectId,
+      issueId,
+      externalIssueId,
+      headSha,
+      manifestDigest: "e".repeat(64),
+      manifestComment: { id: "comment-manifest", sha256: "f".repeat(64) },
+      artifacts: [
+        {
+          path: artifactPath,
+          sha256: "d".repeat(64),
+          assetUrl: "https://uploads.linear.app/asset-1",
+          commentId: "comment-artifact-1",
+        },
+      ],
+      createdAt: now,
+    };
+  }
+
+  const baseHarnessOptions = {
+    reviewRequirement: "dual_review" as const,
+    acceptanceCriteria: [evidenceCriterion],
+    visualReviewCommands: [visualReviewCommand],
+    visualReviewModel: "gemini-2.5-pro",
+    visualEvidenceBuild: successfulVisualEvidenceBuild(),
+  };
+
+  it("calls linearPublication.publish (with the built visualManifest) after visualEvidence.build and before reviewer.run, and proceeds on success", async () => {
+    const { deps, progress, calls, linearPublicationRequests } = await harness({
+      ...baseHarnessOptions,
+      linearPublish: () =>
+        Promise.resolve(
+          Object.freeze({
+            ok: true as const,
+            value: Object.freeze({ receipt: successfulReceipt(), reused: false }),
+          }),
+        ),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+    expect(calls.indexOf("visualEvidence.build")).toBeLessThan(
+      calls.indexOf("linearPublication.publish"),
+    );
+    expect(calls.indexOf("linearPublication.publish")).toBeLessThan(calls.indexOf("reviewer.run"));
+    expect(linearPublicationRequests).toHaveLength(1);
+    const request = linearPublicationRequests[0] as Record<string, unknown>;
+    expect(request["externalIssueId"]).toBe(externalIssueId);
+    expect(request["worktreePath"]).toBe("/tmp/does-not-need-to-exist-for-these-fakes");
+    expect(request["visualManifest"]).toEqual(successfulVisualManifest());
+  });
+
+  it("fails closed to requires_manual (reasonCode visual_publication_failed) when deps.linearPublication is never wired, without ever calling reviewer.run", async () => {
+    const { deps, progress, calls } = await harness({
+      ...baseHarnessOptions,
+      // linearPublish deliberately omitted -- deps.linearPublication stays undefined.
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "linear_publication_unavailable" },
+      ]);
+    }
+    expect(calls).toContain("visualEvidence.build");
+    expect(calls).not.toContain("linearPublication.publish");
+    expect(calls).not.toContain("reviewer.run");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "review", reasonCode: "visual_publication_failed" },
+    });
+  });
+
+  it("fails closed to requires_manual (reasonCode visual_publication_failed, never orphan) when publish fails before anything was created on Linear", async () => {
+    const { deps, progress, calls } = await harness({
+      ...baseHarnessOptions,
+      linearPublish: () =>
+        Promise.resolve(
+          Object.freeze({
+            ok: false as const,
+            failure: Object.freeze({
+              reason: "upload_failed" as const,
+              error: domainError("external_failure"),
+              orphan: false,
+            }),
+          }),
+        ),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "linear_publication_failed:upload_failed" },
+      ]);
+    }
+    expect(calls).not.toContain("reviewer.run");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "review", reasonCode: "visual_publication_failed" },
+    });
+  });
+
+  it("fails closed to requires_manual with the distinct orphan reasonCode (visual_publication_orphan) when publish fails after a Linear-side write already succeeded, and never lets reviewer.run start", async () => {
+    const { deps, progress, calls } = await harness({
+      ...baseHarnessOptions,
+      linearPublish: () =>
+        Promise.resolve(
+          Object.freeze({
+            ok: false as const,
+            failure: Object.freeze({
+              reason: "manifest_comment_failed" as const,
+              error: domainError("external_failure"),
+              orphan: true,
+            }),
+          }),
+        ),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "linear_publication_failed:manifest_comment_failed",
+        },
+      ]);
+    }
+    expect(calls).not.toContain("reviewer.run");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      // The orphan-identifiable acceptance criterion: this reasonCode is never written for the
+      // "nothing was created yet" failure class above (`visual_publication_failed`) -- an operator
+      // greps for this specific code to find a Linear-side asset/comment with no durable receipt.
+      cause: { stage: "review", reasonCode: "visual_publication_orphan" },
+    });
+  });
+
+  it("code_review never touches linearPublication at all (only visual_review/dual_review jobs are gated)", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "code_review",
+      acceptanceCriteria: [evidenceCriterion],
+      linearPublish: () => Promise.reject(new Error("must not be called for code_review")),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+    expect(calls).not.toContain("linearPublication.publish");
   });
 });

@@ -302,6 +302,8 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
         // Never exercised by this test: the E2E chain stops at `ci_waiting`, well before
         // `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
         mutationClient: {} as never,
+        // E102-5: never exercised for the identical reason -- see `mutationClient` above.
+        linearTransport: {} as never,
       },
       project,
       trustedConfig,

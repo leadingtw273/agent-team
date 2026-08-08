@@ -372,6 +372,9 @@ export function createDispatchCliHandlers(
             // Linear cancellation observed by `LifecyclePipeline` can release the lease it holds.
             leases: new LeaseCoordinator(build.value.leases),
             autoMergePause,
+            // E102-5: the same transport `readModel`/`mutationClient` above already share -- see
+            // `BuildResumeCompositionOptions.linearTransport`'s own header.
+            linearTransport: build.value.discovery.linearTransport,
           });
           if (resumeComposition.state !== "ready") {
             return outcome("blocked", {
@@ -424,6 +427,9 @@ export function createDispatchCliHandlers(
             ...(resumeComposition.value.visualReviewModel === undefined
               ? {}
               : { visualReviewModel: resumeComposition.value.visualReviewModel }),
+            ...(resumeComposition.value.linearPublication === undefined
+              ? {}
+              : { linearPublication: resumeComposition.value.linearPublication }),
             clock,
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),

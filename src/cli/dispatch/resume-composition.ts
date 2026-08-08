@@ -64,6 +64,7 @@ import {
   projectIssueByExternalId,
   type LinearDiscoveryReadModel,
 } from "../../adapters/dispatch/linear-discovery.js";
+import type { LinearVisualPublicationCoordinator } from "../../adapters/dispatch/linear-publication.js";
 import {
   FileJobProgressStore,
   type JobProgressRecord,
@@ -367,6 +368,15 @@ export interface ResumeCycleDependencies {
    * model this host actually allowlists would fail the *provider's own* validation instead of
    * this composition's, which is a worse failure to reach. */
   readonly visualReviewModel?: string;
+  /** E102-5: publishes a `visual_review`/`dual_review` job's `VisualEvidenceBuilder` output
+   * (manifest + PNG artifacts) to Linear via the existing `LinearUploadClient` (A004,
+   * adapters/linear/upload.ts) -- see `resumeReview`'s own call site, immediately after the
+   * `visualEvidence.build()` call above succeeds. Optional for the identical reason
+   * `visualEvidence`/`visualReviewModel` are: every pre-existing `code_review`-only composition/
+   * test call site keeps compiling unchanged. `resumeReview` fails closed to `requires_manual`
+   * (reasonCode `visual_publication_failed`) if a job that actually needs a visual reviewer is
+   * resumed while this is undefined, exactly mirroring `visualEvidence`'s own guard. */
+  readonly linearPublication?: Pick<LinearVisualPublicationCoordinator, "publish">;
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
@@ -1435,6 +1445,51 @@ async function resumeReview(
       );
     }
     visualEvidence = built.value;
+
+    // E102-5: the manifest + PNG evidence `built` just produced must reach Linear -- with a
+    // durable, reusable receipt -- before the reviewer is ever allowed to start. Any failure here
+    // (composition-root gap, a stale/mismatched receipt, or the upload/comment call itself failing)
+    // fails this job closed to `requires_manual`, never letting `reviewer.run()` proceed on
+    // evidence nobody outside this process can see. See linear-publication.ts's own header for why
+    // an "orphan" (a Linear-side asset/comment already created, but no durable receipt for it)
+    // gets a distinct reasonCode from every other publication failure.
+    if (deps.linearPublication === undefined) {
+      return requiresManual(
+        record,
+        deps,
+        "linear_publication_unavailable",
+        requiresManualCause("review", "visual_publication_failed"),
+      );
+    }
+    const publicationContext = await deps.readModel.readContext(deps.teamId, deps.linearProjectId);
+    if (!publicationContext.ok) {
+      return requiresManualUnlessRetryable(
+        record,
+        deps,
+        "linear_publication_context_unavailable",
+        publicationContext.error,
+        requiresManualCause("review", "visual_publication_failed"),
+      );
+    }
+    const published = await deps.linearPublication.publish({
+      context: publicationContext.value,
+      projectId: deps.project.id,
+      issueId: context.requirementSnapshot.issue.id,
+      externalIssueId: record.externalIssueId,
+      worktreePath: context.worktree.path,
+      visualManifest: visualEvidence.visualManifest,
+    });
+    if (!published.ok) {
+      return requiresManual(
+        record,
+        deps,
+        `linear_publication_failed:${published.failure.reason}`,
+        requiresManualCause(
+          "review",
+          published.failure.orphan ? "visual_publication_orphan" : "visual_publication_failed",
+        ),
+      );
+    }
   }
 
   const reviewOutcome = await deps.reviewer.run({

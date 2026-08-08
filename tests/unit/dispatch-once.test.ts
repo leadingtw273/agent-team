@@ -127,6 +127,8 @@ function readyComposition(readModel: LinearDiscoveryReadModel): DispatchComposit
       // Never exercised: this fixture only feeds `dispatchOnce` (discovery -> dispatch), well
       // before `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
       mutationClient: {} as never,
+      // E102-5: never exercised for the identical reason -- see `mutationClient` above.
+      linearTransport: {} as never,
     },
     project: project(),
     trustedConfig: trustedConfigFixture(),

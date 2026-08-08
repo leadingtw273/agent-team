@@ -139,6 +139,11 @@ export interface DispatchCompositionReady {
       LinearMutationClient,
       "observeGithubMerge" | "setAgentCondition" | "appendComment"
     >;
+    /** E102-5: the same transport `readModel`/`mutationClient` above already share -- threaded
+     * through `handlers.ts` to `buildResumeComposition` so it can construct a real
+     * `LinearUploadClient` (upload.ts) for `LinearVisualPublicationCoordinator`, never a second,
+     * independently-configured transport. */
+    readonly linearTransport: LinearGraphqlTransport;
   };
   readonly project: ProjectRegistrySnapshot["ready"][number]["project"];
   /** The same entry's trusted config (src/application/projects/loader.ts) -- C015b's run-flow
@@ -402,6 +407,11 @@ export async function buildDispatchComposition(
         linearProjectId: readyEntry.project.workManagement.projectId,
         readModel,
         mutationClient,
+        // E102-5: threaded through to `buildResumeComposition` so it can construct a real
+        // `LinearUploadClient` (upload.ts) for `LinearVisualPublicationCoordinator` -- the same
+        // transport `readModel`/`mutationClient` right above already share, never a second,
+        // independently-configured instance.
+        linearTransport,
       }),
       project: readyEntry.project,
       trustedConfig: readyEntry.config,

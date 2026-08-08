@@ -307,6 +307,8 @@ function fakeBuildComposition(stateRoot: string) {
           // Never exercised here: these handler tests stop at dry-run/dispatch outcomes, well
           // before `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
           mutationClient: {} as never,
+          // E102-5: never exercised for the identical reason -- see `mutationClient` above.
+          linearTransport: {} as never,
         },
         project: project(),
         trustedConfig: trustedConfigFixture(),

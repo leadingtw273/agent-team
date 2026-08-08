@@ -285,6 +285,8 @@ function buildHandlers(
           // Never exercised here: these tests stop at pipeline-outcome mapping, well before
           // `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
           mutationClient: {} as never,
+          // E102-5: never exercised for the identical reason -- see `mutationClient` above.
+          linearTransport: {} as never,
         },
         project: project(repositoryPath),
         trustedConfig: trustedConfigFixture(),

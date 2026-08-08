@@ -189,6 +189,21 @@ export const requiresManualReasonCodeSchema = z.enum([
   // directory, corrupt artifact, ...). Never auto-retried -- every one of these needs a human or
   // an operator config fix, not a resume-cycle retry.
   "visual_evidence_unavailable",
+  // E102-5: the visual evidence `built` above did produce a valid manifest, but publishing it (plus
+  // its PNG artifacts) to Linear -- via `LinearVisualPublicationCoordinator.publish()`
+  // (linear-publication.ts), the required gate before `reviewer.run()` may ever be called for a
+  // `visual_review`/`dual_review` job -- itself failed *before* any Linear-side write succeeded
+  // (invalid request, receipt-store read failure, a stale/mismatched pre-existing receipt, an
+  // artifact that no longer matches its recorded hash, or the upload/comment call itself failing).
+  // Also written when `deps.linearPublication` was never wired at all -- the composition-root gap
+  // symmetric to `visual_evidence_unavailable` above. Never auto-retried, same as that reasonCode.
+  "visual_publication_failed",
+  // E102-5: the publish attempt's failure happened *after* at least one artifact (or the manifest
+  // summary comment) already durably exists on Linear -- an orphan by `linear-publication.ts`'s own
+  // definition (its header's "Orphan-asset contract"). Deliberately a distinct reasonCode from
+  // `visual_publication_failed` above so an operator can find and reconcile the orphaned Linear
+  // asset/comment specifically, rather than conflating it with a failure that created nothing.
+  "visual_publication_orphan",
   "auto_merge_not_enabled",
   // merge
   "lifecycle_not_completed",

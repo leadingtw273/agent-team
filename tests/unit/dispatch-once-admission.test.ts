@@ -261,6 +261,7 @@ function readyComposition(stateRoot: string, externalIssueId: string): DispatchC
       linearProjectId: "linear-proj-1",
       readModel: readModel(externalIssueId) as never,
       mutationClient: {} as never,
+      linearTransport: {} as never,
     },
     project: project(),
     trustedConfig: registry().ready[0]?.config as never,
