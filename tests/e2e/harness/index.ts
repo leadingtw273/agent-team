@@ -1,4 +1,5 @@
 export * from "./case.js";
+export * from "./case-runner.js";
 export * from "./checkpoint-reader.js";
 export * from "./collector.js";
 export * from "./placeholder-project.js";
