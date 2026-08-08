@@ -59,6 +59,18 @@ export const domainErrorDefinitions = {
     message: "The operation was interrupted.",
     retryable: true,
   },
+  /** E102-3: distinct from the pre-existing `conflict` -- this is specifically what a reviewer
+   * pipeline's *second* (post-provider-run) evidence integrity check reports when evidence that
+   * verified cleanly *before* a reviewer provider ran no longer does (content, hash, or manifest
+   * binding changed while the provider had the worktree). Never used for the *first*
+   * (pre-provider-run) check, which still reports the pre-existing `conflict` -- that check has no
+   * "before" state to have changed relative to. See `ReviewerPipeline.run`'s own post-review
+   * evidence re-verification (reviewer.ts) for the one call site that produces this. */
+  evidence_changed: {
+    category: "state",
+    message: "Review evidence changed after being verified.",
+    retryable: false,
+  },
 } as const;
 
 export type DomainErrorCode = keyof typeof domainErrorDefinitions;

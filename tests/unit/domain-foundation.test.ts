@@ -100,7 +100,7 @@ describe("domain foundation", () => {
     );
     const serialized = errors.map(serializeDomainError);
 
-    expect(serialized).toHaveLength(12);
+    expect(serialized).toHaveLength(13);
     for (const error of errors) expect(Object.keys(error)).toEqual(allowedKeys);
     for (const value of serialized) {
       const parsed = JSON.parse(value) as unknown;

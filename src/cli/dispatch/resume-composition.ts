@@ -38,6 +38,8 @@ import type {
   ReviewStatusCoordinator,
   AutoMergeGate,
   LifecyclePipeline,
+  VisualEvidenceBuilder,
+  VisualEvidenceBuildSuccess,
 } from "../../application/pipelines/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { ChangeRequestSnapshot, SourceControlPort } from "../../application/ports/index.js";
@@ -347,6 +349,15 @@ export interface ResumeCycleDependencies {
   readonly ciRecovery: Pick<CiRecoveryPipeline, "run">;
   readonly reviewerRecovery: Pick<ReviewerRecoveryPipeline, "run">;
   readonly reviewer: Pick<ReviewerPipeline, "run">;
+  /** E102-3: builds the `VisualManifest` + `visual_artifact` evidence a `visual_review`/
+   * `dual_review` job's `reviewer.run()` call requires (see `resumeReview`'s own use, below) --
+   * see visual-evidence-builder.ts's own header for the full data flow. Optional (unlike every
+   * other pipeline dependency on this interface) so every pre-existing test/composition call site
+   * that only ever exercises `code_review` jobs keeps compiling unchanged; `resumeReview` fails
+   * closed to `requires_manual` (reasonCode `visual_evidence_unavailable`) if a job that actually
+   * needs a visual reviewer is resumed while this is undefined, rather than silently skipping
+   * visual evidence or crashing. */
+  readonly visualEvidence?: Pick<VisualEvidenceBuilder, "build">;
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
@@ -1369,6 +1380,55 @@ async function resumeReview(
       ? Object.freeze({ category: record.stage.lastCategory })
       : undefined;
 
+  // E102-3: `Issue.reviewRequirement` (optional on the domain schema) decides which reviewer
+  // role(s) `reviewer.run()`'s own `validReviewerRequest` (reviewer-policy.ts) will require --
+  // mirrored here so `models`/`evidence`/`visualManifest` are assembled to match exactly, rather
+  // than this call always forcing `models.code` the way it did before this ticket (which is why a
+  // `visual_review`/`dual_review` job could never pass `validReviewerRequest` at all: it always
+  // set `models.code` even when only a visual reviewer was required, and never set `models.visual`/
+  // `evidence`/`visualManifest` for any requirement). An `undefined` `reviewRequirement` still
+  // resolves to "no role required" here, exactly as it always has -- `validReviewerRequest`'s own
+  // `roles.length > 0` check fails that case closed, unchanged from before this ticket.
+  const reviewRequirement = context.requirementSnapshot.issue.reviewRequirement;
+  const needsCodeReview = reviewRequirement === "code_review" || reviewRequirement === "dual_review";
+  const needsVisualReview =
+    reviewRequirement === "visual_review" || reviewRequirement === "dual_review";
+
+  let visualEvidence: VisualEvidenceBuildSuccess | undefined;
+  if (needsVisualReview) {
+    if (deps.visualEvidence === undefined || deps.trustedConfig.commands.visualReview.length === 0) {
+      return requiresManual(
+        record,
+        deps,
+        "visual_evidence_builder_unavailable",
+        requiresManualCause("review", "visual_evidence_unavailable"),
+      );
+    }
+    const built = await deps.visualEvidence.build({
+      worktreePath: context.worktree.path,
+      issueId: context.requirementSnapshot.issue.id,
+      headSha: expectedHeadSha,
+      commands: deps.trustedConfig.commands.visualReview,
+      allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+      deadlineAt: reviewDeadline,
+    });
+    if (!built.ok) {
+      return requiresManual(
+        record,
+        deps,
+        `visual_evidence_build_failed:${built.failure.reason}`,
+        requiresManualCause("review", "visual_evidence_unavailable"),
+      );
+    }
+    visualEvidence = built.value;
+  }
+
+  // E102-3: `models.visual` has no dedicated config value yet -- `reviewer-composition.ts` (out of
+  // this ticket's scope, owned by E102-2) still wires `visualReviewer` to the identical runner
+  // instance as `codeReviewer`, so reusing `record.model` here is not a guess but the accurate
+  // value for *today's* composition; it is a placeholder only in the sense that E102-2's real
+  // Gemini wiring will replace it with that provider's own selected model, not in the sense that
+  // it is currently wrong.
   const reviewOutcome = await deps.reviewer.run({
     job: context.job,
     project: deps.project,
@@ -1378,8 +1438,12 @@ async function resumeReview(
     changeRequestId: context.changeRequestId,
     baseRevision: context.baseRevision,
     expectedHeadSha,
-    models: { code: record.model },
-    evidence: Object.freeze([]),
+    models: {
+      ...(needsCodeReview ? { code: record.model } : {}),
+      ...(needsVisualReview ? { visual: record.model } : {}),
+    },
+    evidence: visualEvidence?.evidence ?? Object.freeze([]),
+    ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
     deadlineAt: reviewDeadline,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
     ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),

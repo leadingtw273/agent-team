@@ -179,6 +179,16 @@ export const requiresManualReasonCodeSchema = z.enum([
   "review_report_contract",
   "review_record_failed",
   "review_not_approved",
+  // E102-3: a `visual_review`/`dual_review` job reached `resumeReview` (resume-composition.ts)
+  // while either `deps.visualEvidence` itself was never wired (composition-root gap, not this
+  // job's fault) or the project's own `commands.visualReview` is empty (`validReviewerRequest`,
+  // reviewer-policy.ts, would fail this same job on that exact condition regardless -- this
+  // reasonCode surfaces the *specific* reason before ever calling `reviewer.run()` at all, rather
+  // than a generic `invariant_violation` from deep inside that pipeline), or the Visual Evidence
+  // Builder itself returned a failure (bad/missing trusted command, ungitignored evidence
+  // directory, corrupt artifact, ...). Never auto-retried -- every one of these needs a human or
+  // an operator config fix, not a resume-cycle retry.
+  "visual_evidence_unavailable",
   "auto_merge_not_enabled",
   // merge
   "lifecycle_not_completed",

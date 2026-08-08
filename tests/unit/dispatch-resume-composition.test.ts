@@ -73,7 +73,15 @@ import {
   projectSchema,
   reviewRequirementSchema,
   type Project,
+  type ReviewRequirement,
 } from "../../src/domain/project/index.js";
+import { readyGateTemplateHeadings } from "../../src/application/registration/linear-provision-model.js";
+import { validReviewerRequest } from "../../src/application/pipelines/reviewer-policy.js";
+import type {
+  VisualEvidenceBuildRequest,
+  VisualEvidenceBuildResult,
+} from "../../src/application/pipelines/visual-evidence-builder.js";
+import type { ProjectCommand } from "../../src/application/projects/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
 import {
   emptyAttemptCounters,
@@ -215,7 +223,14 @@ function linearContext(): LinearProjectContext {
   });
 }
 
-function readModel(): LinearDiscoveryReadModel {
+/** E102-3: `reviewRequirement`/`description` are read directly off this snapshot (see
+ * `toDomainIssue`, linear-discovery.ts) -- this fake `readIssue` bypasses the real
+ * label-catalog-driven decoding entirely (unlike the real `LinearReadModel`), so setting
+ * `reviewRequirement` here is the direct, correct way to drive a `visual_review`/`dual_review`
+ * fixture, not a shortcut around anything real tests would otherwise exercise. */
+function readModel(
+  overrides: Readonly<{ reviewRequirement?: ReviewRequirement; description?: string }> = {},
+): LinearDiscoveryReadModel {
   return {
     readContext: () => Promise.resolve(ok(linearContext())),
     listIssueIdsInState: () => Promise.resolve(ok([externalIssueId])),
@@ -233,9 +248,17 @@ function readModel(): LinearDiscoveryReadModel {
           otherLabelIds: [],
           relations: [],
           comments: [],
+          ...(overrides.reviewRequirement === undefined
+            ? {}
+            : { reviewRequirement: overrides.reviewRequirement }),
+          ...(overrides.description === undefined ? {} : { description: overrides.description }),
         }),
       ),
   };
+}
+
+function acceptanceCriteriaDescription(criteria: readonly string[]): string {
+  return `## ${readyGateTemplateHeadings.acceptanceCriteria}\n${criteria.map((criterion) => `- ${criterion}`).join("\n")}\n`;
 }
 
 function changeRequest(overrides: Readonly<Record<string, unknown>> = {}) {
@@ -403,6 +426,14 @@ async function harness(
     resolveAuthoritativeBaseOutcome: Awaited<
       ReturnType<ResumeCycleDependencies["resolveAuthoritativeBase"]>
     >;
+    // E102-3: drives `readModel()`'s fake `readIssue` -- see that function's own header for why
+    // setting `reviewRequirement` directly here is the correct fixture technique.
+    reviewRequirement: ReviewRequirement;
+    acceptanceCriteria: readonly string[];
+    visualReviewCommands: readonly ProjectCommand[];
+    visualEvidenceBuild: (
+      request: VisualEvidenceBuildRequest,
+    ) => Promise<VisualEvidenceBuildResult>;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -429,6 +460,7 @@ async function harness(
   const lifecycleRequests: unknown[] = [];
   const admission = new InMemoryAdmissionFake();
   admission.seedActive(projectId, issueId, jobId);
+  const visualEvidenceBuild = overrides.visualEvidenceBuild;
   const deps: ResumeCycleDependencies = {
     progress,
     jobRepository,
@@ -439,14 +471,37 @@ async function harness(
         return Promise.resolve(ok(changeRequest(overrides.changeRequestState ?? {})));
       },
     },
-    readModel: readModel(),
+    readModel: readModel({
+      ...(overrides.reviewRequirement === undefined
+        ? {}
+        : { reviewRequirement: overrides.reviewRequirement }),
+      ...(overrides.acceptanceCriteria === undefined
+        ? {}
+        : { description: acceptanceCriteriaDescription(overrides.acceptanceCriteria) }),
+    }),
     teamId: "team-1",
     linearProjectId: "proj-1",
     project: project(repositoryPath),
+    // E102-3: schema-complete (not the pre-existing loose `as never` stub) so the new
+    // "assembled request satisfies the real `validReviewerRequest`" tests below can run the actual
+    // production validator against it -- every field here matches `project(repositoryPath)`
+    // exactly, the same way it always implicitly needed to for `commands.visualReview` (only ever
+    // read when a job's `reviewRequirement` actually needs a visual reviewer) to be meaningful.
     trustedConfig: {
+      schemaVersion: 1,
+      projectId,
+      defaultBranch: "main",
+      platforms: {
+        workManagement: { provider: "linear", containerId: "team-1", projectId: "proj-1" },
+        sourceControl: { provider: "github", repository: "owner/sandbox" },
+      },
       projectRules: [],
       roleInstructions: {},
-    } as never,
+      commands: {
+        quality: [{ executable: "true", arguments: [] }],
+        visualReview: [...(overrides.visualReviewCommands ?? [])],
+      },
+    },
     ciRecovery: {
       run: () => {
         calls.push("ciRecovery.run");
@@ -466,6 +521,16 @@ async function harness(
         );
       },
     },
+    ...(visualEvidenceBuild === undefined
+      ? {}
+      : {
+          visualEvidence: {
+            build: (request: VisualEvidenceBuildRequest) => {
+              calls.push("visualEvidence.build");
+              return visualEvidenceBuild(request);
+            },
+          },
+        }),
     reviewerRecovery: {
       run: () => {
         calls.push("reviewerRecovery.run");
@@ -2529,5 +2594,217 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
         expect.objectContaining({ jobId, outcome: "progress_write_failed" }),
       ]);
     }
+  });
+});
+
+describe("E102-3: resumeReview visual/dual review evidence threading", () => {
+  const evidenceCriterion = "畫面在健康狀態下正確顯示 status-none.png";
+  const visualReviewCommand: ProjectCommand = {
+    executable: "node",
+    arguments: ["dist/scripts/screenshot.js", "--mode=none", "--out={{evidenceDir}}"],
+  };
+  const artifactPath = `.agent-team/evidence/${issueId}/${headSha}/status-none.png`;
+
+  /** This file's own shared fixtures have one, pre-existing (and pre-E102-3) inconsistency
+   * unrelated to visual/dual review threading: `job()`'s `issueId` is a fixed constant, while the
+   * `Issue.id` `resumeReview` actually derives at runtime (`toDomainIssue`, linear-discovery.ts) is
+   * `generateDeterministicIdentifier("issue", externalIssueId)` -- a different value, only because
+   * no test in this file before this ticket ever ran the assembled request through the real
+   * `validReviewerRequest` (every `reviewer.run` here is a scripted fake that never checks it). In
+   * real production the two always agree (a job's `issueId` is itself set from that exact same
+   * derivation at dispatch time). Patching just that one field lets these tests prove the actually
+   * new thing E102-3 adds -- that a `visual_review`/`dual_review` request `resumeReview` now
+   * assembles satisfies the real, unmodified validator -- without also being the ones on the hook
+   * for repairing this file's unrelated fixture-id inconsistency.
+   */
+  function validAsAssembledByProduction(request: unknown): boolean {
+    const typed = request as { job: { issueId: string }; requirementSnapshot: { issue: { id: string } } };
+    return validReviewerRequest({
+      ...typed,
+      job: { ...typed.job, issueId: typed.requirementSnapshot.issue.id },
+    } as never);
+  }
+
+  function successfulVisualManifest() {
+    return {
+      schemaVersion: 1 as const,
+      issueId,
+      commitSha: headSha,
+      generatedAt: now,
+      environment: { runner: "fixture", operatingSystem: "linux" },
+      artifacts: [
+        {
+          path: artifactPath,
+          mediaType: "image/png",
+          sha256: "d".repeat(64),
+          title: "Status page (healthy)",
+          acceptanceCriteria: [evidenceCriterion],
+        },
+      ],
+    };
+  }
+
+  function successfulVisualEvidenceBuild(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: false,
+          }),
+        }),
+      );
+  }
+
+  it("dual_review threads models.visual + visualManifest + visual_artifact evidence, and the assembled request satisfies validReviewerRequest", async () => {
+    const { deps, progress, calls, reviewerRequests } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      visualEvidenceBuild: successfulVisualEvidenceBuild(),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls.indexOf("visualEvidence.build")).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf("visualEvidence.build")).toBeLessThan(calls.indexOf("reviewer.run"));
+    expect(reviewerRequests).toHaveLength(1);
+    const request = reviewerRequests[0] as Record<string, unknown>;
+    expect(request["models"]).toEqual({ code: "claude-opus", visual: "claude-opus" });
+    expect(request["visualManifest"]).toEqual(successfulVisualManifest());
+    expect(request["evidence"]).toEqual([
+      expect.objectContaining({ kind: "file", category: "visual_artifact" }),
+    ]);
+    // The whole point of this ticket: before it, this exact shape of request always failed
+    // `validReviewerRequest` (reviewer-policy.ts) for a `dual_review` job -- assembling it here and
+    // running it through the real, unmodified production validator is the strongest possible proof
+    // that the invariant no longer fails.
+    expect(validAsAssembledByProduction(request)).toBe(true);
+  });
+
+  it("visual_review-only sets models.visual but never models.code", async () => {
+    const { deps, progress, reviewerRequests } = await harness({
+      reviewRequirement: "visual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      visualEvidenceBuild: successfulVisualEvidenceBuild(),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    const request = reviewerRequests[0] as Record<string, unknown>;
+    expect(request["models"]).toEqual({ visual: "claude-opus" });
+    expect(validAsAssembledByProduction(request)).toBe(true);
+  });
+
+  it("code_review never invokes the visual evidence builder and never sets models.visual (unchanged from before this ticket)", async () => {
+    const { deps, progress, calls, reviewerRequests } = await harness({
+      reviewRequirement: "code_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualEvidenceBuild: () => Promise.reject(new Error("must not be called for code_review")),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).not.toContain("visualEvidence.build");
+    const request = reviewerRequests[0] as Record<string, unknown>;
+    expect(request["models"]).toEqual({ code: "claude-opus" });
+    expect(request["visualManifest"]).toBeUndefined();
+    expect(validAsAssembledByProduction(request)).toBe(true);
+  });
+
+  it("dual_review fails closed to requires_manual when no visual evidence builder is wired, without ever calling reviewer.run", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      // visualEvidenceBuild deliberately omitted -- deps.visualEvidence stays undefined.
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "visual_evidence_builder_unavailable" },
+      ]);
+    }
+    expect(calls).not.toContain("visualEvidence.build");
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("dual_review fails closed to requires_manual when the project's commands.visualReview is empty, even with a builder wired", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      // visualReviewCommands deliberately omitted -- defaults to [].
+      visualEvidenceBuild: () => Promise.reject(new Error("must not be called with no commands")),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "visual_evidence_builder_unavailable" },
+      ]);
+    }
+    expect(calls).not.toContain("visualEvidence.build");
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("dual_review fails closed to requires_manual (never reviewer.run) when the visual evidence builder itself fails", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      visualEvidenceBuild: () =>
+        Promise.resolve(
+          Object.freeze({
+            ok: false as const,
+            failure: Object.freeze({
+              reason: "artifact_invalid" as const,
+              error: domainError("invariant_violation"),
+            }),
+          }),
+        ),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "visual_evidence_build_failed:artifact_invalid",
+        },
+      ]);
+    }
+    expect(calls).toContain("visualEvidence.build");
+    expect(calls).not.toContain("reviewer.run");
   });
 });

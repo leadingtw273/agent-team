@@ -196,6 +196,22 @@ export class ReviewerPipeline {
       return failed("post_review_worktree", error, request.job);
     }
 
+    // E102-3: symmetric to `#verifyEvidence`'s pre-run call above (before `markChangeRequestReady`/
+    // before any provider starts) -- re-verifies every file evidence block's hash and the visual
+    // Manifest binding again now that every reviewer provider has finished. The worktree-clean
+    // check just above only proves the *tracked* tree is untouched; evidence files can live
+    // outside version control entirely (visual artifacts under `.agent-team/evidence/`, which the
+    // Visual Evidence Builder's own gitignore gate requires), so a provider replacing one on disk
+    // during its own run would pass the worktree check yet still have swapped what the report was
+    // actually reviewed against. Any integrity failure here is reported as `evidence_changed`
+    // (never the pre-run check's generic `conflict`) precisely because it can only mean evidence
+    // that verified clean before the provider ran no longer does -- a real, not merely
+    // hypothetical, distinction for whoever reads this failure later.
+    const evidenceAfter = await this.#verifyEvidence(request);
+    if (!evidenceAfter.ok) {
+      return failed("evidence", domainError("evidence_changed"), request.job);
+    }
+
     const firstFailure = runs.find((run) => run.kind === "failed");
     if (firstFailure?.kind === "failed") {
       return failed(firstFailure.stage, firstFailure.error, request.job, {

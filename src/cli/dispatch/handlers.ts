@@ -418,6 +418,9 @@ export function createDispatchCliHandlers(
             reviewStatus: resumeComposition.value.reviewStatus,
             autoMerge: resumeComposition.value.autoMerge,
             lifecycle: resumeComposition.value.lifecycle,
+            ...(resumeComposition.value.visualEvidence === undefined
+              ? {}
+              : { visualEvidence: resumeComposition.value.visualEvidence }),
             clock,
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),

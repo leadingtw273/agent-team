@@ -302,6 +302,13 @@ interface FixtureOptions {
   readonly reports?: Partial<Record<"code_reviewer" | "visual_reviewer", unknown>>;
   readonly postReviewDirty?: boolean;
   readonly evidenceVerified?: boolean;
+  /** E102-3: overrides `evidenceIntegrity.verify`'s per-*call* result for one specific evidence
+   * `source` -- lets a test simulate evidence that verified clean the first time (before any
+   * reviewer provider ran) but no longer does the second time (after every provider finished),
+   * exactly the "swapped mid-run" scenario `ReviewerPipeline.run`'s post-review re-verification
+   * exists to catch. Every call to a source *not* in this map still falls back to
+   * `evidenceVerified` (or its own default of `true`), unaffected. */
+  readonly evidenceVerifiedSequenceBySource?: Readonly<Record<string, readonly boolean[]>>;
   readonly persistence?: "confirmed" | "unknown";
 }
 
@@ -420,12 +427,20 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
         Promise.resolve(ok({ response: "approve", pause: false, summary: "read-only" })),
     },
     evidenceIntegrity: {
-      verify: (evidence) => {
-        calls.push(`evidence:${evidence.source}`);
-        return Promise.resolve(
-          ok({ verified: options.evidenceVerified ?? true, byteLength: 1_024 }),
-        );
-      },
+      verify: (() => {
+        const callCountBySource = new Map<string, number>();
+        return (evidence: Parameters<ReviewerPipelinePorts["evidenceIntegrity"]["verify"]>[0]) => {
+          calls.push(`evidence:${evidence.source}`);
+          const sequence = options.evidenceVerifiedSequenceBySource?.[evidence.source];
+          const callIndex = callCountBySource.get(evidence.source) ?? 0;
+          callCountBySource.set(evidence.source, callIndex + 1);
+          const verified =
+            sequence === undefined
+              ? (options.evidenceVerified ?? true)
+              : (sequence[Math.min(callIndex, sequence.length - 1)] ?? true);
+          return Promise.resolve(ok({ verified, byteLength: 1_024 }));
+        };
+      })(),
     },
     jobs: {
       update: (updated) => {
@@ -516,6 +531,28 @@ describe("ReviewerPipeline", () => {
       "agent-team:visual-manifest",
     ]);
     expect(setup.calls).toContain("evidence:artifact:screen");
+  });
+
+  it("E102-3: fails with evidence_changed when evidence verifies clean before the reviewer runs but not after", async () => {
+    const input = request("dual_review");
+    const setup = fixture(input, {
+      evidenceVerifiedSequenceBySource: { "artifact:screen": [true, false] },
+    });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "evidence",
+      error: { code: "evidence_changed" },
+    });
+    // Both reviewer providers still ran to completion (the swap is only detected afterward) --
+    // this is deliberately *not* the same as the pre-run `#verifyEvidence` failing, which would
+    // never reach `provider:*` at all.
+    expect(setup.calls).toEqual(
+      expect.arrayContaining(["provider:code_reviewer", "provider:visual_reviewer"]),
+    );
+    const verifyCallCount = setup.calls.filter((call) => call === "evidence:artifact:screen").length;
+    expect(verifyCallCount).toBe(2);
   });
 
   it("returns blocking findings when either half of a dual review rejects", async () => {

@@ -13,3 +13,4 @@ export * from "./reviewer-model.js";
 export * from "./reviewer.js";
 export * from "./reviewer-recovery-model.js";
 export * from "./reviewer-recovery.js";
+export * from "./visual-evidence-builder.js";
