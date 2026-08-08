@@ -10,7 +10,8 @@ import { createDispatchCliHandlers } from "./dispatch/index.js";
 import { createWakeupHealthHandler } from "./health/index.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
-import { createUnwiredManualReconcileHandler } from "./reconcile/index.js";
+import { buildManualReconcileUseCase } from "./reconcile/composition.js";
+import { createManualReconcileHandler } from "./reconcile/index.js";
 import { createRegistrationCliHandlers } from "./registration/index.js";
 import { createSystemdHandler } from "./systemd/index.js";
 
@@ -26,7 +27,13 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ingest: createLocalWebhookIngestHandler({
     ...(process.env["AGENT_TEAM_HOME"] === undefined ? {} : { agentTeamHome }),
   }),
-  reconcile: createUnwiredManualReconcileHandler(),
+  // E010b: real production composition (src/cli/reconcile/composition.ts) -- see that file's own
+  // header for exactly which of `ReconcilePorts`' six ports are genuinely real today (leases reap
+  // and job updates) versus disclosed, honest-fail-closed gaps (providers/events/processes/blocks,
+  // structurally unreachable while `jobs.listActive` always returns `[]`).
+  reconcile: createManualReconcileHandler({
+    reconcile: buildManualReconcileUseCase({ agentTeamHome }),
+  }),
   systemd: createSystemdHandler(fileURLToPath(import.meta.url)),
   registration: createRegistrationCliHandlers({ agentTeamHome }),
 });

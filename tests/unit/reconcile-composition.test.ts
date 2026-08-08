@@ -1,0 +1,215 @@
+/**
+ * E010b: composition-level tests for `src/cli/reconcile/composition.ts` -- the first production
+ * wiring of `ReconcileCoordinator` (real store, no fake adapters injected into the coordinator
+ * itself; only the file paths are rooted at a temporary directory instead of `$AGENT_TEAM_HOME`).
+ *
+ * Scope proven here: (1) `leases.reclaimExpired` genuinely reclaims a real expired lease from a
+ * real `FileLeaseRepository`, durably, and the CLI-facing outcome reflects that; (2) re-running the
+ * exact same reconcile pass is idempotent -- no duplicate reclaim, no duplicate write; (3) the four
+ * ports with no real production backing yet (`providers`, `events`, `processes`, `blocks`) always
+ * fail closed with an honest `"unavailable"` error, never a fabricated success, and `jobs.listActive`
+ * always resolves to the empty set -- together these two facts are *why* a real reconcile run can
+ * never spawn a model process (the coordinator's per-target loop, the only place any of those four
+ * ports would ever be called, is structurally unreachable while `listActive` returns `[]`).
+ */
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import {
+  buildManualReconcilePorts,
+  buildManualReconcileUseCase,
+} from "../../src/cli/reconcile/composition.js";
+
+const temporaryDirectories: string[] = [];
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+async function temporaryHome(): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "agent-team-reconcile-composition-"));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+async function writeLeasesFixture(
+  agentTeamHome: string,
+  leases: readonly Readonly<Record<string, unknown>>[],
+): Promise<string> {
+  const stateDirectory = join(agentTeamHome, "state");
+  // The file-locking layer (src/infrastructure/files/secure-directory.ts) requires every directory
+  // in a lock file's path to be a private (0700) directory -- mirrors the same requirement the
+  // real `FileLeaseRepository` production composition already relies on under `$AGENT_TEAM_HOME`.
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
+  const leasesPath = join(stateDirectory, "leases.json");
+  await writeFile(leasesPath, JSON.stringify({ schemaVersion: 1, leases }, null, 2), "utf8");
+  return leasesPath;
+}
+
+const expiredLease = Object.freeze({
+  schemaVersion: 1,
+  id: "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+  holderId: "dead-holder",
+  acquiredAt: "2020-01-01T00:00:00.000Z",
+  expiresAt: "2020-01-01T00:05:00.000Z",
+});
+
+describe("E010b manual reconcile production composition", () => {
+  it("reclaims a real expired lease from the shared FileLeaseRepository", async () => {
+    const agentTeamHome = await temporaryHome();
+    const leasesPath = await writeLeasesFixture(agentTeamHome, [expiredLease]);
+
+    const useCase = buildManualReconcileUseCase({ agentTeamHome });
+    const outcome = await useCase.reconcileAll({
+      controllerId: "manual-reconcile",
+      idempotencyKeyPrefix: "reconcile-test:first",
+    });
+
+    expect(outcome).toEqual({
+      state: "completed",
+      reclaimedLeaseIds: [expiredLease.id],
+      targets: [],
+      modelResumeAttempts: 0,
+    });
+
+    const persisted = JSON.parse(await readFile(leasesPath, "utf8")) as {
+      readonly leases: readonly { readonly id: string; readonly releasedAt?: string }[];
+    };
+    expect(persisted.leases).toHaveLength(1);
+    expect(persisted.leases[0]).toMatchObject({ id: expiredLease.id });
+    expect(typeof persisted.leases[0]?.releasedAt).toBe("string");
+  });
+
+  it("is idempotent: re-running against an already-reclaimed lease reclaims nothing new", async () => {
+    const agentTeamHome = await temporaryHome();
+    const leasesPath = await writeLeasesFixture(agentTeamHome, [expiredLease]);
+    const useCase = buildManualReconcileUseCase({ agentTeamHome });
+
+    const first = await useCase.reconcileAll({
+      controllerId: "manual-reconcile",
+      idempotencyKeyPrefix: "reconcile-test:first",
+    });
+    const second = await useCase.reconcileAll({
+      controllerId: "manual-reconcile",
+      idempotencyKeyPrefix: "reconcile-test:second",
+    });
+
+    expect(first).toMatchObject({ state: "completed", reclaimedLeaseIds: [expiredLease.id] });
+    expect(second).toEqual({
+      state: "completed",
+      reclaimedLeaseIds: [],
+      targets: [],
+      modelResumeAttempts: 0,
+    });
+
+    const persistedAfterBoth = JSON.parse(await readFile(leasesPath, "utf8")) as {
+      readonly leases: readonly unknown[];
+    };
+    // Still exactly one lease record -- no duplicate row was ever written by the second pass.
+    expect(persistedAfterBoth.leases).toHaveLength(1);
+  });
+
+  it("reports completed with zero reclaims and zero model resume attempts when there is no state at all", async () => {
+    const agentTeamHome = await temporaryHome();
+    // Deliberately never writes state/leases.json or state/jobs.json -- proves the "not_found"
+    // path (FileLeaseRepository/FileJobRepository readAll()) is treated as an honest empty
+    // collection, not a failure, matching every other production composition in this codebase.
+    const useCase = buildManualReconcileUseCase({ agentTeamHome });
+
+    await expect(
+      useCase.reconcileAll({
+        controllerId: "manual-reconcile",
+        idempotencyKeyPrefix: "reconcile-test:empty",
+      }),
+    ).resolves.toEqual({
+      state: "completed",
+      reclaimedLeaseIds: [],
+      targets: [],
+      modelResumeAttempts: 0,
+    });
+  });
+
+  describe("disclosed gap ports (providers/events/processes/blocks)", () => {
+    it("never fabricates success for the four ports with no real production backing yet", async () => {
+      const agentTeamHome = await temporaryHome();
+      const ports = buildManualReconcilePorts({ agentTeamHome });
+
+      // `jobs.listActive` is the structural reason none of the four gap ports below can ever be
+      // reached from a real `reconcileAll()` call -- the coordinator only calls them from inside
+      // its per-target loop, which iterates exactly `listActive()`'s result.
+      await expect(ports.jobs.listActive()).resolves.toEqual({ ok: true, value: [] });
+
+      const target = {
+        project: {
+          schemaVersion: 1,
+          id: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          displayName: "fixture",
+          localRepositoryPath: "/tmp/fixture",
+          defaultBranch: "main",
+          workManagement: {
+            provider: "linear" as const,
+            containerId: "workspace",
+            projectId: "team",
+          },
+          sourceControl: { provider: "github" as const, repository: "owner/repository" },
+        },
+        externalIssueId: "ENG-1",
+        job: {
+          schemaVersion: 1,
+          id: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          createdAt: "2026-08-05T12:00:00.000Z",
+          startedAt: "2026-08-05T12:01:00.000Z",
+          watchdogExtensionGranted: false,
+          attempts: { processRecoveries: 0, ciFixRounds: 0, reviewerFixRounds: 0, reviewRuns: 0 },
+        },
+      };
+
+      await expect(ports.providers.readBack(target as never)).resolves.toMatchObject({
+        ok: false,
+        error: { code: "unavailable" },
+      });
+      await expect(
+        ports.events.repairMissing(
+          { target: target as never, providerFindings: [] },
+          { idempotencyKey: "k" },
+        ),
+      ).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+      await expect(ports.processes.inspect(target.job as never)).resolves.toMatchObject({
+        ok: false,
+        error: { code: "unavailable" },
+      });
+      await expect(
+        ports.processes.resumeFromCheckpoint(
+          {
+            job: target.job as never,
+            checkpointId: "checkpoint-1",
+            reason: "unexpected_process_exit",
+          },
+          { idempotencyKey: "k" },
+        ),
+      ).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+      await expect(
+        ports.blocks.record(
+          { target: target as never, reason: "source_unavailable" },
+          { idempotencyKey: "k" },
+        ),
+      ).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+      await expect(
+        ports.leases.prepareRecovery(target as never, "manual-reconcile", { idempotencyKey: "k" }),
+      ).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+      await expect(
+        ports.leases.releaseRecovery("lease-1", "manual-reconcile", { idempotencyKey: "k" }),
+      ).resolves.toMatchObject({ ok: false, error: { code: "unavailable" } });
+    });
+  });
+});

@@ -37,16 +37,23 @@ describe("compiled CLI smoke", () => {
     expect(reconcileHelp.stdout).toContain("--all");
   });
 
-  it("reports the unwired manual reconcile path as blocked instead of pretending it ran", () => {
-    const result = run(["reconcile", "--all"]);
+  it("E010b: runs the real production composition against an empty, isolated state directory", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-reconcile-cli-"));
+    roots.push(root);
+    const environment = { ...process.env, AGENT_TEAM_HOME: join(root, ".agent-team") };
+
+    const result = run(["reconcile", "--all"], environment);
 
     expect(result.error).toBeUndefined();
-    expect(result.status).toBe(3);
-    expect(result.stdout).toBe("");
-    expect(JSON.parse(result.stderr)).toEqual({
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
       operation: "manual_reconcile",
-      state: "blocked",
-      evidenceCode: "manual_reconcile_runtime_unavailable",
+      state: "completed",
+      evidenceCode: "manual_reconcile_completed",
+      reclaimedLeaseCount: 0,
+      targetCounts: { healthy: 0, resumed: 0, blocked: 0, failed: 0 },
+      modelResumeAttempts: 0,
     });
   });
 
