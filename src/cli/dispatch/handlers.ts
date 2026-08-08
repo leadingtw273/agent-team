@@ -354,6 +354,9 @@ export function createDispatchCliHandlers(
             teamId: build.value.discovery.teamId,
             linearProjectId: build.value.discovery.linearProjectId,
             progress,
+            // E115cap: a real `LeaseCoordinator` over this run's own `LeaseRepository` -- so a
+            // Linear cancellation observed by `LifecyclePipeline` can release the lease it holds.
+            leases: new LeaseCoordinator(build.value.leases),
           });
           if (resumeComposition.state !== "ready") {
             return outcome("blocked", {

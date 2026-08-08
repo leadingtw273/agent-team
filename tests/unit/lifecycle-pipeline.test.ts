@@ -85,6 +85,8 @@ interface FixtureOptions {
   readonly policyFailure?: boolean;
   readonly checkpoint?: "not_required" | "preserved";
   readonly activeWorkStopped?: boolean;
+  readonly leaseReleaseFailure?: boolean;
+  readonly leaseReleased?: boolean;
   readonly calls?: string[];
 }
 
@@ -132,16 +134,30 @@ function ports(options: FixtureOptions = {}): LifecyclePipelinePorts {
       }),
     },
     cancellation: {
-      prepare: vi.fn((prepareRequest: { readonly preserveBranchAndWorktree: true }) => {
-        calls.push(`prepare_cancellation:${String(prepareRequest.preserveBranchAndWorktree)}`);
-        const checkpoint = options.checkpoint ?? "preserved";
-        return Promise.resolve(
-          ok({
-            activeWorkStopped: options.activeWorkStopped ?? true,
-            checkpoint,
-            ...(checkpoint === "preserved" ? { checkpointId: "checkpoint-1" } : {}),
-          }),
-        );
+      prepare: vi.fn(
+        (prepareRequest: {
+          readonly preserveBranchAndWorktree: true;
+          readonly issue?: unknown;
+        }) => {
+          calls.push(`prepare_cancellation:${String(prepareRequest.preserveBranchAndWorktree)}`);
+          expect(prepareRequest.issue).toEqual(currentIssue.issue);
+          const checkpoint = options.checkpoint ?? "preserved";
+          return Promise.resolve(
+            ok({
+              activeWorkStopped: options.activeWorkStopped ?? true,
+              checkpoint,
+              ...(checkpoint === "preserved" ? { checkpointId: "checkpoint-1" } : {}),
+            }),
+          );
+        },
+      ),
+    },
+    leaseRelease: {
+      release: vi.fn(() => {
+        calls.push("release_lease");
+        return options.leaseReleaseFailure === true
+          ? Promise.resolve(err(domainError("external_failure")))
+          : Promise.resolve(ok({ released: options.leaseReleased ?? true }));
       }),
     },
   };
@@ -279,7 +295,7 @@ describe("closed and canceled lifecycle", () => {
     expect(JSON.stringify(calls)).not.toContain("work_status:canceled");
   });
 
-  it("stops and checkpoints before closing an open PR after explicit user cancellation", async () => {
+  it("stops and checkpoints before closing an open PR after explicit user cancellation, then releases the lease before commenting", async () => {
     const calls: string[] = [];
     const fixture = ports({ issue: issueSnapshot("canceled"), calls });
     const outcome = await new LifecyclePipeline(fixture).run(request());
@@ -292,10 +308,11 @@ describe("closed and canceled lifecycle", () => {
     });
     expect(calls[0]).toBe("prepare_cancellation:true");
     expect(calls[1]).toBe("close_change_request");
+    expect(calls[2]).toBe("release_lease");
     expect(comments(calls)[0]).toContain("Branch 與 Worktree 均未刪除");
   });
 
-  it("still stops active work but does not close the PR twice when it is already closed", async () => {
+  it("still stops active work but does not close the PR twice when it is already closed, and still releases the lease", async () => {
     const calls: string[] = [];
     const fixture = ports({
       changeRequest: changeRequest("closed"),
@@ -312,10 +329,11 @@ describe("closed and canceled lifecycle", () => {
     });
     expect(calls[0]).toBe("prepare_cancellation:true");
     expect(calls).not.toContain("close_change_request");
+    expect(calls).toContain("release_lease");
     expect(comments(calls)).toHaveLength(1);
   });
 
-  it("does not close a PR when active work could not be stopped and checkpointed", async () => {
+  it("does not close a PR, and never attempts to release the lease, when active work could not be stopped and checkpointed", async () => {
     const calls: string[] = [];
     const fixture = ports({
       issue: issueSnapshot("canceled"),
@@ -326,6 +344,21 @@ describe("closed and canceled lifecycle", () => {
 
     expect(outcome).toMatchObject({ state: "failed", stage: "checkpoint" });
     expect(calls).toEqual(["prepare_cancellation:true"]);
+    expect(calls).not.toContain("release_lease");
+  });
+
+  it("fails closed and never comments when lease release fails after the checkpoint and PR close already succeeded", async () => {
+    const calls: string[] = [];
+    const fixture = ports({
+      issue: issueSnapshot("canceled"),
+      leaseReleaseFailure: true,
+      calls,
+    });
+    const outcome = await new LifecyclePipeline(fixture).run(request());
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "lease_release" });
+    expect(calls).toEqual(["prepare_cancellation:true", "close_change_request", "release_lease"]);
+    expect(comments(calls)).toHaveLength(0);
   });
 
   it("does not mutate an already-completed issue when a stale closed PR is observed", async () => {

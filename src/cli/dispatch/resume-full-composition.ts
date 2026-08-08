@@ -12,6 +12,7 @@ import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-
 import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
+import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ResumeCycleDependencies } from "./resume-composition.js";
 import { buildCiRecoveryPipeline } from "./ci-recovery-composition.js";
 import { buildReviewerPipeline } from "./reviewer-composition.js";
@@ -33,6 +34,9 @@ export interface BuildResumeCompositionOptions {
   readonly teamId: string;
   readonly linearProjectId: string;
   readonly progress: FileJobProgressStore;
+  /** E115cap: threaded through to `buildLifecyclePipeline` so a Linear cancellation can release
+   * the cancelled issue's lease -- see `lifecycle-composition.ts`'s own header. */
+  readonly leases: LeaseCoordinator;
 }
 
 export type ResumePipelineComposition = Pick<
@@ -73,6 +77,8 @@ export async function buildResumeComposition(
     teamId: options.teamId,
     linearProjectId: options.linearProjectId,
     progress: options.progress,
+    agentTeamHome: options.agentTeamHome,
+    leases: options.leases,
   });
 
   return Object.freeze({

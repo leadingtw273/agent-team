@@ -1,5 +1,5 @@
 import type { DomainError } from "../../domain/foundation/index.js";
-import type { Project } from "../../domain/project/index.js";
+import type { Issue, Project } from "../../domain/project/index.js";
 import type { ChangeRequestSnapshot, SourceControlPort } from "../ports/source-control.js";
 import type { AsyncPortResult, MutationOptions } from "../ports/common.js";
 import type { WorkManagementPort } from "../ports/work-management.js";
@@ -52,12 +52,23 @@ export interface LifecyclePolicyPort {
   ): AsyncPortResult<PauseAutoMergeOutcome>;
 }
 
+/**
+ * E115cap: `issue` (the full domain `Issue` `LifecyclePipeline.run()` already fetched and matched
+ * against `request` via `issueMatchesRequest` before ever dispatching to `#handleCancellation`) is
+ * new -- the prior request shape (`{project, externalIssueId, changeRequest,
+ * preserveBranchAndWorktree}`) carried no context a `LifecycleCancellationPort` implementation
+ * could honestly build a real F008 `Checkpoint` from (`src/domain/checkpoint/schema.ts` requires a
+ * full `requirementSnapshot`, which `createRequirementSnapshot` can only build from a real `Issue`).
+ * Adding `issue` here -- rather than inventing a snapshot the adapter was never given -- is what
+ * closes that gap without fabricating anything.
+ */
 export interface LifecycleCancellationPort {
   prepare(
     request: Readonly<{
       project: Project;
       externalIssueId: string;
       changeRequest: ChangeRequestSnapshot;
+      issue: Issue;
       preserveBranchAndWorktree: true;
     }>,
     options: MutationOptions,
@@ -70,6 +81,25 @@ export interface LifecycleCancellationPort {
   >;
 }
 
+/**
+ * E115cap: releases the lease (if any) still held for a cancelled issue's job -- distinct from,
+ * and sequenced strictly after, `LifecycleCancellationPort.prepare()`'s own "stop active work"
+ * (which only CAS-transitions the job-progress record; neither that adapter nor the CLI's own
+ * `dispatch resolve --as cancelled` path ever released a `Lease`, see this ticket's own packet).
+ * `released: false` is not a failure -- it is the honest report that there was nothing to release
+ * (the job never acquired one, or it was already released) -- never conflated with a genuine
+ * `err(...)`, which fails the whole cancellation closed.
+ */
+export interface LifecycleLeaseReleasePort {
+  release(
+    request: Readonly<{
+      project: Project;
+      externalIssueId: string;
+    }>,
+    options: MutationOptions,
+  ): AsyncPortResult<Readonly<{ released: boolean }>>;
+}
+
 export interface LifecyclePipelinePorts {
   readonly sourceControl: Pick<SourceControlPort, "getChangeRequest" | "closeChangeRequest">;
   readonly workManagement: Pick<
@@ -78,6 +108,7 @@ export interface LifecyclePipelinePorts {
   >;
   readonly policy: LifecyclePolicyPort;
   readonly cancellation: LifecycleCancellationPort;
+  readonly leaseRelease: LifecycleLeaseReleasePort;
 }
 
 export interface LifecyclePipelineRequest {
@@ -98,6 +129,7 @@ export type LifecycleFailureStage =
   | "work_status"
   | "agent_condition"
   | "close_change_request"
+  | "lease_release"
   | "comment";
 
 export type LifecyclePipelineOutcome =
