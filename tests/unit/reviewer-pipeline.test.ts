@@ -7,6 +7,7 @@ import {
   type ReviewQualityDimension,
   type ReviewerReport,
 } from "../../src/application/pipelines/index.js";
+import { canonicalVisualManifestInput } from "../../src/application/pipelines/reviewer-model.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type {
   ProviderEvent,
@@ -235,6 +236,24 @@ function request(
   };
 }
 
+function identityForRequest(input: ReviewerPipelineRequest): ReviewIdentity {
+  const created = createReviewIdentity(
+    input.requirementSnapshot,
+    input.expectedHeadSha,
+    diff,
+    {
+      ...(input.visualManifest === undefined
+        ? {}
+        : { visualManifest: canonicalVisualManifestInput(input.visualManifest) }),
+      ...(input.publicationDigest === undefined
+        ? {}
+        : { publicationDigest: input.publicationDigest }),
+    },
+  );
+  if (!created.ok) throw new Error(created.error.code);
+  return created.value;
+}
+
 function report(
   role: "code_reviewer" | "visual_reviewer",
   identity: ReviewIdentity,
@@ -251,6 +270,10 @@ function report(
     requirementsDigest: identity.requirementsDigest,
     headSha: identity.headSha,
     diffDigest: identity.diffDigest,
+    ...(identity.evidenceDigest === undefined ? {} : { evidenceDigest: identity.evidenceDigest }),
+    ...(identity.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: identity.publicationDigest }),
     summary:
       verdict === "passed" ? "All acceptance and quality checks passed." : "Review found issues.",
     acceptanceCriteria: [
@@ -347,7 +370,12 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
     start: (providerRequest: ProviderRunRequest) => {
       calls.push(`provider:${role}`);
       providerRequests.push(providerRequest);
-      const output = options.reports?.[role] ?? report(role, input.review.identity);
+      const identityBlock = providerRequest.externalData.find(
+        (block) => block.kind === "text" && block.source === "agent-team:review-identity",
+      );
+      if (identityBlock?.kind !== "text") throw new Error("Missing review identity evidence.");
+      const output =
+        options.reports?.[role] ?? report(role, JSON.parse(identityBlock.content) as ReviewIdentity);
       return Promise.resolve(ok(handle(output)));
     },
   });
@@ -568,7 +596,7 @@ describe("ReviewerPipeline", () => {
     };
     const setup = fixture(input, {
       reports: {
-        visual_reviewer: report("visual_reviewer", input.review.identity, "changes_requested", [
+        visual_reviewer: report("visual_reviewer", identityForRequest(input.value), "changes_requested", [
           blocking,
         ]),
       },

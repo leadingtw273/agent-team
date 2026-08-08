@@ -12,6 +12,7 @@ import type {
   ReviewerPipelinePorts,
   ReviewerPipelineRequest,
 } from "./reviewer-model.js";
+import { canonicalVisualManifestInput } from "./reviewer-model.js";
 import {
   anyReviewerAttemptLimitReached,
   requiredReviewerRoles,
@@ -128,6 +129,14 @@ export class ReviewerPipeline {
       request.requirementSnapshot,
       request.expectedHeadSha,
       diff.value,
+      {
+        ...(request.visualManifest === undefined
+          ? {}
+          : { visualManifest: canonicalVisualManifestInput(request.visualManifest) }),
+        ...(request.publicationDigest === undefined
+          ? {}
+          : { publicationDigest: request.publicationDigest }),
+      },
     );
     if (!identity.ok) return failed("diff", identity.error, request.job);
 

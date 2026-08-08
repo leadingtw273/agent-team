@@ -192,6 +192,15 @@ export function linearPublicationReceiptDigest(record: LinearPublicationReceiptR
     .digest("hex");
 }
 
+/** Sort per-receipt digests so the aggregate is independent of receipt input order. */
+export function aggregateLinearPublicationDigest(
+  records: readonly LinearPublicationReceiptRecord[],
+): string {
+  const digests = records.map((record) => linearPublicationReceiptDigest(record));
+  const sorted = [...digests].sort();
+  return createHash("sha256").update(JSON.stringify(sorted), "utf8").digest("hex");
+}
+
 function isNotFound(error: DomainError): boolean {
   return error.code === "not_found";
 }

@@ -1,3 +1,4 @@
+import type { VisualManifest } from "../../domain/checkpoint/index.js";
 import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type { ReviewIdentity, RequirementSnapshot } from "../../domain/review/index.js";
@@ -110,6 +111,8 @@ export interface EnableAutoMergeRequest extends ReviewRequestBase {
   readonly requirementSnapshot: RequirementSnapshot;
   readonly baseRevision: string;
   readonly approval: RecordedReviewApproval;
+  readonly currentVisualManifest?: VisualManifest;
+  readonly currentPublicationDigest?: string;
 }
 
 export type ReviewStatusFailureStage =

@@ -254,6 +254,10 @@ function reportSkeleton(
     requirementsDigest: identity.requirementsDigest,
     headSha: identity.headSha,
     diffDigest: identity.diffDigest,
+    ...(identity.evidenceDigest === undefined ? {} : { evidenceDigest: identity.evidenceDigest }),
+    ...(identity.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: identity.publicationDigest }),
     summary: "<replace with your own free-text summary of this review>",
     acceptanceCriteria: acceptanceCriteria.map((criterion) => ({
       criterion,
@@ -323,6 +327,8 @@ export function reviewerReportMatchesContext(
     report.requirementsDigest === identity.requirementsDigest &&
     sameReviewSha(report.headSha, identity.headSha) &&
     report.diffDigest === identity.diffDigest &&
+    report.evidenceDigest === identity.evidenceDigest &&
+    report.publicationDigest === identity.publicationDigest &&
     reviewedCriteria.length === expectedCriteria.length &&
     new Set(reviewedCriteria).size === reviewedCriteria.length &&
     reviewedCriteria.every((criterion) => criteria.has(criterion)) &&
