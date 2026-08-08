@@ -27,6 +27,10 @@ export type ResumeCompositionBlockedReason = "github_authentication_unavailable"
 export interface BuildResumeCompositionOptions {
   readonly agentTeamHome: string;
   readonly claudeConfig: DispatchProviderConfig["claude"];
+  /** E102-2: threaded straight through to `buildReviewerPipeline` (reviewer-composition.ts);
+   * absent means no real visual-review provider is configured on this host -- see that file's own
+   * header for why that fails closed per-job rather than blocking this whole composition. */
+  readonly geminiConfig?: DispatchProviderConfig["gemini"];
   readonly jobs: Pick<FileJobRepository, "update">;
   readonly readModel: LinearReadModel;
   readonly mutationClient: Pick<
@@ -81,6 +85,7 @@ export async function buildResumeComposition(
   const reviewer = await buildReviewerPipeline({
     agentTeamHome: options.agentTeamHome,
     claudeConfig: options.claudeConfig,
+    ...(options.geminiConfig === undefined ? {} : { geminiConfig: options.geminiConfig }),
     jobs: options.jobs,
   });
   if (reviewer.state !== "ready") {

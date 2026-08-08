@@ -8,8 +8,17 @@
  * function consumes it), so the schema is defined here rather than under `src/application`.
  *
  * `leadi 已裁決單 Claude provider 最小路徑` (decision layer: single-Claude-provider minimal
- * path) -- this schema therefore has exactly one provider key (`claude`), not a generic
- * provider-map. Adding `codex`/`gemini` later is an additive schema change, not a rewrite.
+ * path) originally shaped this schema with exactly one provider key (`claude`). E102-2 makes the
+ * first additive change that note anticipated: an *optional* `gemini` key for the real visual-
+ * review provider (`GeminiRunner`, src/adapters/providers/gemini/runner.ts). It is optional, not
+ * required, on purpose -- a host with no `gemini` key can still run `code_review`-only work; only
+ * `dual_review`/`visual_review` jobs need it, and the reviewer composition root
+ * (reviewer-composition.ts) is what turns "no `gemini` key" into a fail-closed outcome for those
+ * jobs specifically (never a silent fallback to the `claude` key for the visual role -- see that
+ * file's own header). `adminPolicyPath` is required whenever `gemini` is present at all: it is
+ * `GeminiRunnerOptions.adminPolicyPath`, and `GeminiRunner.start()` itself refuses to run
+ * (`permission_denied`) unless this is an absolute path, so the schema enforces the same shape
+ * up front rather than deferring an avoidable failure to run time.
  */
 import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
@@ -33,14 +42,41 @@ const claudeProviderConfigSchema = z
   })
   .strict();
 
+/** S003/E102-2: the `gemini` provider config -- feeds `buildGeminiRunner` (gemini-factory.ts),
+ * the same additive-schema shape `claudeProviderConfigSchema` already established (`executable`/
+ * `models`/`account`), plus the one field Gemini's real adapter requires that Claude's does not:
+ * `adminPolicyPath`, the supplemental read-only admin policy file
+ * (`spikes/gemini/read-only-review.toml`'s production analogue) `GeminiRunner` passes via
+ * `--admin-policy` to keep the visual-review role from ever writing to the worktree. Required to
+ * be absolute here (not merely "non-empty") because `GeminiRunner.start()` treats a relative path
+ * as `permission_denied` -- failing that shape at config-load time is strictly more useful than
+ * failing it on the first real review run. */
+const geminiProviderConfigSchema = z
+  .object({
+    executable: z.string().trim().min(1).max(1024),
+    models: z.array(z.string().trim().min(1).max(255)).min(1).max(20),
+    account: z.string().trim().min(1).max(255),
+    adminPolicyPath: z
+      .string()
+      .trim()
+      .min(1)
+      .max(4096)
+      .refine(isAbsolute, "adminPolicyPath must be an absolute path"),
+  })
+  .strict();
+
 export const dispatchProviderConfigSchema = z
   .object({
     schemaVersion: z.literal(1),
     claude: claudeProviderConfigSchema,
+    /** Optional on purpose -- see this file's own header. Absent means "no visual-review
+     * provider is configured on this host," not "use Claude instead." */
+    gemini: geminiProviderConfigSchema.optional(),
   })
   .strict();
 
 export type DispatchProviderConfig = z.infer<typeof dispatchProviderConfigSchema>;
+export type GeminiProviderConfig = NonNullable<DispatchProviderConfig["gemini"]>;
 
 export function defaultDispatchProviderConfigPath(agentTeamHome: string): string {
   return join(agentTeamHome, "config", "dispatch", "providers.json");
