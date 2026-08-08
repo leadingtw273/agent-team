@@ -1,4 +1,9 @@
-import { domainError, parseInstant, type DomainError } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  parseInstant,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import { attemptLimits, consumeAttempt, jobSchema, type Job } from "../../domain/jobs/index.js";
 import { projectSchema } from "../../domain/project/index.js";
 import { requirementSnapshotSchema } from "../../domain/review/index.js";
@@ -12,6 +17,7 @@ import type {
 import type {
   CiFailureLogOutcome,
   CiRecoveryFailureStage,
+  CiRecoveryObservabilityPort,
   CiRecoveryPipelineOutcome,
   CiRecoveryPipelinePorts,
   CiRecoveryPipelineRequest,
@@ -53,6 +59,33 @@ export function ciFailureLogExternalData(outcome: CiFailureLogOutcome): External
     mediaType: "text/plain",
     content,
   });
+}
+
+/**
+ * C017b (D2): derives the closed-shape, content-free observability record from whatever
+ * `ports.ciLog.getFailedCheckLogExcerpts` reported -- mirrors `ciFailureLogExternalData`'s own
+ * three-way handling (`available: true`, `available: false`, hard port `err`) immediately above,
+ * but only ever produces booleans/short reason strings/byte counts, never `excerpt.text` itself.
+ */
+export function recordCiLogExcerptObservability(
+  jobId: string,
+  failureLog: Result<CiFailureLogOutcome, DomainError>,
+): Parameters<CiRecoveryObservabilityPort["recordCiLogExcerpt"]>[0] {
+  if (!failureLog.ok) {
+    return { jobId, available: false, reason: `ci_log_port_error:${failureLog.error.code}` };
+  }
+  if (!failureLog.value.available) {
+    return { jobId, available: false, reason: failureLog.value.reason };
+  }
+  return {
+    jobId,
+    available: true,
+    sourceBytes: failureLog.value.excerpts.reduce((sum, excerpt) => sum + excerpt.sourceBytes, 0),
+    excerptBytes: failureLog.value.excerpts.reduce(
+      (sum, excerpt) => sum + Buffer.byteLength(excerpt.text, "utf8"),
+      0,
+    ),
+  };
 }
 
 const idempotencyPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:/@+-]{0,254}$/u;
@@ -225,6 +258,17 @@ export class CiRecoveryPipeline {
       authoritative.value.headSha,
       request.signal === undefined ? {} : { signal: request.signal },
     );
+    // C017b (D2): best-effort, non-blocking diagnostic -- see `CiRecoveryObservabilityPort`'s own
+    // header (ci-recovery-model.ts) for why this is fire-and-forget and content-free. A throwing
+    // `observability` implementation must never turn a diagnostic into a repair-blocking failure,
+    // hence the `try`/`catch` around a call whose own port contract is already synchronous `void`.
+    try {
+      this.ports.observability?.recordCiLogExcerpt(
+        recordCiLogExcerptObservability(request.job.id, failureLog),
+      );
+    } catch {
+      // Diagnostics-only; deliberately swallowed. See comment above.
+    }
     const externalData = Object.freeze([
       ...request.externalData,
       ciFailureLogExternalData(

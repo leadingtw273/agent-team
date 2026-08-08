@@ -9,9 +9,15 @@
  */
 import { join } from "node:path";
 
-import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
+import {
+  GhTransport,
+  GitHubAdapter,
+  type GhJsonTransport,
+  type GhTextTransport,
+} from "../../adapters/github/index.js";
 import { GitPreflight, LocalGitAdapter } from "../../adapters/git/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
+import { CiLogExcerptDiagnosticsSidecar } from "../../adapters/dispatch/ci-log-excerpt-diagnostics-sidecar.js";
 import { CiRecoveryPipeline } from "../../application/pipelines/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildClaudeRunner } from "./claude-factory.js";
@@ -26,8 +32,21 @@ export interface BuildCiRecoveryPipelineOptions {
   readonly agentTeamHome: string;
   readonly claudeConfig: DispatchProviderConfig["claude"];
   readonly jobs: Pick<FileJobRepository, "update">;
-  /** Injectable for tests; production defaults to a real `GhTransport`. */
-  readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+  /**
+   * Injectable for tests; production defaults to a real `GhTransport`.
+   *
+   * C017b (D1): deliberately requires `GhTextTransport` (`requestText`) as well as
+   * `GhJsonTransport`, not just the latter -- before this ticket, a test double implementing only
+   * `GhJsonTransport` type-checked here just fine, and `ciLog.getFailedCheckLogExcerpts` would
+   * then silently, permanently degrade to `available: false, reason: "log_transport_unavailable"`
+   * for every call, with no type error, no test failure, and no runtime signal pointing at why --
+   * exactly the "recovery flies blind" gap C017 was supposed to close, reintroduced one layer up.
+   * Requiring `GhTextTransport` here forces every caller (including every test fixture) to prove
+   * it can actually serve a job log before `ciLog` is ever considered "wired".
+   */
+  readonly githubTransport?: GhJsonTransport &
+    GhTextTransport &
+    Pick<GhTransport, "inspectAuthentication">;
 }
 
 export type BuildCiRecoveryPipelineResult =
@@ -61,6 +80,9 @@ export async function buildCiRecoveryPipeline(
       store: new LocalYamlCheckpointStore(checkpointDirectory),
     }),
     toolDecisions: new FailClosedToolDecisionAdapter(),
+    // C017b (D2): best-effort, content-free diagnostic -- see that adapter's own header and
+    // `CiRecoveryObservabilityPort`'s header (ci-recovery-model.ts) for the full rationale.
+    observability: new CiLogExcerptDiagnosticsSidecar({ agentTeamHome: options.agentTeamHome }),
   });
 
   return Object.freeze({ state: "ready", value: pipeline });

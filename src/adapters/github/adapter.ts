@@ -588,7 +588,12 @@ export class GitHubAdapter implements SourceControlPort {
       if (!logText.ok) continue;
       const excerpt = extractFailureKeyLines(logText.value, remainingBudget);
       if (excerpt.text.trim().length === 0) continue;
-      excerpts.push({ checkName: run.name, text: excerpt.text, truncated: excerpt.truncated });
+      excerpts.push({
+        checkName: run.name,
+        text: excerpt.text,
+        truncated: excerpt.truncated,
+        sourceBytes: Buffer.byteLength(logText.value, "utf8"),
+      });
       remainingBudget -= Buffer.byteLength(excerpt.text, "utf8");
     }
     if (excerpts.length === 0) return ok({ available: false, reason: "log_fetch_failed" });

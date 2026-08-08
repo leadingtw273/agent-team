@@ -44,6 +44,11 @@ export interface CiFailureLogExcerpt {
   readonly checkName: string;
   readonly text: string;
   readonly truncated: boolean;
+  /** C017b: byte length of the *raw* job log fetched for this check, before extraction --
+   * carried alongside the already-extracted `text` purely so a best-effort observability signal
+   * (see `CiRecoveryObservabilityPort` below) can report "how much source log did we actually get"
+   * without ever needing to re-read or retain the raw log itself. */
+  readonly sourceBytes: number;
 }
 
 /**
@@ -63,6 +68,36 @@ export interface CiRecoveryCiLogPort {
     headSha: string,
     options?: ReadOptions,
   ): AsyncPortResult<CiFailureLogOutcome>;
+}
+
+/**
+ * C017b (D2): the minimal, non-backlog observability signal the coordinator's decision required --
+ * before this, `CiFailureLogOutcome`'s `available: false`/`reason` never left the pipeline, so a
+ * repair that failed *again* gave no way to tell "the log was never attached" (a port/adapter
+ * problem) apart from "the log was attached and the model still couldn't fix it" (a model/prompt
+ * problem) -- the same "one signal cannot distinguish two different situations" failure mode this
+ * codebase's own diagnostic discipline elsewhere already treats as a defect, not a nuance.
+ *
+ * Deliberately **synchronous and void**: this is a fire-and-forget diagnostic, not a mutation with
+ * a durability contract -- `CiRecoveryPipeline.run()` calls it wrapped in its own `try`/`catch` (see
+ * that file) so a throwing implementation can never turn a diagnostic into a repair-blocking
+ * failure. Ports elsewhere in this codebase return `AsyncPortResult` because their failure is part
+ * of the caller's own control flow; this one's failure, by design, is not.
+ *
+ * **Never given the log's own text or content** -- only closed-shape metadata (`available`,
+ * `reason`, byte counts). See `ciFailureLogExternalData` (ci-recovery.ts) for the one place actual
+ * log content is handled, which is a completely separate code path from this port.
+ */
+export interface CiRecoveryObservabilityPort {
+  recordCiLogExcerpt(
+    record: Readonly<{
+      jobId: string;
+      available: boolean;
+      reason?: string;
+      sourceBytes?: number;
+      excerptBytes?: number;
+    }>,
+  ): void;
 }
 
 export type CiRecoveryCheckpointReason = "attempt_limit_reached" | "scope_overrun";
@@ -91,6 +126,10 @@ export interface CiRecoveryPipelinePorts {
   readonly jobs: CiRecoveryJobPort;
   readonly checkpoint: CiRecoveryCheckpointPort;
   readonly toolDecisions: ProviderToolDecisionPort;
+  /** C017b (D2): optional so every pre-existing test double across this codebase that already
+   * constructs `CiRecoveryPipelinePorts` keeps compiling unchanged -- production composition
+   * (ci-recovery-composition.ts) always wires a real one. */
+  readonly observability?: CiRecoveryObservabilityPort;
 }
 
 export interface CiRecoveryPipelineRequest {
