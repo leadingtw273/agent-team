@@ -551,7 +551,9 @@ describe("ReviewerPipeline", () => {
     expect(setup.calls).toEqual(
       expect.arrayContaining(["provider:code_reviewer", "provider:visual_reviewer"]),
     );
-    const verifyCallCount = setup.calls.filter((call) => call === "evidence:artifact:screen").length;
+    const verifyCallCount = setup.calls.filter(
+      (call) => call === "evidence:artifact:screen",
+    ).length;
     expect(verifyCallCount).toBe(2);
   });
 

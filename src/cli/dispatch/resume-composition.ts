@@ -1399,7 +1399,8 @@ async function resumeReview(
   // resolves to "no role required" here, exactly as it always has -- `validReviewerRequest`'s own
   // `roles.length > 0` check fails that case closed, unchanged from before this ticket.
   const reviewRequirement = context.requirementSnapshot.issue.reviewRequirement;
-  const needsCodeReview = reviewRequirement === "code_review" || reviewRequirement === "dual_review";
+  const needsCodeReview =
+    reviewRequirement === "code_review" || reviewRequirement === "dual_review";
   const needsVisualReview =
     reviewRequirement === "visual_review" || reviewRequirement === "dual_review";
 

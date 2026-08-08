@@ -1,9 +1,5 @@
 import { createHash } from "node:crypto";
-import {
-  mkdirSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,13 +31,16 @@ const deadline = (() => {
   if (!parsed.ok) throw new Error(parsed.error.code);
   return parsed.value;
 })();
-const issueId = "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as VisualEvidenceBuildRequest["issueId"];
+const issueId =
+  "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as VisualEvidenceBuildRequest["issueId"];
 const criterion = "AC1-status-page-renders-healthy";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -51,7 +50,10 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
-async function initRepo(directory: string, options: { gitignoreEvidence: boolean }): Promise<string> {
+async function initRepo(
+  directory: string,
+  options: { gitignoreEvidence: boolean },
+): Promise<string> {
   await run("git", ["init", "--quiet", "--initial-branch=main", directory]);
   await run("git", ["-C", directory, "config", "user.email", "test@example.com"]);
   await run("git", ["-C", directory, "config", "user.name", "Test"]);
@@ -138,7 +140,11 @@ function fakeProcessPort(options: {
 
 /** Synchronously mirrors what a real `commands.visualReview` pipeline (screenshot + manifest
  * generation) would leave behind in the (already `{{evidenceDir}}`-rendered) staging directory. */
-function writeFixtureEvidence(stagingDirectory: string, mode: CommandMode, headSha: string): number {
+function writeFixtureEvidence(
+  stagingDirectory: string,
+  mode: CommandMode,
+  headSha: string,
+): number {
   mkdirSync(stagingDirectory, { recursive: true });
   const fileName = "status-none.png";
   const filePath = join(stagingDirectory, fileName);
@@ -167,11 +173,15 @@ function writeFixtureEvidence(stagingDirectory: string, mode: CommandMode, headS
         mediaType: mode === "bad-media-type" ? "image/jpeg" : "image/png",
         sha256: "0".repeat(64),
         title: "Status page (healthy)",
-        acceptanceCriteria: mode === "bad-acceptance-criteria" ? ["not-an-approved-ac"] : [criterion],
+        acceptanceCriteria:
+          mode === "bad-acceptance-criteria" ? ["not-an-approved-ac"] : [criterion],
       },
     ],
   };
-  writeFileSync(join(stagingDirectory, visualEvidenceManifestFileName), JSON.stringify(manifest, null, 2));
+  writeFileSync(
+    join(stagingDirectory, visualEvidenceManifestFileName),
+    JSON.stringify(manifest, null, 2),
+  );
   return 0;
 }
 
@@ -224,7 +234,13 @@ describe("VisualEvidenceBuilder", () => {
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const invocations: string[] = [];
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "ok", commandInvocations: invocations }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: invocations,
+      }),
       clock: createFixedClock(now),
     });
 
@@ -264,7 +280,9 @@ describe("VisualEvidenceBuilder", () => {
 
     // No leftover staging directory, and `git status` reports a clean tree -- the gitignore entry
     // genuinely isolates every produced artifact from the tracked repository.
-    const { stdout: entries } = await run("ls", [join(worktreePath, ".agent-team", "evidence", issueId)]);
+    const { stdout: entries } = await run("ls", [
+      join(worktreePath, ".agent-team", "evidence", issueId),
+    ]);
     expect(entries.trim().split("\n")).toEqual([headSha]);
     const { stdout: status } = await run("git", ["-C", worktreePath, "status", "--porcelain"]);
     expect(status.trim()).toBe("");
@@ -275,13 +293,22 @@ describe("VisualEvidenceBuilder", () => {
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: false });
     const invocations: string[] = [];
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: false, headSha, mode: "ok", commandInvocations: invocations }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: false,
+        headSha,
+        mode: "ok",
+        commandInvocations: invocations,
+      }),
       clock: createFixedClock(now),
     });
 
     const result = await builder.build(buildRequest(worktreePath, { headSha }));
 
-    expect(result).toMatchObject({ ok: false, failure: { reason: "evidence_directory_not_ignored" } });
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { reason: "evidence_directory_not_ignored" },
+    });
     expect(invocations).toEqual([]);
     await expect(run("test", ["-e", join(worktreePath, ".agent-team")])).rejects.toBeDefined();
   });
@@ -290,7 +317,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "symlink", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "symlink",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -341,7 +374,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "no-manifest", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "no-manifest",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -354,7 +393,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "invalid-json", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "invalid-json",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -367,7 +412,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "wrong-commit", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "wrong-commit",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -380,7 +431,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "exit-nonzero", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "exit-nonzero",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -393,7 +450,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "ok", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 
@@ -407,7 +470,13 @@ describe("VisualEvidenceBuilder", () => {
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const invocations: string[] = [];
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "ok", commandInvocations: invocations }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: invocations,
+      }),
       clock: createFixedClock(now),
     });
 
@@ -424,7 +493,13 @@ describe("VisualEvidenceBuilder", () => {
     const worktreePath = await temporaryDirectory();
     const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "ok", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
     const first = await builder.build(buildRequest(worktreePath, { headSha }));
@@ -450,7 +525,13 @@ describe("VisualEvidenceBuilder", () => {
     // Sanity: the builder never even looks at `.agent-team-outside-link` -- this test only proves
     // the fixture's own symlink setup does not confuse `git check-ignore`/the builder's own logic.
     const builder = new VisualEvidenceBuilder({
-      process: fakeProcessPort({ worktreePath, ignored: true, headSha, mode: "ok", commandInvocations: [] }),
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: [],
+      }),
       clock: createFixedClock(now),
     });
 

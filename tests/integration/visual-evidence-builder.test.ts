@@ -30,13 +30,16 @@ import { ChildProcessRunner } from "../../src/adapters/process/index.js";
 import { createClock, parseInstant } from "../../src/domain/foundation/index.js";
 
 const run = promisify(execFile);
-const issueId = "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as VisualEvidenceBuildRequest["issueId"];
+const issueId =
+  "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as VisualEvidenceBuildRequest["issueId"];
 const criterion = "AC1-status-page-renders-healthy";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -77,7 +80,10 @@ const manifest = {
 writeFileSync(join(dir, "visual-manifest.json"), JSON.stringify(manifest, null, 2));
 `;
 
-async function initRepo(directory: string, options: { gitignoreEvidence: boolean }): Promise<string> {
+async function initRepo(
+  directory: string,
+  options: { gitignoreEvidence: boolean },
+): Promise<string> {
   await run("git", ["init", "--quiet", "--initial-branch=main", directory]);
   await run("git", ["-C", directory, "config", "user.email", "test@example.com"]);
   await run("git", ["-C", directory, "config", "user.name", "Test"]);
@@ -118,7 +124,9 @@ describe("VisualEvidenceBuilder with the real ChildProcessRunner + real git (unc
       join(worktreePath, ".agent-team", "evidence", issueId, headSha),
     );
     const bytes = await readFile(join(worktreePath, artifactRepoRelativePath));
-    expect(bytes.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(bytes.subarray(0, 8)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
     const { stdout: status } = await run("git", ["-C", worktreePath, "status", "--porcelain"]);
     expect(status.trim()).toBe("");
   });
@@ -142,6 +150,9 @@ describe("VisualEvidenceBuilder with the real ChildProcessRunner + real git (unc
       deadlineAt: deadline.value,
     });
 
-    expect(result).toMatchObject({ ok: false, failure: { reason: "evidence_directory_not_ignored" } });
+    expect(result).toMatchObject({
+      ok: false,
+      failure: { reason: "evidence_directory_not_ignored" },
+    });
   });
 });

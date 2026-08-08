@@ -2622,7 +2622,10 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
    * for repairing this file's unrelated fixture-id inconsistency.
    */
   function validAsAssembledByProduction(request: unknown): boolean {
-    const typed = request as { job: { issueId: string }; requirementSnapshot: { issue: { id: string } } };
+    const typed = request as {
+      job: { issueId: string };
+      requirementSnapshot: { issue: { id: string } };
+    };
     return validReviewerRequest({
       ...typed,
       job: { ...typed.job, issueId: typed.requirementSnapshot.issue.id },
@@ -2764,7 +2767,8 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       reviewRequirement: "dual_review",
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
-      visualEvidenceBuild: () => Promise.reject(new Error("must not be called with no visual model")),
+      visualEvidenceBuild: () =>
+        Promise.reject(new Error("must not be called with no visual model")),
       // visualReviewModel deliberately omitted -- no gemini config on this host.
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });

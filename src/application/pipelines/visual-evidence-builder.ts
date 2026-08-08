@@ -257,7 +257,10 @@ async function sha256OfFile(path: string): Promise<Result<string, DomainError>> 
       return err(domainError("invariant_violation"));
     }
     const bytes = await readFile(path);
-    if (bytes.byteLength === 0 || bytes.subarray(0, pngMagicBytes.length).compare(pngMagicBytes) !== 0) {
+    if (
+      bytes.byteLength === 0 ||
+      bytes.subarray(0, pngMagicBytes.length).compare(pngMagicBytes) !== 0
+    ) {
       return err(domainError("invariant_violation"));
     }
     return ok(createHash("sha256").update(bytes).digest("hex"));
@@ -281,7 +284,12 @@ export class VisualEvidenceBuilder {
     const ignored = await this.#evidenceDirectoryIgnored(request);
     if (!ignored.ok) return toResult(ignored.error);
 
-    const finalDirectory = join(request.worktreePath, ...evidenceRootSegments, request.issueId, request.headSha);
+    const finalDirectory = join(
+      request.worktreePath,
+      ...evidenceRootSegments,
+      request.issueId,
+      request.headSha,
+    );
     const stagingDirectory = join(
       request.worktreePath,
       ...evidenceRootSegments,
@@ -326,7 +334,12 @@ export class VisualEvidenceBuilder {
     let rawManifestBytes: Buffer;
     try {
       const stats = await lstat(manifestPath);
-      if (!stats.isFile() || stats.isSymbolicLink() || stats.size <= 0 || stats.size > maxManifestFileBytes) {
+      if (
+        !stats.isFile() ||
+        stats.isSymbolicLink() ||
+        stats.size <= 0 ||
+        stats.size > maxManifestFileBytes
+      ) {
         await this.#cleanupStaging(stagingDirectory);
         return failure("manifest_missing", "invariant_violation", visualEvidenceManifestFileName);
       }
@@ -353,7 +366,9 @@ export class VisualEvidenceBuilder {
       return failure("manifest_invalid", "conflict", "manifest commitSha mismatch");
     }
 
-    const stagingRelativePrefix = relative(request.worktreePath, stagingDirectory).split(sep).join("/");
+    const stagingRelativePrefix = relative(request.worktreePath, stagingDirectory)
+      .split(sep)
+      .join("/");
     const finalRelativePrefix = relative(request.worktreePath, finalDirectory).split(sep).join("/");
     const allowed = new Set(request.allowedAcceptanceCriteria);
     const finalArtifacts: VisualManifest["artifacts"][number][] = [];
@@ -400,15 +415,15 @@ export class VisualEvidenceBuilder {
     const validatedManifest = visualManifestSchema.safeParse(finalManifest);
     if (!validatedManifest.success) {
       await this.#cleanupStaging(stagingDirectory);
-      return failure("manifest_invalid", "invariant_violation", "final manifest failed schema validation");
+      return failure(
+        "manifest_invalid",
+        "invariant_violation",
+        "final manifest failed schema validation",
+      );
     }
 
     try {
-      await writeFile(
-        manifestPath,
-        `${JSON.stringify(validatedManifest.data, null, 2)}\n`,
-        "utf8",
-      );
+      await writeFile(manifestPath, `${JSON.stringify(validatedManifest.data, null, 2)}\n`, "utf8");
       await rename(stagingDirectory, finalDirectory);
     } catch {
       // A concurrent build (another resume cycle for the identical issue+headSha) may have won
@@ -527,7 +542,12 @@ export class VisualEvidenceBuilder {
     try {
       const manifestPath = join(finalDirectory, visualEvidenceManifestFileName);
       const stats = await lstat(manifestPath);
-      if (!stats.isFile() || stats.isSymbolicLink() || stats.size <= 0 || stats.size > maxManifestFileBytes) {
+      if (
+        !stats.isFile() ||
+        stats.isSymbolicLink() ||
+        stats.size <= 0 ||
+        stats.size > maxManifestFileBytes
+      ) {
         return undefined;
       }
       manifestBytes = await readFile(manifestPath);
@@ -538,17 +558,29 @@ export class VisualEvidenceBuilder {
     try {
       json = JSON.parse(manifestBytes.toString("utf8"));
     } catch {
-      return failure("existing_evidence_invalid", "invariant_violation", "existing manifest not JSON");
+      return failure(
+        "existing_evidence_invalid",
+        "invariant_violation",
+        "existing manifest not JSON",
+      );
     }
     const parsed = visualManifestSchema.safeParse(json);
     if (!parsed.success) {
-      return failure("existing_evidence_invalid", "invariant_violation", "existing manifest schema");
+      return failure(
+        "existing_evidence_invalid",
+        "invariant_violation",
+        "existing manifest schema",
+      );
     }
     if (
       parsed.data.issueId !== request.issueId ||
       parsed.data.commitSha.toLowerCase() !== request.headSha.toLowerCase()
     ) {
-      return failure("existing_evidence_invalid", "conflict", "existing manifest identity mismatch");
+      return failure(
+        "existing_evidence_invalid",
+        "conflict",
+        "existing manifest identity mismatch",
+      );
     }
     const allowed = new Set(request.allowedAcceptanceCriteria);
     for (const artifact of parsed.data.artifacts) {
