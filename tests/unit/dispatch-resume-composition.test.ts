@@ -36,10 +36,15 @@ import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
 import { LeaseCoordinator } from "../../src/application/leases/index.js";
 import {
+  AutoMergeGate,
   LifecyclePipeline,
+  REVIEW_STATUS_CONTEXT,
+  canonicalVisualManifestInput,
   type CiRecoveryPipelineOutcome,
+  type MergeGatePorts,
   type ReviewerRecoveryPipelineOutcome,
   type ReviewerPipelineOutcome,
+  type ReviewerReport,
   type BeginReviewOutcome,
   type RecordReviewOutcome,
   type EnableAutoMergeOutcome,
@@ -54,8 +59,10 @@ import {
   parseIdentifier,
   parseInstant,
   type Clock,
+  type DomainError,
   type Identifier,
   type Instant,
+  type Result,
 } from "../../src/domain/foundation/index.js";
 import {
   buildLinearReadCatalog,
@@ -80,8 +87,13 @@ import { validReviewerRequest } from "../../src/application/pipelines/reviewer-p
 import type {
   VisualEvidenceBuildRequest,
   VisualEvidenceBuildResult,
+  VisualEvidenceVerifyRequest,
 } from "../../src/application/pipelines/visual-evidence-builder.js";
 import type { LinearPublicationResult } from "../../src/adapters/dispatch/linear-publication.js";
+import {
+  aggregateLinearPublicationDigest,
+  type LinearPublicationReceiptRecord,
+} from "../../src/adapters/dispatch/linear-publication-store.js";
 import type { ProjectCommand } from "../../src/application/projects/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
 import {
@@ -90,7 +102,11 @@ import {
   watchdogHardStopMs,
   type Job,
 } from "../../src/domain/jobs/index.js";
-import { headShaSchema } from "../../src/domain/review/index.js";
+import {
+  createReviewIdentity,
+  headShaSchema,
+  type EffectiveTreeChange,
+} from "../../src/domain/review/index.js";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
@@ -438,10 +454,28 @@ async function harness(
     visualEvidenceBuild: (
       request: VisualEvidenceBuildRequest,
     ) => Promise<VisualEvidenceBuildResult>;
+    // E102-4b: drives the fake `deps.visualEvidence.verifyExisting` -- `resumeReview`'s pre-arm
+    // merge recheck calls this (never `build()` again) once review-time succeeds for a
+    // `dual_review`/`visual_review` job. Only ever wired (and only ever needs to be) when
+    // `visualEvidenceBuild` is also supplied -- see this file's own `harness()` body for why the
+    // key is always present on `deps.visualEvidence` (the real class's method is not optional) but
+    // defaults to a loud rejection unless a test actually reaches the merge recheck.
+    visualEvidenceVerify: (
+      request: VisualEvidenceVerifyRequest,
+    ) => Promise<VisualEvidenceBuildResult>;
     visualReviewModel: string;
     // E102-5: drives the fake `deps.linearPublication.publish` -- omitted means
     // `deps.linearPublication` itself stays undefined (the composition-root-gap fixture).
     linearPublish: (request: unknown) => Promise<LinearPublicationResult>;
+    // E102-4b: drives the fake `deps.linearPublicationStore.load` -- `resumeReview`'s pre-arm merge
+    // recheck calls this to recompute `currentPublicationDigest`. Omitted means
+    // `deps.linearPublicationStore` itself stays undefined (the composition-root-gap fixture,
+    // symmetric to `linearPublish`/`deps.linearPublication` above).
+    linearPublicationStoreLoad: (
+      projectId: string,
+      issueId: string,
+      headSha: string,
+    ) => Promise<Result<LinearPublicationReceiptRecord | undefined, DomainError>>;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -539,6 +573,24 @@ async function harness(
               calls.push("visualEvidence.build");
               return visualEvidenceBuild(request);
             },
+            // E102-4b: real production always has this key present (`VisualEvidenceBuilder`'s own
+            // `verifyExisting` method is not optional) -- defaults to a loud rejection so any test
+            // that never means to reach the merge recheck fails immediately, loudly, if it somehow
+            // does, rather than silently succeeding on an unconsidered fixture. Only a test that
+            // actually supplies `visualEvidenceVerify` (because it means to reach
+            // `deps.autoMerge.enable`) gets real behavior here.
+            verifyExisting: (request: VisualEvidenceVerifyRequest) => {
+              calls.push("visualEvidence.verifyExisting");
+              return (
+                overrides.visualEvidenceVerify ??
+                (() =>
+                  Promise.reject(
+                    new Error(
+                      "visualEvidence.verifyExisting was called but this test never wired visualEvidenceVerify",
+                    ),
+                  ))
+              )(request);
+            },
           },
         }),
     ...(overrides.visualReviewModel === undefined
@@ -552,6 +604,18 @@ async function harness(
               calls.push("linearPublication.publish");
               linearPublicationRequests.push(request);
               return linearPublish(request);
+            },
+          },
+        }),
+    ...(overrides.linearPublicationStoreLoad === undefined
+      ? {}
+      : {
+          linearPublicationStore: {
+            load: (projectIdValue: string, issueIdValue: string, headShaValue: string) => {
+              calls.push("linearPublicationStore.load");
+              const loader = overrides.linearPublicationStoreLoad;
+              if (loader === undefined) throw new Error("unreachable");
+              return loader(projectIdValue, issueIdValue, headShaValue);
             },
           },
         }),
@@ -2733,14 +2797,78 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       );
   }
 
+  function successfulLinearReceipt(): LinearPublicationReceiptRecord {
+    return {
+      schemaVersion: 1,
+      projectId,
+      issueId,
+      externalIssueId,
+      headSha,
+      manifestDigest: "e".repeat(64),
+      manifestComment: { id: "comment-manifest", sha256: "f".repeat(64) },
+      artifacts: [
+        {
+          path: artifactPath,
+          sha256: "d".repeat(64),
+          assetUrl: "https://uploads.linear.app/asset-1",
+          commentId: "comment-artifact-1",
+        },
+      ],
+      createdAt: now,
+    };
+  }
+
+  /** E102-4b: every pre-existing dual/visual-review *success*-path test in this describe block now
+   * also needs `deps.visualEvidence.verifyExisting` wired -- `resumeReview`'s pre-arm merge recheck
+   * gates `deps.autoMerge.enable()` on it. Returns the exact same manifest `successfulVisualEvidenceBuild`
+   * produced (`reused: true`, since this simulates re-verifying what is already on disk, never
+   * building anything fresh), so a test that never means to exercise drift keeps the review-time and
+   * merge-time evidence digests identical. */
+  function successfulVisualEvidenceVerify(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: true,
+          }),
+        }),
+      );
+  }
+
+  /** E102-4b: symmetric to `successfulVisualEvidenceVerify` above, for
+   * `deps.linearPublicationStore.load` -- returns the exact same receipt `successfulLinearPublish`
+   * durably records, so `aggregateLinearPublicationDigest` at merge time matches what
+   * `resumeReview` threaded into `reviewer.run()` at review time. */
+  function successfulLinearPublicationStoreLoad(): () => Promise<
+    Result<LinearPublicationReceiptRecord | undefined, DomainError>
+  > {
+    return () => Promise.resolve(ok(successfulLinearReceipt()));
+  }
+
   it("dual_review threads models.visual + visualManifest + visual_artifact evidence, and the assembled request satisfies validReviewerRequest", async () => {
     const { deps, progress, calls, reviewerRequests } = await harness({
       reviewRequirement: "dual_review",
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
+      visualEvidenceVerify: successfulVisualEvidenceVerify(),
       visualReviewModel: "gemini-2.5-pro",
       linearPublish: successfulLinearPublish(),
+      linearPublicationStoreLoad: successfulLinearPublicationStoreLoad(),
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2756,6 +2884,15 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
     expect(request["evidence"]).toEqual([
       expect.objectContaining({ kind: "file", category: "visual_artifact" }),
     ]);
+    // E102-4b: the actual production defect this ticket closes -- before it, `resumeReview` never
+    // passed `publicationDigest` to `reviewer.run()` at all, so the resulting approval's
+    // `identity.publicationDigest` was always `undefined` and `AutoMergeGate.enable()`'s own
+    // `validApproval` (merge-gate.ts) would fail every `dual_review`/`visual_review` job closed.
+    // Asserts the exact singleton-receipt digest contract from this ticket's spec: one receipt in,
+    // never a directory scan or any other head/issue's receipts.
+    expect(request["publicationDigest"]).toBe(
+      aggregateLinearPublicationDigest([successfulLinearReceipt()]),
+    );
     // The whole point of this ticket: before it, this exact shape of request always failed
     // `validReviewerRequest` (reviewer-policy.ts) for a `dual_review` job -- assembling it here and
     // running it through the real, unmodified production validator is the strongest possible proof
@@ -2769,8 +2906,10 @@ describe("E102-3: resumeReview visual/dual review evidence threading", () => {
       acceptanceCriteria: [evidenceCriterion],
       visualReviewCommands: [visualReviewCommand],
       visualEvidenceBuild: successfulVisualEvidenceBuild(),
+      visualEvidenceVerify: successfulVisualEvidenceVerify(),
       visualReviewModel: "gemini-2.5-pro",
       linearPublish: successfulLinearPublish(),
+      linearPublicationStoreLoad: successfulLinearPublicationStoreLoad(),
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
@@ -2982,9 +3121,40 @@ describe("E102-5: Linear publication gate (resumeReview requires a successful pu
     visualEvidenceBuild: successfulVisualEvidenceBuild(),
   };
 
+  /** E102-4b: matches `successfulVisualEvidenceBuild`'s own manifest -- see this file's identically
+   * named helper in the "E102-3" describe block above for the full rationale (`reused: true`, never
+   * a fresh build). Only the one test below that actually reaches `deps.autoMerge.enable()` needs
+   * this wired. */
+  function successfulVisualEvidenceVerify(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: true,
+          }),
+        }),
+      );
+  }
+
   it("calls linearPublication.publish (with the built visualManifest) after visualEvidence.build and before reviewer.run, and proceeds on success", async () => {
     const { deps, progress, calls, linearPublicationRequests } = await harness({
       ...baseHarnessOptions,
+      visualEvidenceVerify: successfulVisualEvidenceVerify(),
+      linearPublicationStoreLoad: () => Promise.resolve(ok(successfulReceipt())),
       linearPublish: () =>
         Promise.resolve(
           Object.freeze({
@@ -3121,5 +3291,492 @@ describe("E102-5: Linear publication gate (resumeReview requires a successful pu
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
     expect(calls).not.toContain("linearPublication.publish");
+  });
+});
+
+describe("E102-4b: pre-arm merge recheck (verifyExisting + linearPublicationStore.load wired into AutoMergeGate.enable)", () => {
+  const evidenceCriterion = "畫面在健康狀態下正確顯示 status-none.png";
+  const visualReviewCommand: ProjectCommand = {
+    executable: "node",
+    arguments: ["dist/scripts/screenshot.js", "--mode=none", "--out={{evidenceDir}}"],
+  };
+  const artifactPath = `.agent-team/evidence/${issueId}/${headSha}/status-none.png`;
+
+  function successfulVisualManifest() {
+    return {
+      schemaVersion: 1 as const,
+      issueId,
+      commitSha: headSha,
+      generatedAt: now,
+      environment: { runner: "fixture", operatingSystem: "linux" },
+      artifacts: [
+        {
+          path: artifactPath,
+          mediaType: "image/png",
+          sha256: "d".repeat(64),
+          title: "Status page (healthy)",
+          acceptanceCriteria: [evidenceCriterion],
+        },
+      ],
+    };
+  }
+
+  function successfulVisualEvidenceBuild(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: false,
+          }),
+        }),
+      );
+  }
+
+  function successfulVisualEvidenceVerify(): () => Promise<VisualEvidenceBuildResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({
+            visualManifest: successfulVisualManifest(),
+            evidence: Object.freeze([
+              {
+                kind: "file" as const,
+                category: "visual_artifact" as const,
+                source: `agent-team:visual-evidence:${artifactPath}`,
+                mediaType: "image/png",
+                path: `/tmp/does-not-need-to-exist-for-these-fakes/${artifactPath}`,
+                sha256: "d".repeat(64),
+                repositoryPath: artifactPath,
+              },
+            ]),
+            evidenceDirectory: `/tmp/does-not-need-to-exist-for-these-fakes/.agent-team/evidence/${issueId}/${headSha}`,
+            reused: true,
+          }),
+        }),
+      );
+  }
+
+  function successfulReceipt(): LinearPublicationReceiptRecord {
+    return {
+      schemaVersion: 1,
+      projectId,
+      issueId,
+      externalIssueId,
+      headSha,
+      manifestDigest: "e".repeat(64),
+      manifestComment: { id: "comment-manifest", sha256: "f".repeat(64) },
+      artifacts: [
+        {
+          path: artifactPath,
+          sha256: "d".repeat(64),
+          assetUrl: "https://uploads.linear.app/asset-1",
+          commentId: "comment-artifact-1",
+        },
+      ],
+      createdAt: now,
+    };
+  }
+
+  function successfulLinearPublish(): () => Promise<LinearPublicationResult> {
+    return () =>
+      Promise.resolve(
+        Object.freeze({
+          ok: true as const,
+          value: Object.freeze({ receipt: successfulReceipt(), reused: false }),
+        }),
+      );
+  }
+
+  const dualHarnessOptions = {
+    reviewRequirement: "dual_review" as const,
+    acceptanceCriteria: [evidenceCriterion],
+    visualReviewCommands: [visualReviewCommand],
+    visualReviewModel: "gemini-2.5-pro",
+    visualEvidenceBuild: successfulVisualEvidenceBuild(),
+    visualEvidenceVerify: successfulVisualEvidenceVerify(),
+    linearPublish: successfulLinearPublish(),
+    linearPublicationStoreLoad: () => Promise.resolve(ok(successfulReceipt())),
+  };
+
+  it("threads currentVisualManifest/currentPublicationDigest into AutoMergeGate.enable(), read-only (verifyExisting, never a second build())", async () => {
+    const enableRequests: unknown[] = [];
+    const { deps, progress, calls } = await harness({ ...dualHarnessOptions });
+    (deps as { autoMerge: ResumeCycleDependencies["autoMerge"] }).autoMerge = {
+      enable: (request) => {
+        calls.push("autoMerge.enable");
+        enableRequests.push(request);
+        return Promise.resolve({
+          state: "auto_merge_enabled",
+          reuse: "unchanged",
+          identity: {} as never,
+          changeRequest: changeRequest({ state: "merged" }) as never,
+        });
+      },
+    };
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+    // `build()` only ever runs once, at review time -- the merge-time recheck exclusively calls
+    // `verifyExisting()`, never `build()` again (the exact "never re-screenshot to recheck"
+    // guarantee this ticket's spec requires).
+    expect(calls.filter((call) => call === "visualEvidence.build")).toHaveLength(1);
+    expect(calls).toContain("visualEvidence.verifyExisting");
+    expect(calls.indexOf("reviewer.run")).toBeLessThan(
+      calls.indexOf("visualEvidence.verifyExisting"),
+    );
+    expect(calls.indexOf("visualEvidence.verifyExisting")).toBeLessThan(
+      calls.indexOf("autoMerge.enable"),
+    );
+    expect(calls).toContain("linearPublicationStore.load");
+    expect(enableRequests).toHaveLength(1);
+    const request = enableRequests[0] as Record<string, unknown>;
+    expect(request["currentVisualManifest"]).toEqual(successfulVisualManifest());
+    expect(request["currentPublicationDigest"]).toBe(
+      aggregateLinearPublicationDigest([successfulReceipt()]),
+    );
+  });
+
+  it("code_review never calls verifyExisting or linearPublicationStore.load (unaffected by this ticket's new read path)", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "code_review",
+      acceptanceCriteria: [evidenceCriterion],
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
+    expect(calls).toContain("autoMerge.enable");
+    expect(calls).not.toContain("visualEvidence.verifyExisting");
+    expect(calls).not.toContain("linearPublicationStore.load");
+  });
+
+  it("fails closed to requires_manual (visual_evidence_missing_at_merge) when verifyExisting reports the evidence is gone/tampered, and never calls autoMerge.enable", async () => {
+    const { deps, progress, calls } = await harness({
+      ...dualHarnessOptions,
+      visualEvidenceVerify: () =>
+        Promise.resolve(
+          Object.freeze({
+            ok: false as const,
+            failure: Object.freeze({
+              reason: "existing_evidence_invalid" as const,
+              error: domainError("conflict"),
+            }),
+          }),
+        ),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "visual_evidence_verify_failed:existing_evidence_invalid",
+        },
+      ]);
+    }
+    expect(calls).not.toContain("autoMerge.enable");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "visual_evidence_missing_at_merge" },
+    });
+  });
+
+  it("fails closed to requires_manual (visual_evidence_missing_at_merge) when deps.visualEvidence itself is never wired for the merge recheck", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: "dual_review",
+      acceptanceCriteria: [evidenceCriterion],
+      visualReviewCommands: [visualReviewCommand],
+      visualReviewModel: "gemini-2.5-pro",
+      // visualEvidenceBuild deliberately omitted -- deps.visualEvidence stays undefined, which also
+      // means the review-time gate (E102-3) fires first; see the dedicated
+      // `visualEvidenceVerify`-only-omission test below for the merge-time-specific gap.
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "visual_evidence_builder_unavailable" },
+      ]);
+    }
+    expect(calls).not.toContain("autoMerge.enable");
+  });
+
+  it("fails closed to requires_manual (visual_publication_missing_at_merge) when linearPublicationStore.load finds no receipt, and never calls autoMerge.enable", async () => {
+    const { deps, progress, calls } = await harness({
+      ...dualHarnessOptions,
+      linearPublicationStoreLoad: () => Promise.resolve(ok(undefined)),
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "linear_publication_receipt_missing_at_merge",
+        },
+      ]);
+    }
+    expect(calls).not.toContain("autoMerge.enable");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode: "visual_publication_missing_at_merge" },
+    });
+  });
+
+  it("fails closed to requires_manual (visual_publication_missing_at_merge) when deps.linearPublicationStore is never wired for the merge recheck", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewRequirement: dualHarnessOptions.reviewRequirement,
+      acceptanceCriteria: dualHarnessOptions.acceptanceCriteria,
+      visualReviewCommands: dualHarnessOptions.visualReviewCommands,
+      visualReviewModel: dualHarnessOptions.visualReviewModel,
+      visualEvidenceBuild: dualHarnessOptions.visualEvidenceBuild,
+      visualEvidenceVerify: dualHarnessOptions.visualEvidenceVerify,
+      linearPublish: dualHarnessOptions.linearPublish,
+      // linearPublicationStoreLoad deliberately omitted -- deps.linearPublicationStore stays
+      // undefined (the composition-root-gap fixture for the merge-time recheck specifically).
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        {
+          jobId,
+          outcome: "requires_manual",
+          reason: "linear_publication_store_unavailable_at_merge",
+        },
+      ]);
+    }
+    expect(calls).not.toContain("autoMerge.enable");
+  });
+
+  it.each([
+    [
+      "evidence_drift_detected",
+      { state: "evidence_drift_detected", identity: {} } as EnableAutoMergeOutcome,
+      "evidence_drift_detected_at_merge",
+    ],
+    [
+      "publication_drift_detected",
+      { state: "publication_drift_detected", identity: {} } as EnableAutoMergeOutcome,
+      "publication_drift_detected_at_merge",
+    ],
+  ] as const)(
+    "maps AutoMergeGate.enable()'s %s outcome to requires_manual with a distinct reasonCode (never effective_diff_changed / auto_merge_not_enabled)",
+    async (reasonCode, enableOutcome, expectedReason) => {
+      const { deps, progress } = await harness({ ...dualHarnessOptions, enableOutcome });
+      await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+      const result = await runResumeCycle(deps);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toEqual([
+          { jobId, outcome: "requires_manual", reason: expectedReason },
+        ]);
+      }
+      const reloaded = await progress.load(jobId);
+      expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode },
+      });
+    },
+  );
+
+  /**
+   * E102-4b acceptance criterion 3 + the ticket's own "先紅後綠" requirement: proves, with the
+   * *real* `AutoMergeGate`/`createReviewIdentity` domain logic (never `deps.autoMerge.enable`'s
+   * usual scripted fake), that a `dual_review` job whose review-time `publicationDigest` and
+   * merge-time `currentPublicationDigest`/`currentVisualManifest` all trace back to the exact same
+   * evidence really does arm auto-merge end to end. Before E102-4b wired `publicationDigest` into
+   * `reviewer.run()` (review side) and `currentVisualManifest`/`currentPublicationDigest` into
+   * `AutoMergeGate.enable()` (merge side), this exact scenario reproducibly failed closed at
+   * `stage:"request"` (`AutoMergeGate`'s own `validApproval`, merge-gate.ts, requires both digests
+   * non-empty and matching for every `dual_review`/`visual_review` report) -- see this test file's
+   * own git history / PR description for the reproduction of that red state.
+   */
+  it("real AutoMergeGate: a dual_review job with matching evidence+publication digests actually arms auto-merge (regression guard for the production wiring gap)", async () => {
+    const diff: readonly EffectiveTreeChange[] = [
+      {
+        before: null,
+        after: {
+          path: "src/status.ts",
+          mode: "100644",
+          objectId: { algorithm: "sha1", value: "1".repeat(40) },
+        },
+      },
+    ];
+    const mergePortCalls: string[] = [];
+    const mergePorts: MergeGatePorts = {
+      git: { getEffectiveTreeDiff: () => Promise.resolve(ok(diff)) },
+      autoMergePause: { isPaused: () => Promise.resolve(ok({ paused: false })) },
+      sourceControl: {
+        getChangeRequest: () => Promise.resolve(ok(changeRequest())),
+        getCommitChecks: () =>
+          Promise.resolve(ok({ headSha, aggregate: "success" as const, checks: [] })),
+        getCommitStatuses: () =>
+          Promise.resolve(
+            ok({
+              headSha,
+              statuses: [{ context: REVIEW_STATUS_CONTEXT, state: "success" as const }],
+            }),
+          ),
+        appendChangeRequestComment: () => {
+          mergePortCalls.push("comment");
+          return Promise.resolve(
+            ok({
+              id: "100",
+              url: "https://github.com/owner/sandbox/pull/42#issuecomment-100",
+              createdAt: now,
+            }),
+          );
+        },
+        setCommitStatus: () => {
+          mergePortCalls.push("status");
+          return Promise.resolve(ok(undefined));
+        },
+        enableAutoMerge: () => {
+          mergePortCalls.push("enable");
+          return Promise.resolve(
+            ok({
+              outcome: "enabled" as const,
+              changeRequest: changeRequest({ autoMergeEnabled: true }) as never,
+            }),
+          );
+        },
+      },
+    };
+
+    const { deps, progress, calls } = await harness({ ...dualHarnessOptions });
+    (deps as { autoMerge: ResumeCycleDependencies["autoMerge"] }).autoMerge = new AutoMergeGate(
+      mergePorts,
+    );
+    (deps as { reviewer: ResumeCycleDependencies["reviewer"] }).reviewer = {
+      run: (request) => {
+        calls.push("reviewer.run");
+        const manifest = request.visualManifest;
+        const identity = createReviewIdentity(
+          request.requirementSnapshot,
+          request.expectedHeadSha,
+          diff,
+          {
+            ...(manifest === undefined
+              ? {}
+              : { visualManifest: canonicalVisualManifestInput(manifest) }),
+            ...(request.publicationDigest === undefined
+              ? {}
+              : { publicationDigest: request.publicationDigest }),
+          },
+        );
+        if (!identity.ok)
+          throw new Error("fixture invariant violated: identity must build cleanly");
+        const identityValue = identity.value;
+        function reportFor(role: ReviewerReport["role"]): ReviewerReport {
+          return {
+            schemaVersion: 1,
+            role,
+            verdict: "passed",
+            requirementsDigest: identityValue.requirementsDigest,
+            headSha: identityValue.headSha,
+            diffDigest: identityValue.diffDigest,
+            ...(identityValue.evidenceDigest === undefined
+              ? {}
+              : { evidenceDigest: identityValue.evidenceDigest }),
+            ...(identityValue.publicationDigest === undefined
+              ? {}
+              : { publicationDigest: identityValue.publicationDigest }),
+            summary: "All checks passed.",
+            acceptanceCriteria: [
+              {
+                criterion: evidenceCriterion,
+                status: "passed",
+                summary: "Bound to exact evidence.",
+                evidenceSources: ["agent-team:diff"],
+              },
+            ],
+            qualityChecks: [
+              {
+                dimension: "correctness",
+                status: "passed",
+                summary: "Correct.",
+                evidenceSources: ["agent-team:diff"],
+              },
+            ],
+            findings: [],
+          };
+        }
+        return Promise.resolve({
+          state: "approved",
+          job: job(),
+          changeRequest: changeRequest(),
+          checks: { headSha, aggregate: "success" as const, checks: [] },
+          identity: identity.value,
+          reports: [reportFor("code_reviewer"), reportFor("visual_reviewer")],
+        } as never);
+      },
+    };
+    (deps as { reviewStatus: ResumeCycleDependencies["reviewStatus"] }).reviewStatus = {
+      begin: () => Promise.resolve({ state: "pending", changeRequest: changeRequest() } as never),
+      record: (request) =>
+        Promise.resolve({
+          state: "approved",
+          approval: {
+            changeRequestId: "42",
+            identity: request.decision.identity,
+            reports: request.decision.reports,
+            evidenceComment: {
+              id: "100",
+              url: "https://github.com/owner/sandbox/pull/42#issuecomment-100",
+              createdAt: now,
+            },
+          },
+        } as never),
+    };
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([{ jobId, outcome: "merging" }]);
+    }
+    expect(mergePortCalls).toContain("enable");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({ kind: "merging" });
   });
 });

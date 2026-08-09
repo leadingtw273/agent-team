@@ -99,6 +99,19 @@ export interface VisualEvidenceBuildRequest {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * E102-4b: the read-only subset of `VisualEvidenceBuildRequest` `verifyExisting` actually needs --
+ * deliberately excludes `commands`/`deadlineAt`/`signal`, none of which a purely read-and-re-hash
+ * operation ever touches (no command is ever spawned, no deadline is ever raced against). A real
+ * `VisualEvidenceBuildRequest` satisfies this structurally, so `build()`'s own internal calls into
+ * `#loadVerified` (below) keep compiling unchanged. */
+export interface VisualEvidenceVerifyRequest {
+  readonly worktreePath: string;
+  readonly issueId: Identifier<"issue">;
+  readonly headSha: string;
+  readonly allowedAcceptanceCriteria: readonly string[];
+}
+
 export type VisualEvidenceBuildFailureReason =
   | "no_commands_configured"
   | "invalid_request"
@@ -297,7 +310,7 @@ export class VisualEvidenceBuilder {
       `.staging-${request.headSha}`,
     );
 
-    const existing = await this.#tryReuseExisting(request, finalDirectory);
+    const existing = await this.#loadVerified(request, finalDirectory);
     if (existing !== undefined) return existing;
 
     try {
@@ -431,7 +444,7 @@ export class VisualEvidenceBuilder {
       // assuming failure; if it is not valid, fail closed and deliberately leave the staging
       // directory in place (under the gitignored evidence root -- harmless to leave, and useful
       // forensic evidence for a human) rather than guess which side was "right".
-      const raced = await this.#tryReuseExisting(request, finalDirectory);
+      const raced = await this.#loadVerified(request, finalDirectory);
       if (raced !== undefined) {
         await this.#cleanupStaging(stagingDirectory);
         return raced;
@@ -448,6 +461,44 @@ export class VisualEvidenceBuilder {
         reused: false,
       }),
     });
+  }
+
+  /**
+   * E102-4b: a purely read-only re-verification of whatever evidence is *already on disk* for this
+   * exact (issueId, headSha) -- never spawns a process, never runs `git check-ignore`, never writes
+   * or renames anything, and critically **never calls `build()`**. This is the one and only
+   * evidence read `resume-composition.ts`'s pre-arm merge recheck (`resumeReview`, immediately
+   * before `AutoMergeGate.enable()`) is authorized to perform: if the evidence directory is
+   * missing, that must surface as a concrete failure this call returns (`manifest_missing`) rather
+   * than ever be silently treated as "no prior evidence, let's produce fresh evidence instead" --
+   * `build()`'s own fresh-build path does exactly that (correct for the *review-time* call site,
+   * wrong for a *merge-time* integrity recheck: it would let a real "the original evidence
+   * disappeared" incident quietly re-manufacture new evidence and arm auto-merge on it instead of
+   * failing closed). Delegates to the exact same `#loadVerified` re-hash/re-validate logic `build()`
+   * itself falls back on for its own idempotent-resume path -- one implementation, never a second,
+   * independently-drifting read path.
+   */
+  async verifyExisting(request: VisualEvidenceVerifyRequest): Promise<VisualEvidenceBuildResult> {
+    if (
+      !isAbsolute(request.worktreePath) ||
+      request.worktreePath.length > 4_096 ||
+      !issueIdSchema.safeParse(request.issueId).success ||
+      !headShaSchema.safeParse(request.headSha).success ||
+      request.allowedAcceptanceCriteria.length === 0 ||
+      new Set(request.allowedAcceptanceCriteria).size !== request.allowedAcceptanceCriteria.length
+    ) {
+      return failure("invalid_request", "invariant_violation");
+    }
+    const finalDirectory = join(
+      request.worktreePath,
+      ...evidenceRootSegments,
+      request.issueId,
+      request.headSha,
+    );
+    const loaded = await this.#loadVerified(request, finalDirectory);
+    return (
+      loaded ?? failure("manifest_missing", "invariant_violation", visualEvidenceManifestFileName)
+    );
   }
 
   async #evidenceDirectoryIgnored(
@@ -530,12 +581,19 @@ export class VisualEvidenceBuilder {
     await rm(stagingDirectory, { recursive: true, force: true }).catch(() => undefined);
   }
 
-  /** Validates a pre-existing `finalDirectory` (a prior, already-renamed build for this exact
-   * issue+headSha) exactly as strictly as a fresh build would have -- returns `undefined` (meaning
-   * "no usable existing evidence, proceed with a fresh build") if anything about it fails to
-   * verify, rather than ever silently trusting a directory this call did not itself just produce. */
-  async #tryReuseExisting(
-    request: VisualEvidenceBuildRequest,
+  /** E102-4b: extracted from this class's own pre-existing "reuse before rebuilding" check (`build()`
+   * still calls this exact method for that purpose, unchanged) so `verifyExisting` above can reuse
+   * the identical read-only validation for its own, entirely separate merge-time purpose. Validates
+   * a pre-existing `finalDirectory` (a prior, already-renamed build for this exact issue+headSha)
+   * exactly as strictly as a fresh build would have -- re-hashing every artifact from its actual
+   * bytes on disk, re-checking `issueId`/`commitSha`/acceptance-criteria-subset, rejecting symlinks
+   * -- returns `undefined` (meaning "nothing found at this path at all") only when the manifest file
+   * itself could not be read (e.g. `ENOENT` -- ordinary "no prior evidence yet"), and a concrete
+   * `ok: false` failure for every other way an existing directory could fail to verify (corrupt
+   * JSON, schema mismatch, identity mismatch, a tampered/mismatched artifact hash) -- never silently
+   * trusting a directory this call did not itself just re-verify byte-for-byte. */
+  async #loadVerified(
+    request: VisualEvidenceVerifyRequest,
     finalDirectory: string,
   ): Promise<VisualEvidenceBuildResult | undefined> {
     let manifestBytes: Buffer;

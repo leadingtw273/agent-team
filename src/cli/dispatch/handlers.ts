@@ -430,6 +430,9 @@ export function createDispatchCliHandlers(
             ...(resumeComposition.value.linearPublication === undefined
               ? {}
               : { linearPublication: resumeComposition.value.linearPublication }),
+            ...(resumeComposition.value.linearPublicationStore === undefined
+              ? {}
+              : { linearPublicationStore: resumeComposition.value.linearPublicationStore }),
             clock,
             holderId,
             reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),

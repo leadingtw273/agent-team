@@ -203,6 +203,80 @@ function invalidationComment(
   ].join("\n");
 }
 
+/**
+ * E102-4b: renders the audit comment for `"evidence_drift_detected"`/`"publication_drift_detected"`
+ * -- deliberately never `invalidationComment` above (`action: "full_review_required"` would be a
+ * false instruction here: nothing about this commit's code changed, so re-running the implementer/
+ * reviewer loop would not resolve anything, and a fresh review could not safely publish a second
+ * Linear receipt for the same write-once (issueId, headSha) key anyway). `action:
+ * "manual_review_required"` says so explicitly, for both the human reading this comment and any
+ * future `dispatch resolve` tooling parsing it.
+ */
+function driftComment(
+  reason: "evidence_drift_detected" | "publication_drift_detected",
+  approved: ReviewIdentity,
+  current: ReviewIdentity,
+): string {
+  return [
+    `Agent Team review blocked: **${reason.replaceAll("_", " ")}**.`,
+    "",
+    "```json",
+    JSON.stringify(
+      {
+        schemaVersion: 1,
+        kind: "agent_team_review_drift",
+        reason,
+        approvedIdentity: approved,
+        currentIdentity: current,
+        action: "manual_review_required",
+      },
+      null,
+      2,
+    ),
+    "```",
+  ].join("\n");
+}
+
+/**
+ * E102-4b: classifies exactly *why* `compareReviewIdentity` returned `"full_review"` -- the
+ * pre-existing code only ever distinguished `requirementsDigest` changes from everything else
+ * (lumping diff/evidence/publication drift all into one `"effective_diff_changed"` bucket), which
+ * is the exact over-reporting this ticket's coordinator named as a defect: evidence/publication
+ * drift at the *same* commit is a structurally different situation (see
+ * `EnableAutoMergeOutcome.evidence_drift_detected`'s own header, merge-gate-model.ts) from "the
+ * implementer pushed different code," and conflating them would send a drift incident through the
+ * wrong recovery path (or worse, silently through the *same* one that already worked for ordinary
+ * diff changes, hiding a potential tampering/corruption signal behind a routine-looking label).
+ * Priority order (checked top-to-bottom, matching this file's own historical precedence for
+ * `requirementsDigest` over everything else): requirements change, then diff change, then -- only
+ * at the *identical* head SHA, since that is the only condition under which "evidence changed with
+ * nothing else" is even meaningful -- evidence drift, then publication drift. The final fallback
+ * (`current.headSha` differs from `approved.headSha` while only evidence/publication differs) is
+ * not reachable from `resume-composition.ts`'s own call site today (that call always recomputes the
+ * current identity against the *same* `expectedHeadSha` the approval was itself computed against,
+ * within one `resumeReview` invocation -- see that file's own header) -- kept as a safe fallback to
+ * the pre-existing, already-audited `effective_diff_changed` re-review path rather than an
+ * unreachable `default: never` that would make this function partial for `AutoMergeGate`'s general,
+ * reusable port contract.
+ */
+function classifyFullReview(
+  approved: ReviewIdentity,
+  current: ReviewIdentity,
+):
+  | "requirements_changed"
+  | "effective_diff_changed"
+  | "evidence_drift_detected"
+  | "publication_drift_detected" {
+  if (approved.requirementsDigest !== current.requirementsDigest) return "requirements_changed";
+  if (approved.diffDigest !== current.diffDigest) return "effective_diff_changed";
+  if (sameSha(approved.headSha, current.headSha)) {
+    if (approved.evidenceDigest !== current.evidenceDigest) return "evidence_drift_detected";
+    if (approved.publicationDigest !== current.publicationDigest)
+      return "publication_drift_detected";
+  }
+  return "effective_diff_changed";
+}
+
 export class ReviewStatusCoordinator {
   constructor(readonly ports: ReviewStatusPorts) {}
 
@@ -447,10 +521,37 @@ export class AutoMergeGate {
     if (!identity.ok) return mergeFailure("diff", identity.error);
     const reuse = compareReviewIdentity(request.approval.identity, identity.value);
     if (reuse === "full_review") {
-      const reason =
-        request.approval.identity.requirementsDigest !== identity.value.requirementsDigest
-          ? "requirements_changed"
-          : "effective_diff_changed";
+      const classification = classifyFullReview(request.approval.identity, identity.value);
+      if (
+        classification === "evidence_drift_detected" ||
+        classification === "publication_drift_detected"
+      ) {
+        const driftKind = classification;
+        const comment = await this.ports.sourceControl.appendChangeRequestComment(
+          {
+            changeRequest: reference,
+            expectedHeadSha: request.expectedHeadSha,
+            kind: "automation",
+            body: driftComment(driftKind, request.approval.identity, identity.value),
+          },
+          mutation(request, `review-${driftKind}-comment`),
+        );
+        if (!comment.ok) return mergeFailure("comment", comment.error);
+        const drifted = await this.ports.sourceControl.setCommitStatus(
+          {
+            project: request.project,
+            headSha: request.expectedHeadSha,
+            context: REVIEW_STATUS_CONTEXT,
+            state: "failure",
+            description: `Agent Team review blocked: ${driftKind.replaceAll("_", " ")}`,
+            targetUrl: comment.value.url,
+          },
+          mutation(request, `review-${driftKind}-status`),
+        );
+        if (!drifted.ok) return mergeFailure("status", drifted.error);
+        return Object.freeze({ state: driftKind, identity: identity.value });
+      }
+      const reason = classification;
       const comment = await this.ports.sourceControl.appendChangeRequestComment(
         {
           changeRequest: reference,

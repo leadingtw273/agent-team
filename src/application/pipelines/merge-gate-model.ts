@@ -196,6 +196,27 @@ export type EnableAutoMergeOutcome =
       reason: "requirements_changed" | "effective_diff_changed";
       identity: ReviewIdentity;
     }>
+  // E102-4b: the approval's `requirementsDigest`/`diffDigest` are both still identical to the
+  // freshly recomputed `current` identity -- this is *not* a genuine requirements/diff change, so
+  // it must never be folded into `re_review_required`/`effective_diff_changed` (that reasonCode is
+  // reserved for "the code actually changed, send it back through the normal implementer/reviewer
+  // loop," which is exactly wrong here). At the *identical* commit, the evidence this gate just
+  // re-verified from disk (`VisualEvidenceBuilder.verifyExisting`, resume-composition.ts's own
+  // pre-arm recheck) hashes to a different `evidenceDigest` than the one the recorded approval was
+  // actually reviewed against. `LinearPublicationReceiptRecord`s are write-once (see
+  // linear-publication-store.ts's own header) precisely so this should be structurally impossible
+  // in the ordinary flow -- reaching this state means either on-disk evidence was replaced without
+  // a new commit, or a bug, either of which is a safety event for a human, never something this
+  // gate silently re-review-loops on (a fresh review could not safely publish a second receipt for
+  // the same (issueId, headSha) either -- see that file's own "write-once" contract). See
+  // `merge-gate.ts`'s own `enable()` for exactly which comment/status this posts.
+  | Readonly<{ state: "evidence_drift_detected"; identity: ReviewIdentity }>
+  // E102-4b: symmetric to `evidence_drift_detected` above, but the drift is in the *publication*
+  // record (`FileLinearPublicationStore.load()`'s returned receipt digests differently from the one
+  // the recorded approval was reviewed against) rather than the visual manifest/artifacts
+  // themselves -- kept as its own distinct outcome (not merged into `evidence_drift_detected`) so an
+  // operator reading `dispatch resolve`'s output can tell which durable record actually diverged.
+  | Readonly<{ state: "publication_drift_detected"; identity: ReviewIdentity }>
   | Readonly<{
       state: "not_ready";
       reason:

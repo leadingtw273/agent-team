@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
@@ -538,5 +538,200 @@ describe("VisualEvidenceBuilder", () => {
     const result = await builder.build(buildRequest(worktreePath, { headSha }));
 
     expect(result.ok).toBe(true);
+  });
+});
+
+/**
+ * E102-4b: `verifyExisting` is the purely read-only re-verification `resume-composition.ts`'s
+ * pre-arm merge recheck calls -- extracted from `build()`'s own pre-existing "reuse before
+ * rebuilding" logic (`#loadVerified`, visual-evidence-builder.ts) so the merge-time recheck never
+ * has to go through `build()` (which would spawn a process and, on a missing evidence directory,
+ * silently manufacture *new* evidence instead of failing closed). Every test in this block proves
+ * the read-only contract directly: a `ProcessPort` whose `spawn` throws is wired in, so any test
+ * that accidentally exercised `build()`'s process-spawning path would fail loudly rather than
+ * silently passing.
+ */
+describe("VisualEvidenceBuilder.verifyExisting", () => {
+  function neverSpawnProcessPort(): ProcessPort {
+    return {
+      spawn: () => {
+        throw new Error("verifyExisting must never spawn a process (build() must never run here)");
+      },
+    };
+  }
+
+  it("verifies and returns the exact manifest a prior build produced, without ever spawning a process", async () => {
+    const worktreePath = await temporaryDirectory();
+    const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
+    const buildingBuilder = new VisualEvidenceBuilder({
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: [],
+      }),
+      clock: createFixedClock(now),
+    });
+    const built = await buildingBuilder.build(buildRequest(worktreePath, { headSha }));
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+
+    // A fresh builder instance, wired with a `ProcessPort` that throws on any `spawn` call --
+    // `verifyExisting` must succeed purely by reading and re-hashing what `build()` already wrote.
+    const verifyingBuilder = new VisualEvidenceBuilder({
+      process: neverSpawnProcessPort(),
+      clock: createFixedClock(now),
+    });
+
+    const verified = await verifyingBuilder.verifyExisting({
+      worktreePath,
+      issueId,
+      headSha,
+      allowedAcceptanceCriteria: [criterion],
+    });
+
+    expect(verified).toMatchObject({
+      ok: true,
+      value: { visualManifest: built.value.visualManifest, reused: true },
+    });
+  });
+
+  it("fails closed with manifest_missing when no evidence has ever been built for this issue+headSha", async () => {
+    const worktreePath = await temporaryDirectory();
+    const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
+    const builder = new VisualEvidenceBuilder({
+      process: neverSpawnProcessPort(),
+      clock: createFixedClock(now),
+    });
+
+    const verified = await builder.verifyExisting({
+      worktreePath,
+      issueId,
+      headSha,
+      allowedAcceptanceCriteria: [criterion],
+    });
+
+    expect(verified).toMatchObject({ ok: false, failure: { reason: "manifest_missing" } });
+  });
+
+  it("fails closed with existing_evidence_invalid when a previously recorded artifact was tampered with on disk", async () => {
+    const worktreePath = await temporaryDirectory();
+    const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
+    const buildingBuilder = new VisualEvidenceBuilder({
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: [],
+      }),
+      clock: createFixedClock(now),
+    });
+    const built = await buildingBuilder.build(buildRequest(worktreePath, { headSha }));
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const [firstArtifact] = built.value.visualManifest.artifacts;
+    if (firstArtifact === undefined) throw new Error("expected one artifact");
+    await writeFile(
+      join(worktreePath, firstArtifact.path),
+      Buffer.concat([pngMagicBytes, Buffer.from("tampered-bytes")]),
+    );
+
+    const verifyingBuilder = new VisualEvidenceBuilder({
+      process: neverSpawnProcessPort(),
+      clock: createFixedClock(now),
+    });
+    const verified = await verifyingBuilder.verifyExisting({
+      worktreePath,
+      issueId,
+      headSha,
+      allowedAcceptanceCriteria: [criterion],
+    });
+
+    expect(verified).toMatchObject({ ok: false, failure: { reason: "existing_evidence_invalid" } });
+  });
+
+  /**
+   * E102-4b invariant: `.agent-team/evidence/<issueId>/<headSha>/` must survive on disk from
+   * review time all the way through the job's terminal state -- the pre-arm merge recheck
+   * (`resumeReview`, resume-composition.ts) reads this exact directory a second time, and neither
+   * of the two methods it calls (`build()`'s idempotent-reuse path, `verifyExisting()` itself) ever
+   * deletes or empties it. Structurally reinforced elsewhere in this codebase, not just by
+   * convention: `ResumeCycleDependencies`/`MergeGatePorts` never expose `GitPort.removeWorktree` at
+   * all (only `git/local.ts`'s real adapter has that method, and its only two call sites are both
+   * inside `application/registration/proactive-probe.ts` -- the registration setup probe, never
+   * the dispatch/resume/merge pipeline this ticket wires) -- so this test is a *behavioral* lock on
+   * top of that *structural* one, verified directly against the real filesystem rather than only
+   * asserted from reading the type signatures.
+   */
+  it("never deletes or empties the evidence directory across a build() reuse followed by a verifyExisting() recheck (retention invariant)", async () => {
+    const worktreePath = await temporaryDirectory();
+    const headSha = await initRepo(worktreePath, { gitignoreEvidence: true });
+    const invocations: string[] = [];
+    const buildingBuilder = new VisualEvidenceBuilder({
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: invocations,
+      }),
+      clock: createFixedClock(now),
+    });
+
+    const built = await buildingBuilder.build(buildRequest(worktreePath, { headSha }));
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const evidenceDirectoryStatAfterBuild = await stat(built.value.evidenceDirectory);
+    expect(evidenceDirectoryStatAfterBuild.isDirectory()).toBe(true);
+
+    // Simulates the review-time resume cycle reaching `awaiting_review`/`fix_round` and later being
+    // resumed for the merge-time recheck, in a fresh process -- a second, independent builder
+    // instance re-reading the same directory a real `agent-team run` restart would produce.
+    const verifyingBuilder = new VisualEvidenceBuilder({
+      process: fakeProcessPort({
+        worktreePath,
+        ignored: true,
+        headSha,
+        mode: "ok",
+        commandInvocations: invocations,
+      }),
+      clock: createFixedClock(now),
+    });
+    const verified = await verifyingBuilder.verifyExisting({
+      worktreePath,
+      issueId,
+      headSha,
+      allowedAcceptanceCriteria: [criterion],
+    });
+    expect(verified.ok).toBe(true);
+
+    // Only the first `build()` call ever ran a trusted command -- `verifyExisting()` never re-runs
+    // anything, and (the actual invariant this test locks) the directory + its one PNG artifact are
+    // both still present, unmodified, on disk after both calls.
+    expect(invocations).toEqual(["node"]);
+    const evidenceDirectoryStatAfterVerify = await stat(built.value.evidenceDirectory);
+    expect(evidenceDirectoryStatAfterVerify.isDirectory()).toBe(true);
+    const [artifact] = built.value.visualManifest.artifacts;
+    if (artifact === undefined) throw new Error("expected one artifact");
+    const artifactStat = await stat(join(worktreePath, artifact.path));
+    expect(artifactStat.isFile()).toBe(true);
+  });
+
+  it("rejects an invalid request (relative worktreePath) closed, without ever spawning a process", async () => {
+    const builder = new VisualEvidenceBuilder({
+      process: neverSpawnProcessPort(),
+      clock: createFixedClock(now),
+    });
+
+    const verified = await builder.verifyExisting({
+      worktreePath: "relative/path",
+      issueId,
+      headSha: "a".repeat(40),
+      allowedAcceptanceCriteria: [criterion],
+    });
+
+    expect(verified).toMatchObject({ ok: false, failure: { reason: "invalid_request" } });
   });
 });
