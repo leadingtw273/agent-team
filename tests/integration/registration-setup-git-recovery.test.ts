@@ -15,6 +15,7 @@ import {
 } from "../../src/adapters/registration/index.js";
 import {
   createRegistrationSetupPreview,
+  registrationSetupBranchFor,
   RegistrationSetupCoordinator,
   type RegistrationSetupBeginRequest,
   type RegistrationSetupJournalPort,
@@ -121,14 +122,16 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
     roleInstructions: { implementer: ["Stay in scope."] },
     commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
   });
+  const setupSessionId = `setup-git-${crashStep}`;
+  const setupBranch = registrationSetupBranchFor(setupSessionId);
   const preview = createRegistrationSetupPreview({
     schemaVersion: 1,
-    setupSessionId: `setup-git-${crashStep}`,
+    setupSessionId,
     project,
     config,
     baseRevision: baseSha,
     worktreePath,
-    branch: "agent-team/setup",
+    branch: setupBranch,
     remote: "origin",
     linearAuditIssueId: "LINEAR-AUDIT-RECOVERY",
   });
@@ -176,7 +179,7 @@ async function fixture(crashStep: "stage" | "commit"): Promise<RecoveryFixture> 
           state: "open" as const,
           draft: true,
           baseBranch: "main",
-          headBranch: "agent-team/setup",
+          headBranch: setupBranch,
           headSha,
           mergeability: "mergeable" as const,
           autoMergeEnabled: false,

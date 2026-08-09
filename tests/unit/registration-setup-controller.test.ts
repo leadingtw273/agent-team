@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   RegistrationSetupController,
+  registrationSetupBranchFor,
   type RegistrationSetupControllerPorts,
   type RegistrationSetupOutcome,
   type RegistrationSetupSession,
@@ -156,7 +157,7 @@ function readySession(
     worktree: {
       repositoryRoot: project.localRepositoryPath,
       path: `/tmp/agent-team-state/registration-setup/worktrees/${setupSessionId}`,
-      branch: "agent-team/setup",
+      branch: registrationSetupBranchFor(setupSessionId),
       headSha: "e".repeat(40),
     },
     remote: "origin",
@@ -172,7 +173,7 @@ function readySession(
       state: "open" as const,
       draft: false,
       baseBranch: "main",
-      headBranch: "agent-team/setup",
+      headBranch: registrationSetupBranchFor(setupSessionId),
       headSha: "e".repeat(40),
       mergeability: "mergeable",
       autoMergeEnabled: false,
