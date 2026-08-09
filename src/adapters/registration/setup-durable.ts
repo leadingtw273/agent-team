@@ -203,10 +203,7 @@ const journalSchema = z
           })
           .strict()
           .optional(),
-        commit: z
-          .object({ sha: shaSchema, branch: setupBranchSchema })
-          .strict()
-          .optional(),
+        commit: z.object({ sha: shaSchema, branch: setupBranchSchema }).strict().optional(),
         push: z
           .object({
             remote: z.literal("origin"),

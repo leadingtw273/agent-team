@@ -169,11 +169,7 @@ interface HarnessOptions {
    * re-approval case) got stuck failing at `stage`.
    */
   readonly stagedTrustedConfigDiff?:
-    | "modify"
-    | "modify_wrong_path"
-    | "modify_wrong_mode"
-    | "extra_file"
-    | "after_wrong_object";
+    "modify" | "modify_wrong_path" | "modify_wrong_mode" | "extra_file" | "after_wrong_object";
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -276,7 +272,10 @@ function harness(options: HarnessOptions = {}) {
         attack === undefined || attack === "extra_file"
           ? null
           : {
-              path: attack === "modify_wrong_path" ? ".agent-team/other.json" : trustedProjectConfigPath,
+              path:
+                attack === "modify_wrong_path"
+                  ? ".agent-team/other.json"
+                  : trustedProjectConfigPath,
               mode: attack === "modify_wrong_mode" ? ("100755" as const) : ("100644" as const),
               objectId: { algorithm: "sha1" as const, value: "d".repeat(40) },
             },
@@ -421,14 +420,7 @@ function harness(options: HarnessOptions = {}) {
           ),
         );
       },
-      getStagedTreeDiff: () =>
-        Promise.resolve(
-          ok(
-            stagedConfig
-              ? stagedTrustedConfigDiff()
-              : [],
-          ),
-        ),
+      getStagedTreeDiff: () => Promise.resolve(ok(stagedConfig ? stagedTrustedConfigDiff() : [])),
       inspectCommit: () =>
         Promise.resolve(
           ok({

@@ -1243,10 +1243,7 @@ export class RegistrationSetupCoordinator {
         if (!committed.ok) return portFailure("commit", committed.error);
         commitReceipt = committed.value;
       }
-      if (
-        commitReceipt.branch !== request.preview.branch ||
-        !shaPattern.test(commitReceipt.sha)
-      ) {
+      if (commitReceipt.branch !== request.preview.branch || !shaPattern.test(commitReceipt.sha)) {
         return failed("commit");
       }
       const clean = await this.#owned(lease, () => this.#ports.git.inspectWorkingTree(worktree));
