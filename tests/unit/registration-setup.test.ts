@@ -6,6 +6,7 @@ import {
   RegistrationSetupCoordinator,
   createRegistrationSetupApplication,
   createRegistrationSetupPreview,
+  registrationSetupBranchFor,
   type RegistrationSetupPorts,
   type RegistrationSetupJournal,
   type RegistrationSetupJournalStep,
@@ -63,16 +64,17 @@ function digest(value: string) {
 function rawDigest(value: string): Sha256Digest {
   return createHash("sha256").update(value, "utf8").digest("hex") as Sha256Digest;
 }
+const setupSessionId = `setup-${createHash("sha256")
+  .update([project.id, baseSha, configDigest, linearAuditIssueId].join("\0"), "utf8")
+  .digest("hex")}`;
 const previewResult = createRegistrationSetupPreview({
   schemaVersion: 1,
-  setupSessionId: `setup-${createHash("sha256")
-    .update([project.id, baseSha, configDigest, linearAuditIssueId].join("\0"), "utf8")
-    .digest("hex")}`,
+  setupSessionId,
   project,
   config,
   baseRevision: baseSha,
   worktreePath: "/tmp/setup-worktree",
-  branch: "agent-team/setup",
+  branch: registrationSetupBranchFor(setupSessionId),
   remote: "origin",
   linearAuditIssueId,
 });
@@ -87,7 +89,7 @@ function changeRequest(overrides: Partial<ChangeRequestSnapshot> = {}): ChangeRe
     state: "open",
     draft: true,
     baseBranch: "main",
-    headBranch: "agent-team/setup",
+    headBranch: preview.branch,
     headSha,
     mergeability: "mergeable",
     autoMergeEnabled: false,
@@ -159,6 +161,15 @@ interface HarnessOptions {
     "unavailable" | "config_drift" | "wrong_branch" | "wrong_revision" | "wrong_source";
   readonly auditFailure?: "linear" | "pull_request";
   readonly auditReceiptSaveCrash?: "linear" | "pull_request";
+  /**
+   * C026 (A): shapes the "stage" step's own staged-tree-diff `before` leg. `undefined` keeps the
+   * original add-only shape (`before: null`). The other variants exercise
+   * `isExactTrustedConfigDiff`'s relaxed-before branch directly at the one place a fresh `begin()`
+   * first evaluates it -- before the fix, every one of these (including the legitimate `modify`
+   * re-approval case) got stuck failing at `stage`.
+   */
+  readonly stagedTrustedConfigDiff?:
+    "modify" | "modify_wrong_path" | "modify_wrong_mode" | "extra_file" | "after_wrong_object";
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -239,6 +250,45 @@ function harness(options: HarnessOptions = {}) {
       },
     };
     return options.recoveryDiffAttack === "extra"
+      ? [
+          trusted,
+          {
+            before: null,
+            after: {
+              path: ".agent-team/evil",
+              mode: "100644" as const,
+              objectId: { algorithm: "sha1" as const, value: "f".repeat(40) },
+            },
+          },
+        ]
+      : [trusted];
+  };
+  // C026 (A): shapes the "stage" step's own staged-tree-diff -- the first place a fresh begin()
+  // evaluates `isExactTrustedConfigDiff`, before commit/push/effective-diff are ever reached.
+  const stagedTrustedConfigDiff = () => {
+    const attack = options.stagedTrustedConfigDiff;
+    const trusted = {
+      before:
+        attack === undefined || attack === "extra_file"
+          ? null
+          : {
+              path:
+                attack === "modify_wrong_path"
+                  ? ".agent-team/other.json"
+                  : trustedProjectConfigPath,
+              mode: attack === "modify_wrong_mode" ? ("100755" as const) : ("100644" as const),
+              objectId: { algorithm: "sha1" as const, value: "d".repeat(40) },
+            },
+      after: {
+        path: trustedProjectConfigPath,
+        mode: "100644" as const,
+        objectId: {
+          algorithm: "sha1" as const,
+          value: attack === "after_wrong_object" ? "d".repeat(40) : configObjectId,
+        },
+      },
+    };
+    return attack === "extra_file"
       ? [
           trusted,
           {
@@ -370,23 +420,7 @@ function harness(options: HarnessOptions = {}) {
           ),
         );
       },
-      getStagedTreeDiff: () =>
-        Promise.resolve(
-          ok(
-            stagedConfig
-              ? [
-                  {
-                    before: null,
-                    after: {
-                      path: trustedProjectConfigPath,
-                      mode: "100644" as const,
-                      objectId: { algorithm: "sha1" as const, value: configObjectId },
-                    },
-                  },
-                ]
-              : [],
-          ),
-        ),
+      getStagedTreeDiff: () => Promise.resolve(ok(stagedConfig ? stagedTrustedConfigDiff() : [])),
       inspectCommit: () =>
         Promise.resolve(
           ok({
@@ -946,6 +980,23 @@ function approval(session: RegistrationSetupSession, overrides: Record<string, u
 
 const trustedAuthority = { issuer: "local_ui" as const, authorityDigest: uiSessionDigest };
 
+describe("C026(B): registrationSetupBranchFor is session-scoped and deterministic", () => {
+  it("derives the same branch for the same setupSessionId every time (resume-idempotent)", () => {
+    const first = registrationSetupBranchFor(preview.setupSessionId);
+    const second = registrationSetupBranchFor(preview.setupSessionId);
+    expect(first).toBe(second);
+    expect(first).toBe(`agent-team/setup/${preview.setupSessionId}`);
+  });
+
+  it("derives distinct branches for two different setupSessionIds (no cross-session collision)", () => {
+    const sessionA = registrationSetupBranchFor("setup-aaaa");
+    const sessionB = registrationSetupBranchFor("setup-bbbb");
+    expect(sessionA).not.toBe(sessionB);
+    expect(sessionA).toBe("agent-team/setup/setup-aaaa");
+    expect(sessionB).toBe("agent-team/setup/setup-bbbb");
+  });
+});
+
 describe("O005 registration Setup PR flow", () => {
   it("keeps coordinator capabilities private and exposes no raw merge extractor", async () => {
     const test = harness();
@@ -1011,6 +1062,30 @@ describe("O005 registration Setup PR flow", () => {
       expect.arrayContaining(["write", "preflight", "stage", "commit", "push", "draft-pr"]),
     );
   });
+
+  it("C026(A): accepts a same-path Modify staged diff (re-approval over an already-registered config)", async () => {
+    const test = await prepared(harness({ stagedTrustedConfigDiff: "modify" }));
+    expect(test.session.changeRequest).toMatchObject({ draft: true, headSha });
+    expect(test.calls).toEqual(
+      expect.arrayContaining(["write", "preflight", "stage", "commit", "push", "draft-pr"]),
+    );
+  });
+
+  it.each(["modify_wrong_path", "modify_wrong_mode", "extra_file", "after_wrong_object"] as const)(
+    "C026(A): still fails closed at stage for %s (before this fix, only bare Add ever passed)",
+    async (stagedTrustedConfigDiff) => {
+      const test = harness({ stagedTrustedConfigDiff });
+      const result = await test.coordinator.begin({
+        preview,
+        trustedAuthority,
+        confirmation: confirmation(),
+        idempotencyKeyPrefix: `setup:stage-diff:${stagedTrustedConfigDiff}`,
+      });
+      expect(result).toMatchObject({ state: "failed", stage: "stage" });
+      expect(test.calls).not.toContain("commit");
+      expect(test.calls).not.toContain("draft-pr");
+    },
+  );
 
   it("replays begin idempotently without duplicating Git or SCM mutations", async () => {
     const test = await prepared();

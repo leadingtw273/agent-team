@@ -27,6 +27,8 @@ import {
 } from "../../src/adapters/registration/index.js";
 import {
   createRegistrationSetupPreview,
+  registrationSetupActivationMarkerDigest,
+  registrationSetupBranchFor,
   type RegistrationSetupApprovalBinding,
   type RegistrationSetupExecutionLease,
   type RegistrationSetupJournalDraft,
@@ -58,8 +60,18 @@ async function withExecution<Value>(
   root: string,
   action: (lease: RegistrationSetupExecutionLease) => Promise<Value>,
 ): Promise<Value> {
+  return withExecutionFor(root, preview.setupSessionId, action);
+}
+
+// C026(C): a session-scoped variant of `withExecution` -- needed to exercise a *second* session
+// (its own setupSessionId, its own execution lease) for the same project, e.g. a re-approval.
+async function withExecutionFor<Value>(
+  root: string,
+  setupSessionId: string,
+  action: (lease: RegistrationSetupExecutionLease) => Promise<Value>,
+): Promise<Value> {
   const result = await new FileRegistrationSetupExecutionStore(root).runExclusive(
-    preview.setupSessionId,
+    setupSessionId,
     action,
   );
   if (!result.ok) throw new Error(result.error.code);
@@ -136,14 +148,15 @@ const config = trustedProjectConfigSchema.parse({
   roleInstructions: { implementer: ["Stay in scope."] },
   commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
 });
+const setupSessionId = "setup-session-1";
 const previewResult = createRegistrationSetupPreview({
   schemaVersion: 1,
-  setupSessionId: "setup-session-1",
+  setupSessionId,
   project,
   config,
   baseRevision: baseSha,
   worktreePath: "/tmp/setup-worktree",
-  branch: "agent-team/setup",
+  branch: registrationSetupBranchFor(setupSessionId),
   remote: "origin",
   linearAuditIssueId: "LINEAR-AUDIT-1",
 });
@@ -303,7 +316,7 @@ function sessionDraft(
     worktree: {
       repositoryRoot: project.localRepositoryPath,
       path: preview.worktreePath,
-      branch: "agent-team/setup",
+      branch: preview.branch,
       headSha: baseSha,
     },
     remote: "origin",
@@ -319,7 +332,7 @@ function sessionDraft(
       state: phase === "activated" ? "merged" : "open",
       draft: phase !== "activated",
       baseBranch: "main",
-      headBranch: "agent-team/setup",
+      headBranch: preview.branch,
       headSha,
       mergeability: "mergeable",
       autoMergeEnabled: phase === "activated",
@@ -702,6 +715,311 @@ describe("file-backed registration setup state", () => {
       ok: false,
       error: { code: "conflict" },
     });
+  });
+
+  it("C026(C): rejects publish with an expectedPriorMarkerDigest when no index exists yet", async () => {
+    const root = await temporaryRoot();
+    const approvalReceipt = await createConsumedApproval(root);
+    const sessions = new FileRegistrationSetupSessionStore(root);
+    const initial = await withExecution(root, (lease) =>
+      sessions.save(undefined, sessionDraft(), {
+        idempotencyKey: "activation-index:cas-no-index:create",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!initial.ok) throw new Error(initial.error.code);
+    const activated = await withExecution(root, (lease) =>
+      sessions.activate(
+        initial.value.session.revision,
+        sessionDraft("activated", approvalReceipt),
+        mergedSha,
+        {
+          idempotencyKey: "activation-index:cas-no-index:marker",
+          executionFence: lease.fence,
+        },
+      ),
+    );
+    if (!activated.ok) throw new Error(activated.error.code);
+    const registry = new FileRegistrationSetupActivationRegistry(root);
+    // Nothing has ever been published for this project -- expecting a prior digest that doesn't
+    // exist must be a conflict (the caller believed there was already an index; there is none: a
+    // deletion/rollback happened, or the caller is simply wrong), never silently treated as a
+    // first write.
+    await expect(
+      registry.publish(activated.value.marker, {
+        idempotencyKey: "activation-index:cas-no-index:publish",
+        expectedPriorMarkerDigest: "f".repeat(64),
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "conflict" } });
+    await expect(registry.read(project.id)).resolves.toEqual({ ok: true, value: undefined });
+  });
+
+  it("C026(C): CAS-replaces the published marker for a re-approval, and rejects a stale expectedPriorMarkerDigest", async () => {
+    const root = await temporaryRoot();
+    const first = await createActivatedFixture(root);
+    const firstDigest = registrationSetupActivationMarkerDigest(first.activated.value.marker);
+    if (!firstDigest.ok) throw new Error(firstDigest.error.code);
+
+    // Build a second, independently activated session for the *same* project -- the re-approval
+    // scenario C026(B) makes possible (its own session-scoped setup branch) and this CAS replace
+    // is meant to accept. Session-store verification (`sessions.load`/`readActivation`) is real;
+    // only the approval ledger is faked here, to bind a second receipt without re-running the real
+    // issue/consume ledger dance a second time (already covered by the other O005/F-2 tests).
+    const secondSetupSessionId = "setup-session-1-reapproval";
+    const secondApprovalId = "approval-grant-reapproval";
+    const secondRevision = 2;
+    const secondApprovalReferenceDigest = approvalReferenceFor(secondApprovalId);
+    const secondConsumeOperationDigest = rawDigest("cas-reapproval:consume-operation");
+    const secondNonceDigest = rawDigest("cas-reapproval:nonce");
+    const secondBranch = registrationSetupBranchFor(secondSetupSessionId);
+    // Mirrors `testMergeState()` above, but keyed to `secondSetupSessionId` -- production's
+    // `createMergeIntent()` derives `idempotencyKey` from the *owning* session's own id, so reusing
+    // the session-1-scoped helper here would silently produce a mismatched merge intent/receipt.
+    const secondMergeIdempotencyKey = `setup-merge:${secondSetupSessionId}:${secondApprovalReferenceDigest.slice(0, 16)}`;
+    const secondMergeIntentBinding = Object.freeze({
+      schemaVersion: 1 as const,
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      changeRequestId: "42",
+      expectedHeadSha: headSha,
+      mergeMethod: "SQUASH" as const,
+      idempotencyKey: secondMergeIdempotencyKey,
+    });
+    const secondMergeIntent = Object.freeze({
+      ...secondMergeIntentBinding,
+      mergeIntentDigest: mustDigest({
+        kind: "registration_setup_merge_intent",
+        ...secondMergeIntentBinding,
+      }),
+    });
+    const { idempotencyKey: _secondMergeIdempotencyKey, ...secondMergeReceiptBinding } =
+      secondMergeIntent;
+    void _secondMergeIdempotencyKey;
+    const secondMerge = {
+      mergeIntent: secondMergeIntent,
+      mergeReceipt: Object.freeze({
+        ...secondMergeReceiptBinding,
+        state: "merged" as const,
+        idempotencyKeyDigest: mustDigest(secondMergeIdempotencyKey),
+      }),
+    };
+    const secondChangeRequest = {
+      id: "PR_node_1",
+      number: 42,
+      url: "https://github.test/owner/sandbox/pull/42",
+      state: "merged" as const,
+      draft: false,
+      baseBranch: "main",
+      headBranch: secondBranch,
+      headSha,
+      mergeability: "mergeable" as const,
+      autoMergeEnabled: true,
+      updatedAt,
+    };
+    const secondWorktree = {
+      repositoryRoot: project.localRepositoryPath,
+      path: `${preview.worktreePath}-reapproval`,
+      branch: secondBranch,
+      headSha: baseSha,
+    };
+    const ciWaitingDraft: RegistrationSetupSessionDraft = {
+      schemaVersion: 1,
+      phase: "ci_waiting",
+      setupSessionId: secondSetupSessionId,
+      project,
+      config,
+      baseRevision: baseSha,
+      worktree: secondWorktree,
+      remote: "origin",
+      previewDigest: preview.previewDigest,
+      requirementsDigest: preview.requirementsDigest,
+      diffDigest: testDigest,
+      configDigest: serializedConfig.contentDigest,
+      headSha,
+      changeRequest: { ...secondChangeRequest, state: "open", draft: true },
+      linearAuditIssueId: preview.linearAuditIssueId,
+      evidence: [],
+    };
+    const secondEvidenceBinding = {
+      projectId: project.id,
+      setupSessionId: secondSetupSessionId,
+      previewDigest: preview.previewDigest,
+      requirementsDigest: preview.requirementsDigest,
+      headSha,
+      diffDigest: testDigest,
+      changeRequestId: "42",
+    };
+    // Mirrors `auditIntent()`'s body/idempotencyKey construction in setup.ts, keyed to
+    // `secondSetupSessionId` -- `auditReceiptMatches()` recomputes both digests from the session's
+    // own fields, so this must match byte-for-byte or activation fails closed.
+    const secondAuditBody = [
+      "Agent Team registration Setup PR is waiting for explicit user approval.",
+      `project=${project.id}`,
+      `setup_session=${secondSetupSessionId}`,
+      `preview_digest=${preview.previewDigest}`,
+      `change_request=${secondChangeRequest.id}`,
+      `head_sha=${headSha}`,
+      `requirements_digest=${preview.requirementsDigest}`,
+      `diff_digest=${testDigest}`,
+      `linear_audit_issue=${preview.linearAuditIssueId}`,
+      `gate_evidence_digest=${gateEvidenceReceipt.evidenceDigest}`,
+      `review_evidence=${gateEvidenceReceipt.reviewEvidenceUrl}`,
+      "merge=squash",
+      "authority=local UI or trusted current-user conversation only",
+    ].join("\n");
+    function secondAuditIdempotencyKey(destination: "linear" | "pull_request") {
+      return `setup-audit:${secondSetupSessionId}:${gateEvidenceReceipt.evidenceDigest.slice(0, 16)}:${destination}`;
+    }
+    const secondAuditReceiptBinding = {
+      setupSessionId: secondSetupSessionId,
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      linearAuditIssueId: preview.linearAuditIssueId,
+      changeRequestId: "42",
+      headSha,
+      requirementsDigest: preview.requirementsDigest,
+      diffDigest: testDigest,
+      evidenceDigest: gateEvidenceReceipt.evidenceDigest,
+      bodyDigest: mustDigest(secondAuditBody),
+      createdAt: updatedAt,
+      reused: false as const,
+    };
+    const activatedDraft: RegistrationSetupSessionDraft = {
+      ...ciWaitingDraft,
+      phase: "activated",
+      changeRequest: secondChangeRequest,
+      gateEvidenceReceipt,
+      audit: {
+        linearReceipt: {
+          schemaVersion: 1,
+          destination: "linear",
+          externalCommentId: "linear-comment-reapproval",
+          idempotencyKeyDigest: mustDigest(secondAuditIdempotencyKey("linear")),
+          ...secondAuditReceiptBinding,
+        },
+        pullRequestReceipt: {
+          schemaVersion: 1,
+          destination: "pull_request",
+          externalCommentId: "pull_request-comment-reapproval",
+          idempotencyKeyDigest: mustDigest(secondAuditIdempotencyKey("pull_request")),
+          ...secondAuditReceiptBinding,
+        },
+      },
+      evidence: [
+        { code: "setup_user_approval_consumed", ...secondEvidenceBinding },
+        { code: "setup_merge_verified", ...secondEvidenceBinding },
+        { code: "trusted_config_activated", ...secondEvidenceBinding },
+      ],
+      approvalReferenceDigest: secondApprovalReferenceDigest,
+      approvalConsumeOperationDigest: secondConsumeOperationDigest,
+      approvalNonceDigest: secondNonceDigest,
+      approvalAuthorityDigest: authorityDigest,
+      approvalSource: "local_ui",
+      approvalSetupRevision: secondRevision,
+      mergeIntent: secondMerge.mergeIntent,
+      mergeReceipt: secondMerge.mergeReceipt,
+      mergedConfigReceipt: {
+        schemaVersion: 1,
+        source: "source_control_default_branch",
+        projectId: project.id,
+        repository: project.sourceControl.repository,
+        changeRequestId: "42",
+        setupHeadSha: headSha,
+        mergeCommitSha: mergedSha,
+        defaultBranch: project.defaultBranch,
+        authoritativeRevision: mergedSha,
+        path: ".agent-team/project.json",
+        configDigest: serializedConfig.contentDigest,
+        config,
+      },
+      activatedRevisionSha: mergedSha,
+    };
+    const secondSessions = new FileRegistrationSetupSessionStore(root);
+    const secondInitial = await withExecutionFor(root, secondSetupSessionId, (lease) =>
+      secondSessions.save(undefined, ciWaitingDraft, {
+        idempotencyKey: "activation-index:cas-second:create",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!secondInitial.ok) throw new Error(secondInitial.error.code);
+    const secondActivated = await withExecutionFor(root, secondSetupSessionId, (lease) =>
+      secondSessions.activate(secondInitial.value.session.revision, activatedDraft, mergedSha, {
+        idempotencyKey: "activation-index:cas-second:marker",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!secondActivated.ok) throw new Error(secondActivated.error.code);
+    const secondMarker = secondActivated.value.marker;
+    const secondAnchor = {
+      receipt: {
+        schemaVersion: 1 as const,
+        setupSessionId: secondSetupSessionId,
+        setupSessionRevision: secondRevision,
+        projectId: project.id,
+        previewDigest: preview.previewDigest,
+        changeRequestId: "42",
+        headSha,
+        requirementsDigest: preview.requirementsDigest,
+        diffDigest: testDigest,
+        linearAuditIssueId: preview.linearAuditIssueId,
+        gateEvidenceDigest: gateEvidenceReceipt.evidenceDigest,
+        approvalId: secondApprovalId,
+        issuer: "local_ui" as const,
+        authorityDigest,
+        approvalNonceDigest: secondNonceDigest,
+        consumedAt: updatedAt,
+      },
+      consumeOperationDigest: secondConsumeOperationDigest,
+    };
+    // Only session 2's anchor is faked; anything else (e.g. re-verifying session 1's already
+    // real-ledger-issued marker, which `read()`/`publish()` also re-verify) falls through to the
+    // real ledger this same `root` already holds from `createActivatedFixture()` above.
+    const realLedger = new FileRegistrationSetupFinalApprovalAuthority(root);
+    const registryForSecond = new FileRegistrationSetupActivationRegistry(
+      root,
+      new AtomicFileStore(),
+      secondSessions,
+      {
+        readConsumed: (approvalReferenceDigest, options) =>
+          approvalReferenceDigest === secondApprovalReferenceDigest
+            ? Promise.resolve(ok(secondAnchor))
+            : realLedger.readConsumed(approvalReferenceDigest, options),
+      },
+    );
+
+    // Stale/wrong expectedPriorMarkerDigest: reject, and the index must be untouched.
+    await expect(
+      registryForSecond.publish(secondMarker, {
+        idempotencyKey: "activation-index:cas-second:stale",
+        expectedPriorMarkerDigest: mustDigest("not-the-real-prior-digest"),
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "conflict" } });
+    await expect(registryForSecond.read(project.id)).resolves.toEqual({
+      ok: true,
+      value: first.activated.value.marker,
+    });
+
+    // Correct expectedPriorMarkerDigest (the first marker's own digest, read immediately before
+    // this call, exactly as the real caller in setup.ts does): CAS replace succeeds.
+    await expect(
+      registryForSecond.publish(secondMarker, {
+        idempotencyKey: "activation-index:cas-second:replace",
+        expectedPriorMarkerDigest: firstDigest.value,
+      }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "replaced", marker: secondMarker } });
+    await expect(registryForSecond.read(project.id)).resolves.toEqual({
+      ok: true,
+      value: secondMarker,
+    });
+
+    // Idempotent retry of the same replace (e.g. resumed after an unknown-durability response):
+    // reused, not another replace, and not a conflict.
+    await expect(
+      registryForSecond.publish(secondMarker, {
+        idempotencyKey: "activation-index:cas-second:retry",
+        expectedPriorMarkerDigest: firstDigest.value,
+      }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "reused", marker: secondMarker } });
   });
 
   it.each(["authorityDigest", "approvalNonceDigest"] as const)(
@@ -1190,7 +1508,7 @@ describe("file-backed registration setup state", () => {
       config,
       baseRevision: baseSha,
       worktreePath: "/tmp/setup-worktree-2",
-      branch: "agent-team/setup",
+      branch: registrationSetupBranchFor("setup-session-2"),
       remote: "origin",
       linearAuditIssueId: "LINEAR-AUDIT-2",
     });
@@ -1278,7 +1596,7 @@ describe("registration setup local adapters", () => {
           worktree: {
             repositoryRoot: join(root, "repository"),
             path: worktreePath,
-            branch: "agent-team/setup",
+            branch: registrationSetupBranchFor(preview.setupSessionId),
             headSha: baseSha,
           },
           path: ".agent-team/project.json",

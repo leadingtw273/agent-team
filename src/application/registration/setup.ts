@@ -29,7 +29,7 @@ import {
   type RegistrationSetupConversationApprovalFacade,
 } from "./setup-controller.js";
 import {
-  registrationSetupBranch,
+  registrationSetupBranchFor,
   registrationSetupEvidenceCodes,
   registrationSetupReviewStatus,
   type RegistrationSetupAuditIntent,
@@ -161,7 +161,7 @@ function validPreviewInput(input: RegistrationSetupPreviewInput): boolean {
     sameValue(config.data.platforms.sourceControl, project.data.sourceControl) &&
     shaPattern.test(input.baseRevision) &&
     isAbsolute(input.worktreePath) &&
-    raw["branch"] === registrationSetupBranch &&
+    raw["branch"] === registrationSetupBranchFor(input.setupSessionId) &&
     input.remote === "origin" &&
     identifierPattern.test(input.linearAuditIssueId)
   );
@@ -175,7 +175,7 @@ function requirementsDigest(input: RegistrationSetupPreviewInput) {
     defaultBranch: input.project.defaultBranch,
     trustedConfig: input.config,
     allowedPaths: [trustedProjectConfigPath],
-    setupBranch: registrationSetupBranch,
+    setupBranch: registrationSetupBranchFor(input.setupSessionId),
     pullRequestStartsDraft: true,
     requiredReviewStatus: registrationSetupReviewStatus,
     mergeMethod: "squash",
@@ -276,7 +276,7 @@ function isExactTrustedConfigDiff(
     after.path === trustedProjectConfigPath &&
     after.mode === "100644" &&
     after.objectId.value === gitBlobObjectId(canonicalContent, after.objectId.algorithm) &&
-    before === null
+    (before === null || (before.path === trustedProjectConfigPath && before.mode === "100644"))
   );
 }
 
@@ -502,6 +502,18 @@ export function verifyRegistrationSetupActivatedSession(
   );
 }
 
+/**
+ * C026: single source of truth for the activation marker digest used as the CAS token in
+ * `RegistrationSetupActivationRegistryPort.publish`. Callers (this file) and the file-backed
+ * registry adapter must derive the identical digest for the same marker, or the CAS comparison in
+ * publish() would silently diverge from what read() reports as the current index.
+ */
+export function registrationSetupActivationMarkerDigest(
+  marker: RegistrationSetupActivationMarker,
+): Result<Sha256Digest, DomainError> {
+  return sha256Digest({ kind: "registration_setup_activation_marker", marker });
+}
+
 export function verifyRegistrationSetupActivationBinding(
   session: RegistrationSetupSession,
   marker: RegistrationSetupActivationMarker | undefined,
@@ -552,11 +564,11 @@ function validSession(session: RegistrationSetupSession): boolean {
     sameValue(config.data.platforms.workManagement, project.data.workManagement) &&
     sameValue(config.data.platforms.sourceControl, project.data.sourceControl) &&
     session.worktree.repositoryRoot === project.data.localRepositoryPath &&
-    session.worktree.branch === registrationSetupBranch &&
+    session.worktree.branch === registrationSetupBranchFor(session.setupSessionId) &&
     isAbsolute(session.worktree.path) &&
     sameSha(session.changeRequest.headSha, session.headSha) &&
     session.changeRequest.baseBranch === project.data.defaultBranch &&
-    session.changeRequest.headBranch === registrationSetupBranch &&
+    session.changeRequest.headBranch === registrationSetupBranchFor(session.setupSessionId) &&
     digestPattern.test(session.previewDigest) &&
     digestPattern.test(session.requirementsDigest) &&
     digestPattern.test(session.diffDigest) &&
@@ -1008,7 +1020,7 @@ export class RegistrationSetupCoordinator {
       if (
         created.value.repositoryRoot !== request.preview.project.localRepositoryPath ||
         created.value.path !== request.preview.worktreePath ||
-        created.value.branch !== registrationSetupBranch ||
+        created.value.branch !== request.preview.branch ||
         !sameSha(created.value.headSha, request.preview.baseRevision)
       )
         return failed("worktree");
@@ -1188,7 +1200,7 @@ export class RegistrationSetupCoordinator {
           sameSha(commit.value.parentShas[0] ?? "", request.preview.baseRevision) &&
           commit.value.message === expectedMessage
         ) {
-          commitReceipt = { sha: observed.value.headSha, branch: registrationSetupBranch };
+          commitReceipt = { sha: observed.value.headSha, branch: request.preview.branch };
         } else {
           return failed("commit");
         }
@@ -1231,7 +1243,7 @@ export class RegistrationSetupCoordinator {
         if (!committed.ok) return portFailure("commit", committed.error);
         commitReceipt = committed.value;
       }
-      if (commitReceipt.branch !== registrationSetupBranch || !shaPattern.test(commitReceipt.sha)) {
+      if (commitReceipt.branch !== request.preview.branch || !shaPattern.test(commitReceipt.sha)) {
         return failed("commit");
       }
       const clean = await this.#owned(lease, () => this.#ports.git.inspectWorkingTree(worktree));
@@ -1260,7 +1272,7 @@ export class RegistrationSetupCoordinator {
       if (!pushed.ok) return portFailure("push", pushed.error);
       if (
         pushed.value.remote !== request.preview.remote ||
-        pushed.value.branch !== registrationSetupBranch ||
+        pushed.value.branch !== request.preview.branch ||
         !sameSha(pushed.value.sha, commitReceipt.sha)
       )
         return failed("push");
@@ -1283,7 +1295,7 @@ export class RegistrationSetupCoordinator {
         "This PR has no fast path and requires CI, fresh review, and explicit user approval.",
       ].join("\n"),
       baseBranch: request.preview.project.defaultBranch,
-      headBranch: registrationSetupBranch,
+      headBranch: request.preview.branch,
     };
     let draft;
     if (journal.completed.draftPullRequest === undefined) {
@@ -1301,7 +1313,7 @@ export class RegistrationSetupCoordinator {
         draft.value.state !== "open" ||
         !draft.value.draft ||
         draft.value.baseBranch !== request.preview.project.defaultBranch ||
-        draft.value.headBranch !== registrationSetupBranch ||
+        draft.value.headBranch !== request.preview.branch ||
         !sameSha(draft.value.headSha, pushed.sha)
       )
         return failed("draft_pull_request");
@@ -1486,7 +1498,7 @@ export class RegistrationSetupCoordinator {
     if (
       current.value.state !== "open" ||
       current.value.baseBranch !== session.project.defaultBranch ||
-      current.value.headBranch !== registrationSetupBranch ||
+      current.value.headBranch !== session.worktree.branch ||
       !sameSha(current.value.headSha, session.headSha)
     ) {
       return failed("change_request", session);
@@ -1559,7 +1571,7 @@ export class RegistrationSetupCoordinator {
         config: working.config,
         baseRevision: working.baseRevision,
         worktreePath: working.worktree.path,
-        branch: registrationSetupBranch,
+        branch: working.worktree.branch,
         remote: working.remote,
         linearAuditIssueId: working.linearAuditIssueId,
         previewDigest: working.previewDigest,
@@ -1970,7 +1982,7 @@ export class RegistrationSetupCoordinator {
       current.value.state !== "open" ||
       current.value.draft ||
       current.value.baseBranch !== session.project.defaultBranch ||
-      current.value.headBranch !== registrationSetupBranch ||
+      current.value.headBranch !== session.worktree.branch ||
       !sameSha(current.value.headSha, session.headSha)
     ) {
       return Object.freeze({ ok: false, error: domainError("conflict") });
@@ -2058,7 +2070,7 @@ export class RegistrationSetupCoordinator {
         observed.value.id !== session.changeRequest.id ||
         !sameSha(observed.value.headSha, session.headSha) ||
         observed.value.baseBranch !== session.project.defaultBranch ||
-        observed.value.headBranch !== registrationSetupBranch
+        observed.value.headBranch !== session.worktree.branch
       ) {
         return failed("merge", session);
       }
@@ -2159,7 +2171,7 @@ export class RegistrationSetupCoordinator {
     if (
       merged.value.state !== "merged" ||
       merged.value.baseBranch !== session.project.defaultBranch ||
-      merged.value.headBranch !== registrationSetupBranch
+      merged.value.headBranch !== session.worktree.branch
     ) {
       return failed("merge_readback", session);
     }
@@ -2186,7 +2198,7 @@ export class RegistrationSetupCoordinator {
       config: session.config,
       baseRevision: session.baseRevision,
       worktreePath: session.worktree.path,
-      branch: registrationSetupBranch,
+      branch: session.worktree.branch,
       remote: session.remote,
       linearAuditIssueId: session.linearAuditIssueId,
       previewDigest: session.previewDigest,
@@ -2264,8 +2276,25 @@ export class RegistrationSetupCoordinator {
       return failed("activation", session);
     }
     const marker = readMarker.value;
+    // C026: CAS precondition -- read the *current* index for this project immediately before
+    // publish and pass its markerDigest as expectedPriorMarkerDigest. undefined means "no prior
+    // index expected" (first-ever activation); a defined value lets a re-approval's new marker
+    // atomically replace a prior one for the same project without racing an unrelated writer.
+    const priorIndexed = await this.#owned(lease, () =>
+      this.#ports.activationRegistry.read(session.project.id),
+    );
+    if (!priorIndexed.ok) return portFailure("activation", priorIndexed.error, session);
+    let expectedPriorMarkerDigest: string | undefined;
+    if (priorIndexed.value !== undefined) {
+      const priorDigest = registrationSetupActivationMarkerDigest(priorIndexed.value);
+      if (!priorDigest.ok) return failed("activation", session);
+      expectedPriorMarkerDigest = priorDigest.value;
+    }
     const published = await this.#owned(lease, () =>
-      this.#ports.activationRegistry.publish(marker, mutation(request, "publish-activation-index")),
+      this.#ports.activationRegistry.publish(marker, {
+        ...mutation(request, "publish-activation-index"),
+        ...(expectedPriorMarkerDigest === undefined ? {} : { expectedPriorMarkerDigest }),
+      }),
     );
     if (!published.ok || !sameValue(published.value.marker, marker)) {
       return portFailure(

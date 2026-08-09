@@ -8,7 +8,7 @@ import { z } from "zod";
 
 import {
   createRegistrationSetupPreview,
-  registrationSetupBranch,
+  registrationSetupBranchPrefix,
   verifyRegistrationSetupActivatedSession,
   verifyRegistrationSetupActivationBinding,
   type RegistrationSetupActivationMarker,
@@ -74,12 +74,20 @@ const shaSchema = z.string().regex(shaPattern);
 const identifierSchema = z.string().regex(identifierPattern);
 const mutationKeySchema = z.string().regex(mutationKeyPattern);
 const instantSchema = z.string().refine((value) => parseInstant(value).ok);
+// C026: the setup branch is session-scoped (`agent-team/setup/<setupSessionId>`), not a fixed
+// literal. Exact per-record equality against the owning setupSessionId is enforced by
+// application-layer `validSession`/preview recreation on read-back; this pattern only bounds shape.
+const setupBranchPattern = new RegExp(
+  `^${registrationSetupBranchPrefix}/[a-zA-Z0-9][a-zA-Z0-9_.:@+-]{0,220}$`,
+  "u",
+);
+const setupBranchSchema = z.string().regex(setupBranchPattern);
 
 const worktreeSchema = z
   .object({
     repositoryRoot: z.string().refine(isAbsolute),
     path: z.string().refine(isAbsolute),
-    branch: z.literal(registrationSetupBranch),
+    branch: setupBranchSchema,
     headSha: shaSchema,
   })
   .strict();
@@ -141,7 +149,7 @@ const previewSchema = z
     config: trustedProjectConfigSchema,
     baseRevision: shaSchema,
     worktreePath: z.string().refine(isAbsolute),
-    branch: z.literal(registrationSetupBranch),
+    branch: setupBranchSchema,
     remote: z.literal("origin"),
     linearAuditIssueId: identifierSchema,
     previewDigest: digestSchema,
@@ -195,14 +203,11 @@ const journalSchema = z
           })
           .strict()
           .optional(),
-        commit: z
-          .object({ sha: shaSchema, branch: z.literal(registrationSetupBranch) })
-          .strict()
-          .optional(),
+        commit: z.object({ sha: shaSchema, branch: setupBranchSchema }).strict().optional(),
         push: z
           .object({
             remote: z.literal("origin"),
-            branch: z.literal(registrationSetupBranch),
+            branch: setupBranchSchema,
             sha: shaSchema,
           })
           .strict()
@@ -1304,7 +1309,7 @@ export class LocalRegistrationSetupFileAdapter implements RegistrationSetupFileP
       !validMutation(options) ||
       command.path !== trustedProjectConfigPath ||
       !isAbsolute(command.worktree.path) ||
-      command.worktree.branch !== registrationSetupBranch ||
+      !setupBranchPattern.test(command.worktree.branch) ||
       !digestPattern.test(command.contentDigest) ||
       hash(command.content) !== command.contentDigest
     ) {

@@ -798,7 +798,9 @@ describe("O009b registration setup CLI: refresh is the only exit from ci_waiting
     // Post the exact commit status the real gate-evidence read requires, exactly as the real
     // sandbox's own CI/review workflow would (agent-team/review context), so this genuinely
     // exercises the fixture's read path rather than asserting on an internal flag.
-    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    // C026: the setup branch is session-scoped now, not a fixed literal -- read back whatever
+    // branch the real push actually used (FakeGh records it verbatim from the real `head` field).
+    const headSha = await realRefSha(bareRemote, github.prs[0]?.headBranch ?? "");
     if (headSha === undefined) throw new Error("expected a pushed setup branch head");
     github.statusesBySha.set(headSha, [
       {
@@ -923,7 +925,9 @@ describe("O009c regression guard: opaque ChangeRequestSnapshot.id is never mista
     expect(github.prs[0]?.id).toMatch(/^PR_kwDOTest\d{8}$/u);
     expect(Number.isNaN(Number(github.prs[0]?.id))).toBe(true);
 
-    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    // C026: the setup branch is session-scoped now, not a fixed literal -- read back whatever
+    // branch the real push actually used (FakeGh records it verbatim from the real `head` field).
+    const headSha = await realRefSha(bareRemote, github.prs[0]?.headBranch ?? "");
     if (headSha === undefined) throw new Error("expected a pushed setup branch head");
     github.statusesBySha.set(headSha, [
       {
@@ -1020,7 +1024,9 @@ describe("O009c regression guard: opaque ChangeRequestSnapshot.id is never mista
     expect(preFixSession.audit).toBeUndefined();
     expect(preFixSession.mergedConfigReceipt).toBeUndefined();
 
-    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    // C026: the setup branch is session-scoped now, not a fixed literal -- read back whatever
+    // branch the real push actually used (FakeGh records it verbatim from the real `head` field).
+    const headSha = await realRefSha(bareRemote, github.prs[0]?.headBranch ?? "");
     if (headSha === undefined) throw new Error("expected a pushed setup branch head");
     github.statusesBySha.set(headSha, [
       {
@@ -1106,7 +1112,9 @@ describe("F-2 regression guard: approval binding issue-side (controller) and con
     });
     await handlers.setupStart({ projectId });
 
-    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    // C026: the setup branch is session-scoped now, not a fixed literal -- read back whatever
+    // branch the real push actually used (FakeGh records it verbatim from the real `head` field).
+    const headSha = await realRefSha(bareRemote, github.prs[0]?.headBranch ?? "");
     if (headSha === undefined) throw new Error("expected a pushed setup branch head");
     github.statusesBySha.set(headSha, [
       {
@@ -1295,7 +1303,9 @@ describe("O009d regression guard: direct-merge fallback lets setup approve finis
     });
     await handlers.setupStart({ projectId });
 
-    const headSha = await realRefSha(bareRemote, "agent-team/setup");
+    // C026: the setup branch is session-scoped now, not a fixed literal -- read back whatever
+    // branch the real push actually used (FakeGh records it verbatim from the real `head` field).
+    const headSha = await realRefSha(bareRemote, github.prs[0]?.headBranch ?? "");
     if (headSha === undefined) throw new Error("expected a pushed setup branch head");
     github.statusesBySha.set(headSha, [
       {

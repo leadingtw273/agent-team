@@ -12,7 +12,7 @@ import {
   type RegistrationSetupCoordinator,
 } from "./setup.js";
 import {
-  registrationSetupBranch,
+  registrationSetupBranchFor,
   type RegistrationSetupApprovalBinding,
   type RegistrationSetupConversationApprovalBridgePort,
   type RegistrationSetupConversationHostCapability,
@@ -431,7 +431,7 @@ export class RegistrationSetupController implements RegistrationSetupControllerU
       config: config.data,
       baseRevision: repository.value.headSha,
       worktreePath: join(this.#stateRoot, "registration-setup", "worktrees", setupSessionId),
-      branch: registrationSetupBranch,
+      branch: registrationSetupBranchFor(setupSessionId),
       remote: "origin",
       linearAuditIssueId: draft.value.linearAuditIssueId,
     });

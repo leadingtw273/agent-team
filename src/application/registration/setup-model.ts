@@ -13,8 +13,18 @@ import type {
 } from "../ports/index.js";
 import type { ImplementerPreflightPort } from "../pipelines/implementer-model.js";
 
-export const registrationSetupBranch = "agent-team/setup" as const;
+/** Prefix for the session-scoped setup branch; never used bare as a ref (see registrationSetupBranchFor). */
+export const registrationSetupBranchPrefix = "agent-team/setup" as const;
 export const registrationSetupReviewStatus = "agent-team/review" as const;
+
+/**
+ * C026: setup branches are session-scoped and deterministic so a second (re-approval) setup for an
+ * already-registered project never collides with -- or non-fast-forwards against -- a prior setup's
+ * branch. Same setupSessionId always derives the same branch (resume-idempotent).
+ */
+export function registrationSetupBranchFor(setupSessionId: string): string {
+  return `${registrationSetupBranchPrefix}/${setupSessionId}`;
+}
 
 export interface RegistrationSetupPreviewInput {
   readonly schemaVersion: 1;
@@ -23,7 +33,7 @@ export interface RegistrationSetupPreviewInput {
   readonly config: TrustedProjectConfig;
   readonly baseRevision: string;
   readonly worktreePath: string;
-  readonly branch: typeof registrationSetupBranch;
+  readonly branch: string;
   readonly remote: string;
   readonly linearAuditIssueId: string;
 }
@@ -261,12 +271,25 @@ export interface RegistrationSetupSquashMergePort {
   >;
 }
 
+export interface RegistrationSetupActivationPublishOptions extends MutationOptions {
+  /**
+   * C026: CAS precondition. `undefined` means "no prior index expected" (first-ever activation for
+   * this project). A defined value must equal the *currently published* marker's digest for the
+   * publish to replace it -- otherwise the call is rejected as `conflict` (anti-stale/anti-rollback).
+   * Callers must read the current index immediately before publish and pass its markerDigest here.
+   */
+  readonly expectedPriorMarkerDigest?: string;
+}
+
 export interface RegistrationSetupActivationRegistryPort {
   publish(
     marker: RegistrationSetupActivationMarker,
-    options: MutationOptions,
+    options: RegistrationSetupActivationPublishOptions,
   ): AsyncPortResult<
-    Readonly<{ state: "confirmed" | "reused"; marker: RegistrationSetupActivationMarker }>
+    Readonly<{
+      state: "confirmed" | "reused" | "replaced";
+      marker: RegistrationSetupActivationMarker;
+    }>
   >;
   read(
     projectId: Project["id"],
