@@ -152,6 +152,37 @@ describe("Linear upload adapter", () => {
     expect(result.value.commentBody).toContain(harness.input.sha256);
   });
 
+  it("accepts Linear's server-generated storage-path filename that differs from the request filename", async () => {
+    const harness = new UploadHarness();
+    harness.graphqlPayload = {
+      fileUpload: {
+        success: true,
+        uploadFile: {
+          filename:
+            "1fbe13f4-1111-4c1a-9b1a-000000000001/db84f0f8-2222-4c1a-9b1a-000000000002/17951e26-3333-4c1a-9b1a-000000000003",
+          contentType: harness.input.mediaType,
+          size: harness.input.content.byteLength,
+          uploadUrl: "https://uploads.linear.example/signed",
+          assetUrl: "https://uploads.linear.example/asset/image",
+          headers: [
+            { key: "x-goog-content-length-range", value: "0,10485760" },
+            { key: "Content-Disposition", value: "inline" },
+          ],
+        },
+      },
+    };
+
+    const result = await harness
+      .client()
+      .uploadArtifact(context, "issue-fixture", harness.input, "storage-path-attempt");
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.url).toBe("https://uploads.linear.example/asset/image");
+    expect(harness.putRequests).toHaveLength(1);
+    expect(harness.comments.calls).toHaveLength(1);
+  });
+
   it("renders a raw HTTPS video URL so Linear can create its video placeholder", async () => {
     const input = artifact("video/mp4");
     const harness = new UploadHarness(input);
@@ -191,9 +222,22 @@ describe("Linear upload adapter", () => {
         fileUpload: {
           success: true,
           uploadFile: {
-            filename: "different.png",
-            contentType: "image/png",
+            filename: artifact().filename,
+            contentType: "image/jpeg",
             size: artifact().content.byteLength,
+            uploadUrl: "https://uploads.linear.example/signed",
+            assetUrl: "https://uploads.linear.example/asset/image",
+            headers: [],
+          },
+        },
+      },
+      {
+        fileUpload: {
+          success: true,
+          uploadFile: {
+            filename: artifact().filename,
+            contentType: "image/png",
+            size: artifact().content.byteLength + 1,
             uploadUrl: "https://uploads.linear.example/signed",
             assetUrl: "https://uploads.linear.example/asset/image",
             headers: [],

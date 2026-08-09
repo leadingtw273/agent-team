@@ -165,15 +165,16 @@ function validatedHeaders(
   return headers;
 }
 
+/**
+ * Linear 的 fileUpload mutation 回傳的 uploadFile.filename 是伺服器端生成的內部儲存路徑
+ * （例如三段 UUID 組成的字串），並非客戶端請求時送出的原始檔名，因此不能對其做等值斷言。
+ * contentType 與 size 仍會被 Linear 原樣 echo 回來，故繼續逐欄驗證以防竄改或大小不符。
+ */
 function validateUploadFile(
   artifact: WorkManagementArtifact,
   value: z.infer<typeof uploadFileSchema>,
 ): ValidatedUploadFile | undefined {
-  if (
-    value.filename !== artifact.filename ||
-    value.contentType !== artifact.mediaType ||
-    value.size !== artifact.content.byteLength
-  ) {
+  if (value.contentType !== artifact.mediaType || value.size !== artifact.content.byteLength) {
     return undefined;
   }
   const uploadUrl = secureUrl(value.uploadUrl);
