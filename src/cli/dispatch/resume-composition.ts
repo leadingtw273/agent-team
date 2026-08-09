@@ -57,7 +57,7 @@ import {
   headShaSchema,
   type HeadSha,
 } from "../../domain/review/index.js";
-import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
+import { checkpointIdSchema, type VisualManifest } from "../../domain/checkpoint/index.js";
 import { watchdogHardStopMs } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
 import {
@@ -65,6 +65,10 @@ import {
   type LinearDiscoveryReadModel,
 } from "../../adapters/dispatch/linear-discovery.js";
 import type { LinearVisualPublicationCoordinator } from "../../adapters/dispatch/linear-publication.js";
+import {
+  aggregateLinearPublicationDigest,
+  type LinearPublicationStorePort,
+} from "../../adapters/dispatch/linear-publication-store.js";
 import {
   FileJobProgressStore,
   type JobProgressRecord,
@@ -358,7 +362,12 @@ export interface ResumeCycleDependencies {
    * closed to `requires_manual` (reasonCode `visual_evidence_unavailable`) if a job that actually
    * needs a visual reviewer is resumed while this is undefined, rather than silently skipping
    * visual evidence or crashing. */
-  readonly visualEvidence?: Pick<VisualEvidenceBuilder, "build">;
+  /** E102-4b: `verifyExisting` is a purely read-only re-hash/re-validate of whatever evidence is
+   * already on disk for the exact (issueId, headSha) under review -- see its own header
+   * (visual-evidence-builder.ts) for why `resumeReview`'s pre-arm merge recheck must call *only*
+   * this method, never `build()` again, before ever passing `currentVisualManifest` to
+   * `AutoMergeGate.enable()`. */
+  readonly visualEvidence?: Pick<VisualEvidenceBuilder, "build" | "verifyExisting">;
   /** E102-2/E102-3: the real Gemini model `models.visual` should request, sourced from the host's
    * optional `providers.json` `gemini.models` (provider-config-store.ts) -- E102-2 wired
    * `visualReviewer` itself (`GeminiRunner`) but deliberately left this per-request model value to
@@ -377,6 +386,16 @@ export interface ResumeCycleDependencies {
    * (reasonCode `visual_publication_failed`) if a job that actually needs a visual reviewer is
    * resumed while this is undefined, exactly mirroring `visualEvidence`'s own guard. */
   readonly linearPublication?: Pick<LinearVisualPublicationCoordinator, "publish">;
+  /** E102-4b: read-only access to the same durable, write-once receipt store `linearPublication`
+   * above publishes through (`FileLinearPublicationStore`, linear-publication-store.ts) -- used
+   * *only* by `resumeReview`'s pre-arm merge recheck to load the exact receipt for this
+   * (projectId, issueId, headSha) and recompute `aggregateLinearPublicationDigest` from it, never to
+   * publish or create anything. Optional for the same composition-root-gap reason
+   * `visualEvidence`/`linearPublication` are: every pre-existing `code_review`-only call site keeps
+   * compiling unchanged. `resumeReview` fails closed to `requires_manual` (reasonCode
+   * `visual_publication_missing_at_merge`) if a `dual_review`/`visual_review` job reaches this
+   * point while it is undefined. */
+  readonly linearPublicationStore?: Pick<LinearPublicationStorePort, "load">;
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
@@ -1415,6 +1434,15 @@ async function resumeReview(
     reviewRequirement === "visual_review" || reviewRequirement === "dual_review";
 
   let visualEvidence: VisualEvidenceBuildSuccess | undefined;
+  // E102-4b: the review-time counterpart of `identity.ts`'s own `publicationDigest` field --
+  // `aggregateLinearPublicationDigest` over the *single* receipt `published` below just durably
+  // recorded (or reused) for this exact (issueId, headSha). Deliberately never scans the receipt
+  // store's directory or aggregates any other head/issue's receipts: the coordinator's own spec for
+  // this ticket is explicit that today's data model has exactly one receipt per (project, issue,
+  // head) key, so "the one receipt this call just produced" already *is* the complete input set --
+  // seeing more than one receipt here would itself be a bug this aggregation is not asked to guard
+  // against.
+  let publicationDigest: string | undefined;
   if (needsVisualReview) {
     if (
       deps.visualEvidence === undefined ||
@@ -1490,6 +1518,7 @@ async function resumeReview(
         ),
       );
     }
+    publicationDigest = aggregateLinearPublicationDigest([published.value.receipt]);
   }
 
   const reviewOutcome = await deps.reviewer.run({
@@ -1511,6 +1540,7 @@ async function resumeReview(
     },
     evidence: visualEvidence?.evidence ?? Object.freeze([]),
     ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
+    ...(publicationDigest === undefined ? {} : { publicationDigest }),
     deadlineAt: reviewDeadline,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
     ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
@@ -1739,6 +1769,69 @@ async function resumeReview(
         );
   }
 
+  // E102-4b: `AutoMergeGate.enable()`'s own `validApproval` (merge-gate.ts) requires a non-empty
+  // `currentVisualManifest`/`currentPublicationDigest` for every `dual_review`/`visual_review` job
+  // (see that function's own `requiresEvidence` branch) -- before this ticket, this call site never
+  // supplied either, so `enable()` always failed closed with `stage:"request"` for exactly the jobs
+  // that most need auto-merge (E102-4's own domain/gate logic was correct; only this production
+  // wiring was missing -- see this ticket's own PR description for the full history). Both values
+  // come from a fresh, read-only re-verification of the exact commit under review -- never from
+  // `recorded.approval.identity` itself (that would be comparing the approval against itself, which
+  // can never detect drift) and never from `deps.visualEvidence.build()` (which would silently
+  // re-manufacture evidence, and re-publish is impossible anyway -- Linear receipts are write-once,
+  // see linear-publication-store.ts's own header) -- only ever this call site, only ever for a job
+  // that actually needs visual evidence.
+  let currentVisualManifest: VisualManifest | undefined;
+  let currentPublicationDigest: string | undefined;
+  if (needsVisualReview) {
+    if (deps.visualEvidence === undefined) {
+      return requiresManual(
+        record,
+        deps,
+        "visual_evidence_builder_unavailable_at_merge",
+        requiresManualCause("merge", "visual_evidence_missing_at_merge"),
+      );
+    }
+    const verified = await deps.visualEvidence.verifyExisting({
+      worktreePath: context.worktree.path,
+      issueId: context.requirementSnapshot.issue.id,
+      headSha: expectedHeadSha,
+      allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+    });
+    if (!verified.ok) {
+      return requiresManual(
+        record,
+        deps,
+        `visual_evidence_verify_failed:${verified.failure.reason}`,
+        requiresManualCause("merge", "visual_evidence_missing_at_merge"),
+      );
+    }
+    currentVisualManifest = verified.value.visualManifest;
+
+    if (deps.linearPublicationStore === undefined) {
+      return requiresManual(
+        record,
+        deps,
+        "linear_publication_store_unavailable_at_merge",
+        requiresManualCause("merge", "visual_publication_missing_at_merge"),
+      );
+    }
+    const receipt = await deps.linearPublicationStore.load(
+      deps.project.id,
+      context.requirementSnapshot.issue.id,
+      expectedHeadSha,
+    );
+    if (!receipt.ok || receipt.value === undefined) {
+      return requiresManual(
+        record,
+        deps,
+        "linear_publication_receipt_missing_at_merge",
+        requiresManualCause("merge", "visual_publication_missing_at_merge"),
+      );
+    }
+    currentPublicationDigest = aggregateLinearPublicationDigest([receipt.value]);
+  }
+
   const enabled = await deps.autoMerge.enable({
     project: deps.project,
     changeRequestId: context.changeRequestId,
@@ -1747,6 +1840,8 @@ async function resumeReview(
     requirementSnapshot: context.requirementSnapshot,
     baseRevision: context.baseRevision,
     approval: recorded.approval,
+    ...(currentVisualManifest === undefined ? {} : { currentVisualManifest }),
+    ...(currentPublicationDigest === undefined ? {} : { currentPublicationDigest }),
   });
   // C015t decision 1: `AutoMergeGate.enable()`'s outcome union now distinguishes exactly why/how a
   // merge did or didn't happen -- this switch is the CLI-side mapping table the coordinator
@@ -1802,6 +1897,26 @@ async function resumeReview(
         jobId: record.jobId,
         outcome: "awaiting_review",
       }));
+    // E102-4b: the freshly re-verified evidence/publication at this *identical* commit hashes
+    // differently from what the recorded approval was reviewed against -- `AutoMergeGate.enable()`
+    // has already posted its own drift comment/status before returning this (merge-gate.ts). Never
+    // routed back through `awaiting_review`/a fresh reviewer run like `re_review_required` above --
+    // see `EnableAutoMergeOutcome.evidence_drift_detected`'s own header for why this is always a
+    // human-routed safety event instead.
+    case "evidence_drift_detected":
+      return requiresManual(
+        record,
+        deps,
+        "evidence_drift_detected_at_merge",
+        requiresManualCause("merge", "evidence_drift_detected"),
+      );
+    case "publication_drift_detected":
+      return requiresManual(
+        record,
+        deps,
+        "publication_drift_detected_at_merge",
+        requiresManualCause("merge", "publication_drift_detected"),
+      );
     case "not_ready":
       switch (enabled.reason) {
         case "ci_pending":

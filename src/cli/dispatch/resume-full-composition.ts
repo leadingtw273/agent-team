@@ -77,6 +77,7 @@ export type ResumePipelineComposition = Pick<
   | "visualEvidence"
   | "visualReviewModel"
   | "linearPublication"
+  | "linearPublicationStore"
 >;
 
 export type BuildResumeCompositionResult =
@@ -143,10 +144,18 @@ export async function buildResumeComposition(
   // `appendComment` matches that interface exactly, see `LinearVisualPublicationCoordinator`'s own
   // constructor). `FileLinearPublicationStore` is rooted at the same `agentTeamHome` every other
   // adapter in this function's return value is.
+  // E102-4b: named separately (rather than only ever constructed inline inside
+  // `LinearVisualPublicationCoordinator`'s own constructor call below) so this same store instance
+  // can also be exposed as `linearPublicationStore` -- `resumeReview`'s pre-arm merge recheck
+  // (resume-composition.ts) needs read-only `load()` access to the exact same durable receipts
+  // `linearPublication.publish()` writes, never a second, independently-rooted store instance.
+  const linearPublicationStore = new FileLinearPublicationStore(
+    defaultLinearPublicationDirectory(options.agentTeamHome),
+  );
   const linearPublication = new LinearVisualPublicationCoordinator(
     new LinearUploadClient(options.linearTransport, options.mutationClient),
     options.mutationClient,
-    new FileLinearPublicationStore(defaultLinearPublicationDirectory(options.agentTeamHome)),
+    linearPublicationStore,
   );
 
   return Object.freeze({
@@ -161,6 +170,7 @@ export async function buildResumeComposition(
       lifecycle,
       visualEvidence,
       linearPublication,
+      linearPublicationStore,
       ...(visualReviewModel === undefined ? {} : { visualReviewModel }),
     }),
   });

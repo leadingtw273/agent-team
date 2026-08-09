@@ -626,7 +626,7 @@ describe("auto-merge gate", () => {
     }
   });
 
-  it("invalidates an approved dual review and blocks merge when a visual artifact's SHA-256 changes", async () => {
+  it("E102-4b: blocks merge with a distinct evidence_drift_detected outcome (never re_review_required/effective_diff_changed) when a visual artifact's SHA-256 changes at the identical commit", async () => {
     const manifestV1 = dualManifest("d".repeat(64));
     const receiptV1 = dualReceipt(manifestV1);
     const publicationDigestV1 = aggregateLinearPublicationDigest([receiptV1]);
@@ -651,16 +651,35 @@ describe("auto-merge gate", () => {
     const evidenceDigestV2 = evidenceDigestOf(canonicalVisualManifestInput(manifestV2));
     if (!evidenceDigestV1.ok || !evidenceDigestV2.ok) throw new Error("fixture invariant violated");
     expect(evidenceDigestV2.value).not.toBe(evidenceDigestV1.value);
-    const driftPorts = mergePorts();
-    expect(
-      await new AutoMergeGate(driftPorts).enable(
-        dualMergeRequest(approvalValue, manifestV2, publicationDigestV1),
-      ),
-    ).toMatchObject({ state: "re_review_required" });
+    const driftCalls: string[] = [];
+    const driftPorts = mergePorts({ calls: driftCalls });
+    const outcome = await new AutoMergeGate(driftPorts).enable(
+      dualMergeRequest(approvalValue, manifestV2, publicationDigestV1),
+    );
+    // E102-4b: same head SHA, same requirements, same effective diff -- only the freshly
+    // re-verified visual evidence differs from what the recorded approval was reviewed against.
+    // This is never routed back through `re_review_required` (that reasonCode means "send it back
+    // through the normal implementer/reviewer loop," which cannot resolve a same-commit evidence
+    // mismatch and would silently hide a potential tampering/corruption signal behind a
+    // routine-looking label -- see `EnableAutoMergeOutcome.evidence_drift_detected`'s own header,
+    // merge-gate-model.ts).
+    expect(outcome).toMatchObject({ state: "evidence_drift_detected" });
+    expect(outcome).toHaveProperty("identity");
+    expect(outcome).not.toMatchObject({ state: "re_review_required" });
     expect(driftPorts.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+    expect(driftCalls).toEqual(["auto_merge_pause_check", "comment", "status"]);
+    const append = vi.mocked(driftPorts.sourceControl.appendChangeRequestComment);
+    const body = append.mock.calls[0]?.[0].body ?? "";
+    expect(body).toContain("evidence_drift_detected");
+    // Never the wording a genuine full-review invalidation posts -- a human reading this comment
+    // must not mistake it for "the implementer's diff changed."
+    expect(body).not.toContain("full_review_required");
+    expect(body).toContain("manual_review_required");
+    const status = vi.mocked(driftPorts.sourceControl.setCommitStatus);
+    expect(status.mock.calls[0]?.[0].description).toContain("evidence drift detected");
   });
 
-  it("invalidates an approved dual review and blocks merge when a Linear receipt's content changes", async () => {
+  it("E102-4b: blocks merge with a distinct publication_drift_detected outcome (never re_review_required/effective_diff_changed) when a Linear receipt's content changes at the identical commit", async () => {
     const manifestV1 = dualManifest("d".repeat(64));
     const receiptV1 = dualReceipt(manifestV1);
     const publicationDigestV1 = aggregateLinearPublicationDigest([receiptV1]);
@@ -679,13 +698,19 @@ describe("auto-merge gate", () => {
     };
     const publicationDigestV2 = aggregateLinearPublicationDigest([receiptV2]);
     expect(publicationDigestV2).not.toBe(publicationDigestV1);
-    const driftPorts = mergePorts();
-    expect(
-      await new AutoMergeGate(driftPorts).enable(
-        dualMergeRequest(approvalValue, manifestV1, publicationDigestV2),
-      ),
-    ).toMatchObject({ state: "re_review_required" });
+    const driftCalls: string[] = [];
+    const driftPorts = mergePorts({ calls: driftCalls });
+    const outcome = await new AutoMergeGate(driftPorts).enable(
+      dualMergeRequest(approvalValue, manifestV1, publicationDigestV2),
+    );
+    expect(outcome).toMatchObject({ state: "publication_drift_detected" });
+    expect(outcome).not.toMatchObject({ state: "re_review_required" });
     expect(driftPorts.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+    expect(driftCalls).toEqual(["auto_merge_pause_check", "comment", "status"]);
+    const append = vi.mocked(driftPorts.sourceControl.appendChangeRequestComment);
+    const body = append.mock.calls[0]?.[0].body ?? "";
+    expect(body).toContain("publication_drift_detected");
+    expect(body).not.toContain("full_review_required");
   });
 
   it.each([

@@ -207,6 +207,30 @@ export const requiresManualReasonCodeSchema = z.enum([
   "auto_merge_not_enabled",
   // merge
   "lifecycle_not_completed",
+  // E102-4b: `resumeReview`'s own pre-arm merge recheck (immediately before
+  // `AutoMergeGate.enable()`, resume-composition.ts) could not obtain a currently-valid
+  // `VisualManifest` for a `dual_review`/`visual_review` job -- either `deps.visualEvidence` itself
+  // (or its own `verifyExisting` method) was never wired (composition-root gap, symmetric to
+  // `visual_evidence_unavailable`'s own review-time reasonCode above), or `verifyExisting` itself
+  // returned a concrete failure (the evidence directory is missing, an artifact no longer hashes to
+  // its recorded value, the manifest is corrupt/schema-invalid, or its issue/headSha identity no
+  // longer matches). Deliberately never auto-retried, and deliberately never routed through
+  // `AutoMergeGate.enable()` at all -- see `VisualEvidenceBuilder.verifyExisting`'s own header
+  // (visual-evidence-builder.ts) for why this recheck never falls back to `build()`.
+  "visual_evidence_missing_at_merge",
+  // E102-4b: symmetric to `visual_evidence_missing_at_merge` above, but for the Linear publication
+  // receipt side of the same pre-arm recheck -- either `deps.linearPublicationStore` was never
+  // wired, or `FileLinearPublicationStore.load()` found no receipt (or a load failure) for this
+  // exact (projectId, issueId, headSha).
+  "visual_publication_missing_at_merge",
+  // E102-4b: `AutoMergeGate.enable()` returned `"evidence_drift_detected"` -- the freshly
+  // re-verified `VisualManifest` at this *identical* commit hashes differently from the one the
+  // recorded approval was actually reviewed against. Never auto-retried and never treated as
+  // `auto_merge_not_enabled`/`re_review_required` -- see that outcome's own header
+  // (merge-gate-model.ts) for why this is a distinct, always-human-routed safety event.
+  "evidence_drift_detected",
+  // E102-4b: symmetric to `evidence_drift_detected` above, for the Linear publication receipt.
+  "publication_drift_detected",
   // C015x decision 3: the change request's own authoritative `mergeStateStatus` reads `"behind"` --
   // GitHub's own `strict` required-status-checks ruleset policy (O004) means this can never
   // actually execute the merge no matter how long a job sits in `"merging"`; escalates immediately,
