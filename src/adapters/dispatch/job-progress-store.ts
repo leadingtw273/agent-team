@@ -179,6 +179,9 @@ export const requiresManualReasonCodeSchema = z.enum([
   "review_report_contract",
   "review_record_failed",
   "review_not_approved",
+  // C031: a non-draft PR's failed CI has no automatic repair path, so fail closed rather than
+  // share draft PRs' `ci_waiting` retry semantics and loop indefinitely.
+  "ci_failed_after_ready",
   // E102-3: a `visual_review`/`dual_review` job reached `resumeReview` (resume-composition.ts)
   // while either `deps.visualEvidence` itself was never wired (composition-root gap, not this
   // job's fault) or the project's own `commands.visualReview` is empty (`validReviewerRequest`,

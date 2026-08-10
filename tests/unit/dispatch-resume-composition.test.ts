@@ -743,7 +743,7 @@ async function seedProgressRecord(
 
 describe("runResumeCycle", () => {
   it("happy path: ci_waiting -> CI green -> approved -> merged -> Lifecycle completed, in one cycle", async () => {
-    const { deps, progress, calls } = await harness();
+    const { deps, progress, calls } = await harness({ changeRequestState: { draft: true } });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
     const result = await runResumeCycle(deps);
@@ -770,6 +770,7 @@ describe("runResumeCycle", () => {
 
   it("CI-red -> CiRecoveryPipeline checkpoints (attempt-count scenario) -> stage paused with checkpointId", async () => {
     const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
       ciRecoveryOutcome: {
         state: "checkpointed",
         reason: "attempt_limit_reached",
@@ -1038,6 +1039,7 @@ describe("runResumeCycle", () => {
 
   it("still-pending CI leaves the job at ci_waiting, untouched, without ever reaching the reviewer", async () => {
     const { deps, progress, calls } = await harness({
+      changeRequestState: { draft: true },
       ciRecoveryOutcome: {
         state: "ci_waiting",
         source: "polling",
@@ -1334,6 +1336,7 @@ describe("runResumeCycle", () => {
   it("a retryable CI-recovery provider failure becomes ci_pending_retry, not requires_manual", async () => {
     const timeoutError = domainError("timeout");
     const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
       ciRecoveryOutcome: {
         state: "failed",
         stage: "provider_start",
@@ -1370,6 +1373,7 @@ describe("runResumeCycle", () => {
   it("ci_pending_retry exhausting providerRetryLimit goes to requires_manual, independent of review's own counter", async () => {
     const timeoutError = domainError("timeout");
     const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
       ciRecoveryOutcome: {
         state: "failed",
         stage: "provider_run",
@@ -1406,7 +1410,7 @@ describe("runResumeCycle", () => {
    */
   it("passes a real future deadline (now + watchdogHardStopMs) to both CiRecovery and Reviewer, never clock.now() verbatim", async () => {
     const seenDeadlines: string[] = [];
-    const { deps: baseDeps, progress } = await harness();
+    const { deps: baseDeps, progress } = await harness({ changeRequestState: { draft: true } });
     const deps: ResumeCycleDependencies = {
       ...baseDeps,
       ciRecovery: {
@@ -1478,6 +1482,143 @@ describe("runResumeCycle", () => {
       expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
       expect(reloaded.value?.revision).toBe(0);
     }
+  });
+
+  it("C031: resumes a non-draft review_report_pending_retry directly through reviewer with report retry feedback", async () => {
+    const { deps, progress, calls, reviewerRequests } = await harness();
+    await seedProgressRecord(progress, {
+      kind: "review_report_pending_retry",
+      retries: 1,
+      lastCategory: "schema_invalid",
+    });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).not.toContain("ciRecovery.run");
+    expect(calls).toContain("reviewer.run");
+    expect(reviewerRequests[reviewerRequests.length - 1]).toMatchObject({
+      reportRetryFeedback: { category: "schema_invalid" },
+    });
+  });
+
+  it("C031: a draft PR resume still runs CI recovery", async () => {
+    const { deps, progress, calls } = await harness({ changeRequestState: { draft: true } });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).toContain("ciRecovery.run");
+  });
+
+  it("C031: a non-draft PR with failed CI at review begin requires manual intervention", async () => {
+    const { deps, progress } = await harness({
+      beginOutcome: {
+        state: "not_ready",
+        reason: "ci_failed",
+        changeRequest: changeRequest(),
+        checks: {} as never,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toEqual([
+        { jobId, outcome: "requires_manual", reason: "ci_failed_after_ready" },
+      ]);
+    }
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "review", reasonCode: "ci_failed_after_ready" },
+      });
+    }
+  });
+
+  it("C031: a non-draft PR with pending CI at review begin remains ci_waiting", async () => {
+    const { deps, progress } = await harness({
+      beginOutcome: {
+        state: "not_ready",
+        reason: "ci_pending",
+        changeRequest: changeRequest(),
+        checks: {} as never,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  // C031: pins the `!begin.changeRequest.draft` half of the `ci_failed_after_ready` guard. A draft
+  // PR can still reach `begin()` with `ci_failed` -- CI recovery hands back `ready_for_review` and
+  // the merge gate's own re-read races a check turning red -- and that job must stay resumable, so
+  // the next cycle can drive it back through CI recovery. Only a non-draft PR, which recovery can
+  // never touch again, is allowed to fail closed here.
+  it("C031: a draft PR with failed CI at review begin still retreats to ci_waiting", async () => {
+    const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
+      beginOutcome: {
+        state: "not_ready",
+        reason: "ci_failed",
+        changeRequest: changeRequest({ draft: true }),
+        checks: {} as never,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("C031: a non-draft review_pending_retry does not re-enter CI recovery", async () => {
+    const { deps, progress, calls } = await harness();
+    await seedProgressRecord(progress, {
+      kind: "review_pending_retry",
+      retries: 1,
+      lastErrorCode: "timeout",
+    });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).not.toContain("ciRecovery.run");
+  });
+
+  it("C031: a non-draft fix_round does not re-enter CI recovery", async () => {
+    const { deps, progress, calls } = await harness();
+    await seedProgressRecord(progress, { kind: "fix_round" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).not.toContain("ciRecovery.run");
+  });
+
+  it("C031: a non-draft awaiting_review does not re-enter CI recovery", async () => {
+    const { deps, progress, calls } = await harness();
+    await seedProgressRecord(progress, { kind: "awaiting_review" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(calls).not.toContain("ciRecovery.run");
   });
 
   it("a non-retryable getChangeRequest failure still goes to requires_manual exactly as before", async () => {
