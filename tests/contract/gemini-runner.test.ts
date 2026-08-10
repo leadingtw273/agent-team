@@ -138,6 +138,9 @@ function successPayload(model = "gemini-3.1-pro-preview-customtools") {
       models: { [model]: { tokens: {} } },
       tools: {
         byName: { read_file: { count: 1, success: 1, fail: 0 } },
+        totalCalls: 1,
+        totalSuccess: 1,
+        totalFail: 0,
       },
       files: { totalLinesAdded: 0, totalLinesRemoved: 0 },
     },
@@ -257,6 +260,136 @@ describe("Gemini visual-review runner", () => {
         value: { outcome: "failed" },
       });
     }
+  });
+
+  it("C028 regression: accepts a whitelisted read tool the sandbox correctly refused, as long as its own count/success/fail triple and the aggregate totals stay internally consistent", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: { read_file: { count: 3, success: 2, fail: 1 } },
+          totalCalls: 3,
+          totalSuccess: 2,
+          totalFail: 1,
+        },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "completed" },
+    });
+  });
+
+  it("fails closed when a whitelisted read tool never succeeds even once", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: { read_file: { count: 1, success: 0, fail: 1 } },
+          totalCalls: 1,
+          totalSuccess: 0,
+          totalFail: 1,
+        },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "failed", error: { code: "permission_denied" } },
+    });
+  });
+
+  it("fails closed when a successful whitelisted read is mixed with a failed non-whitelisted tool", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: {
+            read_file: { count: 1, success: 1, fail: 0 },
+            write_file: { count: 1, success: 0, fail: 1 },
+          },
+          totalCalls: 2,
+          totalSuccess: 1,
+          totalFail: 1,
+        },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "failed", error: { code: "permission_denied" } },
+    });
+  });
+
+  it("fails closed when a whitelisted read tool has failures and the repository was also changed", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: { read_file: { count: 2, success: 1, fail: 1 } },
+          totalCalls: 2,
+          totalSuccess: 1,
+          totalFail: 1,
+        },
+        files: { totalLinesAdded: 1, totalLinesRemoved: 0 },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "failed", error: { code: "permission_denied" } },
+    });
+  });
+
+  it("fails closed when a tool's own count does not equal its success plus fail", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: { read_file: { count: 3, success: 2, fail: 2 } },
+          totalCalls: 3,
+          totalSuccess: 2,
+          totalFail: 2,
+        },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "failed", error: { code: "permission_denied" } },
+    });
+  });
+
+  it("fails closed when the aggregate tool totals disagree with the sum of the byName entries", async () => {
+    const process = new FakeProcessPort({
+      ...successPayload(),
+      stats: {
+        ...successPayload().stats,
+        tools: {
+          byName: { read_file: { count: 1, success: 1, fail: 0 } },
+          totalCalls: 5,
+          totalSuccess: 5,
+          totalFail: 0,
+        },
+      },
+    });
+    const started = await runner(process).start(runRequest());
+    if (!started.ok) throw new Error(started.error.code);
+    expect(await started.value.completion()).toMatchObject({
+      ok: true,
+      value: { outcome: "failed", error: { code: "permission_denied" } },
+    });
   });
 
   it("reports visual-only capability without dynamic approval or resume claims", async () => {

@@ -108,7 +108,8 @@ function validateGeminiResult(
   const payload = asRecord(input);
   const stats = asRecord(payload?.["stats"]);
   const models = asRecord(stats?.["models"]);
-  const toolStats = asRecord(asRecord(stats?.["tools"])?.["byName"]);
+  const toolsStats = asRecord(stats?.["tools"]);
+  const toolStats = asRecord(toolsStats?.["byName"]);
   const fileStats = asRecord(stats?.["files"]);
   const response = payload?.["response"];
   if (
@@ -133,7 +134,17 @@ function validateGeminiResult(
     return err(domainError("unavailable"));
   }
 
+  // A whitelisted read tool that the sandbox correctly refused (for example a `read_file` on a
+  // path outside the worktree) is not the same thing as an unauthorized capability succeeding --
+  // the admin policy, not this count, is the actual enforcement boundary for what the CLI may
+  // touch. So a `fail` count on a whitelisted read tool is tolerated here as long as its own
+  // count/success/fail triple is internally consistent. Any tool name outside the read-only
+  // whitelist is still rejected unconditionally, because merely *requesting* an unauthorized
+  // capability (whether it succeeded or was refused) is itself a signal this report is untrusted.
   let readSucceeded = false;
+  let observedCount = 0;
+  let observedSuccess = 0;
+  let observedFail = 0;
   for (const [name, value] of Object.entries(toolStats)) {
     const tool = asRecord(value);
     const count = finiteCount(tool?.["count"]);
@@ -145,14 +156,30 @@ function validateGeminiResult(
       success === undefined ||
       fail === undefined ||
       count === 0 ||
-      fail !== 0
+      success + fail !== count
     ) {
       return err(domainError("permission_denied"));
     }
     if (success > 0) readSucceeded = true;
+    observedCount += count;
+    observedSuccess += success;
+    observedFail += fail;
   }
+
+  // Aggregate totals must be reported and must equal the sum of the per-tool byName entries --
+  // this closes off a report that pads or omits byName entries to make the per-tool checks above
+  // pass while the aggregate (or vice versa) tells a different story.
+  const totalCalls = finiteCount(toolsStats?.["totalCalls"]);
+  const totalSuccess = finiteCount(toolsStats?.["totalSuccess"]);
+  const totalFail = finiteCount(toolsStats?.["totalFail"]);
   if (
     !readSucceeded ||
+    totalCalls === undefined ||
+    totalSuccess === undefined ||
+    totalFail === undefined ||
+    totalCalls !== observedCount ||
+    totalSuccess !== observedSuccess ||
+    totalFail !== observedFail ||
     finiteCount(fileStats["totalLinesAdded"]) !== 0 ||
     finiteCount(fileStats["totalLinesRemoved"]) !== 0
   ) {

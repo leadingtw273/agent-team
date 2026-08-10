@@ -821,6 +821,17 @@ describe("ReviewerPipeline report contract (C015r decisions 2/3/4/5)", () => {
     );
   });
 
+  it("C028: directive no longer tells the model to read the repository itself, and instead tells it not to inspect .git", async () => {
+    const input = request("code_review");
+    const setup = fixture(input);
+    await setup.pipeline.run(input.value);
+
+    const directive = setup.providerRequests[0]?.controllerDirective ?? "";
+    expect(directive).not.toContain("Read only the approved repository at base revision");
+    expect(directive).toContain("controller-provided approved snapshot");
+    expect(directive).toContain("do not inspect `.git`");
+  });
+
   it("decision 3 step 2 tolerates a leading preamble sentence before an otherwise-valid JSON report", async () => {
     const input = request("code_review");
     const clean = report("code_reviewer", input.review.identity);
