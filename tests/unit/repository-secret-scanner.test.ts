@@ -215,4 +215,107 @@ describe("RepositorySecretScanner", () => {
       expect(scanner.classify(text)).toEqual({ matched: false, reasons: [] });
     });
   });
+
+  // C034c: the acceptance review for C034b found that its new bucket 4d/4e/4f/4g fixtures were
+  // written in shapes convenient for the implementation, not the shapes these credentials actually
+  // take in real source -- a bare `?token=...` with nothing around it, a `set-cookie:` line with no
+  // attributes, prose that happened to have no bearer/basic prefix collide with a value that
+  // happened to be an ordinary word. Every fixture below is deliberately written the way the
+  // underlying bug report/regex documents it appearing for real: quoted, parenthesized,
+  // attribute-bearing, or as a doc-comment sentence.
+  describe("C034c: query-key values wrapped the way real source code wraps a URL", () => {
+    it.each([
+      ["bare, unwrapped URL", `https://api.example.com/v1?token=${fixtureQueryTokenValue}`],
+      [
+        "single-quoted JS string literal",
+        `const u = 'https://api.example.com/v1?token=${fixtureQueryTokenValue}';`,
+      ],
+      [
+        "double-quoted JS string literal",
+        `const u = "https://api.example.com/v1?token=${fixtureQueryTokenValue}";`,
+      ],
+      [
+        "bare call-argument, closed by a paren",
+        `fetch(https://x.com/?access_token=${fixtureQueryTokenValue})`,
+      ],
+      [
+        "Markdown link target, closed by a paren",
+        `[docs](https://x.com/?token=${fixtureQueryTokenValue})`,
+      ],
+      [
+        "followed by a second, unrelated query parameter",
+        `https://api.example.com/v1?token=${fixtureQueryTokenValue}&page=2`,
+      ],
+    ] as const)("flags %s", (_label, text) => {
+      const scanner = new RepositorySecretScanner();
+      const classification = scanner.classify(text);
+      expect(classification.matched).toBe(true);
+      expect(classification.reasons).toContain("contextual_credential");
+    });
+  });
+
+  describe("C034c: Set-Cookie/cookie lines carrying the attributes a real header has", () => {
+    it.each([
+      ["trailing HttpOnly attribute", `set-cookie: sid=${fixtureCookieSessionValue}; HttpOnly`],
+      ["trailing Path attribute", `set-cookie: sid=${fixtureCookieSessionValue}; Path=/`],
+      [
+        "multiple trailing attributes, capitalized header",
+        `Set-Cookie: session=${fixtureCookieSessionValue}; Secure; HttpOnly`,
+      ],
+      ["no attributes at all", `set-cookie: sid=${fixtureCookieSessionValue}`],
+    ] as const)("flags %s", (_label, text) => {
+      const scanner = new RepositorySecretScanner();
+      const classification = scanner.classify(text);
+      expect(classification.matched).toBe(true);
+      expect(classification.reasons).toContain("contextual_credential");
+    });
+  });
+
+  describe("C034c: Authorization -- doc-comment prose must not collide with real headers", () => {
+    it.each([
+      "// Authorization: required for all admin routes; see docs/auth.md",
+      "* Authorization: optional when the request is internal.",
+      "// authorization: disabled in local dev mode",
+      "// Authorization: inherited from the parent router",
+    ])("does not flag prose: %s", (text) => {
+      const scanner = new RepositorySecretScanner();
+      expect(scanner.classify(text)).toEqual({ matched: false, reasons: [] });
+    });
+
+    it.each([
+      ["Basic <base64>", `Authorization: Basic ${fixtureBasicAuthValue}`],
+      ["Bearer <opaque token>", `Authorization: Bearer ${fixtureBearerOpaqueValue}`],
+      ["unprefixed but quoted", `authorization: "${fixtureBearerOpaqueValue}"`],
+    ] as const)("still flags a real header: %s", (_label, text) => {
+      const scanner = new RepositorySecretScanner();
+      const classification = scanner.classify(text);
+      expect(classification.matched).toBe(true);
+      expect(classification.reasons).toContain("contextual_credential");
+    });
+  });
+
+  describe("C034c: bucket 4d must not flag an ordinary quoted English word as a credential", () => {
+    it.each([
+      'const node = { token: "identifier", start: 0 };',
+      'const x = { secret: "santa-list" };',
+      'const rules = { password: "required" };',
+      'kind: "punctuation", token: "semicolon"',
+    ])("does not flag: %s", (text) => {
+      const scanner = new RepositorySecretScanner();
+      expect(scanner.classify(text)).toEqual({ matched: false, reasons: [] });
+    });
+
+    it.each([
+      ["client_secret", `client_secret: "${fixtureClientSecretValue}"`],
+      ["password", `const cfg = { password: "${fixturePasswordValue}" };`],
+      ["private_key", `private_key: "${fixturePrivateKeyValue}"`],
+      ["api_key", `api_key=${fixtureApiKeyValue}`],
+      ["webhook secret via .env shape", "WEBHOOK_SECRET=whsec_8f3a9c2b1d4e5f607182930a4b5c6d7e"],
+    ] as const)("still flags a real credential: %s", (_label, text) => {
+      const scanner = new RepositorySecretScanner();
+      const classification = scanner.classify(text);
+      expect(classification.matched).toBe(true);
+      expect(classification.reasons).toContain("contextual_credential");
+    });
+  });
 });

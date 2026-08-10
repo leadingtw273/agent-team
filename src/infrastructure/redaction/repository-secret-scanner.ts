@@ -266,6 +266,19 @@ function isSensitiveContextKey(key: string): boolean {
 const contextualKeyValuePattern =
   /(^|[\s,{;])(["']?)([A-Za-z][A-Za-z0-9_-]*)\2\s*([:=])\s*("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s,;}\r\n]+)/gmu;
 
+/** A quote/`=` alone does not save a value that is itself just an ordinary English word (or
+ * hyphenated compound), e.g. `{ token: "identifier" }` or `{ secret: "santa-list" }` -- these are
+ * data describing *what kind of thing* a field holds, not a credential, and both clear the shared
+ * `isCredibleCredentialValue` gate (>= 8 letters, no placeholder token, legal character set) on
+ * their own. Real credentials mix case and/or digits (`Tr0ub4dor3xKq9zP`, `whsec_...`,
+ * `a9f8e7d6...`); a single unbroken run of lowercase letters/hyphens never does, so this bucket
+ * alone (not the shared gate every other bucket relies on) additionally rejects that shape. */
+const singleLowercaseWordPattern = /^[a-z][a-z-]*$/u;
+
+function isSingleLowercaseWordValue(rawValue: string): boolean {
+  return singleLowercaseWordPattern.test(stripSurroundingQuotes(rawValue));
+}
+
 function containsSensitiveKeyValueCredential(text: string): boolean {
   for (const match of text.matchAll(contextualKeyValuePattern)) {
     const key = match[3];
@@ -276,6 +289,7 @@ function containsSensitiveKeyValueCredential(text: string): boolean {
     const isQuotedValue =
       rawValue.length >= 2 && (rawValue.startsWith('"') || rawValue.startsWith("'"));
     if (separator === ":" && !isQuotedValue) continue;
+    if (isSingleLowercaseWordValue(rawValue)) continue;
     if (isCredibleCredentialValue(rawValue)) return true;
   }
   return false;
@@ -284,13 +298,26 @@ function containsSensitiveKeyValueCredential(text: string): boolean {
 /** Bucket 4e: an `Authorization: Basic <base64>` / `Authorization: Bearer <token>` header. Mirrors
  * `redactor.ts:121-124`'s own extraction (strip an optional `Bearer`/`Basic` prefix, take the
  * remaining non-whitespace run as the credential), then applies the shared credible-value gate --
- * an opaque Bearer token is caught here; a JWT-shaped one is already caught by bucket 2. */
-const authorizationHeaderPattern = /authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?([^\s,;]+)/giu;
+ * an opaque Bearer token is caught here; a JWT-shaped one is already caught by bucket 2.
+ *
+ * Because the `Bearer`/`Basic` prefix is optional, an unprefixed, unquoted value is exactly the
+ * shape of a doc-comment sentence whose first word happens to clear the credible-value length
+ * floor (`// Authorization: required for all admin routes`, `// Authorization: inherited from the
+ * parent router`) -- both real headers this scanner must still catch. The fix: a bare `authorization:
+ * <value>` line is only treated as a header when the value carries its own credential signal, a
+ * `bearer`/`basic` scheme prefix (captured separately below so its presence/absence is observable)
+ * or the value itself is quoted -- prose is never quoted here, a real opaque token pasted into
+ * config commonly is. */
+const authorizationHeaderPattern = /authorization\s*[:=]\s*((?:bearer|basic)\s+)?([^\s,;]+)/giu;
 
 function containsAuthorizationHeaderCredential(text: string): boolean {
   for (const match of text.matchAll(authorizationHeaderPattern)) {
-    const value = match[1];
-    if (value !== undefined && isCredibleCredentialValue(value)) return true;
+    const schemePrefix = match[1];
+    const value = match[2];
+    if (value === undefined) continue;
+    const isQuotedValue = value.length >= 2 && (value.startsWith('"') || value.startsWith("'"));
+    if (schemePrefix === undefined && !isQuotedValue) continue;
+    if (isCredibleCredentialValue(value)) return true;
   }
   return false;
 }
@@ -298,20 +325,43 @@ function containsAuthorizationHeaderCredential(text: string): boolean {
 /** Bucket 4f: a `cookie:` / `set-cookie:` line carrying a credible `name=value` pair. Mirrors
  * `redactor.ts:125`'s own extraction (everything after the header name to end of line); no quote
  * requirement here (unlike bucket 4d) because the credible-value gate already rejects the
- * whitespace-containing prose shape on its own. */
+ * whitespace-containing prose shape on its own.
+ *
+ * A real `Set-Cookie` line is essentially never just `name=value` -- it carries `; `-separated
+ * attributes (`; HttpOnly`, `; Path=/`, `; Secure`), and taking "everything after the header name"
+ * as one value means those attributes ride along and break the credible-value character-class
+ * check (`;`, ` `, `/` are not in it), silently letting the real cookie value through. The line is
+ * therefore split on `;` first, and every `name=value` segment is checked independently -- an
+ * attribute segment either has no `=` (skipped) or a short/non-credential value (`Path=/`,
+ * `Max-Age=3600`) that clears its own gate the same as any other bucket. */
 const cookieCredentialPattern = /(?:set-cookie|cookie)\s*[:=]\s*([^\r\n]*)/giu;
 
 function containsCookieCredential(text: string): boolean {
   for (const match of text.matchAll(cookieCredentialPattern)) {
-    const value = match[1];
-    if (value !== undefined && isCredibleCredentialValue(value)) return true;
+    const line = match[1];
+    if (line === undefined) continue;
+    for (const segment of line.split(";")) {
+      const equalsIndex = segment.indexOf("=");
+      if (equalsIndex === -1) continue;
+      const value = segment.slice(equalsIndex + 1);
+      if (isCredibleCredentialValue(value)) return true;
+    }
   }
   return false;
 }
 
 /** Bucket 4g: a sensitive URL query parameter (`?token=...`, `&api_key=...`). Mirrors
  * `redactor.ts:130-134`'s own extraction and key-decoding, restated locally since that helper is
- * private to the Redactor. */
+ * private to the Redactor.
+ *
+ * A real URL carrying a query string is almost never a bare standalone token in source -- it is
+ * quoted (`'https://...?token=...'`), parenthesized (`fetch(https://...)`), or wrapped in a
+ * Markdown link (`[x](https://...)`). The value character class below used to run to the next
+ * `&`/`#`/whitespace and no further, so it swallowed that trailing quote/paren/bracket into the
+ * "value", which then failed the shared credible-value character-class check and let the URL
+ * through. Excluding those wrapper characters from the value class itself (rather than the key
+ * class, which never carries them) makes the match stop at the credential and not before -- the
+ * wrapper closes right where source code actually puts it, immediately after the value. */
 function decodeQueryParameterKey(key: string): string {
   try {
     return decodeURIComponent(key.replace(/\+/gu, " "));
@@ -319,7 +369,7 @@ function decodeQueryParameterKey(key: string): string {
     return key;
   }
 }
-const queryKeyCredentialPattern = /[?&]([^=&#\s]+)=([^&#\s]*)/gu;
+const queryKeyCredentialPattern = /[?&]([^=&#\s]+)=([^&#\s'"()<>[\]]*)/gu;
 
 function containsQueryKeyCredential(text: string): boolean {
   for (const match of text.matchAll(queryKeyCredentialPattern)) {
