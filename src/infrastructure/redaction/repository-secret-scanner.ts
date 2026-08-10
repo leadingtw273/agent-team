@@ -166,13 +166,19 @@ function containsSensitiveEnvAssignment(text: string): boolean {
   return false;
 }
 
-/** Bucket 4b: a connection-string URL with embedded `user:password@` userinfo
- * (`postgres://`, `mysql://`, `mongodb(+srv)://`, `redis://`, `amqp(s)://`). */
-const connectionStringCredentialPattern =
-  /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?):\/\/[^\s:/@]+:([^\s@/]+)@/giu;
+/** Bucket 4b: a URL with embedded `user:password@` userinfo. C034 restricted this to a five-scheme
+ * database allowlist (`postgres`, `mysql`, `mongodb`, `redis`, `amqp`), which is why
+ * `https://admin:S3cur3Passw0rd@internal.example.com/api` -- a real embedded credential, just not
+ * a database URL -- went from "blocked" to "allowed". `redactor.ts`'s own userinfo rule
+ * (`redactor.ts:126-129`) never had this restriction; it masks userinfo for *any* URL scheme.
+ * Restated here (not shared, `redactor.ts` stays unmodified) with the same generic scheme grammar
+ * (`[a-z][a-z0-9+.-]*`), so a legitimate embedded credential is caught regardless of scheme -- the
+ * `isCredibleCredentialValue` gate below, not the scheme allowlist, is what keeps placeholders like
+ * `postgres://dbuser:changeme@db.internal:5432/app` from being flagged. */
+const urlUserinfoCredentialPattern = /\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:([^\s@/]+)@/giu;
 
-function containsConnectionStringCredential(text: string): boolean {
-  for (const match of text.matchAll(connectionStringCredentialPattern)) {
+function containsUrlUserinfoCredential(text: string): boolean {
+  for (const match of text.matchAll(urlUserinfoCredentialPattern)) {
     const value = match[1];
     if (value !== undefined && isCredibleCredentialValue(value)) return true;
   }
@@ -197,8 +203,138 @@ function containsAwsCredential(text: string): boolean {
   return false;
 }
 
+/** Bucket 4d support: sensitive key names, restated (not shared) from `redactor.ts`'s
+ * `defaultSensitiveKeys`/`sensitiveKeySuffixes` -- same normalize-then-match semantics
+ * (lowercase, strip non-alphanumerics, then exact-name-or-suffix), but with one deliberate
+ * omission: `signature` is *not* in this list. `signature` is the one sensitive key name the
+ * Redactor carries that this scanner's whole reason for existing is to stop treating as
+ * sufficient (see the module doc comment's `required signature:` example) -- carrying it into
+ * this bucket would silently reintroduce that exact false positive under its colon/quote form. */
+const contextualSensitiveKeyNames = new Set(
+  [
+    "authorization",
+    "proxyauthorization",
+    "cookie",
+    "setcookie",
+    "apikey",
+    "xapikey",
+    "token",
+    "accesstoken",
+    "refreshtoken",
+    "password",
+    "passwd",
+    "secret",
+    "clientsecret",
+    "privatekey",
+    "webhooksecret",
+    "accesskey",
+  ].map(normalizeContextKey),
+);
+const contextualSensitiveKeySuffixes = [
+  "authorization",
+  "cookie",
+  "apikey",
+  "token",
+  "password",
+  "passwd",
+  "secret",
+  "privatekey",
+  "accesskey",
+] as const;
+
+function normalizeContextKey(key: string): string {
+  return key.toLowerCase().replace(/[^a-z0-9]/gu, "");
+}
+
+function isSensitiveContextKey(key: string): boolean {
+  const normalized = normalizeContextKey(key);
+  return (
+    contextualSensitiveKeyNames.has(normalized) ||
+    contextualSensitiveKeySuffixes.some((suffix) => normalized.endsWith(suffix))
+  );
+}
+
+/** Bucket 4d: lower- or mixed-case, optionally-quoted `key: value` / `key=value` pairs whose key is
+ * sensitive (a YAML/JSON config line, not just the uppercase `.env` shape bucket 4a already
+ * covers). The discriminator that keeps this from reintroducing the `required signature:` /
+ * `password: complexity requirements are enforced by policy` prose false positives: a *colon*
+ * separator is only accepted when the value is quoted (`key: "value"`); an unquoted value after a
+ * colon is exactly the descriptive-prose shape (`password: complexity requirements ...`) this
+ * scanner must not flag. An `=` assignment, by contrast, is inherently a value-carrying form
+ * (`api_key=...`), so it is accepted unquoted too. Either way the value still has to clear the
+ * shared `isCredibleCredentialValue` gate. */
+const contextualKeyValuePattern =
+  /(^|[\s,{;])(["']?)([A-Za-z][A-Za-z0-9_-]*)\2\s*([:=])\s*("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s,;}\r\n]+)/gmu;
+
+function containsSensitiveKeyValueCredential(text: string): boolean {
+  for (const match of text.matchAll(contextualKeyValuePattern)) {
+    const key = match[3];
+    const separator = match[4];
+    const rawValue = match[5];
+    if (key === undefined || separator === undefined || rawValue === undefined) continue;
+    if (!isSensitiveContextKey(key)) continue;
+    const isQuotedValue =
+      rawValue.length >= 2 && (rawValue.startsWith('"') || rawValue.startsWith("'"));
+    if (separator === ":" && !isQuotedValue) continue;
+    if (isCredibleCredentialValue(rawValue)) return true;
+  }
+  return false;
+}
+
+/** Bucket 4e: an `Authorization: Basic <base64>` / `Authorization: Bearer <token>` header. Mirrors
+ * `redactor.ts:121-124`'s own extraction (strip an optional `Bearer`/`Basic` prefix, take the
+ * remaining non-whitespace run as the credential), then applies the shared credible-value gate --
+ * an opaque Bearer token is caught here; a JWT-shaped one is already caught by bucket 2. */
+const authorizationHeaderPattern = /authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?([^\s,;]+)/giu;
+
+function containsAuthorizationHeaderCredential(text: string): boolean {
+  for (const match of text.matchAll(authorizationHeaderPattern)) {
+    const value = match[1];
+    if (value !== undefined && isCredibleCredentialValue(value)) return true;
+  }
+  return false;
+}
+
+/** Bucket 4f: a `cookie:` / `set-cookie:` line carrying a credible `name=value` pair. Mirrors
+ * `redactor.ts:125`'s own extraction (everything after the header name to end of line); no quote
+ * requirement here (unlike bucket 4d) because the credible-value gate already rejects the
+ * whitespace-containing prose shape on its own. */
+const cookieCredentialPattern = /(?:set-cookie|cookie)\s*[:=]\s*([^\r\n]*)/giu;
+
+function containsCookieCredential(text: string): boolean {
+  for (const match of text.matchAll(cookieCredentialPattern)) {
+    const value = match[1];
+    if (value !== undefined && isCredibleCredentialValue(value)) return true;
+  }
+  return false;
+}
+
+/** Bucket 4g: a sensitive URL query parameter (`?token=...`, `&api_key=...`). Mirrors
+ * `redactor.ts:130-134`'s own extraction and key-decoding, restated locally since that helper is
+ * private to the Redactor. */
+function decodeQueryParameterKey(key: string): string {
+  try {
+    return decodeURIComponent(key.replace(/\+/gu, " "));
+  } catch {
+    return key;
+  }
+}
+const queryKeyCredentialPattern = /[?&]([^=&#\s]+)=([^&#\s]*)/gu;
+
+function containsQueryKeyCredential(text: string): boolean {
+  for (const match of text.matchAll(queryKeyCredentialPattern)) {
+    const key = match[1];
+    const value = match[2];
+    if (key === undefined || value === undefined) continue;
+    if (!isSensitiveContextKey(decodeQueryParameterKey(key))) continue;
+    if (isCredibleCredentialValue(value)) return true;
+  }
+  return false;
+}
+
 /** Bucket 4: a multi-signal contextual credential. Each sub-check requires *both* a sensitive
- * context (an uppercase `.env`-style key name, an embedded connection-string userinfo, or an AWS
+ * context (an uppercase `.env`-style key name, a lower/mixed-case quoted-or-`=` key name, an
+ * embedded URL userinfo/query parameter, an `Authorization`/`cookie` header, or an AWS
  * access-key-id shape) *and*, where the context alone does not already fix the value's format, a
  * value that is neither an obvious placeholder (`changeme`, `<...>`, `xxx...`, empty, ...) nor
  * implausibly formatted (too short/long, unexpected characters). */
@@ -206,7 +342,11 @@ function containsContextualCredential(text: string): boolean {
   return (
     containsAwsCredential(text) ||
     containsSensitiveEnvAssignment(text) ||
-    containsConnectionStringCredential(text)
+    containsUrlUserinfoCredential(text) ||
+    containsSensitiveKeyValueCredential(text) ||
+    containsAuthorizationHeaderCredential(text) ||
+    containsCookieCredential(text) ||
+    containsQueryKeyCredential(text)
   );
 }
 

@@ -17,6 +17,18 @@ const fixtureAizaToken = joined("AI", "za", "abcdefghijklmnopqrstuvwxyz012345678
 const fixtureJwtToken = joined("eyJ", "abcdefghijk", ".", "abcdefghijkl", ".", "abcdefghijkl");
 const fixtureLinApiToken = joined("lin", "_api_", "abcdefghijklmnopqrstuv");
 const fixtureAwsAccessKeyId = joined("AKIA", "JH3IUF7QOWSNBPA1");
+const fixtureClientSecretValue = joined("9f8a7b6c5d4e3f2a", "1b0c9d8e");
+const fixturePasswordValue = joined("Tr0ub4dor3x", "Kq9zP");
+const fixturePrivateKeyValue = joined(
+  "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA1234567890abcdef",
+  "ghijklmnopqrstuvwxyz",
+);
+const fixtureApiKeyValue = joined("a9f8e7d6c5b4a3f2", "e1d0c9b8");
+const fixtureBasicAuthValue = joined("dXNlcjpzdXBl", "cnNlY3JldA==");
+const fixtureBearerOpaqueValue = joined("9f8a7b6c5d4e3f2a", "1b0c9d8e");
+const fixtureUrlUserinfoPasswordValue = joined("S3cur3Pass", "w0rd");
+const fixtureQueryTokenValue = joined("a9f8e7d6c5b4a3f2", "e1d0c9b8");
+const fixtureCookieSessionValue = joined("abc123def", "456ghi789");
 const fixturePemPrivateKeyBlock = [
   joined("-----BEGIN ", "RSA PRIVATE KEY", "-----"),
   "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA1234567890abcdef",
@@ -153,6 +165,54 @@ describe("RepositorySecretScanner", () => {
     it("does not flag ordinary uppercase constants unrelated to credentials", () => {
       const scanner = new RepositorySecretScanner();
       expect(scanner.containsSecret("MAX_RETRY_COUNT=5\nLOG_LEVEL=info\n")).toBe(false);
+    });
+  });
+
+  // C034b: C034's new scanner dropped bucket coverage the old
+  // `redactor.redactText(text) !== text` check used to provide incidentally -- lowercase/quoted
+  // sensitive key:value pairs, any-scheme URL userinfo, and Authorization/cookie/query-key
+  // credentials. Each of these 9 real-credential shapes regressed from "blocked" to "allowed".
+  describe("C034b regression: real credentials the pre-scanner Redactor-based check used to catch", () => {
+    it.each([
+      [
+        "lowercase quoted client_secret (YAML/JSON)",
+        `client_secret: "${fixtureClientSecretValue}"`,
+      ],
+      [
+        "lowercase quoted password (JS object literal)",
+        `const cfg = { password: "${fixturePasswordValue}" };`,
+      ],
+      [
+        "lowercase quoted private_key without a PEM header",
+        `private_key: "${fixturePrivateKeyValue}"`,
+      ],
+      ["lowercase api_key= assignment", `api_key=${fixtureApiKeyValue}`],
+      ["Authorization: Basic <base64>", `Authorization: Basic ${fixtureBasicAuthValue}`],
+      ["Authorization: Bearer <opaque token>", `Authorization: Bearer ${fixtureBearerOpaqueValue}`],
+      [
+        "non-database-scheme URL userinfo",
+        `https://admin:${fixtureUrlUserinfoPasswordValue}@internal.example.com/api`,
+      ],
+      ["sensitive URL query parameter", `?token=${fixtureQueryTokenValue}`],
+      ["set-cookie session credential", `set-cookie: session=${fixtureCookieSessionValue}`],
+    ] as const)("flags %s", (_label, text) => {
+      const scanner = new RepositorySecretScanner();
+      const classification = scanner.classify(text);
+      expect(classification.matched).toBe(true);
+      expect(classification.reasons).toContain("contextual_credential");
+      expect(scanner.containsSecret(text)).toBe(true);
+    });
+
+    // The one false positive this fix is known to reintroduce -- `value=complexity` (10 letters)
+    // clears the shared credible-value gate on its own -- is suppressed by the quote-or-`=`
+    // discipline: a bare colon-separated value never qualifies. Already covered by the
+    // "descriptive prose" `it.each` above (`// password: complexity requirements ...`); asserted
+    // again here, explicitly, because C034b's acceptance review singled it out by name.
+    it("does not reintroduce the 'password: complexity requirements...' false positive", () => {
+      const scanner = new RepositorySecretScanner();
+      const text =
+        "// password: complexity requirements are enforced by policy and are not stored here.";
+      expect(scanner.classify(text)).toEqual({ matched: false, reasons: [] });
     });
   });
 });
