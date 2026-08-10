@@ -1561,6 +1561,32 @@ describe("runResumeCycle", () => {
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
   });
 
+  // C031: pins the `!begin.changeRequest.draft` half of the `ci_failed_after_ready` guard. A draft
+  // PR can still reach `begin()` with `ci_failed` -- CI recovery hands back `ready_for_review` and
+  // the merge gate's own re-read races a check turning red -- and that job must stay resumable, so
+  // the next cycle can drive it back through CI recovery. Only a non-draft PR, which recovery can
+  // never touch again, is allowed to fail closed here.
+  it("C031: a draft PR with failed CI at review begin still retreats to ci_waiting", async () => {
+    const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
+      beginOutcome: {
+        state: "not_ready",
+        reason: "ci_failed",
+        changeRequest: changeRequest({ draft: true }),
+        checks: {} as never,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "still_ci_waiting" }]);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
   it("C031: a non-draft review_pending_retry does not re-enter CI recovery", async () => {
     const { deps, progress, calls } = await harness();
     await seedProgressRecord(progress, {
