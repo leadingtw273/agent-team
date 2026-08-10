@@ -107,6 +107,12 @@ const worktreeSchema = buildWorktreeSchema(setupBranchSchema);
 // Read path only (JournalStore.load / SessionStore.load / SessionStore.readActivation): tolerant of
 // the one legacy literal above, so pre-C026 activation markers keep loading instead of failing
 // closed with `invariant_violation`. Never used to validate a value about to be persisted.
+// Scope note (C027b): this restores loading of pre-C026 *session* and *activation* records, which
+// is what an activation marker's verification needs. A pre-C026 *journal* still fails to load --
+// its `preview.branch` (and `completed.commit/push.branch`) stay strict, so the tolerance below
+// never gets reached. Widening those too would not make such a journal safe to resume from, so it
+// is deliberately out of scope here; see C027b for the decision to either narrow this read path to
+// sessions/activations only or design a real legacy-journal migration.
 const legacyReadWorktreeSchema = buildWorktreeSchema(legacyReadSetupBranchSchema);
 
 const changeRequestSchema = z
@@ -900,7 +906,8 @@ export class FileRegistrationSetupJournalStore implements RegistrationSetupJourn
       this.#stateRoot,
       ["registration-setup", setupSessionId],
       { create: false },
-      // C026b: legacy-tolerant read schema -- see journalReadSchema's definition comment.
+      // C026b: legacy-tolerant read schema. Note this tolerance does not actually reach a pre-C026
+      // journal, whose stricter `preview.branch` rejects it first -- see the scope note above.
       (directory) => readPrivate(directory, "journal.json", journalReadSchema),
     );
     if (!loaded.ok && loaded.error.code === "not_found") return ok(undefined);
