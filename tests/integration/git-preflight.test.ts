@@ -132,6 +132,65 @@ describe("Git preflight", () => {
     expect(JSON.stringify(result.value)).not.toContain(secret);
   });
 
+  /**
+   * C034 regression: a harmless comment merely mentioning the word `signature` (one of the
+   * Redactor's sensitive key names) must not be classified as a secret and must not block
+   * preflight -- this is the exact real-world false positive that motivated splitting
+   * `RepositorySecretScanner` out of the (deliberately lenient) log-masking `Redactor`.
+   */
+  it("allows a harmless file whose comment merely mentions a sensitive-looking key name", async () => {
+    const environment = await fixture();
+    await writeFile(
+      join(environment.worktree.path, "src", "harmless-signature.ts"),
+      [
+        "// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters --",
+        "// required signature: lastIndex<T>(items: readonly T[]): number",
+        "export function lastIndex<T>(items: readonly T[]): number {",
+        "  return items.length - 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const result = await new GitPreflight(environment.git).inspect({
+      worktree: environment.worktree,
+      declaredRegions: [{ path: "src", coverage: "subtree" }],
+      expectedUntrackedPaths: ["src/harmless-signature.ts"],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.allowed).toBe(true);
+    expect(result.value.findings).toEqual([]);
+  });
+
+  /**
+   * C034 regression: a real, registered secret must still be caught and still block preflight
+   * (`allowed: false`, `suspected_secret` finding), proving the precision-first scanner is not a
+   * capability regression relative to the lenient-redactor check it replaced.
+   */
+  it("still fails closed for a genuinely registered secret, without leaking it in the report", async () => {
+    const environment = await fixture();
+    const secret = "registered-file-secret-value/with+symbols";
+    await writeFile(
+      join(environment.worktree.path, "src", "config.ts"),
+      `export const token = "${secret}";\n`,
+      "utf8",
+    );
+
+    const result = await new GitPreflight(environment.git).inspect({
+      worktree: environment.worktree,
+      declaredRegions: [{ path: "src", coverage: "subtree" }],
+      expectedUntrackedPaths: ["src/config.ts"],
+      knownSecrets: [secret],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.allowed).toBe(false);
+    expect(result.value.findings).toEqual([{ code: "suspected_secret", path: "src/config.ts" }]);
+    expect(JSON.stringify(result.value)).not.toContain(secret);
+  });
+
   it("checks both sides of a rename against the declared region", async () => {
     const environment = await fixture();
     await rename(
