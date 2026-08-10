@@ -318,6 +318,18 @@ const snakeCaseProsePattern = /^[a-z]+(?:_[a-z]+)+$/u;
  * splitting the key into short parts. This list can only ever be wrong by omission -- a missing
  * provider is one entry away, and adding it cannot start rejecting ordinary prose -- which is the
  * same shape of failure as bucket 2's pattern list, and the reason it replaced the threshold. */
+/** Only prefixes that are themselves all lowercase letters belong here. A prefix containing a digit
+ * (`sq0atp`, `lsv2`, `dt0c01`) can never be reached: the value stops being snake_case prose the
+ * moment it holds a digit, so it is already flagged one branch earlier.
+ *
+ * A prefix that is also an ordinary word is the one way this list can reject prose: `npm`, `lin`,
+ * `sk`, `pk`, `rk`, `ak`, `dop`, `doo`, `dor` and `ops` mean an enum member whose first part happens
+ * to match -- `token: "npm_install_failed"` -- is flagged. That is a bounded, per-entry cost, and it
+ * is the price of the list only ever being wrong by omission otherwise.
+ *
+ * Notion's older `secret_<random>` form is deliberately absent: `secret` is far too ordinary a word
+ * (`token: "secret_rotation_due"`). A prefix with a fixed-length random tail belongs in the shared
+ * `tokenPatternSources` instead, where the whole shape is matched rather than just the prefix. */
 const credentialPrefixSegments: ReadonlySet<string> = new Set([
   "sk",
   "pk",
@@ -329,18 +341,39 @@ const credentialPrefixSegments: ReadonlySet<string> = new Set([
   "xoxp",
   "xoxa",
   "xoxs",
+  "xapp",
   "glpat",
   "gltoken",
+  "glrt",
+  "gloas",
+  "glsoat",
+  "glimt",
+  "glagent",
+  "glptt",
+  "glcbt",
+  "glft",
   "shpat",
   "shpss",
+  "shpca",
+  "shppa",
   "npm",
   "dop",
   "doo",
   "dor",
-  "sq0atp",
-  "sq0csp",
   "rzp",
   "figd",
+  "figu",
+  "hf",
+  "ntn",
+  "pcsk",
+  "gsk",
+  "dckr",
+  "sbp",
+  "sbs",
+  "waka",
+  "ops",
+  "rubygems",
+  "mlsn",
 ]);
 
 function isSnakeCaseProseValue(rawValue: string): boolean {
@@ -369,25 +402,25 @@ function isProseValue(rawValue: string): boolean {
  * versioned opaque token like `v1.abc123def456.xyz789`) -- without this, the shape of reading a
  * property and the shape of such a token are the same. */
 const identifierSegmentPattern = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
-const maximumIdentifierDigitRatio = 1 / 3;
-const shortIdentifierSegmentLength = 3;
 
-/** Digits alone cannot separate the two: `config.v2Secret`, `res.body.token2`, `cfg.sha256Secret`
- * and `process.env.API_KEY_V2` are all ordinary property access, while `abc123.def456.ghi789` is a
- * credential. What differs is density -- a name carries a digit or two as a suffix or a namespace
- * (`v2`, `oauth2`, `sha256`), a credential segment runs about half digits. Short segments are
- * exempt because `v2` alone is all suffix. */
-function isIdentifierSegment(segment: string): boolean {
-  if (!identifierSegmentPattern.test(segment)) return false;
-  if (segment.length <= shortIdentifierSegmentLength) return true;
-  const digits = segment.match(/[0-9]/gu)?.length ?? 0;
-  return digits / segment.length < maximumIdentifierDigitRatio;
-}
-
+/** No bound on the digits within a segment. Forbidding them flagged `config.v2Secret` and
+ * `cfg.sha256Secret`; bounding their density flagged `hash.sha256`, `enc.base64` and `algo.sha512`
+ * -- names this repository, which hashes and redacts for a living, is especially likely to write --
+ * while still being evadable by diluting a credential's digits below the ratio. Every threshold
+ * tried here moved the failure rather than removing it, so the shape alone decides: an unquoted
+ * dot-joined chain of identifiers is read as property access.
+ *
+ * The bounded cost, measured over the review corpus: a credential written as an unquoted dotted
+ * value under a lowercase key (`api_key=abc123.def456.ghi789`) is missed. Write the same credential
+ * any conventional way and it is still caught -- quoted by bucket 4d, uppercase by 4a, prefixed or
+ * JWT-shaped by bucket 2, registered by bucket 1. That is a limitation this comment can state; a
+ * ratio that flags `enc.base64` is one every future reader has to rediscover. */
 function isIdentifierExpressionValue(rawValue: string, isQuotedValue: boolean): boolean {
   if (isQuotedValue) return false;
   const segments = rawValue.split(".");
-  return segments.length >= 2 && segments.every((segment) => isIdentifierSegment(segment));
+  return (
+    segments.length >= 2 && segments.every((segment) => identifierSegmentPattern.test(segment))
+  );
 }
 
 function containsSensitiveKeyValueCredential(text: string): boolean {

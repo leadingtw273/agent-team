@@ -482,8 +482,10 @@ describe("RepositorySecretScanner", () => {
       ['secret: "whsec_abcdefabcdef"', "Stripe webhook secret"],
       ['api_key: "sk_test_abcdefghijkl"', "Stripe test key"],
       ['api_key: "sk_live_abcdefghijklmnop"', "Stripe live key"],
-      ["api_key=abc123.def456.ghi789", "dot-joined key"],
-      ["token=v1.abc123def456.xyz789", "versioned opaque token"],
+      // The unquoted dotted forms that used to sit here are now a disclosed miss -- see
+      // "accepts the disclosed miss for an unquoted dotted value" below for what replaced them.
+      ['api_key: "abc123.def456.ghi789"', "dot-joined key, quoted"],
+      ['token: "v1.abc123def456.xyz789"', "versioned opaque token, quoted"],
     ])("flags %s (%s)", (text) => {
       expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
     });
@@ -523,9 +525,57 @@ describe("RepositorySecretScanner", () => {
     it.each([
       ['secret: "whsec_abc_def_ghi"', "prefixed key split into short parts"],
       ['api_key: "sk_test_abcdefghi"', "prefixed key, segment at the old bound"],
-      ["api_key=abc123.def456.ghi789", "dot-joined, half digits per part"],
+      ['api_key: "abc123.def456.ghi789"', "dot-joined, quoted"],
     ])("flags %s (%s)", (text) => {
       expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
+
+  describe("C034h: property access, whatever digits the name carries", () => {
+    // Forbidding digits flagged config.v2Secret; bounding their density flagged hash.sha256 and
+    // enc.base64 -- names a repository that hashes and redacts writes constantly -- and was still
+    // evadable by diluting them. The shape alone decides now.
+    it.each([
+      ["const secret = hash.sha256;", "hash algorithm"],
+      ["const secret = enc.base64;", "encoding name"],
+      ["const token = algo.sha512;", "another algorithm"],
+      ["const secret = oauth.rfc6749;", "specification number"],
+      ["const secret = hasher.sha3_256;", "algorithm with underscore"],
+      ["const token = res.v2.x1y2;", "short digit-heavy parts"],
+      ["const secret = config.v2Secret;", "version prefix"],
+      ["const token = this.v2.accessToken;", "versioned namespace"],
+    ])("still allows %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(false);
+    });
+
+    // The bounded cost, stated so nobody has to rediscover it: an unquoted dotted value under a
+    // lowercase key is missed. Quoting it, or any other conventional form, is still caught.
+    it("accepts the disclosed miss for an unquoted dotted value, and catches the quoted form", () => {
+      const scanner = new RepositorySecretScanner();
+      expect(scanner.containsSecret("api_key=abc123.def456.ghi789")).toBe(false);
+      expect(scanner.containsSecret('api_key: "abc123.def456.ghi789"')).toBe(true);
+    });
+  });
+
+  describe("C034h: provider prefixes the list had omitted", () => {
+    it.each([
+      ['secret: "hf_abcdefghijklmnop"', "HuggingFace"],
+      ['token: "ntn_abcdefghijklmnop"', "Notion"],
+      ['api_key: "gsk_abcdefghijklmnop"', "Groq"],
+      ['token: "xapp_abcdefghijklmnop"', "Slack app-level"],
+      ['secret: "sbp_abcdefghijklmnop"', "Supabase"],
+      ['token: "dckr_abcdefghijklmnop"', "Docker Hub"],
+      ['token: "glrt_abcdefghijklmnop"', "GitLab runner"],
+      ['secret: "mlsn_abcdefghijklmnop"', "MailerSend"],
+    ])("flags %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+
+    // A prefix that is also a word is the list's one cost, kept visible rather than worked around.
+    it("flags an enum member whose first part happens to be a prefix", () => {
+      expect(new RepositorySecretScanner().containsSecret('token: "npm_install_failed"')).toBe(
+        true,
+      );
     });
   });
 });
