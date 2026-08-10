@@ -168,8 +168,10 @@ function containsSensitiveEnvAssignment(text: string): boolean {
 
 /** Bucket 4b: a URL with embedded `user:password@` userinfo. C034 restricted this to a five-scheme
  * database allowlist (`postgres`, `mysql`, `mongodb`, `redis`, `amqp`), which is why
- * `https://admin:S3cur3Passw0rd@internal.example.com/api` -- a real embedded credential, just not
- * a database URL -- went from "blocked" to "allowed". `redactor.ts`'s own userinfo rule
+ * `https://admin:changeme@internal.example.com/api` -- a real embedded credential, just not
+ * a database URL -- went from "blocked" to "allowed" (the value here is an explicit placeholder,
+ * same convention as the `postgres://...changeme...` example below it, so this doc comment does not
+ * trip the very scanner it documents). `redactor.ts`'s own userinfo rule
  * (`redactor.ts:126-129`) never had this restriction; it masks userinfo for *any* URL scheme.
  * Restated here (not shared, `redactor.ts` stays unmodified) with the same generic scheme grammar
  * (`[a-z][a-z0-9+.-]*`), so a legitimate embedded credential is caught regardless of scheme -- the
@@ -292,6 +294,44 @@ function isSingleProseWordValue(rawValue: string): boolean {
   return value.length < maximumProseWordLength && singleWordPattern.test(value);
 }
 
+/** M2: a lowercase, underscore-joined value (`project_long_term`, `ordinary_user`) reads as a
+ * TS/JS enum or union-literal member, not a credential, regardless of length -- unlike the
+ * hyphenated/plain-word prose check above, which is deliberately bounded to <16 characters so it
+ * does not swallow real all-letter secrets. The two checks use different separators as their
+ * signal on purpose: this codebase's union/enum literals are conventionally `snake_case`
+ * (underscore-joined), while passphrases that happen to be several real words are conventionally
+ * hyphenated (`correct-horse-battery-staple`, already covered and intentionally still flagged by
+ * `isSingleProseWordValue`'s length bound). The accepted cost, recorded rather than silently
+ * eaten: an underscore-joined passphrase (`correct_horse_battery`) would now be missed, and a
+ * hyphenated enum member (`kebab-case`) at or above 16 characters could still be misread as a
+ * credential. Separator choice is the most stable signal this heuristic has in a TS-flavored
+ * codebase, so this is accepted rather than solved. */
+const snakeCaseProsePattern = /^[a-z]+(?:_[a-z]+)+$/u;
+
+function isSnakeCaseProseValue(rawValue: string): boolean {
+  const value = stripSurroundingQuotes(rawValue);
+  return snakeCaseProsePattern.test(value);
+}
+
+function isProseValue(rawValue: string): boolean {
+  return isSingleProseWordValue(rawValue) || isSnakeCaseProseValue(rawValue);
+}
+
+/** M1: an unquoted, dot-joined identifier chain (`request.confirmation`, `config.webhookSecret`,
+ * `process.env.API_KEY`) is a property-access *expression*, not a literal value -- exactly the
+ * shape of reading a credential out of some other object, which is unremarkable code, not a
+ * credential appearing in source. Requiring at least one dot is what keeps this narrow: a bare
+ * identifier with no dot (`deadbeefcafebabe`) is indistinguishable from a lowercase-hex credential
+ * and must still fall through to the shared plausibility gate below. Quoted values are never
+ * matched here (`"request.confirmation"` as a literal string is not an expression), which is also
+ * why this only ever fires for the `=` form: bucket 4d's `:` form already requires a quoted value
+ * a few lines up, so an unquoted expression after `:` never reaches this check in the first place. */
+const identifierExpressionPattern = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/u;
+
+function isIdentifierExpressionValue(rawValue: string, isQuotedValue: boolean): boolean {
+  return !isQuotedValue && identifierExpressionPattern.test(rawValue);
+}
+
 function containsSensitiveKeyValueCredential(text: string): boolean {
   for (const match of text.matchAll(contextualKeyValuePattern)) {
     const key = match[3];
@@ -302,7 +342,8 @@ function containsSensitiveKeyValueCredential(text: string): boolean {
     const isQuotedValue =
       rawValue.length >= 2 && (rawValue.startsWith('"') || rawValue.startsWith("'"));
     if (separator === ":" && !isQuotedValue) continue;
-    if (separator === ":" && isSingleProseWordValue(rawValue)) continue;
+    if (separator === ":" && isProseValue(rawValue)) continue;
+    if (isIdentifierExpressionValue(rawValue, isQuotedValue)) continue;
     if (isCredibleCredentialValue(rawValue)) return true;
   }
   return false;
@@ -330,6 +371,11 @@ function containsAuthorizationHeaderCredential(text: string): boolean {
     if (value === undefined) continue;
     const isQuotedValue = value.length >= 2 && (value.startsWith('"') || value.startsWith("'"));
     if (schemePrefix === undefined && !isQuotedValue) continue;
+    // M2: the same prose rejection bucket 4d applies to its quoted colon form is needed here too --
+    // a quoted TS union/enum member (`authorization: "ordinary"`, `authorization:
+    // "project_long_term"`) clears the quote gate above the same way a real quoted token would, so
+    // it needs the same prose backstop before the credible-value check, not a separate one.
+    if (isProseValue(value)) continue;
     if (isCredibleCredentialValue(value)) return true;
   }
   return false;

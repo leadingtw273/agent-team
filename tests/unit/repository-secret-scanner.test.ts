@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { RepositorySecretScanner } from "../../src/infrastructure/redaction/repository-secret-scanner.js";
@@ -354,6 +357,120 @@ describe("RepositorySecretScanner", () => {
       [`https://api.example.com/v1?token=${token};`, "trailing semicolon"],
     ])("flags %s (%s)", (text) => {
       expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
+
+  // C034e (this fixes a fresh-context acceptance FAIL): a fourth-round scan of this very repo's
+  // 701 tracked files found bucket 4d's `=` form treating ordinary property-access reads
+  // (`const token = request.confirmation;`) as credentials, purely because the right-hand side is
+  // an identifier chain at least 8 characters long that clears the shared plausibility gate.
+  describe("C034e / M1: an unquoted, dot-joined identifier chain is a property read, not a credential", () => {
+    it.each([
+      "const token = request.confirmation;",
+      "const confirmationToken = panel.dataset.confirmationToken;",
+      "const secret = config.webhookSecret;",
+      "let apiKey = process.env.API_KEY;",
+      "const accessToken = response.body.accessToken;",
+      "const password = credentials.password;",
+    ])("does not flag: %s", (text) => {
+      expect(new RepositorySecretScanner().classify(text)).toEqual({ matched: false, reasons: [] });
+    });
+
+    // Real credentials the acceptance reviewer re-ran against this fix, confirming none regressed.
+    // The last entry is the boundary case: the dot alone is not the discriminator (a real
+    // credential can legitimately contain one) -- what matters is whether every dot-separated
+    // segment is itself a valid identifier (letter/underscore/$ first). A value whose first
+    // segment starts with a digit can never be a JS/TS property-access expression, so it must
+    // fall through to the ordinary plausibility gate and still be flagged.
+    it.each([
+      ["bare hex, no dot", "api_key=deadbeefcafebabe"],
+      ["bare hex, no dot, longer", "api_key=a9f8e7d6c5b4a3f2e1d0c9b8"],
+      ["provider-prefixed secret", "WEBHOOK_SECRET=whsec_8f3a9c2b1d4e5f607182930a4b5c6d7e"],
+      ["quoted passphrase", 'const cfg = { password: "Tr0ub4dor3xKq9zP" };'],
+      [
+        "quoted PEM-shaped base64",
+        'private_key: "MIIBVQIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA1234567890abcdefghijklmnopqrstuvwxyz"',
+      ],
+      ["dotted value, not an identifier chain", "api_key=9f8e7d6.c5b4a3f2e1d0c9b8"],
+    ] as const)("still flags a real credential: %s", (_label, text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
+
+  // C034e / M2: a TS union/enum literal (`authorization: "ordinary"`) reached bucket 4e's
+  // quoted-value hatch, which -- unlike bucket 4d's colon form -- had no prose rejection at all.
+  describe("C034e / M2: a quoted TS union/enum literal under a sensitive key is not a credential", () => {
+    it.each([
+      'authorization: "ordinary"',
+      'authorization: "ordinary" | "project_long_term";',
+      'authorization: "project_long_term",',
+    ])("does not flag: %s", (text) => {
+      expect(new RepositorySecretScanner().classify(text)).toEqual({ matched: false, reasons: [] });
+    });
+
+    // The snake_case prose rule is deliberately separator-driven, not just length-driven -- it
+    // must not eat an underscore-joined value that is genuinely long and hyphen-free but is a real
+    // credential shape (a lowercase env-style secret), only values that look like an identifier.
+    it("still flags a real quoted credential that happens to contain no underscore-joined words", () => {
+      const text = 'authorization: "9f8a7b6c5d4e3f2a1b0c9d8e"';
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
+
+  // C034e / M4: pins the `=` vs `:` separator distinction bucket 4d's prose rejection relies on.
+  // The pre-existing `api_key=deadbeefcafebabe` fixture is 16 characters, so it was already
+  // outside the prose-word length bound (< 16) and would pass even if the separator guard were
+  // accidentally widened to cover `=` too. An 8-letter `=` value is the only shape that actually
+  // exercises the guard: `deadbeef` is a single all-lowercase word under the 16-char bound, so it
+  // WOULD be misread as prose if the `:`-only condition on `isProseValue` were ever loosened.
+  describe("C034e / M4: the `=` form is never subject to the colon-only prose rejection", () => {
+    it("flags an 8-letter = value that a broadened prose rejection would incorrectly drop", () => {
+      expect(new RepositorySecretScanner().containsSecret("api_key=deadbeef")).toBe(true);
+    });
+  });
+
+  // C034e / M5: the decisive regression guard for this round -- the acceptance failure was found
+  // by running the scanner against this repository's own source, not against hand-picked fixtures.
+  // Re-running that exact scan here means any future change that reintroduces a false positive on
+  // real code in this repo fails a unit test, not a fresh-context acceptance review.
+  describe("C034e / M5: scanning this repository's own src/** must never flag a secret", () => {
+    /** Deliberately empty. If a file genuinely must contain a fixture-shaped credential under
+     * `src/**` (none currently do -- all such fixtures live under `tests/`), add its repo-relative
+     * path here with a comment naming the exact line and why it cannot be rewritten to avoid the
+     * false positive. Do NOT add an entry to make a real miss disappear, and do NOT loosen any
+     * bucket above to shrink this list -- that is exactly the regression this test exists to catch. */
+    const allowlistedRelativePaths: readonly string[] = [];
+
+    function collectSourceFiles(directory: string): string[] {
+      const files: string[] = [];
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const fullPath = join(directory, entry.name);
+        if (entry.isDirectory()) {
+          files.push(...collectSourceFiles(fullPath));
+        } else if (entry.isFile() && /\.(ts|js)$/u.test(entry.name)) {
+          files.push(fullPath);
+        }
+      }
+      return files;
+    }
+
+    const srcRoot = join(__dirname, "..", "..", "src");
+    const sourceFiles = collectSourceFiles(srcRoot);
+
+    it("finds a non-trivial number of source files to scan (sanity check on the walk itself)", () => {
+      expect(sourceFiles.length).toBeGreaterThan(50);
+    });
+
+    it("flags zero files under src/** (allowlist above must stay empty in the passing state)", () => {
+      const scanner = new RepositorySecretScanner();
+      const flaggedFiles: string[] = [];
+      for (const filePath of sourceFiles) {
+        const relativePath = filePath.slice(srcRoot.length + 1);
+        if (allowlistedRelativePaths.includes(relativePath)) continue;
+        const text = readFileSync(filePath, "utf8");
+        if (scanner.containsSecret(text)) flaggedFiles.push(relativePath);
+      }
+      expect(flaggedFiles).toEqual([]);
     });
   });
 });
