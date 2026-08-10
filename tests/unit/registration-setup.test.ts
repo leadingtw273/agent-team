@@ -1036,6 +1036,30 @@ describe("O005 registration Setup PR flow", () => {
     expect(test.calls).toEqual([]);
   });
 
+  // C026b test 5: the durable adapter's read path was made tolerant of the pre-C026 bare legacy
+  // branch (`agent-team/setup`, no session suffix) purely so an already-activated session/marker
+  // could be *read back* instead of failing closed with `invariant_violation`. This application
+  // layer's own exact-equality guard (`validSession`, unmodified by that fix) still independently
+  // blocks a legacy-branch session from ever proceeding into push/PR/merge -- resuming `begin()`
+  // for such a session fails at the "session" stage before any mutation, exactly as it did before.
+  it("C026b test 5: still rejects a durably-stored legacy bare-branch session before any mutation (application-layer exact-branch guard)", async () => {
+    const first = await prepared();
+    const legacySession = {
+      ...first.session,
+      worktree: { ...first.session.worktree, branch: "agent-team/setup" },
+    };
+    const resumed = harness();
+    resumed.sessions.set(preview.setupSessionId, legacySession);
+    const result = await resumed.coordinator.begin({
+      preview,
+      trustedAuthority,
+      confirmation: confirmation(),
+      idempotencyKeyPrefix: "setup:legacy-resume",
+    });
+    expect(result).toMatchObject({ state: "failed", stage: "session" });
+    expect(resumed.calls).toEqual([]);
+  });
+
   it.each(["worktree", "write"] as const)("fails closed at %s", async (fail) => {
     const test = harness({ fail });
     const result = await test.coordinator.begin({
