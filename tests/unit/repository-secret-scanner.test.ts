@@ -318,4 +318,42 @@ describe("RepositorySecretScanner", () => {
       expect(classification.reasons).toContain("contextual_credential");
     });
   });
+
+  describe("C034d: credentials written as all letters, and words that only look like them", () => {
+    // Probing the prose-word rejection against credentials as they are actually written found it
+    // dropped every all-letter credential; probing it against real files found an i18n label file
+    // tripping it. One bound fixes both: prose values that reach here are short, credentials are not.
+    it.each([
+      ['password: "deadbeefcafebabe"', "lowercase hex"],
+      ['password: "supersecretpassphrase"', "passphrase"],
+      ['client_secret: "abcdefghijklmnopqrst"', "all-letter secret"],
+      ['api_key: "mfrggzdfmztwqzlm"', "lowercase base32"],
+      ['secret: "correct-horse-battery-staple"', "hyphenated passphrase"],
+    ])("flags an all-letter credential: %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+
+    it("flags an = assignment regardless of the value's shape, which has no prose ambiguity", () => {
+      expect(new RepositorySecretScanner().containsSecret("api_key=deadbeefcafebabe")).toBe(true);
+    });
+
+    it.each([
+      ['export const en = { password: "Password", token: "Access token" };', "i18n labels"],
+      ['{ password: "Passwort" }', "i18n label, other language"],
+      ['{ token: "AccessToken" }', "i18n label, camel case"],
+    ])("still allows a label whose value is one word: %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(false);
+    });
+  });
+
+  describe("C034d: a query credential inside whatever the surrounding code wraps the URL in", () => {
+    const token = "a9f8e7d6c5b4a3f2e1d0c9b8";
+    it.each([
+      [`const url = \`https://api.example.com/v1?token=${token}\`;`, "template literal"],
+      [`url: https://api.example.com/v1?token=${token},`, "trailing comma"],
+      [`https://api.example.com/v1?token=${token};`, "trailing semicolon"],
+    ])("flags %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
 });

@@ -266,17 +266,30 @@ function isSensitiveContextKey(key: string): boolean {
 const contextualKeyValuePattern =
   /(^|[\s,{;])(["']?)([A-Za-z][A-Za-z0-9_-]*)\2\s*([:=])\s*("(?:[^"\\\r\n]|\\.)*"|'(?:[^'\\\r\n]|\\.)*'|[^\s,;}\r\n]+)/gmu;
 
-/** A quote/`=` alone does not save a value that is itself just an ordinary English word (or
- * hyphenated compound), e.g. `{ token: "identifier" }` or `{ secret: "santa-list" }` -- these are
- * data describing *what kind of thing* a field holds, not a credential, and both clear the shared
- * `isCredibleCredentialValue` gate (>= 8 letters, no placeholder token, legal character set) on
- * their own. Real credentials mix case and/or digits (`Tr0ub4dor3xKq9zP`, `whsec_...`,
- * `a9f8e7d6...`); a single unbroken run of lowercase letters/hyphens never does, so this bucket
- * alone (not the shared gate every other bucket relies on) additionally rejects that shape. */
-const singleLowercaseWordPattern = /^[a-z][a-z-]*$/u;
+/** A quote alone does not save a value that is itself just an ordinary word (or hyphenated
+ * compound), e.g. `{ token: "identifier" }`, `{ secret: "santa-list" }`, or an i18n label file's
+ * `{ password: "Password" }` -- these describe *what kind of thing* a field holds, not a
+ * credential, yet they clear the shared `isCredibleCredentialValue` gate (>= 8 letters, no
+ * placeholder token, legal character set) on their own. So this bucket alone (not the shared gate
+ * every other bucket relies on) additionally rejects that shape.
+ *
+ * Two bounds keep the rejection from swallowing real credentials, both found by probing it against
+ * credentials as they are actually written rather than against the rule's own examples:
+ *
+ * - **Length.** Matching letters alone would drop every all-letter credential: lowercase hex
+ *   (`deadbeefcafebabe`), base32 (`mfrggzdfmztwqzlm`), a passphrase (`supersecretpassphrase`), a
+ *   hyphenated one (`correct-horse-battery-staple`). Every prose value that reaches here is short
+ *   (`required` 8, `semicolon` 9, `identifier` 10, `punctuation` 11, `Password` 8) while those
+ *   credentials all run to 16 or beyond, so the rejection stops at 16 characters. A genuine
+ *   16-letter English word under a sensitive key is treated as a credential -- the safe direction.
+ * - **Separator.** Prose ambiguity comes from the colon form; `api_key=deadbeefcafebabe` has none,
+ *   so an `=` assignment is never rejected on these grounds. */
+const singleWordPattern = /^[A-Za-z][A-Za-z-]*$/u;
+const maximumProseWordLength = 16;
 
-function isSingleLowercaseWordValue(rawValue: string): boolean {
-  return singleLowercaseWordPattern.test(stripSurroundingQuotes(rawValue));
+function isSingleProseWordValue(rawValue: string): boolean {
+  const value = stripSurroundingQuotes(rawValue);
+  return value.length < maximumProseWordLength && singleWordPattern.test(value);
 }
 
 function containsSensitiveKeyValueCredential(text: string): boolean {
@@ -289,7 +302,7 @@ function containsSensitiveKeyValueCredential(text: string): boolean {
     const isQuotedValue =
       rawValue.length >= 2 && (rawValue.startsWith('"') || rawValue.startsWith("'"));
     if (separator === ":" && !isQuotedValue) continue;
-    if (isSingleLowercaseWordValue(rawValue)) continue;
+    if (separator === ":" && isSingleProseWordValue(rawValue)) continue;
     if (isCredibleCredentialValue(rawValue)) return true;
   }
   return false;
@@ -369,7 +382,11 @@ function decodeQueryParameterKey(key: string): string {
     return key;
   }
 }
-const queryKeyCredentialPattern = /[?&]([^=&#\s]+)=([^&#\s'"()<>[\]]*)/gu;
+/** The excluded set is everything source and prose wrap a URL in, because whatever follows the
+ * credential must not be absorbed into it -- the shared value gate rejects anything outside
+ * `[A-Za-z0-9+/=_.:-]`, so one trailing quote is enough to let a real credential through. Backtick
+ * matters most of the two added last: a template literal is how TypeScript usually builds a URL. */
+const queryKeyCredentialPattern = /[?&]([^=&#\s]+)=([^&#\s'"`()<>[\];,]*)/gu;
 
 function containsQueryKeyCredential(text: string): boolean {
   for (const match of text.matchAll(queryKeyCredentialPattern)) {
