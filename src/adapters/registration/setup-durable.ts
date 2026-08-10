@@ -82,15 +82,32 @@ const setupBranchPattern = new RegExp(
   "u",
 );
 const setupBranchSchema = z.string().regex(setupBranchPattern);
+// C026b: pre-C026 durable records wrote this exact bare literal (no session suffix) as
+// `worktree.branch`. This union is *read-only* tolerance for that one known legacy value -- it must
+// never back a write-path schema, or a fresh save/activate could durably recreate the very literal
+// C026 retired. Exact-value match only (no arbitrary prefix/variant), on purpose.
+const legacyReadSetupBranchSchema = z.union([
+  z.literal(registrationSetupBranchPrefix),
+  setupBranchSchema,
+]);
 
-const worktreeSchema = z
-  .object({
-    repositoryRoot: z.string().refine(isAbsolute),
-    path: z.string().refine(isAbsolute),
-    branch: setupBranchSchema,
-    headSha: shaSchema,
-  })
-  .strict();
+function buildWorktreeSchema(branchSchema: z.ZodType<string>) {
+  return z
+    .object({
+      repositoryRoot: z.string().refine(isAbsolute),
+      path: z.string().refine(isAbsolute),
+      branch: branchSchema,
+      headSha: shaSchema,
+    })
+    .strict();
+}
+type WorktreeSchema = ReturnType<typeof buildWorktreeSchema>;
+// Write path (save/activate/new session+journal creation): strict, session-scoped only.
+const worktreeSchema = buildWorktreeSchema(setupBranchSchema);
+// Read path only (JournalStore.load / SessionStore.load / SessionStore.readActivation): tolerant of
+// the one legacy literal above, so pre-C026 activation markers keep loading instead of failing
+// closed with `invariant_violation`. Never used to validate a value about to be persisted.
+const legacyReadWorktreeSchema = buildWorktreeSchema(legacyReadSetupBranchSchema);
 
 const changeRequestSchema = z
   .object({
@@ -175,86 +192,95 @@ const previewSchema = z
     );
   });
 
-const journalSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    revision: z.number().int().positive(),
-    setupSessionId: identifierSchema,
-    preview: previewSchema,
-    configDigest: digestSchema,
-    pending: z
-      .object({
-        step: z.enum(["worktree", "write", "stage", "commit", "push", "draft_pull_request"]),
-        idempotencyKey: mutationKeySchema,
-      })
-      .strict()
-      .optional(),
-    completed: z
-      .object({
-        worktree: worktreeSchema.optional(),
-        write: z
-          .object({ path: z.literal(trustedProjectConfigPath), contentDigest: digestSchema })
-          .strict()
-          .optional(),
-        stage: z
-          .object({
-            headSha: shaSchema,
-            paths: z.array(z.literal(trustedProjectConfigPath)).length(1),
-          })
-          .strict()
-          .optional(),
-        commit: z.object({ sha: shaSchema, branch: setupBranchSchema }).strict().optional(),
-        push: z
-          .object({
-            remote: z.literal("origin"),
-            branch: setupBranchSchema,
-            sha: shaSchema,
-          })
-          .strict()
-          .optional(),
-        draftPullRequest: z
-          .object({ changeRequestId: identifierSchema, headSha: shaSchema })
-          .strict()
-          .optional(),
-        diff: z.object({ digest: digestSchema }).strict().optional(),
-      })
-      .strict(),
-  })
-  .strict()
-  .refine((journal) => {
-    const completed = journal.completed;
-    const pending = journal.pending?.step;
-    const prerequisites =
-      (completed.worktree === undefined ||
-        (completed.worktree.headSha.toLowerCase() === journal.preview.baseRevision.toLowerCase() &&
-          completed.worktree.path === journal.preview.worktreePath)) &&
-      (completed.write === undefined ||
-        (completed.worktree !== undefined &&
-          completed.write.contentDigest === journal.configDigest)) &&
-      (completed.stage === undefined || completed.write !== undefined) &&
-      (completed.commit === undefined || completed.stage !== undefined) &&
-      (completed.push === undefined ||
-        completed.push.sha.toLowerCase() === completed.commit?.sha.toLowerCase()) &&
-      (completed.draftPullRequest === undefined ||
-        completed.draftPullRequest.headSha.toLowerCase() === completed.push?.sha.toLowerCase()) &&
-      (completed.diff === undefined || completed.draftPullRequest !== undefined);
-    const pendingValid =
-      pending === undefined ||
-      (pending === "worktree" && completed.worktree === undefined) ||
-      (pending === "write" && completed.worktree !== undefined && completed.write === undefined) ||
-      (pending === "stage" && completed.write !== undefined && completed.stage === undefined) ||
-      (pending === "commit" && completed.stage !== undefined && completed.commit === undefined) ||
-      (pending === "push" && completed.commit !== undefined && completed.push === undefined) ||
-      (pending === "draft_pull_request" &&
-        completed.push !== undefined &&
-        completed.draftPullRequest === undefined);
-    return (
-      prerequisites &&
-      pendingValid &&
-      journal.setupSessionId === journal.preview.setupSessionId &&
-      journal.preview.config.projectId === journal.preview.project.id
-    );
-  }) as unknown as z.ZodType<RegistrationSetupJournal>;
+function buildJournalSchema(worktreeVariant: WorktreeSchema) {
+  return z
+    .object({
+      schemaVersion: z.literal(1),
+      revision: z.number().int().positive(),
+      setupSessionId: identifierSchema,
+      preview: previewSchema,
+      configDigest: digestSchema,
+      pending: z
+        .object({
+          step: z.enum(["worktree", "write", "stage", "commit", "push", "draft_pull_request"]),
+          idempotencyKey: mutationKeySchema,
+        })
+        .strict()
+        .optional(),
+      completed: z
+        .object({
+          worktree: worktreeVariant.optional(),
+          write: z
+            .object({ path: z.literal(trustedProjectConfigPath), contentDigest: digestSchema })
+            .strict()
+            .optional(),
+          stage: z
+            .object({
+              headSha: shaSchema,
+              paths: z.array(z.literal(trustedProjectConfigPath)).length(1),
+            })
+            .strict()
+            .optional(),
+          commit: z.object({ sha: shaSchema, branch: setupBranchSchema }).strict().optional(),
+          push: z
+            .object({
+              remote: z.literal("origin"),
+              branch: setupBranchSchema,
+              sha: shaSchema,
+            })
+            .strict()
+            .optional(),
+          draftPullRequest: z
+            .object({ changeRequestId: identifierSchema, headSha: shaSchema })
+            .strict()
+            .optional(),
+          diff: z.object({ digest: digestSchema }).strict().optional(),
+        })
+        .strict(),
+    })
+    .strict()
+    .refine((journal) => {
+      const completed = journal.completed;
+      const pending = journal.pending?.step;
+      const prerequisites =
+        (completed.worktree === undefined ||
+          (completed.worktree.headSha.toLowerCase() ===
+            journal.preview.baseRevision.toLowerCase() &&
+            completed.worktree.path === journal.preview.worktreePath)) &&
+        (completed.write === undefined ||
+          (completed.worktree !== undefined &&
+            completed.write.contentDigest === journal.configDigest)) &&
+        (completed.stage === undefined || completed.write !== undefined) &&
+        (completed.commit === undefined || completed.stage !== undefined) &&
+        (completed.push === undefined ||
+          completed.push.sha.toLowerCase() === completed.commit?.sha.toLowerCase()) &&
+        (completed.draftPullRequest === undefined ||
+          completed.draftPullRequest.headSha.toLowerCase() === completed.push?.sha.toLowerCase()) &&
+        (completed.diff === undefined || completed.draftPullRequest !== undefined);
+      const pendingValid =
+        pending === undefined ||
+        (pending === "worktree" && completed.worktree === undefined) ||
+        (pending === "write" &&
+          completed.worktree !== undefined &&
+          completed.write === undefined) ||
+        (pending === "stage" && completed.write !== undefined && completed.stage === undefined) ||
+        (pending === "commit" && completed.stage !== undefined && completed.commit === undefined) ||
+        (pending === "push" && completed.commit !== undefined && completed.push === undefined) ||
+        (pending === "draft_pull_request" &&
+          completed.push !== undefined &&
+          completed.draftPullRequest === undefined);
+      return (
+        prerequisites &&
+        pendingValid &&
+        journal.setupSessionId === journal.preview.setupSessionId &&
+        journal.preview.config.projectId === journal.preview.project.id
+      );
+    }) as unknown as z.ZodType<RegistrationSetupJournal>;
+}
+// Write path (save/persist): strict, session-scoped worktree.branch only.
+const journalSchema = buildJournalSchema(worktreeSchema);
+// Read path only (JournalStore.load): tolerant of the one legacy bare-literal branch.
+const journalReadSchema = buildJournalSchema(legacyReadWorktreeSchema);
 
 const gateEvidenceSchema = z
   .object({
@@ -343,114 +369,121 @@ const mergedConfigReceiptSchema = z
   })
   .strict() as unknown as z.ZodType<RegistrationSetupMergedConfigReceipt>;
 
-const sessionSchema = z
-  .object({
-    schemaVersion: z.literal(1),
-    revision: z.number().int().positive(),
-    phase: z.enum([
-      "ci_waiting",
-      "audit_pending",
-      "awaiting_user_approval",
-      "merge_authorized",
-      "merge_pending",
-      "activated",
-      "cancelled",
-    ]),
-    setupSessionId: identifierSchema,
-    project: projectSchema,
-    config: trustedProjectConfigSchema,
-    baseRevision: shaSchema,
-    worktree: worktreeSchema,
-    remote: z.literal("origin"),
-    previewDigest: digestSchema,
-    requirementsDigest: digestSchema,
-    diffDigest: digestSchema,
-    configDigest: digestSchema,
-    headSha: shaSchema,
-    changeRequest: changeRequestSchema,
-    linearAuditIssueId: identifierSchema,
-    gateEvidenceReceipt: gateEvidenceSchema.optional(),
-    audit: z
-      .object({
-        pending: auditIntentSchema.optional(),
-        linearReceipt: auditReceiptSchema.optional(),
-        pullRequestReceipt: auditReceiptSchema.optional(),
-      })
-      .strict()
-      .optional(),
-    evidence: z.array(evidenceSchema),
-    approvalReferenceDigest: digestSchema.optional(),
-    approvalConsumeOperationDigest: digestSchema.optional(),
-    approvalNonceDigest: digestSchema.optional(),
-    approvalAuthorityDigest: digestSchema.optional(),
-    approvalSource: z.enum(["local_ui", "current_user_conversation"]).optional(),
-    approvalSetupRevision: z.number().int().positive().optional(),
-    mergeIntent: mergeIntentSchema.optional(),
-    mergeReceipt: mergeReceiptSchema.optional(),
-    mergedConfigReceipt: mergedConfigReceiptSchema.optional(),
-    activatedRevisionSha: shaSchema.optional(),
-  })
-  .strict()
-  .refine((session) => {
-    const approvalRequired =
-      session.phase === "merge_authorized" ||
-      session.phase === "merge_pending" ||
-      session.phase === "activated";
-    const evidenceCodes = new Set(session.evidence.map((item) => item.code));
-    const gate = session.gateEvidenceReceipt;
-    const gateBound =
-      gate?.projectId === session.project.id &&
-      gate.repository === session.project.sourceControl.repository &&
-      // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
-      gate.changeRequestId === String(session.changeRequest.number) &&
-      gate.headSha.toLowerCase() === session.headSha.toLowerCase() &&
-      gate.requirementsDigest === session.requirementsDigest &&
-      gate.diffDigest === session.diffDigest;
-    const receiptBound = (receipt: RegistrationSetupAuditReceipt | undefined) =>
-      receipt?.setupSessionId === session.setupSessionId &&
-      receipt.projectId === session.project.id &&
-      receipt.repository === session.project.sourceControl.repository &&
-      receipt.linearAuditIssueId === session.linearAuditIssueId &&
-      // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
-      receipt.changeRequestId === String(session.changeRequest.number) &&
-      receipt.headSha.toLowerCase() === session.headSha.toLowerCase() &&
-      receipt.requirementsDigest === session.requirementsDigest &&
-      receipt.diffDigest === session.diffDigest &&
-      receipt.evidenceDigest === gate?.evidenceDigest;
-    return (
-      session.project.id === session.config.projectId &&
-      session.config.defaultBranch === session.project.defaultBranch &&
-      session.setupSessionId.length > 0 &&
-      session.worktree.repositoryRoot === session.project.localRepositoryPath &&
-      session.changeRequest.headSha.toLowerCase() === session.headSha.toLowerCase() &&
-      (session.phase === "ci_waiting" || session.phase === "cancelled" || gateBound) &&
-      (session.phase === "ci_waiting" ||
-        session.phase === "cancelled" ||
-        session.phase === "audit_pending" ||
-        (session.audit?.pending === undefined &&
-          receiptBound(session.audit?.linearReceipt) &&
-          receiptBound(session.audit?.pullRequestReceipt))) &&
-      session.evidence.every(
-        (item) =>
-          item.projectId === session.project.id &&
-          item.setupSessionId === session.setupSessionId &&
-          item.previewDigest === session.previewDigest &&
-          item.requirementsDigest === session.requirementsDigest,
-      ) &&
-      (!approvalRequired ||
-        (session.approvalReferenceDigest !== undefined &&
-          session.approvalConsumeOperationDigest !== undefined &&
-          session.approvalNonceDigest !== undefined &&
-          session.approvalAuthorityDigest !== undefined &&
-          session.approvalSetupRevision !== undefined &&
-          session.approvalSource !== undefined &&
-          evidenceCodes.has("setup_user_approval_consumed"))) &&
-      ((session.phase !== "merge_pending" && session.phase !== "activated") ||
-        session.mergeIntent !== undefined) &&
-      (session.phase !== "activated" ||
-        verifyRegistrationSetupActivatedSession(session as unknown as RegistrationSetupSession))
-    );
-  }) as unknown as z.ZodType<RegistrationSetupSession>;
+function buildSessionSchema(worktreeVariant: WorktreeSchema) {
+  return z
+    .object({
+      schemaVersion: z.literal(1),
+      revision: z.number().int().positive(),
+      phase: z.enum([
+        "ci_waiting",
+        "audit_pending",
+        "awaiting_user_approval",
+        "merge_authorized",
+        "merge_pending",
+        "activated",
+        "cancelled",
+      ]),
+      setupSessionId: identifierSchema,
+      project: projectSchema,
+      config: trustedProjectConfigSchema,
+      baseRevision: shaSchema,
+      worktree: worktreeVariant,
+      remote: z.literal("origin"),
+      previewDigest: digestSchema,
+      requirementsDigest: digestSchema,
+      diffDigest: digestSchema,
+      configDigest: digestSchema,
+      headSha: shaSchema,
+      changeRequest: changeRequestSchema,
+      linearAuditIssueId: identifierSchema,
+      gateEvidenceReceipt: gateEvidenceSchema.optional(),
+      audit: z
+        .object({
+          pending: auditIntentSchema.optional(),
+          linearReceipt: auditReceiptSchema.optional(),
+          pullRequestReceipt: auditReceiptSchema.optional(),
+        })
+        .strict()
+        .optional(),
+      evidence: z.array(evidenceSchema),
+      approvalReferenceDigest: digestSchema.optional(),
+      approvalConsumeOperationDigest: digestSchema.optional(),
+      approvalNonceDigest: digestSchema.optional(),
+      approvalAuthorityDigest: digestSchema.optional(),
+      approvalSource: z.enum(["local_ui", "current_user_conversation"]).optional(),
+      approvalSetupRevision: z.number().int().positive().optional(),
+      mergeIntent: mergeIntentSchema.optional(),
+      mergeReceipt: mergeReceiptSchema.optional(),
+      mergedConfigReceipt: mergedConfigReceiptSchema.optional(),
+      activatedRevisionSha: shaSchema.optional(),
+    })
+    .strict()
+    .refine((session) => {
+      const approvalRequired =
+        session.phase === "merge_authorized" ||
+        session.phase === "merge_pending" ||
+        session.phase === "activated";
+      const evidenceCodes = new Set(session.evidence.map((item) => item.code));
+      const gate = session.gateEvidenceReceipt;
+      const gateBound =
+        gate?.projectId === session.project.id &&
+        gate.repository === session.project.sourceControl.repository &&
+        // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+        gate.changeRequestId === String(session.changeRequest.number) &&
+        gate.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+        gate.requirementsDigest === session.requirementsDigest &&
+        gate.diffDigest === session.diffDigest;
+      const receiptBound = (receipt: RegistrationSetupAuditReceipt | undefined) =>
+        receipt?.setupSessionId === session.setupSessionId &&
+        receipt.projectId === session.project.id &&
+        receipt.repository === session.project.sourceControl.repository &&
+        receipt.linearAuditIssueId === session.linearAuditIssueId &&
+        // O009c fix: decimal PR number, not the opaque ChangeRequestSnapshot.id.
+        receipt.changeRequestId === String(session.changeRequest.number) &&
+        receipt.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+        receipt.requirementsDigest === session.requirementsDigest &&
+        receipt.diffDigest === session.diffDigest &&
+        receipt.evidenceDigest === gate?.evidenceDigest;
+      return (
+        session.project.id === session.config.projectId &&
+        session.config.defaultBranch === session.project.defaultBranch &&
+        session.setupSessionId.length > 0 &&
+        session.worktree.repositoryRoot === session.project.localRepositoryPath &&
+        session.changeRequest.headSha.toLowerCase() === session.headSha.toLowerCase() &&
+        (session.phase === "ci_waiting" || session.phase === "cancelled" || gateBound) &&
+        (session.phase === "ci_waiting" ||
+          session.phase === "cancelled" ||
+          session.phase === "audit_pending" ||
+          (session.audit?.pending === undefined &&
+            receiptBound(session.audit?.linearReceipt) &&
+            receiptBound(session.audit?.pullRequestReceipt))) &&
+        session.evidence.every(
+          (item) =>
+            item.projectId === session.project.id &&
+            item.setupSessionId === session.setupSessionId &&
+            item.previewDigest === session.previewDigest &&
+            item.requirementsDigest === session.requirementsDigest,
+        ) &&
+        (!approvalRequired ||
+          (session.approvalReferenceDigest !== undefined &&
+            session.approvalConsumeOperationDigest !== undefined &&
+            session.approvalNonceDigest !== undefined &&
+            session.approvalAuthorityDigest !== undefined &&
+            session.approvalSetupRevision !== undefined &&
+            session.approvalSource !== undefined &&
+            evidenceCodes.has("setup_user_approval_consumed"))) &&
+        ((session.phase !== "merge_pending" && session.phase !== "activated") ||
+          session.mergeIntent !== undefined) &&
+        (session.phase !== "activated" ||
+          verifyRegistrationSetupActivatedSession(session as unknown as RegistrationSetupSession))
+      );
+    }) as unknown as z.ZodType<RegistrationSetupSession>;
+}
+// Write path (save/activate): strict, session-scoped worktree.branch only.
+const sessionSchema = buildSessionSchema(worktreeSchema);
+// Read path only (SessionStore.load / SessionStore.readActivation, via activationRecordReadSchema):
+// tolerant of the one legacy bare-literal branch.
+const sessionReadSchema = buildSessionSchema(legacyReadWorktreeSchema);
 
 const markerSchema = z
   .object({
@@ -476,10 +509,17 @@ const markerSchema = z
   })
   .strict() as unknown as z.ZodType<RegistrationSetupActivationMarker>;
 
-const activationRecordSchema = z
-  .object({ schemaVersion: z.literal(1), session: sessionSchema, marker: markerSchema })
-  .strict()
-  .refine(({ session, marker }) => verifyRegistrationSetupActivationBinding(session, marker));
+function buildActivationRecordSchema(sessionVariant: z.ZodType<RegistrationSetupSession>) {
+  return z
+    .object({ schemaVersion: z.literal(1), session: sessionVariant, marker: markerSchema })
+    .strict()
+    .refine(({ session, marker }) => verifyRegistrationSetupActivationBinding(session, marker));
+}
+// Write path (activate): strict, session-scoped worktree.branch only.
+const activationRecordSchema = buildActivationRecordSchema(sessionSchema);
+// Read path only (SessionStore.load / SessionStore.readActivation): tolerant of the one legacy
+// bare-literal branch, so an activation.json durably written before C026 keeps loading.
+const activationRecordReadSchema = buildActivationRecordSchema(sessionReadSchema);
 
 function durableAuditReceiptsDigest(session: RegistrationSetupSession): string | undefined {
   if (
@@ -860,7 +900,8 @@ export class FileRegistrationSetupJournalStore implements RegistrationSetupJourn
       this.#stateRoot,
       ["registration-setup", setupSessionId],
       { create: false },
-      (directory) => readPrivate(directory, "journal.json", journalSchema),
+      // C026b: legacy-tolerant read schema -- see journalReadSchema's definition comment.
+      (directory) => readPrivate(directory, "journal.json", journalReadSchema),
     );
     if (!loaded.ok && loaded.error.code === "not_found") return ok(undefined);
     return loaded;
@@ -1111,10 +1152,16 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
       ["registration-setup", setupSessionId],
       { create: false },
       async (directory) => {
-        const activated = await readPrivate(directory, "activation.json", activationRecordSchema);
+        // C026b: legacy-tolerant read schemas -- see activationRecordReadSchema/sessionReadSchema's
+        // definition comments. Write paths (save/activate below) stay strict and are unaffected.
+        const activated = await readPrivate(
+          directory,
+          "activation.json",
+          activationRecordReadSchema,
+        );
         if (activated.ok) return ok(activated.value.session);
         return activated.error.code === "not_found"
-          ? readPrivate(directory, "session.json", sessionSchema)
+          ? readPrivate(directory, "session.json", sessionReadSchema)
           : activated;
       },
     );
@@ -1286,7 +1333,14 @@ export class FileRegistrationSetupSessionStore implements RegistrationSetupSessi
       ["registration-setup", setupSessionId],
       { create: false },
       async (directory) => {
-        const activation = await readPrivate(directory, "activation.json", activationRecordSchema);
+        // C026b: legacy-tolerant read schema -- see activationRecordReadSchema's definition
+        // comment. The marker itself never contained a branch field, so tolerance here only
+        // affects whether the embedded `session` parses, not the returned marker's shape.
+        const activation = await readPrivate(
+          directory,
+          "activation.json",
+          activationRecordReadSchema,
+        );
         return activation.ok ? ok(activation.value.marker) : activation;
       },
     );

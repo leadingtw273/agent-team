@@ -37,6 +37,7 @@ import {
 import {
   serializeTrustedProjectConfig,
   TrustedProjectConfigLoader,
+  trustedProjectConfigPath,
   trustedProjectConfigSchema,
 } from "../../src/application/projects/index.js";
 import { createFixedClock, ok, parseInstant } from "../../src/domain/foundation/index.js";
@@ -538,6 +539,208 @@ function binding(revision = 2): RegistrationSetupApprovalBinding {
   };
 }
 
+// C026b test 6 helper: builds and durably activates a second, independently re-approved session for
+// the *same* project -- own setupSessionId, own session-scoped branch, own real approval ledger
+// entry (issued and consumed for real, unlike the CAS test above which fakes only the ledger
+// lookup). Mirrors the "C026(C): CAS-replaces..." test's inline second-session construction, kept as
+// its own helper so the legacy-branch resume test below doesn't have to repeat ~150 lines of it.
+async function createReapprovalFixture(root: string, setupSessionId: string, tag: string) {
+  const branch = registrationSetupBranchFor(setupSessionId);
+  const worktree = {
+    repositoryRoot: project.localRepositoryPath,
+    path: `${preview.worktreePath}-${tag}`,
+    branch,
+    headSha: baseSha,
+  };
+  const mergedChangeRequest = {
+    id: "PR_node_1",
+    number: 42,
+    url: "https://github.test/owner/sandbox/pull/42",
+    state: "merged" as const,
+    draft: false,
+    baseBranch: "main",
+    headBranch: branch,
+    headSha,
+    mergeability: "mergeable" as const,
+    autoMergeEnabled: true,
+    updatedAt,
+  };
+  const ciWaitingDraft: RegistrationSetupSessionDraft = {
+    schemaVersion: 1,
+    phase: "ci_waiting",
+    setupSessionId,
+    project,
+    config,
+    baseRevision: baseSha,
+    worktree,
+    remote: "origin",
+    previewDigest: preview.previewDigest,
+    requirementsDigest: preview.requirementsDigest,
+    diffDigest: testDigest,
+    configDigest: serializedConfig.contentDigest,
+    headSha,
+    changeRequest: { ...mergedChangeRequest, state: "open", draft: true },
+    linearAuditIssueId: preview.linearAuditIssueId,
+    evidence: [],
+  };
+  const evidenceBinding = {
+    projectId: project.id,
+    setupSessionId,
+    previewDigest: preview.previewDigest,
+    requirementsDigest: preview.requirementsDigest,
+    headSha,
+    diffDigest: testDigest,
+    changeRequestId: "42",
+  };
+  const auditBody = [
+    "Agent Team registration Setup PR is waiting for explicit user approval.",
+    `project=${project.id}`,
+    `setup_session=${setupSessionId}`,
+    `preview_digest=${preview.previewDigest}`,
+    `change_request=${mergedChangeRequest.id}`,
+    `head_sha=${headSha}`,
+    `requirements_digest=${preview.requirementsDigest}`,
+    `diff_digest=${testDigest}`,
+    `linear_audit_issue=${preview.linearAuditIssueId}`,
+    `gate_evidence_digest=${gateEvidenceReceipt.evidenceDigest}`,
+    `review_evidence=${gateEvidenceReceipt.reviewEvidenceUrl}`,
+    "merge=squash",
+    "authority=local UI or trusted current-user conversation only",
+  ].join("\n");
+  const auditIdempotencyKey = (destination: "linear" | "pull_request") =>
+    `setup-audit:${setupSessionId}:${gateEvidenceReceipt.evidenceDigest.slice(0, 16)}:${destination}`;
+  const auditReceiptBinding = {
+    setupSessionId,
+    projectId: project.id,
+    repository: project.sourceControl.repository,
+    linearAuditIssueId: preview.linearAuditIssueId,
+    changeRequestId: "42",
+    headSha,
+    requirementsDigest: preview.requirementsDigest,
+    diffDigest: testDigest,
+    evidenceDigest: gateEvidenceReceipt.evidenceDigest,
+    bodyDigest: mustDigest(auditBody),
+    createdAt: updatedAt,
+    reused: false as const,
+  };
+  const approvalId = `${tag}:approval`;
+  const revision = 2;
+  const approvalReferenceDigest = approvalReferenceFor(approvalId);
+  const mergeIdempotencyKey = `setup-merge:${setupSessionId}:${approvalReferenceDigest.slice(0, 16)}`;
+  const mergeIntentBinding = Object.freeze({
+    schemaVersion: 1 as const,
+    projectId: project.id,
+    repository: project.sourceControl.repository,
+    changeRequestId: "42",
+    expectedHeadSha: headSha,
+    mergeMethod: "SQUASH" as const,
+    idempotencyKey: mergeIdempotencyKey,
+  });
+  const mergeIntent = Object.freeze({
+    ...mergeIntentBinding,
+    mergeIntentDigest: mustDigest({
+      kind: "registration_setup_merge_intent",
+      ...mergeIntentBinding,
+    }),
+  });
+  const { idempotencyKey: _mergeIdempotencyKey, ...mergeReceiptBinding } = mergeIntent;
+  void _mergeIdempotencyKey;
+  const mergeReceipt = Object.freeze({
+    ...mergeReceiptBinding,
+    state: "merged" as const,
+    idempotencyKeyDigest: mustDigest(mergeIdempotencyKey),
+  });
+  const consumeOperationDigest = rawDigest(`${tag}:consume-operation`);
+  const nonceDigest = rawDigest(`${tag}:nonce`);
+  const activatedDraft: RegistrationSetupSessionDraft = {
+    ...ciWaitingDraft,
+    phase: "activated",
+    changeRequest: mergedChangeRequest,
+    gateEvidenceReceipt,
+    audit: {
+      linearReceipt: {
+        schemaVersion: 1,
+        destination: "linear",
+        externalCommentId: `${tag}-linear`,
+        idempotencyKeyDigest: mustDigest(auditIdempotencyKey("linear")),
+        ...auditReceiptBinding,
+      },
+      pullRequestReceipt: {
+        schemaVersion: 1,
+        destination: "pull_request",
+        externalCommentId: `${tag}-pull-request`,
+        idempotencyKeyDigest: mustDigest(auditIdempotencyKey("pull_request")),
+        ...auditReceiptBinding,
+      },
+    },
+    evidence: [
+      { code: "setup_user_approval_consumed", ...evidenceBinding },
+      { code: "setup_merge_verified", ...evidenceBinding },
+      { code: "trusted_config_activated", ...evidenceBinding },
+    ],
+    approvalReferenceDigest,
+    approvalConsumeOperationDigest: consumeOperationDigest,
+    approvalNonceDigest: nonceDigest,
+    approvalAuthorityDigest: authorityDigest,
+    approvalSource: "local_ui",
+    approvalSetupRevision: revision,
+    mergeIntent,
+    mergeReceipt,
+    mergedConfigReceipt: {
+      schemaVersion: 1,
+      source: "source_control_default_branch",
+      projectId: project.id,
+      repository: project.sourceControl.repository,
+      changeRequestId: "42",
+      setupHeadSha: headSha,
+      mergeCommitSha: mergedSha,
+      defaultBranch: project.defaultBranch,
+      authoritativeRevision: mergedSha,
+      path: ".agent-team/project.json",
+      configDigest: serializedConfig.contentDigest,
+      config,
+    },
+    activatedRevisionSha: mergedSha,
+  };
+  const sessions = new FileRegistrationSetupSessionStore(root);
+  const initial = await withExecutionFor(root, setupSessionId, (lease) =>
+    sessions.save(undefined, ciWaitingDraft, {
+      idempotencyKey: `${tag}:create`,
+      executionFence: lease.fence,
+    }),
+  );
+  if (!initial.ok) throw new Error(initial.error.code);
+  const activated = await withExecutionFor(root, setupSessionId, (lease) =>
+    sessions.activate(initial.value.session.revision, activatedDraft, mergedSha, {
+      idempotencyKey: `${tag}:marker`,
+      executionFence: lease.fence,
+    }),
+  );
+  if (!activated.ok) throw new Error(activated.error.code);
+  const anchor = {
+    receipt: {
+      schemaVersion: 1 as const,
+      setupSessionId,
+      setupSessionRevision: revision,
+      projectId: project.id,
+      previewDigest: preview.previewDigest,
+      changeRequestId: "42",
+      headSha,
+      requirementsDigest: preview.requirementsDigest,
+      diffDigest: testDigest,
+      linearAuditIssueId: preview.linearAuditIssueId,
+      gateEvidenceDigest: gateEvidenceReceipt.evidenceDigest,
+      approvalId,
+      issuer: "local_ui" as const,
+      authorityDigest,
+      approvalNonceDigest: nonceDigest,
+      consumedAt: updatedAt,
+    },
+    consumeOperationDigest,
+  };
+  return { marker: activated.value.marker, approvalReferenceDigest, anchor, sessions };
+}
+
 describe("file-backed registration setup state", () => {
   it("assigns journal revisions under lock, enforces CAS, and keeps private permissions", async () => {
     const root = await temporaryRoot();
@@ -664,6 +867,122 @@ describe("file-backed registration setup state", () => {
       value: { phase: "activated", activatedRevisionSha: mergedSha },
     });
     expect((await stat(store.paths(preview.setupSessionId).activation)).mode & 0o777).toBe(0o600);
+    // C026b test 3: the write path (activate, above) only ever produces a session-scoped branch --
+    // never the pre-C026 bare literal a legacy-tolerant *read* schema exists to keep loading.
+    const reloaded = await store.load(preview.setupSessionId);
+    if (!reloaded.ok || reloaded.value === undefined) throw new Error("expected session");
+    expect(reloaded.value.worktree.branch).toBe(registrationSetupBranchFor(preview.setupSessionId));
+    expect(reloaded.value.worktree.branch).not.toBe("agent-team/setup");
+  });
+
+  // C026b: pre-C026 durable records wrote `worktree.branch` as this exact bare literal (no session
+  // suffix). C026 tightened the schema to session-scoped-only without a read-side allowance, so an
+  // already-activated session/marker written before C026 could no longer be read back --
+  // `activation.read` failed with `invariant_violation`, which the loader surfaced as
+  // `activation_unavailable`. These tests are the read-side regression coverage for the fix.
+  const legacyBareBranch = "agent-team/setup";
+
+  it("C026b test 1: reads back a session.json/activation.json durably written before C026 (bare legacy branch), instead of invariant_violation", async () => {
+    const root = await temporaryRoot();
+    const { sessions } = await createActivatedFixture(root);
+    const activationPath = sessions.paths(preview.setupSessionId).activation;
+    const record = JSON.parse(await readFile(activationPath, "utf8")) as {
+      session: { worktree: { branch: string } };
+    };
+    // Mirrors a real pre-C026 write: the *write* path can never produce this literal anymore
+    // (verified by the "rejects save/activate given a bare legacy branch" test below), so this
+    // mutation stands in for a record that predates C026's tightened schema.
+    record.session.worktree.branch = legacyBareBranch;
+    await writeFile(activationPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+
+    await expect(sessions.load(preview.setupSessionId)).resolves.toMatchObject({
+      ok: true,
+      value: { phase: "activated", worktree: { branch: legacyBareBranch } },
+    });
+    await expect(sessions.readActivation(preview.setupSessionId)).resolves.toMatchObject({
+      ok: true,
+      value: { setupSessionId: preview.setupSessionId },
+    });
+  });
+
+  it("C026b test 2: activationRegistry.read succeeds and the trusted-config loader reports ready when the project index points at a legacy bare-branch session", async () => {
+    const root = await temporaryRoot();
+    const { sessions, activated, registry } = await createActivatedFixture(root);
+    const activationPath = sessions.paths(preview.setupSessionId).activation;
+    const record = JSON.parse(await readFile(activationPath, "utf8")) as {
+      session: { worktree: { branch: string } };
+    };
+    record.session.worktree.branch = legacyBareBranch;
+    await writeFile(activationPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+
+    // Before the fix this failed closed with `conflict` (session.load -> invariant_violation).
+    await expect(registry.read(project.id)).resolves.toEqual({
+      ok: true,
+      value: activated.value.marker,
+    });
+
+    const loader = new TrustedProjectConfigLoader(
+      {
+        readTextFileAtRevision: () =>
+          Promise.resolve(
+            ok({
+              revisionSha: mergedSha,
+              path: trustedProjectConfigPath,
+              content: serializedConfig.content,
+              byteLength: Buffer.byteLength(serializedConfig.content, "utf8"),
+            }),
+          ),
+      },
+      registry,
+    );
+    // Before the fix this resolved to { state: "rejected", reason: "activation_unavailable" }.
+    await expect(loader.load(project)).resolves.toMatchObject({ state: "ready" });
+  });
+
+  it("C026b test 4: rejects save/activate given a bare legacy branch -- the write path stays session-scoped-only", async () => {
+    const root = await temporaryRoot();
+    const store = new FileRegistrationSetupSessionStore(root);
+    const legacyCreateDraft: RegistrationSetupSessionDraft = {
+      ...sessionDraft(),
+      worktree: { ...sessionDraft().worktree, branch: legacyBareBranch },
+    };
+    await expect(
+      withExecution(root, (lease) =>
+        store.save(undefined, legacyCreateDraft, {
+          idempotencyKey: "legacy-branch:save",
+          executionFence: lease.fence,
+        }),
+      ),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+    const approvalReceipt = await createConsumedApproval(root);
+    const initial = await withExecution(root, (lease) =>
+      store.save(undefined, sessionDraft(), {
+        idempotencyKey: "legacy-branch:create",
+        executionFence: lease.fence,
+      }),
+    );
+    if (!initial.ok) throw new Error(initial.error.code);
+    const legacyActivateDraft: RegistrationSetupSessionDraft = {
+      ...sessionDraft("activated", approvalReceipt),
+      worktree: {
+        ...sessionDraft("activated", approvalReceipt).worktree,
+        branch: legacyBareBranch,
+      },
+    };
+    await expect(
+      withExecution(root, (lease) =>
+        store.activate(initial.value.session.revision, legacyActivateDraft, mergedSha, {
+          idempotencyKey: "legacy-branch:activate",
+          executionFence: lease.fence,
+        }),
+      ),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+    // No file was ever written for the rejected attempts.
+    await expect(store.load(preview.setupSessionId)).resolves.toMatchObject({
+      ok: true,
+      value: { phase: "ci_waiting" },
+    });
   });
 
   it("publishes a digest-keyed project activation index with idempotent CAS", async () => {
@@ -1020,6 +1339,78 @@ describe("file-backed registration setup state", () => {
         expectedPriorMarkerDigest: firstDigest.value,
       }),
     ).resolves.toMatchObject({ ok: true, value: { state: "reused", marker: secondMarker } });
+  });
+
+  it("C026b test 6: resumes past a legacy bare-branch marker via CAS replace onto a fresh session-scoped marker, and the loader then reports ready", async () => {
+    const root = await temporaryRoot();
+
+    // "Old" project state: an activation whose durably-stored session recorded `worktree.branch`
+    // as the pre-C026 bare literal (the write path, exercised elsewhere, can never produce this
+    // anymore -- this mutation stands in for a record that predates C026's tightened schema).
+    const first = await createActivatedFixture(root);
+    const activationPath = first.sessions.paths(preview.setupSessionId).activation;
+    const legacyRecord = JSON.parse(await readFile(activationPath, "utf8")) as {
+      session: { worktree: { branch: string } };
+    };
+    legacyRecord.session.worktree.branch = "agent-team/setup";
+    await writeFile(activationPath, `${JSON.stringify(legacyRecord, null, 2)}\n`, { mode: 0o600 });
+
+    // Read must now succeed (the bug this ticket fixes) and return the legacy marker unchanged --
+    // the marker itself never carried a branch field, so the digest below is unaffected.
+    const priorRead = await first.registry.read(project.id);
+    expect(priorRead).toEqual({ ok: true, value: first.activated.value.marker });
+    if (!priorRead.ok || priorRead.value === undefined) throw new Error("expected legacy marker");
+    const priorDigest = registrationSetupActivationMarkerDigest(priorRead.value);
+    if (!priorDigest.ok) throw new Error(priorDigest.error.code);
+
+    // A fresh re-approval: its own session-scoped setupSessionId, its own real activated session
+    // and ledger entry -- entirely unaffected by the legacy tolerance above (its own read/write
+    // both go through the strict, unmodified schema).
+    const secondSetupSessionId = "setup-session-1-c026b-resume";
+    const second = await createReapprovalFixture(root, secondSetupSessionId, "c026b-resume");
+    const realLedger = new FileRegistrationSetupFinalApprovalAuthority(root);
+    const registryForSecond = new FileRegistrationSetupActivationRegistry(
+      root,
+      new AtomicFileStore(),
+      second.sessions,
+      {
+        readConsumed: (approvalReferenceDigest, options) =>
+          approvalReferenceDigest === second.approvalReferenceDigest
+            ? Promise.resolve(ok(second.anchor))
+            : realLedger.readConsumed(approvalReferenceDigest, options),
+      },
+    );
+
+    await expect(
+      registryForSecond.publish(second.marker, {
+        idempotencyKey: "activation-index:cas-legacy-resume:replace",
+        expectedPriorMarkerDigest: priorDigest.value,
+      }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "replaced", marker: second.marker } });
+
+    // The loader now points at the new, fully session-scoped marker -- not the legacy one.
+    await expect(registryForSecond.read(project.id)).resolves.toEqual({
+      ok: true,
+      value: second.marker,
+    });
+    const loader = new TrustedProjectConfigLoader(
+      {
+        readTextFileAtRevision: () =>
+          Promise.resolve(
+            ok({
+              revisionSha: mergedSha,
+              path: trustedProjectConfigPath,
+              content: serializedConfig.content,
+              byteLength: Buffer.byteLength(serializedConfig.content, "utf8"),
+            }),
+          ),
+      },
+      registryForSecond,
+    );
+    await expect(loader.load(project)).resolves.toMatchObject({
+      state: "ready",
+      revisionSha: mergedSha,
+    });
   });
 
   it.each(["authorityDigest", "approvalNonceDigest"] as const)(
