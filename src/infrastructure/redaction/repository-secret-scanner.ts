@@ -307,10 +307,18 @@ function isSingleProseWordValue(rawValue: string): boolean {
  * credential. Separator choice is the most stable signal this heuristic has in a TS-flavored
  * codebase, so this is accepted rather than solved. */
 const snakeCaseProsePattern = /^[a-z]+(?:_[a-z]+)+$/u;
+/** A union member is a phrase, so every underscore-joined part is a short word
+ * (`project_long_term`, `safety_review`). A prefixed credential looks the same to the pattern above
+ * -- Stripe issues `whsec_`, `sk_test_`, `sk_live_` keys -- but its last part is a random run, so a
+ * length bound on each part tells the two apart. Any digit at all already leaves this rule. */
+const maximumSnakeCaseProseSegmentLength = 9;
 
 function isSnakeCaseProseValue(rawValue: string): boolean {
   const value = stripSurroundingQuotes(rawValue);
-  return snakeCaseProsePattern.test(value);
+  return (
+    snakeCaseProsePattern.test(value) &&
+    value.split("_").every((segment) => segment.length <= maximumSnakeCaseProseSegmentLength)
+  );
 }
 
 function isProseValue(rawValue: string): boolean {
@@ -325,8 +333,13 @@ function isProseValue(rawValue: string): boolean {
  * and must still fall through to the shared plausibility gate below. Quoted values are never
  * matched here (`"request.confirmation"` as a literal string is not an expression), which is also
  * why this only ever fires for the `=` form: bucket 4d's `:` form already requires a quoted value
- * a few lines up, so an unquoted expression after `:` never reaches this check in the first place. */
-const identifierExpressionPattern = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/u;
+ * a few lines up, so an unquoted expression after `:` never reaches this check in the first place.
+ *
+ * No part may contain a digit. Property names in real code are words (`confirmation`, `dataset`,
+ * `webhookSecret`), while a dot-joined credential carries random runs (`abc123.def456.ghi789`, or a
+ * versioned opaque token like `v1.abc123def456.xyz789`) -- without this, the shape of reading a
+ * property and the shape of such a token are the same. */
+const identifierExpressionPattern = /^[A-Za-z_$]+(?:\.[A-Za-z_$]+)+$/u;
 
 function isIdentifierExpressionValue(rawValue: string, isQuotedValue: boolean): boolean {
   return !isQuotedValue && identifierExpressionPattern.test(rawValue);

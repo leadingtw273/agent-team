@@ -473,4 +473,30 @@ describe("RepositorySecretScanner", () => {
       expect(flaggedFiles).toEqual([]);
     });
   });
+
+  describe("C034f: credentials whose shape the M1/M2 skips had swallowed", () => {
+    // A provider prefix plus a random all-letter run reads as snake_case prose, and a dot-joined
+    // token reads as a property access. Both were let through until the review sampled the formats
+    // real providers issue.
+    it.each([
+      ['secret: "whsec_abcdefabcdef"', "Stripe webhook secret"],
+      ['api_key: "sk_test_abcdefghijkl"', "Stripe test key"],
+      ['api_key: "sk_live_abcdefghijklmnop"', "Stripe live key"],
+      ["api_key=abc123.def456.ghi789", "dot-joined key"],
+      ["token=v1.abc123def456.xyz789", "versioned opaque token"],
+    ])("flags %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+
+    it.each([
+      ["const token = request.confirmation;", "property access"],
+      ["const confirmationToken = panel.dataset.confirmationToken;", "nested property access"],
+      ["let apiKey = process.env.API_KEY;", "env read"],
+      ["const secret = config.webhookSecret;", "config read"],
+      ['authorization: "ordinary" | "project_long_term";', "union declaration"],
+      ['{ token: "safety_review" }', "enum member"],
+    ])("still allows %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(false);
+    });
+  });
 });
