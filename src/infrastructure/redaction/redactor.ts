@@ -46,7 +46,11 @@ const sensitiveKeySuffixes = [
   "signature",
 ] as const;
 
-const tokenPatternSources = [
+/** Shared with `RepositorySecretScanner` (repository-secret-scanner.ts) so the two never drift:
+ * a provider prefix worth redacting out of a log is also one worth refusing to commit. Only these
+ * high-confidence shapes are shared -- the key/value heuristics below stay private to this file,
+ * because "worth redacting from a log" is deliberately far broader than "is a secret". */
+export const tokenPatternSources = [
   String.raw`\bsk-ant-[a-zA-Z0-9_-]{12,}\b`,
   String.raw`\bsk-[a-zA-Z0-9_-]{12,}\b`,
   String.raw`\blin_api_[a-zA-Z0-9_-]{12,}\b`,

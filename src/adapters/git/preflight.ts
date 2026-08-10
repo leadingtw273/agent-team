@@ -15,7 +15,7 @@ import {
   repositoryRelativePathSchema,
   type ChangeRegion,
 } from "../../domain/project/index.js";
-import { Redactor } from "../../infrastructure/redaction/index.js";
+import { RepositorySecretScanner } from "../../infrastructure/redaction/repository-secret-scanner.js";
 
 const defaultMaximumScanBytes = 5 * 1024 * 1024;
 const jobIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_.:/@+-]{0,254}$/u;
@@ -177,7 +177,7 @@ export class GitPreflight {
         new Set(job.changes.flatMap(touchedPaths)),
       ]),
     );
-    const redactor = new Redactor({ secrets: request.knownSecrets ?? [] });
+    const scanner = new RepositorySecretScanner({ knownSecrets: request.knownSecrets ?? [] });
 
     for (const change of snapshot.value.changes) {
       for (const path of touchedPaths(change)) {
@@ -208,7 +208,7 @@ export class GitPreflight {
         }
         continue;
       }
-      const scan = await this.#scanFile(root, change.path, redactor);
+      const scan = await this.#scanFile(root, change.path, scanner);
       if (scan !== undefined) findings.push({ code: scan, path: change.path });
     }
 
@@ -239,7 +239,7 @@ export class GitPreflight {
   async #scanFile(
     root: string,
     path: string,
-    redactor: Redactor,
+    scanner: RepositorySecretScanner,
   ): Promise<"suspected_secret" | "unscannable_file" | undefined> {
     try {
       const absolutePath = join(root, path);
@@ -248,7 +248,7 @@ export class GitPreflight {
       const content = await readFile(absolutePath);
       if (content.byteLength !== stat.size) return "unscannable_file";
       const text = content.toString("utf8");
-      return redactor.redactText(text) === text ? undefined : "suspected_secret";
+      return scanner.containsSecret(text) ? "suspected_secret" : undefined;
     } catch {
       return "unscannable_file";
     }
