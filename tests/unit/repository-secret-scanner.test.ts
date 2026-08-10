@@ -499,4 +499,33 @@ describe("RepositorySecretScanner", () => {
       expect(new RepositorySecretScanner().containsSecret(text)).toBe(false);
     });
   });
+
+  describe("C034g: signals that do not swing both ways when tuned", () => {
+    // Bounding digits, then segment length, each fixed one side and broke the other for three
+    // rounds. Digit *density* and an explicit provider-prefix list replace both guesses: a name
+    // carries a digit as a suffix, a credential segment runs about half digits; and a prefix list
+    // can only ever be wrong by omission.
+    it.each([
+      ["const secret = config.v2Secret;", "digit in a property name"],
+      ["const token = res.body.token2;", "digit suffix"],
+      ["const key = client.oauth2Token;", "digit inside a namespace"],
+      ["let apiKey = process.env.API_KEY_V2;", "digit in an env name"],
+      ["const secret = cfg.sha256Secret;", "algorithm name"],
+      ["const token = this.v2.accessToken;", "versioned namespace"],
+      ['authorization: "authorization_required_for_admin",', "union member of long words"],
+      ['token: "authentication_failed",', "error code"],
+      ['secret: "configuration_error",', "error code, other word"],
+      ['password: "verification_pending",', "status enum"],
+    ])("still allows %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(false);
+    });
+
+    it.each([
+      ['secret: "whsec_abc_def_ghi"', "prefixed key split into short parts"],
+      ['api_key: "sk_test_abcdefghi"', "prefixed key, segment at the old bound"],
+      ["api_key=abc123.def456.ghi789", "dot-joined, half digits per part"],
+    ])("flags %s (%s)", (text) => {
+      expect(new RepositorySecretScanner().containsSecret(text)).toBe(true);
+    });
+  });
 });

@@ -311,14 +311,43 @@ const snakeCaseProsePattern = /^[a-z]+(?:_[a-z]+)+$/u;
  * (`project_long_term`, `safety_review`). A prefixed credential looks the same to the pattern above
  * -- Stripe issues `whsec_`, `sk_test_`, `sk_live_` keys -- but its last part is a random run, so a
  * length bound on each part tells the two apart. Any digit at all already leaves this rule. */
-const maximumSnakeCaseProseSegmentLength = 9;
+/** Prefixes providers put in front of an issued key. Bounding segment length instead was tried and
+ * swung both ways at once: raising it to fit `authorization_required_for_admin` let a credential
+ * through, lowering it to catch `whsec_...` flagged every union member built from a long word
+ * (`authentication_failed`, `configuration_error`). A length rule is also trivially evaded by
+ * splitting the key into short parts. This list can only ever be wrong by omission -- a missing
+ * provider is one entry away, and adding it cannot start rejecting ordinary prose -- which is the
+ * same shape of failure as bucket 2's pattern list, and the reason it replaced the threshold. */
+const credentialPrefixSegments: ReadonlySet<string> = new Set([
+  "sk",
+  "pk",
+  "rk",
+  "ak",
+  "whsec",
+  "lin",
+  "xoxb",
+  "xoxp",
+  "xoxa",
+  "xoxs",
+  "glpat",
+  "gltoken",
+  "shpat",
+  "shpss",
+  "npm",
+  "dop",
+  "doo",
+  "dor",
+  "sq0atp",
+  "sq0csp",
+  "rzp",
+  "figd",
+]);
 
 function isSnakeCaseProseValue(rawValue: string): boolean {
   const value = stripSurroundingQuotes(rawValue);
-  return (
-    snakeCaseProsePattern.test(value) &&
-    value.split("_").every((segment) => segment.length <= maximumSnakeCaseProseSegmentLength)
-  );
+  if (!snakeCaseProsePattern.test(value)) return false;
+  const [first] = value.split("_");
+  return first === undefined || !credentialPrefixSegments.has(first);
 }
 
 function isProseValue(rawValue: string): boolean {
@@ -339,10 +368,26 @@ function isProseValue(rawValue: string): boolean {
  * `webhookSecret`), while a dot-joined credential carries random runs (`abc123.def456.ghi789`, or a
  * versioned opaque token like `v1.abc123def456.xyz789`) -- without this, the shape of reading a
  * property and the shape of such a token are the same. */
-const identifierExpressionPattern = /^[A-Za-z_$]+(?:\.[A-Za-z_$]+)+$/u;
+const identifierSegmentPattern = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
+const maximumIdentifierDigitRatio = 1 / 3;
+const shortIdentifierSegmentLength = 3;
+
+/** Digits alone cannot separate the two: `config.v2Secret`, `res.body.token2`, `cfg.sha256Secret`
+ * and `process.env.API_KEY_V2` are all ordinary property access, while `abc123.def456.ghi789` is a
+ * credential. What differs is density -- a name carries a digit or two as a suffix or a namespace
+ * (`v2`, `oauth2`, `sha256`), a credential segment runs about half digits. Short segments are
+ * exempt because `v2` alone is all suffix. */
+function isIdentifierSegment(segment: string): boolean {
+  if (!identifierSegmentPattern.test(segment)) return false;
+  if (segment.length <= shortIdentifierSegmentLength) return true;
+  const digits = segment.match(/[0-9]/gu)?.length ?? 0;
+  return digits / segment.length < maximumIdentifierDigitRatio;
+}
 
 function isIdentifierExpressionValue(rawValue: string, isQuotedValue: boolean): boolean {
-  return !isQuotedValue && identifierExpressionPattern.test(rawValue);
+  if (isQuotedValue) return false;
+  const segments = rawValue.split(".");
+  return segments.length >= 2 && segments.every((segment) => isIdentifierSegment(segment));
 }
 
 function containsSensitiveKeyValueCredential(text: string): boolean {
