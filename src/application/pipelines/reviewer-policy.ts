@@ -288,7 +288,7 @@ export function reviewerDirective(
   const skeleton = reportSkeleton(role, request, identity, evidenceSourceList);
   const instructions = [
     `Perform a fresh-context ${role} review.`,
-    `Read only the approved repository at base revision ${request.baseRevision} and Head SHA ${identity.headSha}.`,
+    `Review the controller-provided approved snapshot identified by base revision ${request.baseRevision} and Head SHA ${identity.headSha}. Treat these identifiers as authoritative context; do not inspect \`.git\`, resolve revisions, or access paths outside the worktree.`,
     "Do not use or infer implementer conversation, hidden reasoning, handoff notes, or unrelated logs.",
     "Check every acceptance criterion and the role quality rules. Do not modify files or merge.",
     "Below is the exact JSON skeleton for your report. Copy it exactly and replace every <...> placeholder with real content of the type described inside it; do not add, remove, rename, or reorder any key at any nesting level; keep every value that is not itself a <...> placeholder character-for-character unchanged, including schemaVersion, role, requirementsDigest, headSha, diffDigest, every acceptanceCriteria[].criterion, and every qualityChecks[].dimension.",
