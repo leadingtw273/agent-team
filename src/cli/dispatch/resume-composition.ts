@@ -1163,6 +1163,34 @@ async function resumeUnderLease(
   };
   const idempotencyKeyPrefix = `cli-dispatch-resume:${record.jobId}:${String(record.revision)}`;
 
+  // C031: a non-draft PR has already had `ReviewerPipeline.run()` call
+  // `markChangeRequestReady()` (reviewer.ts) at least once. `CiRecoveryPipeline.run()`'s own
+  // `validRequest()` (ci-recovery.ts) hard-requires `request.changeRequest.draft` -- a non-draft
+  // PR can never satisfy that invariant, by design (ci-recovery's safety semantics: only ever
+  // auto-push a repair commit to a PR that has never yet been shown to a reviewer). Routing such
+  // a job through `deps.ciRecovery.run()` anyway does not mean "CI recovery is inapplicable, try
+  // something else" -- it means a guaranteed, non-retryable `failed("request",
+  // invariant_violation)`, which used to surface as a misleading `ci_recovery_failed`
+  // requires_manual, silently discarding whatever retry budget this job's *actual* current stage
+  // still had (e.g. `review_report_pending_retry`'s own report-contract retry). `resumeReview()`
+  // itself re-reads the live PR/CI state independently, and `markChangeRequestReady()` is a no-op
+  // against an already-ready PR, so skipping straight to it here loses nothing this PR's own
+  // history still needed. Deliberately never relaxes ci-recovery's own draft invariant -- that
+  // stays exactly as strict as before this ticket; this is purely a routing decision made from
+  // the live readback already in hand.
+  if (!currentChangeRequest.value.draft) {
+    return resumeReview(record, deps, {
+      job,
+      issue: issue.value,
+      changeRequestId,
+      requirementSnapshot: requirementSnapshot.value,
+      worktree,
+      changeRequest: currentChangeRequest.value,
+      baseRevision,
+      idempotencyKeyPrefix,
+    });
+  }
+
   const ciDeadline = computeProviderDeadline(deps.clock);
   if (ciDeadline === undefined) {
     return requiresManual(
@@ -1383,6 +1411,21 @@ async function resumeReview(
     );
   }
   if (begin.state === "not_ready") {
+    // C031: `begin.reason` is `"ci_pending" | "ci_failed"` (BeginReviewOutcome, merge-gate-model.ts)
+    // -- a draft PR's CI failure still retreats to `ci_waiting` (a fresh `agent-team run` resume
+    // will drive it back through `CiRecoveryPipeline`, exactly as before this ticket). A *non-draft*
+    // PR's `ci_failed`, though, has no automatic repair path left at all -- ci-recovery's own draft
+    // invariant (ci-recovery.ts's `validRequest()`) means it can never run against this PR again --
+    // so retreating to `ci_waiting` here would just have the next resume observe the identical
+    // `ci_failed` forever, an unbounded retry loop rather than a bounded one. Fail closed instead.
+    if (begin.reason === "ci_failed" && !begin.changeRequest.draft) {
+      return requiresManual(
+        record,
+        deps,
+        "ci_failed_after_ready",
+        requiresManualCause("review", "ci_failed_after_ready"),
+      );
+    }
     return transitionOrReport(deps, record, { stage: { kind: "ci_waiting" } }, () => ({
       jobId: record.jobId,
       outcome: "still_ci_waiting",
