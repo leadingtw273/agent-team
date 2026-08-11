@@ -20,7 +20,12 @@ import { fileURLToPath } from "node:url";
 
 import type { CliCommandOutcome } from "../program.js";
 
-export const systemdUnitNames = Object.freeze({
+export interface SystemdUnitNames {
+  readonly service: string;
+  readonly timer: string;
+}
+
+export const systemdUnitNames: Readonly<SystemdUnitNames> = Object.freeze({
   service: "agent-team-reconcile.service",
   timer: "agent-team-reconcile.timer",
 });
@@ -88,6 +93,7 @@ export interface SystemdManagerOptions {
   readonly runtimeCommand: RuntimeCommand;
   readonly commandRunner?: CommandRunner;
   readonly templateDirectory?: string;
+  readonly unitNames?: SystemdUnitNames;
 }
 
 type UnitObservationKind = "missing" | "canonical" | "untrusted";
@@ -175,8 +181,54 @@ const defaultTerminateGraceMs = 500;
 const maximumDeadlineMs = 60_000;
 const maximumOutputLimit = 1_048_576;
 const maximumTerminateGraceMs = 5_000;
+const maximumSystemdUnitNameLength = 255;
 const supportsDetachedProcessGroups = process.platform !== "win32";
 const runtimeEnvironmentExecutable = "/usr/bin/env";
+const systemdUnitNamePattern = /^[A-Za-z0-9:_.-]+$/u;
+
+function assertSafeSystemdUnitName(
+  kind: "service" | "timer",
+  value: unknown,
+): asserts value is string {
+  if (typeof value !== "string") {
+    throw new Error(`Systemd ${kind} unit name must be a string.`);
+  }
+  const suffix = kind === "service" ? ".service" : ".timer";
+  if (!value.endsWith(suffix)) {
+    throw new Error(`Systemd ${kind} unit name must end with ${suffix}.`);
+  }
+  const basenameBeforeSuffix = value.slice(0, -suffix.length);
+  if (
+    value.length === 0 ||
+    value.length > maximumSystemdUnitNameLength ||
+    basenameBeforeSuffix.length === 0 ||
+    basename(value) !== value ||
+    value.startsWith(".") ||
+    value.includes("..") ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(value) ||
+    /\s/u.test(value) ||
+    value.includes("{{") ||
+    value.includes("}}") ||
+    !systemdUnitNamePattern.test(value)
+  ) {
+    throw new Error(`Systemd ${kind} unit name is unsafe.`);
+  }
+}
+
+function resolveSystemdUnitNames(input: unknown): Readonly<SystemdUnitNames> {
+  if (input === undefined) return systemdUnitNames;
+  if (typeof input !== "object" || input === null || Array.isArray(input)) {
+    throw new Error("Systemd unit names must be an object.");
+  }
+  const names = input as Readonly<Record<string, unknown>>;
+  const service = names["service"];
+  const timer = names["timer"];
+  assertSafeSystemdUnitName("service", service);
+  assertSafeSystemdUnitName("timer", timer);
+  return Object.freeze({ service, timer });
+}
 
 function isErrorWithCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
@@ -893,8 +945,10 @@ export class SystemdManager {
   readonly #inheritedEnvironment: NodeJS.ProcessEnv;
   readonly #commandRunner: CommandRunner;
   readonly #templateDirectory: string;
+  readonly #unitNames: Readonly<SystemdUnitNames>;
 
   constructor(options: SystemdManagerOptions) {
+    this.#unitNames = resolveSystemdUnitNames(options.unitNames);
     this.#inheritedEnvironment = Object.freeze({ ...options.runtimeCommand.environment });
     this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
     this.#runtimeCommand = buildRuntimeWrapperCommand(
@@ -915,11 +969,13 @@ export class SystemdManager {
     const service = renderTemplate(serviceTemplate, {
       "{{EXEC_START}}": renderExecStart(this.#runtimeCommand),
     });
-    const timer = renderTemplate(timerTemplate, {});
+    const timer = renderTemplate(timerTemplate, {
+      "{{SERVICE_UNIT}}": this.#unitNames.service,
+    });
     return Object.freeze({
       unitDirectory,
-      servicePath: join(unitDirectory, systemdUnitNames.service),
-      timerPath: join(unitDirectory, systemdUnitNames.timer),
+      servicePath: join(unitDirectory, this.#unitNames.service),
+      timerPath: join(unitDirectory, this.#unitNames.timer),
       service,
       timer,
       runtimeCommand: Object.freeze([
@@ -1022,8 +1078,8 @@ export class SystemdManager {
 
   async #verify(preview: RenderedSystemdUnits): Promise<CommandRunResult> {
     const validationRoot = await mkdtemp(join(tmpdir(), "agent-team-systemd-verify-"));
-    const servicePath = join(validationRoot, systemdUnitNames.service);
-    const timerPath = join(validationRoot, systemdUnitNames.timer);
+    const servicePath = join(validationRoot, this.#unitNames.service);
+    const timerPath = join(validationRoot, this.#unitNames.timer);
     try {
       await Promise.all([
         writeFile(servicePath, preview.service, { encoding: "utf8", mode: 0o644 }),
@@ -1048,9 +1104,9 @@ export class SystemdManager {
 
   async #queryTimer(): Promise<TimerQueryResult> {
     const [enabledResult, activeResult, failedResult] = await Promise.all([
-      this.#systemctl(["is-enabled", systemdUnitNames.timer]),
-      this.#systemctl(["is-active", systemdUnitNames.timer]),
-      this.#systemctl(["is-failed", systemdUnitNames.timer]),
+      this.#systemctl(["is-enabled", this.#unitNames.timer]),
+      this.#systemctl(["is-active", this.#unitNames.timer]),
+      this.#systemctl(["is-failed", this.#unitNames.timer]),
     ]);
     return {
       enabledResult,
@@ -1080,7 +1136,7 @@ export class SystemdManager {
     requiresDisable: boolean,
   ): Promise<RollbackResult> {
     if (requiresDisable) {
-      const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+      const disable = await this.#systemctl(["disable", "--now", this.#unitNames.timer]);
       if (!successful(disable)) return { rolledBack: false, reason: "disable_failed" };
     }
     if (created.length === 0) return { rolledBack: true };
@@ -1189,7 +1245,7 @@ export class SystemdManager {
           return outcome("blocked", {
             operation: "install",
             state: "unit_write_conflict",
-            unit: systemdUnitNames.service,
+            unit: this.#unitNames.service,
           });
         }
         created.push(service);
@@ -1203,7 +1259,7 @@ export class SystemdManager {
           return outcome("blocked", {
             operation: "install",
             state: rollback.rolledBack ? "unit_write_conflict" : "rollback_failed",
-            unit: systemdUnitNames.timer,
+            unit: this.#unitNames.timer,
             ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
           });
         }
@@ -1238,10 +1294,10 @@ export class SystemdManager {
         });
       }
       enableAttempted = true;
-      const enable = await this.#systemctl(["enable", "--now", systemdUnitNames.timer]);
+      const enable = await this.#systemctl(["enable", "--now", this.#unitNames.timer]);
       const afterEnable = await this.#observePair(preview, directory);
       if (!this.#sameCanonicalPair(afterEnable, expectedPair)) {
-        const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+        const disable = await this.#systemctl(["disable", "--now", this.#unitNames.timer]);
         const rollbackSucceeded = successful(disable);
         return outcome("failed", {
           operation: "install",
@@ -1271,7 +1327,7 @@ export class SystemdManager {
         state:
           installationState === "not_installed" ? "installed" : "enabled_existing_installation",
         unitDirectory: preview.unitDirectory,
-        timer: systemdUnitNames.timer,
+        timer: this.#unitNames.timer,
       });
     } catch {
       const rollback = await this.#rollbackInstall(created, directory, enableAttempted);
@@ -1314,7 +1370,7 @@ export class SystemdManager {
       });
     }
     const original = Object.freeze({ service: observed.service.unit, timer: observed.timer.unit });
-    const disable = await this.#systemctl(["disable", "--now", systemdUnitNames.timer]);
+    const disable = await this.#systemctl(["disable", "--now", this.#unitNames.timer]);
     if (!successful(disable)) {
       return outcome("failed", {
         operation: "uninstall",

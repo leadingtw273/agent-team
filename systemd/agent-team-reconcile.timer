@@ -5,7 +5,7 @@ Description=Run Agent Team reconcile every five minutes
 [Timer]
 OnBootSec=5min
 OnUnitInactiveSec=5min
-Unit=agent-team-reconcile.service
+Unit={{SERVICE_UNIT}}
 
 [Install]
 WantedBy=timers.target

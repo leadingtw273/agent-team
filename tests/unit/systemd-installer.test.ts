@@ -25,9 +25,14 @@ import {
   type CommandRunResult,
   type CommandRunner,
   type RenderedSystemdUnits,
+  type SystemdUnitNames,
 } from "../../src/cli/systemd/index.js";
 
 const roots: string[] = [];
+const canaryUnitNames = Object.freeze({
+  service: "agent-team-reconcile-canary.service",
+  timer: "agent-team-reconcile-canary.timer",
+} satisfies SystemdUnitNames);
 
 interface Fixture {
   readonly root: string;
@@ -72,6 +77,19 @@ function isRuntimePreflight(request: CommandRunRequest): boolean {
   );
 }
 
+function hasCommandCall(
+  calls: readonly CommandRunRequest[],
+  executable: string,
+  arguments_: readonly string[],
+): boolean {
+  return calls.some(
+    (call) =>
+      call.executable === executable &&
+      call.arguments.length === arguments_.length &&
+      call.arguments.every((value, index) => value === arguments_[index]),
+  );
+}
+
 function payload(message: string | undefined): Readonly<Record<string, unknown>> {
   expect(message).toBeDefined();
   return JSON.parse(message ?? "") as Readonly<Record<string, unknown>>;
@@ -80,6 +98,7 @@ function payload(message: string | undefined): Readonly<Record<string, unknown>>
 async function setup(
   responder: Responder = () => exited(),
   overrides: EnvironmentOverrides = () => ({}),
+  unitNames?: SystemdUnitNames,
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-unit-"));
   roots.push(root);
@@ -121,6 +140,7 @@ async function setup(
         environment,
       },
       commandRunner,
+      ...(unitNames === undefined ? {} : { unitNames }),
     }),
     calls,
   };
@@ -168,6 +188,214 @@ describe("systemd installer security boundary", () => {
       [...runtimeEnvironmentNames].sort(),
     );
     await expect(readFile(preview.servicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps injected unit names isolated across render, query, enable, and uninstall", async () => {
+    const fixture = await setup(
+      (request) => {
+        if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+        if (request.arguments[1] === "is-active") return exited(0, "active\n");
+        if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+        return exited();
+      },
+      () => ({}),
+      canaryUnitNames,
+    );
+    const preview = await fixture.manager.preview();
+    const canonicalServicePath = join(fixture.unitDirectory, systemdUnitNames.service);
+    const canonicalTimerPath = join(fixture.unitDirectory, systemdUnitNames.timer);
+
+    expect(preview.servicePath).toBe(join(fixture.unitDirectory, canaryUnitNames.service));
+    expect(preview.timerPath).toBe(join(fixture.unitDirectory, canaryUnitNames.timer));
+    expect(preview.timer).toContain(`Unit=${canaryUnitNames.service}`);
+    expect(preview.timer).not.toContain(`Unit=${systemdUnitNames.service}`);
+
+    const installed = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(installed.state).toBe("success");
+    expect(payload(installed.message)).toMatchObject({
+      state: "installed",
+      timer: canaryUnitNames.timer,
+    });
+    expect(
+      fixture.calls.some(
+        (call) =>
+          call.executable === "systemd-analyze" &&
+          call.arguments[0] === "verify" &&
+          call.arguments[1]?.includes(canaryUnitNames.service) === true &&
+          call.arguments[2]?.includes(canaryUnitNames.timer) === true,
+      ),
+    ).toBe(true);
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "enable",
+        "--now",
+        canaryUnitNames.timer,
+      ]),
+    ).toBe(true);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.service);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.timer);
+    await expect(readFile(canonicalServicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(canonicalTimerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+    fixture.calls.splice(0);
+    const status = await fixture.manager.handle({ action: "status" });
+
+    expect(status.state).toBe("success");
+    expect(payload(status.message)).toMatchObject({
+      installation: "installed",
+      timer: { state: "queried", enabled: "enabled", activity: "active" },
+    });
+    const timerQueries = fixture.calls.filter(
+      (call) =>
+        call.executable === "systemctl" &&
+        ["is-enabled", "is-active", "is-failed"].includes(call.arguments[1] ?? ""),
+    );
+    expect(timerQueries).toHaveLength(3);
+    expect(timerQueries.every((call) => call.arguments.at(-1) === canaryUnitNames.timer)).toBe(
+      true,
+    );
+
+    fixture.calls.splice(0);
+    const uninstalled = await fixture.manager.handle({ action: "uninstall", dryRun: false });
+
+    expect(uninstalled.state).toBe("success");
+    expect(payload(uninstalled.message)).toMatchObject({ state: "uninstalled" });
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "disable",
+        "--now",
+        canaryUnitNames.timer,
+      ]),
+    ).toBe(true);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.service);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.timer);
+    await expect(readFile(preview.servicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(preview.timerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses the injected timer name during failed-enable rollback", async () => {
+    const fixture = await setup(
+      (request) =>
+        request.executable === "systemctl" && request.arguments[1] === "enable"
+          ? exited(1)
+          : exited(),
+      () => ({}),
+      canaryUnitNames,
+    );
+    const preview = await fixture.manager.preview();
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("failed");
+    expect(payload(result.message)).toMatchObject({ state: "timer_enable_failed" });
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "enable",
+        "--now",
+        canaryUnitNames.timer,
+      ]),
+    ).toBe(true);
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "disable",
+        "--now",
+        canaryUnitNames.timer,
+      ]),
+    ).toBe(true);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.service);
+    expect(fixture.calls.flatMap((call) => call.arguments)).not.toContain(systemdUnitNames.timer);
+    await expect(readFile(preview.servicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(preview.timerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    {
+      service: ".service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: canaryUnitNames.service,
+      timer: ".timer",
+    },
+    {
+      service: ".hidden.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: canaryUnitNames.service,
+      timer: "foo..bar.timer",
+    },
+    {
+      service: "../agent-team-reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: "agent-team\\reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: "agent team-reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: "agent{{team}}-reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: "agent-team\u0000reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: "agent-team@reconcile-canary.service",
+      timer: canaryUnitNames.timer,
+    },
+    {
+      service: canaryUnitNames.service,
+      timer: "agent-team-reconcile-canary.service",
+    },
+    {
+      service: `${"a".repeat(248)}.service`,
+      timer: canaryUnitNames.timer,
+    },
+  ])("rejects unsafe injected unit names before writes or commands", async (unitNames) => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-invalid-name-"));
+    roots.push(root);
+    const environment: NodeJS.ProcessEnv = {
+      PATH: "/test/bin",
+      HOME: join(root, "home"),
+      XDG_CONFIG_HOME: join(root, "xdg-config"),
+    };
+    const calls: CommandRunRequest[] = [];
+    const commandRunner: CommandRunner = {
+      run: (request) => {
+        calls.push(request);
+        return Promise.resolve(exited());
+      },
+    };
+
+    expect(
+      () =>
+        new SystemdManager({
+          runtimeCommand: {
+            executable: "/tmp/fake-node",
+            arguments: ["/tmp/fake-agent-team", "reconcile", "--all"],
+            environment,
+          },
+          commandRunner,
+          unitNames,
+        }),
+    ).toThrow(/Systemd/);
+    expect(calls).toEqual([]);
+    await expect(
+      lstat(join(environment["XDG_CONFIG_HOME"] ?? "", "systemd", "user")),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("preflights the exact compiled command, verifies, writes canonical bytes, reloads, and enables", async () => {

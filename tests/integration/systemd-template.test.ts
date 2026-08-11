@@ -13,6 +13,10 @@ import {
 
 const roots: string[] = [];
 const linuxIt = process.platform === "linux" ? it : it.skip;
+const canaryUnitNames = Object.freeze({
+  service: "agent-team-reconcile-canary.service",
+  timer: "agent-team-reconcile-canary.timer",
+});
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -52,6 +56,45 @@ describe("rendered systemd templates", () => {
       expect(preview.service).toContain("agent-$$home");
       expect(preview.service).not.toContain("\nEnvironment=");
       expect(preview.service).not.toContain("must-not-render");
+      const verification = spawnSync("systemd-analyze", ["verify", servicePath, timerPath], {
+        encoding: "utf8",
+      });
+      expect(verification.error).toBeUndefined();
+      expect(verification.status).toBe(0);
+    },
+  );
+
+  linuxIt(
+    "renders an injected timer target and unit paths without canonical output names",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-canary-"));
+      roots.push(root);
+      const manager = new SystemdManager({
+        runtimeCommand: {
+          executable: process.execPath,
+          arguments: [resolve("dist/cli/index.js"), "reconcile", "--all"],
+          environment: {
+            PATH: process.env["PATH"] ?? "/usr/bin:/bin",
+            HOME: join(root, "home"),
+            XDG_CONFIG_HOME: join(root, "xdg-config"),
+          },
+        },
+        unitNames: canaryUnitNames,
+      });
+      const preview = await manager.preview();
+      const renderedDirectory = join(root, "rendered");
+      const servicePath = join(renderedDirectory, canaryUnitNames.service);
+      const timerPath = join(renderedDirectory, canaryUnitNames.timer);
+      await mkdir(renderedDirectory, { recursive: true });
+      await Promise.all([
+        writeFile(servicePath, preview.service, { encoding: "utf8", mode: 0o644 }),
+        writeFile(timerPath, preview.timer, { encoding: "utf8", mode: 0o644 }),
+      ]);
+
+      expect(preview.servicePath).toContain(canaryUnitNames.service);
+      expect(preview.timerPath).toContain(canaryUnitNames.timer);
+      expect(preview.timer).toContain(`Unit=${canaryUnitNames.service}`);
+      expect(preview.timer).not.toContain(`Unit=${systemdUnitNames.service}`);
       const verification = spawnSync("systemd-analyze", ["verify", servicePath, timerPath], {
         encoding: "utf8",
       });
