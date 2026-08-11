@@ -316,6 +316,9 @@ function fakeBuildComposition(stateRoot: string) {
           config: { executable: "claude", models: ["opus"], account: "default" },
           process: new ReadyProcessPort(),
         },
+        quotaAdmission: {
+          resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
+        },
       },
     });
   return { buildComposition, leases, jobs, realLeases, realJobs };

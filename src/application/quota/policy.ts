@@ -3,6 +3,7 @@ import type {
   QuotaPort,
   QuotaSample,
   QuotaSnapshot,
+  ReadOptions,
   UsageQuotaSample,
 } from "../ports/index.js";
 import type { Instant } from "../../domain/foundation/index.js";
@@ -37,12 +38,26 @@ function validPolicy(policy: QuotaPolicy): boolean {
     policy.terminalRemainingPercent >= 0 &&
     policy.terminalRemainingPercent <= 100 &&
     Number.isSafeInteger(policy.maxSampleAgeMs) &&
-    policy.maxSampleAgeMs > 0
+    policy.maxSampleAgeMs > 0 &&
+    Object.values(policy.expectedCliVersions).every(
+      (version) => typeof version === "string" && version.trim().length > 0,
+    )
+  );
+}
+
+function validIdentity(identity: PlatformIdentity): boolean {
+  return (
+    typeof identity.provider === "string" &&
+    identity.provider.trim().length > 0 &&
+    typeof identity.accountFingerprint === "string" &&
+    identity.accountFingerprint.trim().length > 0
   );
 }
 
 function identityMatches(sample: QuotaSample, identity: PlatformIdentity): boolean {
   return (
+    validIdentity(sample) &&
+    validIdentity(identity) &&
     sample.provider === identity.provider &&
     sample.accountFingerprint === identity.accountFingerprint
   );
@@ -51,6 +66,10 @@ function identityMatches(sample: QuotaSample, identity: PlatformIdentity): boole
 function sampleFresh(sample: QuotaSample, now: Instant, policy: QuotaPolicy): boolean {
   const age = Date.parse(now) - Date.parse(sample.observedAt);
   return (
+    typeof sample.cliVersion === "string" &&
+    sample.cliVersion.trim().length > 0 &&
+    typeof sample.source === "string" &&
+    sample.source.trim().length > 0 &&
     policy.expectedCliVersions[sample.provider] === sample.cliVersion &&
     Number.isFinite(age) &&
     age >= 0 &&
@@ -77,6 +96,17 @@ function usageSample(
     : undefined;
 }
 
+function validRemainingPercent(
+  sample: UsageQuotaSample,
+): sample is Extract<UsageQuotaSample, { state: "confirmed" }> {
+  return (
+    sample.state === "confirmed" &&
+    Number.isFinite(sample.remainingPercent) &&
+    sample.remainingPercent >= 0 &&
+    sample.remainingPercent <= 100
+  );
+}
+
 export function evaluateQuotaForNewJob(
   snapshot: QuotaSnapshot,
   identity: PlatformIdentity,
@@ -85,6 +115,8 @@ export function evaluateQuotaForNewJob(
 ): NewJobQuotaDecision {
   if (
     !validPolicy(policy) ||
+    !validIdentity(identity) ||
+    !validIdentity(snapshot) ||
     snapshot.provider !== identity.provider ||
     snapshot.accountFingerprint !== identity.accountFingerprint
   ) {
@@ -95,6 +127,7 @@ export function evaluateQuotaForNewJob(
     const sample = availability.length === 1 ? availability[0] : undefined;
     if (
       sample?.state !== "confirmed" ||
+      typeof sample.available !== "boolean" ||
       !identityMatches(sample, identity) ||
       !sampleFresh(sample, now, policy)
     ) {
@@ -110,8 +143,8 @@ export function evaluateQuotaForNewJob(
   if (
     weekly === undefined ||
     fiveHour === undefined ||
-    weekly.state !== "confirmed" ||
-    fiveHour.state !== "confirmed"
+    !validRemainingPercent(weekly) ||
+    !validRemainingPercent(fiveHour)
   ) {
     return Object.freeze({ state: "quota_unknown", reason: "usage_unknown_or_stale" });
   }
@@ -131,7 +164,13 @@ export function evaluateRunningQuota(
   now: Instant,
   policy: QuotaPolicy,
 ): RunningQuotaDecision {
-  if (!validPolicy(policy)) {
+  if (
+    !validPolicy(policy) ||
+    !validIdentity(identity) ||
+    !validIdentity(snapshot) ||
+    snapshot.provider !== identity.provider ||
+    snapshot.accountFingerprint !== identity.accountFingerprint
+  ) {
     return Object.freeze({ action: "checkpoint", reason: "quota_policy_invalid" });
   }
   if (identity.provider === "gemini") {
@@ -145,8 +184,8 @@ export function evaluateRunningQuota(
   if (
     weekly === undefined ||
     fiveHour === undefined ||
-    weekly.state !== "confirmed" ||
-    fiveHour.state !== "confirmed"
+    !validRemainingPercent(weekly) ||
+    !validRemainingPercent(fiveHour)
   ) {
     return Object.freeze({ action: "checkpoint", reason: "quota_signal_unknown_or_stale" });
   }
@@ -164,13 +203,14 @@ export async function resolveQuotaForNewJob(
   identity: PlatformIdentity,
   now: Instant,
   policy: QuotaPolicy,
+  options: ReadOptions = {},
 ): Promise<Readonly<{ decision: NewJobQuotaDecision; refreshed: boolean }>> {
-  const cached = await port.readCached(identity);
+  const cached = await port.readCached(identity, options);
   if (cached.ok) {
     const decision = evaluateQuotaForNewJob(cached.value, identity, now, policy);
     if (decision.state !== "quota_unknown") return Object.freeze({ decision, refreshed: false });
   }
-  const refreshed = await port.refresh(identity.provider);
+  const refreshed = await port.refresh(identity.provider, options);
   const decision = refreshed.ok
     ? evaluateQuotaForNewJob(refreshed.value, identity, now, policy)
     : Object.freeze({ state: "quota_unknown" as const, reason: "refresh_failed" });

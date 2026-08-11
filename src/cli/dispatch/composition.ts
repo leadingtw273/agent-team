@@ -6,30 +6,28 @@
  * failure, before any subsequent step -- including any real Linear network call -- ever runs),
  * host paths rooted at `${AGENT_TEAM_HOME}`, and a single `{state:"ready"|"blocked"}` result.
  *
- * Scope (C015a is the "接單" half only): this wires discovery -> eligibility -> lease -> job
- * creation. It deliberately does NOT stand up model provider factories, quota tracking, or
- * pipeline execution -- `routeObservations` is therefore always the empty set here.
+ * Scope: this wires discovery -> eligibility -> quota admission -> provider liveness -> issue
+ * admission -> lease -> job creation. T03A adds a fail-closed quota boundary before every durable
+ * claim. The default production composition has no trusted collector yet, so model work remains
+ * waiting with `quota_unknown`; tests and controlled canaries may inject a policy-backed port.
  *
- * A real (non-dry-run) invocation against typical Linear-discovered work will currently always
- * end in `kind:"waiting"`, for **two independent reasons** -- do not assume fixing one fixes the
- * other:
+ * A real invocation against typical Linear-discovered work can still end in `kind:"waiting"` for
+ * independent reasons -- do not assume fixing one fixes the others:
  *
  * 1. (Earlier, and blocking on its own) The Linear discovery bridge's `toDomainIssue`
  *    (src/adapters/dispatch/linear-discovery.ts) does not populate `goal`/`acceptanceCriteria`/
  *    `inScope`/`outOfScope`/`estimatedMinutes` on the `Issue` it produces -- `LinearIssueSnapshot`
  *    has no such fields at all. `evaluateEligibility` runs *before* routing ever sees a
  *    candidate, so every real candidate fails eligibility (`reason:"no_eligible_candidates"`) and
- *    is filtered out long before `routeObservations` is ever consulted.
- * 2. (Only reachable once #1 is fixed) With zero `routeObservations`, model-work candidates that
- *    *do* clear eligibility can still never reach `kind:"selected"` (`reason:
- *    "no_dispatchable_candidate"`) -- an honest reflection of "we have not wired up model
- *    availability yet," not a bug in this composition.
+ *    is filtered out before quota or model routing is consulted.
+ * 2. A candidate that clears eligibility still requires a trusted, fresh quota observation. Until
+ *    a real collector is wired, the production default intentionally reports `quota_unknown` and
+ *    performs no provider process probe or durable write.
+ * 3. Quota-ready candidates also require a live execution-provider route. Claude has a liveness
+ *    probe; other providers remain unavailable until their runner wiring exists.
  *
- * Wiring a genuine `routeObservations` source is **not sufficient** to make a real `run` produce
- * a dispatched job -- #1 has to be closed first, and closing it is not this composition's job
- * (see linear-discovery.ts's own comment on `toDomainIssue` for why). C015b owns #2;
- * #1 is presently unowned and should be raised as its own ticket rather than assumed folded into
- * C015b's scope.
+ * Wiring a collector alone is therefore **not sufficient** to make a real `run` dispatch: the
+ * Linear projection and provider runner/liveness boundaries must also be complete.
  *
  * `active` is likewise always the empty set here -- this composition has no source of "jobs
  * currently in flight" (that is `pipeline` state, and C015a stands up no pipeline). This is safe
@@ -73,6 +71,7 @@ import {
 } from "../../application/dispatch/index.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../application/leases/index.js";
 import type { ProcessPort } from "../../application/ports/index.js";
+import type { NewJobQuotaAdmissionPort } from "../../application/quota/index.js";
 import {
   ProjectRegistry,
   TrustedProjectConfigLoader,
@@ -82,7 +81,11 @@ import {
   type TrustedProjectGitPort,
   type TrustedProjectRejectionReason,
 } from "../../application/projects/index.js";
-import type { ModelRoutingConfig } from "../../application/routing/index.js";
+import {
+  selectModelRoute,
+  type ModelRouteDecision,
+  type ModelRoutingConfig,
+} from "../../application/routing/index.js";
 import type { JobRepository } from "../../application/dispatch/index.js";
 import type { DomainError } from "../../domain/foundation/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
@@ -93,6 +96,11 @@ import {
 } from "../registration/draft-store.js";
 import { readLinearApiKey } from "../registration/secrets.js";
 import { observeClaudeRouteCandidates } from "./claude-observation.js";
+import {
+  applyProviderLiveness,
+  createFailClosedNewJobQuotaAdmission,
+  observeQuotaRouteCandidates,
+} from "./quota-admission.js";
 import {
   defaultDispatchProviderConfigPath,
   loadHostDispatchProviderConfig,
@@ -155,6 +163,10 @@ export interface DispatchCompositionReady {
     /** Injectable for tests; production defaults to a real `ChildProcessRunner` (R001). */
     readonly process: ProcessPort;
   };
+  /** T03A: required new-Job quota boundary. Production is fail-closed until a trusted collector
+   * supplies Provider-owned identity and both required windows. Tests may inject a controlled
+   * policy-backed port; config.account is never used as identity. */
+  readonly quotaAdmission: NewJobQuotaAdmissionPort;
   /** E102-2: the same host provider config file's optional `gemini` key, read alongside `claude`
    * above -- `undefined`/absent when this host has no real visual-review provider configured.
    * Optional here (not merely a possibly-`undefined`-valued required field) so every pre-existing
@@ -181,6 +193,8 @@ export interface BuildDispatchCompositionOptions {
   readonly activationPort?: TrustedProjectActivationPort;
   /** Injectable for tests; production defaults to a real `ChildProcessRunner`. */
   readonly claudeProcessPort?: ProcessPort;
+  /** Test/canary seam only. Production deliberately defaults to collector_unavailable. */
+  readonly quotaAdmissionPort?: NewJobQuotaAdmissionPort;
 }
 
 export interface DispatchOncePorts {
@@ -197,10 +211,21 @@ export interface DispatchOncePorts {
  * candidate was considered -- a *different*, still-unresolved job already owns it. Visible,
  * distinct from `LinearDiscoverySkippedIssue` (which is discovery's own, engine-independent skip
  * taxonomy) -- this reason only exists past discovery, at the composition root. */
-export type DispatchOnceAdmissionSkippedIssue = Readonly<{
-  issueId: string;
-  reason: "issue_claim_active";
-}>;
+export type DispatchOnceAdmissionSkippedIssue =
+  | Readonly<{ issueId: string; reason: "issue_claim_active" }>
+  | Readonly<{
+      issueId: string;
+      reason: "quota_unknown" | "quota_blocked" | "provider_route_unavailable";
+    }>;
+
+function routeAdmissionSkipReason(
+  decision: Extract<ModelRouteDecision, { kind: "waiting" }>,
+): Exclude<DispatchOnceAdmissionSkippedIssue["reason"], "issue_claim_active"> {
+  const states = new Set(decision.skipped.map((candidate) => candidate.state));
+  if (states.has("quota_unknown")) return "quota_unknown";
+  if (states.has("quota_blocked")) return "quota_blocked";
+  return "provider_route_unavailable";
+}
 
 /**
  * `dispatchOnce`'s result. Deliberately a discriminated union distinct from `DispatcherResult`
@@ -277,19 +302,45 @@ export async function dispatchOnce(
   if (!discovered.ok) {
     return Object.freeze({ outcome: "discovery_failed" as const, error: discovered.error });
   }
-  // C015b item 2: a real (not hard-coded-empty) observation -- see claude-observation.ts's own
-  // header for exactly what "real" means here (a live `--version` probe, not a static echo) and
-  // what it deliberately does not attempt (quota tracking; no adapter for that exists yet).
-  const routeObservations = await observeClaudeRouteCandidates({
-    process: ready.claude.process,
-    config: ready.claude.config,
-    workingDirectory: ready.project.localRepositoryPath,
+  // T03A: quota resolves before provider liveness. Unknown quota therefore performs no CLI probe,
+  // creates no admission claim, and cannot reach lease/Job/provider pipeline creation.
+  const quotaObservations = await observeQuotaRouteCandidates({
+    routingConfig: ready.routingConfig,
+    candidates: discovered.value.candidates,
+    quota: ready.quotaAdmission,
   });
+  const claudeQuotaReady = quotaObservations.some(
+    (observation) => observation.provider === "claude" && observation.state === "ready",
+  );
+  const livenessObservations = claudeQuotaReady
+    ? await observeClaudeRouteCandidates({
+        process: ready.claude.process,
+        config: ready.claude.config,
+        workingDirectory: ready.project.localRepositoryPath,
+      })
+    : Object.freeze([]);
+  const routeObservations = applyProviderLiveness(quotaObservations, livenessObservations);
 
   const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
   const claimedRevisions = new Map<string, number>();
   const claimedCandidates: DispatcherCandidate[] = [];
   for (const candidate of discovered.value.candidates) {
+    if (candidate.workKind === "model") {
+      const route = selectModelRoute(
+        ready.routingConfig,
+        candidate.issue.agentRole,
+        routeObservations,
+      );
+      if (route.kind === "waiting") {
+        admissionSkipped.push(
+          Object.freeze({
+            issueId: candidate.issue.id,
+            reason: routeAdmissionSkipReason(route),
+          }),
+        );
+        continue;
+      }
+    }
     const claimed = await ports.admission.claim(ready.project.id, candidate.issue.id);
     if (!claimed.ok) {
       admissionSkipped.push(
@@ -301,15 +352,23 @@ export async function dispatchOnce(
     claimedCandidates.push(candidate);
   }
 
-  const dispatcher = new Dispatcher(ports);
-  const result = await dispatcher.dispatch({
-    holderId,
-    candidates: claimedCandidates,
-    registry: ready.registry,
-    active: [],
-    routingConfig: ready.routingConfig,
-    routeObservations,
-  });
+  const quotaPreventedAllClaims =
+    claimedCandidates.length === 0 &&
+    admissionSkipped.some((candidate) => candidate.reason !== "issue_claim_active");
+  const result: DispatcherResult = quotaPreventedAllClaims
+    ? Object.freeze({
+        kind: "waiting" as const,
+        reason: "no_dispatchable_candidate" as const,
+        skipped: Object.freeze([]),
+      })
+    : await new Dispatcher(ports).dispatch({
+        holderId,
+        candidates: claimedCandidates,
+        registry: ready.registry,
+        active: [],
+        routingConfig: ready.routingConfig,
+        routeObservations,
+      });
 
   const dispatchedIssueId = result.kind === "dispatched" ? result.job.issueId : undefined;
   for (const [issueId, revision] of claimedRevisions) {
@@ -419,6 +478,7 @@ export async function buildDispatchComposition(
         config: providerConfig.value.claude,
         process: options.claudeProcessPort ?? new ChildProcessRunner(),
       }),
+      quotaAdmission: options.quotaAdmissionPort ?? createFailClosedNewJobQuotaAdmission(),
       gemini: providerConfig.value.gemini,
     }),
   });

@@ -39,6 +39,7 @@ import type { ProjectRegistrySnapshot } from "../../src/application/projects/ind
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
 import type { ImplementerPipeline } from "../../src/application/pipelines/index.js";
+import type { NewJobQuotaAdmissionPort } from "../../src/application/quota/index.js";
 import type { ProcessPort } from "../../src/application/ports/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
@@ -264,6 +265,7 @@ function buildHandlers(
   resolveAuthoritativeBase?: Parameters<
     typeof createDispatchCliHandlers
   >[0]["resolveAuthoritativeBase"],
+  quotaAdmission?: NewJobQuotaAdmissionPort,
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -293,6 +295,9 @@ function buildHandlers(
         claude: {
           config: { executable: "claude", models: ["opus"], account: "default" },
           process: new ReadyProcessPort(),
+        },
+        quotaAdmission: quotaAdmission ?? {
+          resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
         },
       },
     });
@@ -365,6 +370,42 @@ function fakeResolveAuthoritativeBase(repositoryPath: string) {
 }
 
 describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
+  it("quota_unknown stops before pipeline construction and leaves no durable claim or job", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("must never build a pipeline without trusted quota")),
+    );
+    const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline, undefined, {
+      resolve: () =>
+        Promise.resolve({ state: "quota_unknown" as const, reason: "collector_unavailable" }),
+    });
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome.state).toBe("success");
+    const payload = JSON.parse(outcome.message ?? "{}") as {
+      state: string;
+      reason: string;
+      admissionSkipped: readonly { issueId: string; reason: string }[];
+    };
+    expect(payload).toMatchObject({
+      state: "waiting",
+      reason: "no_dispatchable_candidate",
+      admissionSkipped: [{ issueId, reason: "quota_unknown" }],
+    });
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+
+    const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
+    const persistedJobs = await jobs.readAll();
+    expect(persistedJobs).toEqual({ ok: true, value: [] });
+    const admissions = new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(stateRoot));
+    const persistedAdmission = await admissions.load(projectId, issueId);
+    expect(persistedAdmission).toEqual({ ok: true, value: undefined });
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    const persistedProgress = await progress.listForProject(projectId);
+    expect(persistedProgress).toEqual({ ok: true, value: [] });
+  });
+
   it("maps a ci_waiting pipeline outcome to a success payload with the change request URL", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();

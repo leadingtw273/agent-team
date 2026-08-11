@@ -287,5 +287,9 @@ describe("buildDispatchComposition", () => {
     expect(result.value.project.id).toBe(projectId);
     expect(result.value.trustedConfig).toEqual(config);
     expect(result.value.claude.config).toEqual(validProviderConfig.claude);
+    await expect(result.value.quotaAdmission.resolve("claude")).resolves.toEqual({
+      state: "quota_unknown",
+      reason: "collector_unavailable",
+    });
   });
 });
