@@ -404,13 +404,7 @@ describe("lifecycle authority boundaries", () => {
     expect(calls).toEqual([]);
   });
 
-  /** C015v decision 4's third required automated case: a canceled issue whose PR also happens to
-   * be merged must never be mis-transitioned to Done just because the policy step now accepts
-   * `not_applicable` as "fine, continue" -- the domain's own `transitionWorkStatus` (canceled is
-   * terminal, `src/domain/workflow/transition.ts:34`) is what actually blocks this, unchanged by
-   * this ticket; this test proves that guard still fires with the new, more permissive policy step
-   * in front of it. */
-  it("does not let an already-canceled terminal issue silently become completed", async () => {
+  it("records cancellation-after-merge without Done, close, or revert mutations", async () => {
     const calls: string[] = [];
     const fixture = ports({
       issue: issueSnapshot("canceled"),
@@ -418,12 +412,41 @@ describe("lifecycle authority boundaries", () => {
       calls,
     });
     const outcome = await new LifecyclePipeline(fixture).run(
-      request({ mergeAuthorizationHeadSha: headSha }),
+      request({
+        mergeAuthorizationHeadSha: headSha,
+        cancellationRaceAudit: {
+          observedAt: now,
+          mergeMutations: [
+            {
+              kind: "direct_squash",
+              idempotencyKey: "job:ENG-123:merge:direct-squash",
+              attemptedAt: now,
+              outcome: "merged_directly",
+            },
+          ],
+        },
+      }),
     );
 
-    expect(outcome).toMatchObject({ state: "failed", stage: "work_status" });
-    expect(calls[0]).toBe("pause_auto_merge");
+    expect(outcome).toEqual({ state: "blocked", reason: "cancellation_after_merge" });
+    expect(calls.slice(0, 3)).toEqual([
+      "prepare_cancellation:true",
+      "pause_auto_merge",
+      "release_lease",
+    ]);
     expect(calls.some((call) => call.startsWith("work_status:"))).toBe(false);
     expect(calls).not.toContain("close_change_request");
+    expect(comments(calls)[0]).toContain("cancellation-after-merge");
+    expect(comments(calls)[0]).toContain(`PR Head：${headSha}`);
+    expect(comments(calls)[0]).toContain(`Linear providerUpdatedAt：${now}`);
+    expect(comments(calls)[0]).toContain(
+      "Linear CAS revision：unavailable（Provider 未提供；不可用 updatedAt 冒充）",
+    );
+    expect(comments(calls)[0]).toContain(`Controller observedAt：${now}`);
+    expect(comments(calls)[0]).toContain(
+      `GitHub mutation attempt 1：direct_squash｜key=job:ENG-123:merge:direct-squash｜attemptedAt=${now}｜outcome=merged_directly`,
+    );
+    expect(comments(calls)[0]).not.toContain("Linear revision：revision-1");
+    expect(comments(calls)[0]).toContain("不自動 Revert");
   });
 });

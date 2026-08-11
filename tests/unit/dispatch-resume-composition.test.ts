@@ -26,7 +26,10 @@ import {
   runResumeCycle,
   type ResumeCycleDependencies,
 } from "../../src/cli/dispatch/resume-composition.js";
-import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
+import {
+  FileJobProgressStore,
+  type JobProgressRecordMutation,
+} from "../../src/adapters/dispatch/job-progress-store.js";
 import type {
   IssueAdmissionPort,
   IssueAdmissionRecord,
@@ -77,6 +80,7 @@ import {
 } from "../../src/adapters/linear/model.js";
 import {
   agentRoleSchema,
+  issueSchema,
   projectSchema,
   reviewRequirementSchema,
   type Project,
@@ -96,6 +100,7 @@ import {
 } from "../../src/adapters/dispatch/linear-publication-store.js";
 import type { ProjectCommand } from "../../src/application/projects/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
+import type { WorkStatus } from "../../src/domain/workflow/index.js";
 import {
   emptyAttemptCounters,
   jobSchema,
@@ -476,6 +481,7 @@ async function harness(
       issueId: string,
       headSha: string,
     ) => Promise<Result<LinearPublicationReceiptRecord | undefined, DomainError>>;
+    workStatus: WorkStatus;
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -514,6 +520,23 @@ async function harness(
         calls.push("getChangeRequest");
         return Promise.resolve(ok(changeRequest(overrides.changeRequestState ?? {})));
       },
+    },
+    workManagement: {
+      getIssue: () =>
+        Promise.resolve(
+          ok({
+            issue: issueSchema.parse({
+              schemaVersion: 1,
+              id: issueId,
+              projectId,
+              externalId: externalIssueId,
+              title: "Ship the thing",
+            }),
+            workStatus: overrides.workStatus ?? "in_review",
+            updatedAt: now,
+            revision: now,
+          }),
+        ),
     },
     readModel: readModel({
       ...(overrides.reviewRequirement === undefined
@@ -661,6 +684,7 @@ async function harness(
               reuse: "unchanged",
               identity: {},
               changeRequest: changeRequest({ state: "merged" }),
+              mutations: [],
             } as never),
         );
       },
@@ -719,6 +743,7 @@ async function harness(
 async function seedProgressRecord(
   progress: FileJobProgressStore,
   stage: Readonly<{ kind: string }> & Readonly<Record<string, unknown>>,
+  overrides: Partial<JobProgressRecordMutation> = {},
 ) {
   await progress.compareAndSwap(jobId, null, {
     jobId,
@@ -731,13 +756,14 @@ async function seedProgressRecord(
     worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
     changeRequestId: "42",
     headSha,
+    ...overrides,
     // C015z decision (Q3): a legacy (no-`baseRevision`) record now fails closed unconditionally to
     // `requires_manual(legacy_base_revision_unrecoverable)` instead of being transparently
     // repaired -- every test in this file *except* the dedicated "C015y decision A" describe block
     // (which builds its own records directly via `compareAndSwap`, bypassing this helper, precisely
     // to exercise the legacy path on purpose) needs a real `baseRevision` here to reach whatever
     // behavior it actually means to test.
-    baseRevision,
+    baseRevision: overrides.baseRevision ?? baseRevision,
   });
 }
 
@@ -766,6 +792,72 @@ describe("runResumeCycle", () => {
     const reloaded = await progress.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+  });
+
+  it("C035: ci_waiting canceled in Linear stops before CI, review, or merge", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatus: "canceled",
+      lifecycleOutcome: {
+        state: "canceled",
+        changeRequest: "closed",
+        checkpoint: "preserved",
+        checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "work_item_canceled" }]),
+    );
+    expect(calls).toEqual(["getChangeRequest", "lifecycle.run"]);
+  });
+
+  it("C035: an armed merging job canceled in Linear preserves the actual merge mutation audit across resume", async () => {
+    const { deps, progress, calls, lifecycleRequests } = await harness({
+      workStatus: "canceled",
+      lifecycleOutcome: {
+        state: "canceled",
+        changeRequest: "closed",
+        checkpoint: "preserved",
+        checkpointId: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      },
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "merging", armedAt: now },
+      {
+        mergeMutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "resume-test:enable-auto-merge",
+            attemptedAt: now,
+            outcome: "confirmed_enabled",
+          },
+        ],
+      },
+    );
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "work_item_canceled" }]),
+    );
+    expect(calls).toEqual(["getChangeRequest", "lifecycle.run"]);
+    expect(lifecycleRequests[0]).toMatchObject({
+      cancellationRaceAudit: {
+        observedAt: now,
+        mergeMutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "resume-test:enable-auto-merge",
+            attemptedAt: now,
+            outcome: "confirmed_enabled",
+          },
+        ],
+      },
+    });
   });
 
   it("CI-red -> CiRecoveryPipeline checkpoints (attempt-count scenario) -> stage paused with checkpointId", async () => {
@@ -1712,7 +1804,15 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     const { deps, progress, lifecycleRequests, admission } = await harness({
       enableOutcome: {
         state: "directly_merged",
-        changeRequest: changeRequest({ state: "merged" }),
+        headSha,
+        mutations: [
+          {
+            kind: "direct_squash",
+            idempotencyKey: "resume-test:direct-squash",
+            attemptedAt: now,
+            outcome: "merged_directly",
+          },
+        ],
       },
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
@@ -1729,6 +1829,64 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
 
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("C035: persists direct-squash receipts before Lifecycle so a later failure cannot erase them", async () => {
+    const receipt = {
+      kind: "direct_squash" as const,
+      idempotencyKey: "resume-test:direct-squash",
+      attemptedAt: now,
+      outcome: "merged_directly" as const,
+    };
+    const { deps, progress } = await harness({
+      enableOutcome: { state: "directly_merged", headSha, mutations: [receipt] },
+      lifecycleOutcome: {
+        state: "failed",
+        stage: "comment",
+        error: domainError("external_failure"),
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.mergeMutations).toEqual([receipt]);
+  });
+
+  it("C035: persists failed fallback receipts before entering requires-manual", async () => {
+    const receipts = [
+      {
+        kind: "enable_auto_merge" as const,
+        idempotencyKey: "resume-test:enable-auto-merge",
+        attemptedAt: now,
+        outcome: "outcome_unknown" as const,
+      },
+      {
+        kind: "direct_squash" as const,
+        idempotencyKey: "resume-test:direct-squash",
+        attemptedAt: now,
+        outcome: "rejected" as const,
+      },
+    ] as const;
+    const { deps, progress } = await harness({
+      enableOutcome: {
+        state: "failed",
+        stage: "auto_merge",
+        error: domainError("external_failure"),
+        mutations: receipts,
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.mergeMutations).toEqual(receipts);
   });
 
   it("③ already_merged_external: converges through Lifecycle but explicitly WITHOUT controller authorization (provenance never reverse-inferred)", async () => {
@@ -1762,6 +1920,14 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
         reuse: "unchanged",
         identity: {} as never,
         changeRequest: changeRequest({ autoMergeEnabled: true }),
+        mutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "resume-test:enable-auto-merge",
+            attemptedAt: now,
+            outcome: "confirmed_enabled",
+          },
+        ],
       },
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
@@ -1791,6 +1957,14 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
         // C015y decision C: seeded to this same arm-time instant.
         lastProgressAt: now,
       });
+      expect(reloaded.value?.mergeMutations).toEqual([
+        {
+          kind: "enable_auto_merge",
+          idempotencyKey: "resume-test:enable-auto-merge",
+          attemptedAt: now,
+          outcome: "confirmed_enabled",
+        },
+      ]);
     }
   });
 
@@ -2157,6 +2331,35 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(lifecycleRequests).toHaveLength(2);
     const [first, second] = lifecycleRequests as { idempotencyKeyPrefix: string }[];
     expect(first?.idempotencyKeyPrefix).toBe(second?.idempotencyKeyPrefix);
+  });
+
+  it("C035: reconcile forwards durable receipts when a later run discovers merged+canceled", async () => {
+    const receipt = {
+      kind: "direct_squash" as const,
+      idempotencyKey: "resume-test:direct-squash",
+      attemptedAt: now,
+      outcome: "merged_directly" as const,
+    };
+    const { deps, progress, lifecycleRequests } = await harness({
+      workStatus: "canceled",
+      changeRequestState: { state: "merged" },
+      lifecycleOutcome: { state: "blocked", reason: "cancellation_after_merge" },
+    });
+    await seedProgressRecord(
+      progress,
+      {
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "lifecycle_not_completed", attempts: { count: 1 } },
+      },
+      { mergeMutations: [receipt] },
+    );
+
+    const result = await runResumeCycle(deps);
+
+    expect(result.ok).toBe(true);
+    expect(lifecycleRequests[0]).toMatchObject({
+      cancellationRaceAudit: { observedAt: now, mergeMutations: [receipt] },
+    });
   });
 
   it("⑦ decision 3: admission already released by a concurrent process is treated as success, not an error", async () => {
@@ -3566,6 +3769,7 @@ describe("E102-4b: pre-arm merge recheck (verifyExisting + linearPublicationStor
           reuse: "unchanged",
           identity: {} as never,
           changeRequest: changeRequest({ state: "merged" }) as never,
+          mutations: [],
         });
       },
     };
@@ -3786,6 +3990,23 @@ describe("E102-4b: pre-arm merge recheck (verifyExisting + linearPublicationStor
     const mergePorts: MergeGatePorts = {
       git: { getEffectiveTreeDiff: () => Promise.resolve(ok(diff)) },
       autoMergePause: { isPaused: () => Promise.resolve(ok({ paused: false })) },
+      workManagement: {
+        getIssue: () =>
+          Promise.resolve(
+            ok({
+              issue: issueSchema.parse({
+                schemaVersion: 1,
+                id: issueId,
+                projectId,
+                externalId: externalIssueId,
+                title: "Ship the thing",
+              }),
+              workStatus: "in_review" as const,
+              updatedAt: now,
+              revision: now,
+            }),
+          ),
+      },
       sourceControl: {
         getChangeRequest: () => Promise.resolve(ok(changeRequest())),
         getCommitChecks: () =>
@@ -3817,6 +4038,7 @@ describe("E102-4b: pre-arm merge recheck (verifyExisting + linearPublicationStor
             ok({
               outcome: "enabled" as const,
               changeRequest: changeRequest({ autoMergeEnabled: true }) as never,
+              mutations: [],
             }),
           );
         },

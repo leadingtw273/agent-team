@@ -1,8 +1,9 @@
-import type { DomainError } from "../../domain/foundation/index.js";
+import type { DomainError, Instant } from "../../domain/foundation/index.js";
 import type { Issue, Project } from "../../domain/project/index.js";
 import type { ChangeRequestSnapshot, SourceControlPort } from "../ports/source-control.js";
 import type { AsyncPortResult, MutationOptions } from "../ports/common.js";
 import type { WorkManagementPort } from "../ports/work-management.js";
+import type { MergeMutationReceipt } from "./merge-gate-model.js";
 
 /**
  * C015v decision 1: replaces the old bare `{durability: "confirmed" | "unknown"}` receipt, which
@@ -117,6 +118,13 @@ export interface LifecyclePipelineRequest {
   readonly changeRequestId: string;
   readonly mergeAuthorizationHeadSha?: string;
   readonly idempotencyKeyPrefix: string;
+  /** C035: narrow audit metadata for a merged+canceled race; absent on ordinary lifecycle runs. */
+  readonly cancellationRaceAudit?: Readonly<{
+    /** Local controller time sampled immediately before the authoritative lifecycle read. */
+    observedAt: Instant;
+    /** Actual GitHub mutation receipt, when this controller can prove one. */
+    mergeMutations?: readonly MergeMutationReceipt[];
+  }>;
   readonly signal?: AbortSignal;
 }
 
@@ -154,7 +162,7 @@ export type LifecyclePipelineOutcome =
     }>
   | Readonly<{
       state: "blocked";
-      reason: "change_request_closed";
+      reason: "change_request_closed" | "cancellation_after_merge";
     }>
   | Readonly<{
       state: "unchanged";

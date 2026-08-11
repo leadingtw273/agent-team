@@ -20,6 +20,7 @@ import type {
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
   CommitStatusesSnapshot,
+  WorkManagementIssueRef,
 } from "../../src/application/ports/index.js";
 import {
   domainError,
@@ -253,6 +254,8 @@ function mergePorts(
      * (never-paused) path, unaffected by the new gate check. */
     paused?: boolean;
     isPausedResult?: Awaited<ReturnType<MergeGatePorts["autoMergePause"]["isPaused"]>>;
+    workStatus?: "in_review" | "canceled" | "completed";
+    authorizationResult?: Awaited<ReturnType<MergeGatePorts["workManagement"]["getIssue"]>>;
   } = {},
 ): MergeGatePorts {
   const sha = options.sha ?? headSha;
@@ -264,6 +267,23 @@ function mergePorts(
         calls.push("auto_merge_pause_check");
         return Promise.resolve(options.isPausedResult ?? ok({ paused: options.paused ?? false }));
       }),
+    },
+    workManagement: {
+      getIssue: vi.fn((reference: WorkManagementIssueRef) =>
+        Promise.resolve(
+          options.authorizationResult ??
+            ok({
+              issue: {
+                ...issue,
+                projectId: reference.project.id,
+                externalId: reference.externalIssueId,
+              },
+              workStatus: options.workStatus ?? "in_review",
+              updatedAt: now,
+              revision: now,
+            }),
+        ),
+      ),
     },
     sourceControl: {
       getChangeRequest: vi.fn(() => Promise.resolve(ok(options.cr ?? changeRequest(sha)))),
@@ -290,6 +310,14 @@ function mergePorts(
             options.enableAutoMergeAttempt ?? {
               outcome: "enabled" as const,
               changeRequest: changeRequest(sha, { autoMergeEnabled: true }),
+              mutations: [
+                {
+                  kind: "enable_auto_merge" as const,
+                  idempotencyKey: "merge-gate-test:enable-auto-merge",
+                  attemptedAt: now,
+                  outcome: "confirmed_enabled" as const,
+                },
+              ],
             },
           ),
         );
@@ -511,13 +539,26 @@ describe("auto-merge gate", () => {
     const ports = mergePorts({ calls });
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
 
-    expect(outcome).toMatchObject({ state: "auto_merge_enabled", reuse: "unchanged", identity });
+    expect(outcome).toMatchObject({
+      state: "auto_merge_enabled",
+      reuse: "unchanged",
+      identity,
+      mutations: [
+        {
+          kind: "enable_auto_merge",
+          idempotencyKey: "merge-gate-test:enable-auto-merge",
+          attemptedAt: now,
+          outcome: "confirmed_enabled",
+        },
+      ],
+    });
     expect(calls).toEqual(["auto_merge_pause_check", "auto_merge"]);
     expect(ports.sourceControl.getChangeRequest).toHaveBeenCalledTimes(2);
     expect(ports.sourceControl.enableAutoMerge).toHaveBeenCalledWith(
       expect.anything(),
       headSha,
       expect.anything(),
+      issue.externalId,
     );
   });
 
@@ -743,6 +784,27 @@ describe("auto-merge gate", () => {
     expect(outcome).toMatchObject({ state: "not_ready", reason: "behind" });
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
   });
+
+  it("C035: canceled Linear work revokes authorization immediately before GitHub mutation", async () => {
+    const ports = mergePorts({ workStatus: "canceled" });
+
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toEqual({ state: "work_canceled", mutations: [] });
+    expect(ports.workManagement.getIssue).toHaveBeenCalledTimes(1);
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("C035: an unknown Linear authorization read fails closed before GitHub mutation", async () => {
+    const ports = mergePorts({
+      authorizationResult: err(domainError("external_failure")),
+    });
+
+    const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "authorization" });
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
 });
 
 /**
@@ -797,14 +859,30 @@ describe("auto-merge gate: C015t decision 1 merge outcomes", () => {
       calls,
       enableAutoMergeAttempt: {
         outcome: "merged_directly",
-        changeRequest: changeRequest(headSha, { state: "merged", autoMergeEnabled: false }),
+        headSha,
+        mutations: [
+          {
+            kind: "direct_squash",
+            idempotencyKey: "merge-gate-test:direct-squash",
+            attemptedAt: now,
+            outcome: "merged_directly",
+          },
+        ],
       },
     });
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());
 
     expect(outcome).toMatchObject({
       state: "directly_merged",
-      changeRequest: { state: "merged", headSha },
+      headSha,
+      mutations: [
+        {
+          kind: "direct_squash",
+          idempotencyKey: "merge-gate-test:direct-squash",
+          attemptedAt: now,
+          outcome: "merged_directly",
+        },
+      ],
     });
     expect(calls).toEqual(["auto_merge_pause_check", "auto_merge"]);
   });
@@ -857,7 +935,15 @@ describe("auto-merge gate: C015t decision 1 merge outcomes", () => {
     const ports = mergePorts({
       enableAutoMergeAttempt: {
         outcome: "merged_directly",
-        changeRequest: changeRequest(rebasedHeadSha, { state: "merged" }),
+        headSha: rebasedHeadSha,
+        mutations: [
+          {
+            kind: "direct_squash",
+            idempotencyKey: "merge-gate-test:direct-squash",
+            attemptedAt: now,
+            outcome: "merged_directly",
+          },
+        ],
       },
     });
     const outcome = await new AutoMergeGate(ports).enable(mergeRequest());

@@ -1,5 +1,5 @@
 import type { VisualManifest } from "../../domain/checkpoint/index.js";
-import type { DomainError, Result } from "../../domain/foundation/index.js";
+import type { DomainError, Instant, Result } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type { ReviewIdentity, RequirementSnapshot } from "../../domain/review/index.js";
 import type {
@@ -9,6 +9,7 @@ import type {
   CommitChecksSnapshot,
   GitPort,
   SourceControlPort,
+  WorkManagementPort,
 } from "../ports/index.js";
 import type { ReviewerPipelineOutcome, ReviewerReport } from "./reviewer-model.js";
 
@@ -46,10 +47,41 @@ export interface ReviewStatusPorts {
  * from head-SHA equality alone, and this is the only structural way to make that true without
  * touching the shared `SourceControlPort` interface.
  */
+export interface MergeMutationReceipt {
+  readonly kind: "enable_auto_merge" | "direct_squash";
+  readonly idempotencyKey: string;
+  readonly attemptedAt: Instant;
+  readonly outcome:
+    | "confirmed_enabled"
+    | "request_accepted_readback_unknown"
+    | "merged_directly"
+    | "rejected"
+    | "outcome_unknown";
+}
+
 export type MergeGateAutoMergeAttempt =
-  | Readonly<{ outcome: "enabled"; changeRequest: ChangeRequestSnapshot }>
-  | Readonly<{ outcome: "merged_directly"; changeRequest: ChangeRequestSnapshot }>
-  | Readonly<{ outcome: "merged_externally"; changeRequest: ChangeRequestSnapshot }>;
+  | Readonly<{
+      outcome: "enabled";
+      changeRequest: ChangeRequestSnapshot;
+      mutations: readonly MergeMutationReceipt[];
+    }>
+  | Readonly<{
+      outcome: "merged_directly";
+      headSha: string;
+      mutations: readonly [MergeMutationReceipt, ...MergeMutationReceipt[]];
+    }>
+  | Readonly<{ outcome: "merged_externally"; changeRequest: ChangeRequestSnapshot }>
+  | Readonly<{
+      outcome: "authorization_revoked";
+      changeRequest: ChangeRequestSnapshot;
+      mutations: readonly MergeMutationReceipt[];
+    }>
+  | Readonly<{
+      outcome: "mutation_failed";
+      stage: "authorization" | "auto_merge";
+      error: DomainError;
+      mutations: readonly [MergeMutationReceipt, ...MergeMutationReceipt[]];
+    }>;
 
 export interface MergeGatePorts {
   readonly git: Pick<GitPort, "getEffectiveTreeDiff">;
@@ -64,6 +96,8 @@ export interface MergeGatePorts {
    * `SourceControlPort`/`LifecyclePolicyPort`.
    */
   readonly autoMergePause: AutoMergePauseQueryPort;
+  /** C035: authoritative Linear read used at the final merge authorization boundary. */
+  readonly workManagement: Pick<WorkManagementPort, "getIssue">;
   readonly sourceControl: Pick<
     SourceControlPort,
     | "getChangeRequest"
@@ -82,6 +116,7 @@ export interface MergeGatePorts {
       reference: Parameters<SourceControlPort["enableAutoMerge"]>[0],
       expectedHeadSha: string,
       options: Parameters<SourceControlPort["enableAutoMerge"]>[2],
+      externalIssueId: string,
     ) => Promise<Result<MergeGateAutoMergeAttempt, DomainError>>;
   };
 }
@@ -148,6 +183,7 @@ export type RecordReviewOutcome =
 
 export type MergeGateFailureStage =
   | "request"
+  | "authorization"
   // E116cap: the one failure stage `autoMergePause.isPaused()` itself can produce (the port call
   // returning `!ok`) -- distinct from `"request"` (a shape/invariant problem with the request
   // itself) and from every other stage below, none of which are reachable until *after* this port
@@ -188,9 +224,15 @@ export type EnableAutoMergeOutcome =
       reuse: "unchanged" | "ci_revalidation";
       identity: ReviewIdentity;
       changeRequest: ChangeRequestSnapshot;
+      mutations: readonly MergeMutationReceipt[];
     }>
-  | Readonly<{ state: "directly_merged"; changeRequest: ChangeRequestSnapshot }>
+  | Readonly<{
+      state: "directly_merged";
+      headSha: string;
+      mutations: readonly [MergeMutationReceipt, ...MergeMutationReceipt[]];
+    }>
   | Readonly<{ state: "already_merged_external"; changeRequest: ChangeRequestSnapshot }>
+  | Readonly<{ state: "work_canceled"; mutations: readonly MergeMutationReceipt[] }>
   | Readonly<{
       state: "re_review_required";
       reason: "requirements_changed" | "effective_diff_changed";
@@ -240,4 +282,9 @@ export type EnableAutoMergeOutcome =
         // this is an unconditional short-circuit, not one more condition ANDed with the rest.
         | "auto_merge_paused";
     }>
-  | Readonly<{ state: "failed"; stage: MergeGateFailureStage; error: DomainError }>;
+  | Readonly<{
+      state: "failed";
+      stage: MergeGateFailureStage;
+      error: DomainError;
+      mutations?: readonly MergeMutationReceipt[];
+    }>;

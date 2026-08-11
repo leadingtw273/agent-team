@@ -38,13 +38,19 @@ import type {
   ReviewStatusCoordinator,
   AutoMergeGate,
   LifecyclePipeline,
+  LifecyclePipelineRequest,
   VisualEvidenceBuilder,
   VisualEvidenceBuildSuccess,
 } from "../../application/pipelines/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
-import type { ChangeRequestSnapshot, SourceControlPort } from "../../application/ports/index.js";
+import type {
+  ChangeRequestSnapshot,
+  SourceControlPort,
+  WorkManagementPort,
+} from "../../application/ports/index.js";
 import {
   domainError,
+  err,
   instantFromDate,
   ok,
   type Clock,
@@ -346,6 +352,8 @@ export interface ResumeCycleDependencies {
   readonly jobRepository: ResumeJobRepository;
   readonly leases: LeaseCoordinator;
   readonly sourceControl: Pick<SourceControlPort, "getChangeRequest">;
+  /** C035: authoritative Linear state read, separate from the requirement projection. */
+  readonly workManagement: Pick<WorkManagementPort, "getIssue">;
   readonly readModel: LinearDiscoveryReadModel;
   readonly teamId: string;
   readonly linearProjectId: string;
@@ -498,6 +506,16 @@ export type ResumeJobOutcome =
   // be reported, so a failure here is always safe to retry independently (never redoes Lifecycle).
   | Readonly<{ jobId: string; outcome: "admission_release_failed"; error: DomainError }>;
 
+type CancellationRaceMergeMutations = NonNullable<
+  NonNullable<LifecyclePipelineRequest["cancellationRaceAudit"]>["mergeMutations"]
+>;
+
+function persistedMergeMutations(
+  record: JobProgressRecord,
+): CancellationRaceMergeMutations | undefined {
+  return record.mergeMutations;
+}
+
 /**
  * C015t decision 3: the narrow, read-only re-entry set for `requires_manual` records -- deliberately
  * *not* a blanket reopening of `requires_manual` (codex's own review explicitly warned against a
@@ -609,6 +627,46 @@ async function transition(
     ...mutationFrom(record),
     ...next,
   });
+}
+
+type PersistedMergeMutation = NonNullable<JobProgressRecord["mergeMutations"]>[number];
+
+function mergedMutationHistory(
+  existing: readonly PersistedMergeMutation[] | undefined,
+  incoming: CancellationRaceMergeMutations,
+): JobProgressRecordMutation["mergeMutations"] | undefined {
+  const combined = [...(existing ?? [])];
+  for (const receipt of incoming) {
+    const index = combined.findIndex(
+      (candidate) =>
+        candidate.kind === receipt.kind &&
+        candidate.idempotencyKey === receipt.idempotencyKey &&
+        candidate.attemptedAt === receipt.attemptedAt,
+    );
+    if (index < 0) combined.push({ ...receipt });
+    else combined[index] = { ...receipt };
+  }
+  return combined.length <= 32 ? combined : undefined;
+}
+
+async function persistMergeMutations(
+  progress: FileJobProgressStore,
+  initialRecord: JobProgressRecord,
+  incoming: CancellationRaceMergeMutations,
+): Promise<Result<JobProgressRecord, DomainError>> {
+  if (incoming.length === 0) return ok(initialRecord);
+  let current = initialRecord;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const mergeMutations = mergedMutationHistory(current.mergeMutations, incoming);
+    if (mergeMutations === undefined) return err(domainError("invariant_violation"));
+    const written = await transition(progress, current, { mergeMutations });
+    if (written.ok || written.error.code !== "conflict") return written;
+    const loaded = await progress.load(current.jobId);
+    if (!loaded.ok) return loaded;
+    if (loaded.value === undefined) return err(domainError("conflict"));
+    current = loaded.value;
+  }
+  return err(domainError("conflict"));
 }
 
 async function resumeOneJob(
@@ -734,6 +792,10 @@ async function reconcileMergeStateUnderLease(
     externalIssueId: record.externalIssueId,
     changeRequestId,
     idempotencyKeyPrefix: `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`,
+    cancellationRaceAudit: {
+      observedAt: deps.clock.now(),
+      ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
+    },
   });
   if (lifecycleOutcome.state !== "completed") {
     return {
@@ -1054,6 +1116,35 @@ async function resumeUnderLease(
       requiresManualCause("setup", "change_request_unavailable"),
     );
   }
+  const workItem = await deps.workManagement.getIssue({
+    project: deps.project,
+    externalIssueId: record.externalIssueId,
+  });
+  if (!workItem.ok) {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      "work_item_status_unavailable",
+      workItem.error,
+      requiresManualCause("merge", "work_item_status_unavailable"),
+    );
+  }
+  if (
+    workItem.value.issue.projectId !== deps.project.id ||
+    workItem.value.issue.externalId !== record.externalIssueId
+  ) {
+    return requiresManual(
+      record,
+      deps,
+      "work_item_status_mismatch",
+      requiresManualCause("merge", "work_item_status_unavailable"),
+    );
+  }
+  // C035: this check deliberately precedes both the already-merged and `merging` branches. Once
+  // Linear says canceled, no stale local stage is allowed to keep driving GitHub mutations.
+  if (workItem.value.workStatus === "canceled") {
+    return stopCanceledWork(record, deps, changeRequestId);
+  }
   // Exact-readback: the recorded branch/headSha must still match live GitHub, unless the PR has
   // since merged out of band (a legitimate, expected race between this resume and a prior run's
   // own auto-merge/manual merge) -- everything else is a genuine mismatch, fail-closed.
@@ -1072,7 +1163,13 @@ async function resumeUnderLease(
   if (currentChangeRequest.value.state === "merged") {
     const authorizedHeadSha =
       record.stage.kind === "merging" ? currentChangeRequest.value.headSha : undefined;
-    return finishMerged(record, deps, changeRequestId, authorizedHeadSha);
+    return finishMerged(
+      record,
+      deps,
+      changeRequestId,
+      authorizedHeadSha,
+      persistedMergeMutations(record),
+    );
   }
   if (
     currentChangeRequest.value.headBranch !== record.branch ||
@@ -1321,6 +1418,52 @@ async function resumeUnderLease(
     baseRevision,
     idempotencyKeyPrefix,
   });
+}
+
+/**
+ * Runs the existing cancellation lifecycle. For an unmerged PR that lifecycle already performs
+ * the progress CAS, checkpoint, close, lease release and Linear comment, so this helper must not
+ * attempt a second CAS with the stale `record.revision`. For a merged race the lifecycle only
+ * writes the audit/pause side effects and this helper persists the requires-manual cause.
+ */
+async function stopCanceledWork(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  changeRequestId: string,
+  observedMergeMutations?: CancellationRaceMergeMutations,
+): Promise<ResumeJobOutcome> {
+  const mergeMutations = observedMergeMutations ?? persistedMergeMutations(record);
+  const outcome = await deps.lifecycle.run({
+    project: deps.project,
+    externalIssueId: record.externalIssueId,
+    changeRequestId,
+    idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:cancellation`,
+    cancellationRaceAudit: {
+      observedAt: deps.clock.now(),
+      ...(mergeMutations === undefined ? {} : { mergeMutations }),
+    },
+  });
+  if (outcome.state === "canceled") {
+    return { jobId: record.jobId, outcome: "requires_manual", reason: "work_item_canceled" };
+  }
+  if (outcome.state === "blocked" && outcome.reason === "cancellation_after_merge") {
+    return { jobId: record.jobId, outcome: "requires_manual", reason: "cancellation_after_merge" };
+  }
+  if (outcome.state === "failed") {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      `cancellation_lifecycle_failed:${outcome.stage}:${outcome.error.code}`,
+      outcome.error,
+      requiresManualCause("merge", "work_item_canceled"),
+    );
+  }
+  return requiresManual(
+    record,
+    deps,
+    `cancellation_lifecycle_unexpected:${outcome.state}`,
+    requiresManualCause("merge", "work_item_canceled"),
+  );
 }
 
 /**
@@ -1886,6 +2029,17 @@ async function resumeReview(
     ...(currentVisualManifest === undefined ? {} : { currentVisualManifest }),
     ...(currentPublicationDigest === undefined ? {} : { currentPublicationDigest }),
   });
+  const mutationReceipts = "mutations" in enabled ? (enabled.mutations ?? []) : [];
+  if (mutationReceipts.length > 0) {
+    // Persist the transport-boundary receipts before Lifecycle, requires-manual handling, or any
+    // other side effect. This cannot make GitHub + local disk atomic; it closes the controllable
+    // crash window after the GitHub call returned and keeps CAS conflicts fail-closed.
+    const persisted = await persistMergeMutations(deps.progress, record, mutationReceipts);
+    if (!persisted.ok) {
+      return { jobId: record.jobId, outcome: "progress_write_failed", error: persisted.error };
+    }
+    record = persisted.value;
+  }
   // C015t decision 1: `AutoMergeGate.enable()`'s outcome union now distinguishes exactly why/how a
   // merge did or didn't happen -- this switch is the CLI-side mapping table the coordinator
   // specified, and it is exhaustive over every state the engine can return (see
@@ -1897,7 +2051,13 @@ async function resumeReview(
         // time this check ran -- a pre-existing, disclosed race this ticket does not regress
         // (unlike the C015q/C015s incident, which is `directly_merged`/`already_merged_external`
         // below). Controller-authorized: this exact call armed it.
-        return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
+        return finishMerged(
+          record,
+          deps,
+          context.changeRequestId,
+          enabled.changeRequest.headSha,
+          enabled.mutations,
+        );
       }
       // C015x decision 3: arms the persisted readback fingerprint/bound at the exact moment
       // auto-merge is enabled -- never left bare -- so `resumeMergingStage` has a real baseline to
@@ -1923,7 +2083,13 @@ async function resumeReview(
     case "directly_merged":
       // This exact call performed the squash fallback and confirmed it landed -- controller-
       // authorized (see `finishMerged`'s own header for why this is never re-derived elsewhere).
-      return finishMerged(record, deps, context.changeRequestId, enabled.changeRequest.headSha);
+      return finishMerged(
+        record,
+        deps,
+        context.changeRequestId,
+        enabled.headSha,
+        enabled.mutations,
+      );
     case "already_merged_external":
       // Found already merged before this call could have caused it -- explicitly NOT controller-
       // authorized. Lifecycle still runs (Linear still needs its Done transition and audit
@@ -1931,6 +2097,8 @@ async function resumeReview(
       // pausing auto-merge/warning on out-of-process merges is Lifecycle's own existing job and
       // is out of this ticket's scope either way).
       return finishMerged(record, deps, context.changeRequestId, undefined);
+    case "work_canceled":
+      return stopCanceledWork(record, deps, context.changeRequestId, enabled.mutations);
     case "re_review_required":
       // The diff/requirements genuinely changed since the approval this job recorded -- needs a
       // fresh review, not a human. `AutoMergeGate.enable()` has already posted its own
@@ -2017,6 +2185,15 @@ async function resumeReview(
           );
       }
     case "failed":
+      if (enabled.stage === "authorization") {
+        return requiresManualUnlessRetryable(
+          record,
+          deps,
+          `work_item_status_unavailable:${enabled.error.code}`,
+          enabled.error,
+          requiresManualCause("merge", "work_item_status_unavailable"),
+        );
+      }
       return requiresManualUnlessRetryable(
         record,
         deps,
@@ -2044,6 +2221,7 @@ async function finishMerged(
   deps: ResumeCycleDependencies,
   changeRequestId: string,
   authorizedHeadSha: string | undefined,
+  mergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
   const outcome = await deps.lifecycle.run({
     project: deps.project,
@@ -2051,6 +2229,10 @@ async function finishMerged(
     changeRequestId,
     ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
     idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
+    cancellationRaceAudit: {
+      observedAt: deps.clock.now(),
+      ...(mergeMutations === undefined ? {} : { mergeMutations }),
+    },
   });
   if (outcome.state !== "completed") {
     return outcome.state === "failed"

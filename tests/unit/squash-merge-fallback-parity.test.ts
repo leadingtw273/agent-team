@@ -162,12 +162,36 @@ async function runMergeGateSideFallback(
         ]
       : []),
   ]);
-  const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport));
-  const result = await sourceControl.enableAutoMerge({ project, changeRequestId: "42" }, sha, {
-    idempotencyKey: "parity-merge-gate",
+  const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport), {
+    getIssue: () =>
+      Promise.resolve(
+        ok({
+          issue: {
+            schemaVersion: 1,
+            id: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+            projectId: project.id,
+            externalId: "LEA-1",
+            title: "Parity fixture",
+          },
+          workStatus: "in_review",
+          updatedAt: timestamp,
+          revision: timestamp,
+        } as never),
+      ),
   });
+  const result = await sourceControl.enableAutoMerge(
+    { project, changeRequestId: "42" },
+    sha,
+    {
+      idempotencyKey: "parity-merge-gate",
+    },
+    "LEA-1",
+  );
   transport.expectDone();
   if (!result.ok) return { merged: false, errorCode: result.error.code };
+  if (result.value.outcome === "mutation_failed") {
+    return { merged: false, errorCode: result.value.error.code };
+  }
   return { merged: result.value.outcome === "merged_directly" };
 }
 

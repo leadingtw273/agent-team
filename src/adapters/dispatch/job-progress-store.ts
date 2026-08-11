@@ -209,6 +209,9 @@ export const requiresManualReasonCodeSchema = z.enum([
   "visual_publication_orphan",
   "auto_merge_not_enabled",
   // merge
+  "work_item_status_unavailable",
+  "work_item_canceled",
+  "cancellation_after_merge",
   "lifecycle_not_completed",
   // E102-4b: `resumeReview`'s own pre-arm merge recheck (immediately before
   // `AutoMergeGate.enable()`, resume-composition.ts) could not obtain a currently-valid
@@ -544,6 +547,27 @@ export const jobProgressRecordSchema = z
     worktreePath: z.string().startsWith("/").min(2).max(1024),
     changeRequestId: changeRequestNumberSchema.optional(),
     headSha: headShaSchema.optional(),
+    // C035: job-level (not stage-level) because a direct merge or uncertain mutation can leave
+    // `ci_waiting`/`awaiting_review` without ever entering `merging`. Optional for legacy records.
+    mergeMutations: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["enable_auto_merge", "direct_squash"]),
+            idempotencyKey: z.string().trim().min(1),
+            attemptedAt: instantSchema,
+            outcome: z.enum([
+              "confirmed_enabled",
+              "request_accepted_readback_unknown",
+              "merged_directly",
+              "rejected",
+              "outcome_unknown",
+            ]),
+          })
+          .strict(),
+      )
+      .max(32)
+      .optional(),
     /** C015y decision A: the authoritative base revision dispatch resolved *once*
      * (`resolveAuthoritativeBaseRevision`, authoritative-base.ts) -- written exactly once, at the
      * same moment `changeRequestId`/`headSha` above are first learned (see `handlers.ts`'s own

@@ -410,6 +410,7 @@ export function createDispatchCliHandlers(
             jobRepository: build.value.jobs,
             leases: new LeaseCoordinator(build.value.leases),
             sourceControl: resumeComposition.value.sourceControl,
+            workManagement: resumeComposition.value.workManagement,
             readModel: build.value.discovery.readModel,
             teamId: build.value.discovery.teamId,
             linearProjectId: build.value.discovery.linearProjectId,
