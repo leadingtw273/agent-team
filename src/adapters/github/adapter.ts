@@ -31,6 +31,24 @@ import {
 import { defaultCiFailureLogExcerptMaxBytes, extractFailureKeyLines } from "./ci-log-excerpt.js";
 import { GhTransport } from "./transport.js";
 
+export type GitHubMergeMutationKind = "enable_auto_merge" | "direct_squash";
+export type GitHubMergeMutationOutcome =
+  | "confirmed_enabled"
+  | "request_accepted_readback_unknown"
+  | "merged_directly"
+  | "rejected"
+  | "outcome_unknown";
+
+/** Called synchronously at the real transport mutation boundary, never for adapter no-ops. */
+export interface GitHubMergeMutationObserver {
+  attempted(kind: GitHubMergeMutationKind, idempotencyKey: string): void;
+  settled(
+    kind: GitHubMergeMutationKind,
+    idempotencyKey: string,
+    outcome: GitHubMergeMutationOutcome,
+  ): void;
+}
+
 const repositoryPattern = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/u;
 const branchPattern = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$/u;
 const shaPattern = /^[0-9a-f]{40}$/iu;
@@ -806,6 +824,7 @@ export class GitHubAdapter implements SourceControlPort {
     reference: ChangeRequestRef,
     expectedHeadSha: string,
     options: MutationOptions,
+    observer?: GitHubMergeMutationObserver,
   ): Promise<Result<ChangeRequestSnapshot, DomainError>> {
     if (
       !validRepository(reference) ||
@@ -827,6 +846,7 @@ export class GitHubAdapter implements SourceControlPort {
       return failure("conflict");
     }
     if (current.value.autoMergeEnabled) return current;
+    observer?.attempted("enable_auto_merge", options.idempotencyKey);
     const result = await this.transport.requestJson(
       [
         "api",
@@ -839,16 +859,29 @@ export class GitHubAdapter implements SourceControlPort {
       autoMergeMutationSchema,
       options,
     );
-    if (!result.ok) return result;
+    if (!result.ok) {
+      observer?.settled("enable_auto_merge", options.idempotencyKey, "outcome_unknown");
+      return result;
+    }
     if (result.value.data.enablePullRequestAutoMerge.pullRequest.id !== current.value.id) {
+      observer?.settled("enable_auto_merge", options.idempotencyKey, "outcome_unknown");
       return failure();
     }
+    observer?.settled(
+      "enable_auto_merge",
+      options.idempotencyKey,
+      "request_accepted_readback_unknown",
+    );
     const readBack = await this.getChangeRequest(reference, options);
-    return readBack.ok &&
+    const confirmed =
+      readBack.ok &&
       readBack.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase() &&
-      readBack.value.autoMergeEnabled
-      ? readBack
-      : failure(readBack.ok ? "external_failure" : readBack.error.code);
+      readBack.value.autoMergeEnabled;
+    if (confirmed) {
+      observer?.settled("enable_auto_merge", options.idempotencyKey, "confirmed_enabled");
+      return readBack;
+    }
+    return failure(readBack.ok ? "external_failure" : readBack.error.code);
   }
 
   /**
@@ -865,6 +898,7 @@ export class GitHubAdapter implements SourceControlPort {
     reference: ChangeRequestRef,
     expectedHeadSha: string,
     options: MutationOptions,
+    observer?: GitHubMergeMutationObserver,
   ): Promise<Result<ChangeRequestSnapshot, DomainError>> {
     const number = changeRequestNumber(reference);
     if (
@@ -882,6 +916,7 @@ export class GitHubAdapter implements SourceControlPort {
       return failure("conflict");
     }
     if (current.value.state !== "open") return failure("conflict");
+    observer?.attempted("direct_squash", options.idempotencyKey);
     const merged = await this.transport.requestJson(
       [
         "api",
@@ -896,8 +931,15 @@ export class GitHubAdapter implements SourceControlPort {
       squashMergeResultSchema,
       options,
     );
-    if (!merged.ok) return merged;
-    if (!merged.value.merged) return failure();
+    if (!merged.ok) {
+      observer?.settled("direct_squash", options.idempotencyKey, "outcome_unknown");
+      return merged;
+    }
+    if (!merged.value.merged) {
+      observer?.settled("direct_squash", options.idempotencyKey, "rejected");
+      return failure();
+    }
+    observer?.settled("direct_squash", options.idempotencyKey, "merged_directly");
     const readBack = await this.getChangeRequest(reference, options);
     return readBack.ok &&
       readBack.value.headSha.toLowerCase() === expectedHeadSha.toLowerCase() &&

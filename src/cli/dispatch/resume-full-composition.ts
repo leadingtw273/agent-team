@@ -30,6 +30,7 @@ import { buildReviewerRecoveryPipeline } from "./reviewer-recovery-composition.j
 import { buildReviewerPipeline } from "./reviewer-composition.js";
 import { buildStatusMergePipelines } from "./status-merge-composition.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
+import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
 
 export type ResumeCompositionBlockedReason = "github_authentication_unavailable";
@@ -73,6 +74,7 @@ export type ResumePipelineComposition = Pick<
   | "reviewer"
   | "reviewStatus"
   | "autoMerge"
+  | "workManagement"
   | "lifecycle"
   | "visualEvidence"
   | "visualReviewModel"
@@ -109,8 +111,15 @@ export async function buildResumeComposition(
   if (reviewer.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: reviewer.reason });
   }
+  const workManagement = new LinearWorkManagementAdapter({
+    readModel: options.readModel,
+    mutationClient: options.mutationClient,
+    teamId: options.teamId,
+    linearProjectId: options.linearProjectId,
+  });
   const statusMerge = await buildStatusMergePipelines({
     autoMergePauseStore: options.autoMergePause,
+    workManagement,
   });
   if (statusMerge.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: statusMerge.reason });
@@ -167,6 +176,7 @@ export async function buildResumeComposition(
       reviewer: reviewer.value,
       reviewStatus: statusMerge.value.reviewStatus,
       autoMerge: statusMerge.value.autoMergeGate,
+      workManagement,
       lifecycle,
       visualEvidence,
       linearPublication,

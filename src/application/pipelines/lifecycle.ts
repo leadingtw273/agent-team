@@ -132,6 +132,37 @@ function cancellationComment(
   ].join("\n");
 }
 
+function cancellationAfterMergeComment(
+  request: LifecyclePipelineRequest,
+  issue: WorkManagementIssueSnapshot,
+  mergedHeadSha: string,
+  checkpoint: "not_required" | "preserved",
+  pauseDisposition: "paused" | "not_applicable",
+  checkpointId?: string,
+): string {
+  const mergeMutations = request.cancellationRaceAudit?.mergeMutations ?? [];
+  return [
+    "🤖 Agent Team｜團隊管理者",
+    "- 狀態：cancellation-after-merge（等待人工判定）",
+    pauseDisposition === "paused"
+      ? "- 安全處置：未標記完成、不自動 Revert，並已暫停此專案新的 Auto-merge"
+      : "- 安全處置：未標記完成、不自動 Revert；目前無可用的專案級 Auto-merge 暫停能力",
+    `- PR：${request.changeRequestId}`,
+    `- PR Head：${mergedHeadSha}`,
+    `- Linear providerUpdatedAt：${issue.updatedAt}`,
+    "- Linear CAS revision：unavailable（Provider 未提供；不可用 updatedAt 冒充）",
+    `- Controller observedAt：${request.cancellationRaceAudit?.observedAt ?? "unavailable"}`,
+    ...(mergeMutations.length === 0
+      ? ["- GitHub mutation attempt：unknown_or_out_of_process"]
+      : mergeMutations.map(
+          (attempt, index) =>
+            `- GitHub mutation attempt ${String(index + 1)}：${attempt.kind}｜key=${attempt.idempotencyKey}｜attemptedAt=${attempt.attemptedAt}｜outcome=${attempt.outcome}`,
+        )),
+    `- Checkpoint：${checkpoint === "preserved" ? (checkpointId ?? "已保存") : "無需建立"}`,
+    "- 保留：Branch 與 Worktree 均未刪除，交由團隊管理者稽核",
+  ].join("\n");
+}
+
 export class LifecyclePipeline {
   constructor(readonly ports: LifecyclePipelinePorts) {}
 
@@ -159,11 +190,14 @@ export class LifecyclePipeline {
       return failed("request", domainError("conflict"));
     }
 
-    if (changeRequest.value.state === "merged") {
-      return this.#handleMerge(request, issue.value, changeRequest.value.headSha);
+    if (changeRequest.value.state === "merged" && issue.value.workStatus === "canceled") {
+      return this.#handleCancellationAfterMerge(request, changeRequest.value, issue.value);
     }
     if (issue.value.workStatus === "canceled") {
       return this.#handleCancellation(request, changeRequest.value, issue.value);
+    }
+    if (changeRequest.value.state === "merged") {
+      return this.#handleMerge(request, issue.value, changeRequest.value.headSha);
     }
     if (issue.value.workStatus === "completed") {
       return Object.freeze({ state: "unchanged", reason: "terminal_issue" });
@@ -303,6 +337,70 @@ export class LifecyclePipeline {
         ? {}
         : { checkpointId: prepared.value.checkpointId }),
     });
+  }
+
+  async #handleCancellationAfterMerge(
+    request: LifecyclePipelineRequest,
+    changeRequest: ChangeRequestSnapshot,
+    issue: WorkManagementIssueSnapshot,
+  ): Promise<LifecyclePipelineOutcome> {
+    const prepared = await this.ports.cancellation.prepare(
+      {
+        project: request.project,
+        externalIssueId: request.externalIssueId,
+        changeRequest,
+        issue: issue.issue,
+        preserveBranchAndWorktree: true,
+      },
+      mutation(request, "prepare-cancellation-after-merge"),
+    );
+    if (!prepared.ok) return failed("checkpoint", prepared.error);
+    if (!prepared.value.activeWorkStopped) {
+      return failed("checkpoint", domainError("conflict"));
+    }
+    if (
+      (prepared.value.checkpoint === "preserved" &&
+        (prepared.value.checkpointId === undefined ||
+          prepared.value.checkpointId.trim().length === 0)) ||
+      (prepared.value.checkpoint === "not_required" && prepared.value.checkpointId !== undefined)
+    ) {
+      return failed("checkpoint", domainError("invariant_violation"));
+    }
+
+    const paused = await this.ports.policy.pauseAutoMerge(
+      {
+        project: request.project,
+        reason: "out_of_process_merge",
+        changeRequestId: request.changeRequestId,
+        mergedHeadSha: changeRequest.headSha,
+      },
+      mutation(request, "pause-auto-merge-after-cancellation-race"),
+    );
+    if (!paused.ok) return failed("policy", paused.error);
+    if (paused.value.state === "unknown") {
+      return failed("policy", domainError("external_failure"));
+    }
+
+    const leaseReleased = await this.ports.leaseRelease.release(
+      { project: request.project, externalIssueId: request.externalIssueId },
+      mutation(request, "release-lease-after-cancellation-race"),
+    );
+    if (!leaseReleased.ok) return failed("lease_release", leaseReleased.error);
+
+    const comment = await this.ports.workManagement.appendComment(
+      { project: request.project, externalIssueId: request.externalIssueId },
+      cancellationAfterMergeComment(
+        request,
+        issue,
+        changeRequest.headSha,
+        prepared.value.checkpoint,
+        paused.value.state,
+        prepared.value.checkpointId,
+      ),
+      mutation(request, "cancellation-after-merge-comment"),
+    );
+    if (!comment.ok) return failed("comment", comment.error);
+    return Object.freeze({ state: "blocked", reason: "cancellation_after_merge" });
   }
 
   async #handleUnexpectedClosure(

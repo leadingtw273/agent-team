@@ -124,7 +124,17 @@ export class JobProgressLifecycleCancellationAdapter implements LifecycleCancell
       void _updatedAt;
       const transitioned = await this.#progress.compareAndSwap(record.jobId, record.revision, {
         ...rest,
-        stage: { kind: "requires_manual" },
+        stage: {
+          kind: "requires_manual",
+          cause: {
+            stage: "merge",
+            reasonCode:
+              request.changeRequest.state === "merged"
+                ? "cancellation_after_merge"
+                : "work_item_canceled",
+            attempts: { count: 1 },
+          },
+        },
       });
       if (!transitioned.ok) return transitioned;
     }

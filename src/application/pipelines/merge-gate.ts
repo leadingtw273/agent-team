@@ -643,19 +643,63 @@ export class AutoMergeGate {
     ) {
       return mergeFailure("change_request", domainError("conflict"));
     }
+    // C035: Linear cancellation is an authorization revocation, so re-read it at the final
+    // mutation boundary. A failed/ambiguous read fails closed and performs no GitHub mutation.
+    const authorization = await this.ports.workManagement.getIssue(
+      {
+        project: request.project,
+        externalIssueId: request.requirementSnapshot.issue.externalId,
+      },
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (!authorization.ok) return mergeFailure("authorization", authorization.error);
+    if (
+      authorization.value.issue.projectId !== request.project.id ||
+      authorization.value.issue.externalId !== request.requirementSnapshot.issue.externalId
+    ) {
+      return mergeFailure("authorization", domainError("conflict"));
+    }
+    if (authorization.value.workStatus === "canceled") {
+      return Object.freeze({ state: "work_canceled", mutations: [] });
+    }
+    if (authorization.value.workStatus === "completed") {
+      return mergeFailure("authorization", domainError("conflict"));
+    }
     const enabled = await this.ports.sourceControl.enableAutoMerge(
       reference,
       request.expectedHeadSha,
       mutation(request, "enable-auto-merge"),
+      request.requirementSnapshot.issue.externalId,
     );
     if (!enabled.ok) return mergeFailure("auto_merge", enabled.error);
     const attempt = enabled.value;
+    if (attempt.outcome === "mutation_failed") {
+      return Object.freeze({
+        state: "failed",
+        stage: attempt.stage,
+        error: attempt.error,
+        mutations: attempt.mutations,
+      });
+    }
+    if (attempt.outcome === "authorization_revoked") {
+      return Object.freeze({ state: "work_canceled", mutations: attempt.mutations });
+    }
     // C015t decision 1: `attempt.outcome` is the one place provenance ("did this call cause the
     // merge, or find one already there") is decided -- by `buildMergeGateSourceControl`
     // (src/cli/dispatch/status-merge-composition.ts), the only composition root that knows whether
     // it personally invoked the direct-squash fallback. This gate never re-derives that from head-
     // SHA equality; it only validates the returned snapshot is internally consistent.
-    if (attempt.outcome === "merged_directly" || attempt.outcome === "merged_externally") {
+    if (attempt.outcome === "merged_directly") {
+      if (!sameSha(attempt.headSha, request.expectedHeadSha)) {
+        return mergeFailure("auto_merge", domainError("conflict"));
+      }
+      return Object.freeze({
+        state: "directly_merged" as const,
+        headSha: attempt.headSha,
+        mutations: attempt.mutations,
+      });
+    }
+    if (attempt.outcome === "merged_externally") {
       if (
         !sameSha(attempt.changeRequest.headSha, request.expectedHeadSha) ||
         attempt.changeRequest.state !== "merged"
@@ -663,8 +707,7 @@ export class AutoMergeGate {
         return mergeFailure("auto_merge", domainError("conflict"));
       }
       return Object.freeze({
-        state:
-          attempt.outcome === "merged_directly" ? "directly_merged" : "already_merged_external",
+        state: "already_merged_external" as const,
         changeRequest: attempt.changeRequest,
       });
     }
@@ -681,6 +724,7 @@ export class AutoMergeGate {
       reuse,
       identity: identity.value,
       changeRequest: attempt.changeRequest,
+      mutations: attempt.mutations,
     });
   }
 }

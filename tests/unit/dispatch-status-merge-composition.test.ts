@@ -39,6 +39,8 @@ function autoMergePauseStore(): FileAutoMergePauseStore {
 const sha = "0123456789abcdef0123456789abcdef01234567";
 const otherSha = "fedcba9876543210fedcba9876543210fedcba98";
 const timestamp = "2026-08-07T00:00:00Z";
+const attemptedAt = "2026-08-07T00:00:00.000Z" as never;
+const fixedClock = { now: () => attemptedAt };
 const reference = Object.freeze({
   project: {
     id: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab" as never,
@@ -51,6 +53,27 @@ const reference = Object.freeze({
   changeRequestId: "42",
 });
 const mutation = Object.freeze({ idempotencyKey: "merge-1" });
+const externalIssueId = "LEA-1";
+
+function workManagement(workStatus: "in_review" | "canceled" = "in_review") {
+  return {
+    getIssue: () =>
+      Promise.resolve(
+        ok({
+          issue: {
+            schemaVersion: 1,
+            id: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+            projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+            externalId: externalIssueId,
+            title: "Merge safely",
+          },
+          workStatus,
+          updatedAt: timestamp,
+          revision: timestamp,
+        } as never),
+      ),
+  };
+}
 
 interface ScriptStep {
   readonly value?: unknown;
@@ -104,6 +127,7 @@ describe("buildStatusMergePipelines", () => {
   it("blocks with github_authentication_unavailable before constructing any port", async () => {
     const result = await buildStatusMergePipelines({
       autoMergePauseStore: autoMergePauseStore(),
+      workManagement: workManagement(),
       githubTransport: {
         requestJson: () => Promise.reject(new Error("must never be called")),
         inspectAuthentication: () => Promise.resolve(err(domainError("permission_denied"))),
@@ -115,6 +139,7 @@ describe("buildStatusMergePipelines", () => {
   it("reaches state:ready with both coordinators constructed once GitHub auth succeeds", async () => {
     const result = await buildStatusMergePipelines({
       autoMergePauseStore: autoMergePauseStore(),
+      workManagement: workManagement(),
       githubTransport: {
         requestJson: () => Promise.reject(new Error("unused in this test")),
         inspectAuthentication: () =>
@@ -131,6 +156,23 @@ describe("buildStatusMergePipelines", () => {
 });
 
 describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
+  it("does not invent a mutation receipt when auto-merge was already enabled", async () => {
+    const transport = new ScriptedTransport([{ value: pull({ autoMergeEnabled: true }) }]);
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+      fixedClock,
+    );
+
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { outcome: "enabled", mutations: [] },
+    });
+    transport.expectDone();
+  });
+
   it("leaves the auto-merge-enabled success path unaffected -- fallback never triggered", async () => {
     const transport = new ScriptedTransport([
       { value: pull() }, // enableAutoMerge's own internal pre-check
@@ -139,14 +181,61 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
       },
       { value: pull({ autoMergeEnabled: true }) }, // enableAutoMerge's own readback
     ]);
-    const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport));
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+    );
 
-    const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
 
     expect(result).toMatchObject({
       ok: true,
-      value: { outcome: "enabled", changeRequest: { autoMergeEnabled: true } },
+      value: {
+        outcome: "enabled",
+        changeRequest: { autoMergeEnabled: true },
+        mutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "merge-1",
+            outcome: "confirmed_enabled",
+          },
+        ],
+      },
     });
+    transport.expectDone();
+  });
+
+  it("preserves the real auto-merge attempt when the mutation was accepted but its read-back races to merged", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull() },
+      {
+        value: { data: { enablePullRequestAutoMerge: { pullRequest: { id: "PR_node_fixture" } } } },
+      },
+      { error: "external_failure" },
+      { value: pull({ state: "merged" }) },
+    ]);
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+      fixedClock,
+    );
+
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
+
+    expect(result).toEqual(
+      ok({
+        outcome: "merged_directly",
+        headSha: sha,
+        mutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "merge-1",
+            attemptedAt,
+            outcome: "request_accepted_readback_unknown",
+          },
+        ],
+      }),
+    );
     transport.expectDone();
   });
 
@@ -159,14 +248,64 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
       { value: { merged: true } }, // direct PUT merge succeeds
       { value: pull({ state: "merged" }) }, // squashMergeChangeRequest's own readback
     ]);
-    const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport));
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+    );
 
-    const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
 
     expect(result).toMatchObject({
       ok: true,
-      value: { outcome: "merged_directly", changeRequest: { state: "merged" } },
+      value: {
+        outcome: "merged_directly",
+        headSha: sha,
+        mutations: [
+          { kind: "enable_auto_merge", idempotencyKey: "merge-1", outcome: "outcome_unknown" },
+          { kind: "direct_squash", idempotencyKey: "merge-1", outcome: "merged_directly" },
+        ],
+      },
     });
+    transport.expectDone();
+  });
+
+  it("preserves direct-squash success when REST confirmed merged but the final read-back failed", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull() },
+      { error: "external_failure" },
+      { value: pull() },
+      { value: pull() },
+      { value: { merged: true } },
+      { error: "external_failure" },
+    ]);
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+      fixedClock,
+    );
+
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
+
+    expect(result).toEqual(
+      ok({
+        outcome: "merged_directly",
+        headSha: sha,
+        mutations: [
+          {
+            kind: "enable_auto_merge",
+            idempotencyKey: "merge-1",
+            attemptedAt,
+            outcome: "outcome_unknown",
+          },
+          {
+            kind: "direct_squash",
+            idempotencyKey: "merge-1",
+            attemptedAt,
+            outcome: "merged_directly",
+          },
+        ],
+      }),
+    );
     transport.expectDone();
   });
 
@@ -176,11 +315,22 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
       { error: "external_failure" },
       { value: pull({ headSha: otherSha }) },
     ]);
-    const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport));
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+    );
 
-    const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
 
-    expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        outcome: "mutation_failed",
+        stage: "auto_merge",
+        error: { code: "external_failure" },
+        mutations: [{ kind: "enable_auto_merge", outcome: "outcome_unknown" }],
+      },
+    });
     transport.expectDone();
   });
 
@@ -192,11 +342,69 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
       { value: pull() },
       { error: "conflict" },
     ]);
-    const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport));
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement(),
+    );
 
-    const result = await sourceControl.enableAutoMerge(reference, sha, mutation);
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
 
-    expect(result).toMatchObject({ ok: false, error: { code: "external_failure" } });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        outcome: "mutation_failed",
+        stage: "auto_merge",
+        error: { code: "external_failure" },
+        mutations: [
+          { kind: "enable_auto_merge", outcome: "outcome_unknown" },
+          { kind: "direct_squash", outcome: "outcome_unknown" },
+        ],
+      },
+    });
+    transport.expectDone();
+  });
+
+  it("C035: re-reads Linear and skips direct squash when cancellation arrives after auto-merge fails", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull() },
+      { error: "external_failure" },
+      { value: pull() },
+    ]);
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement("canceled"),
+    );
+
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { outcome: "authorization_revoked", changeRequest: { state: "open" } },
+    });
+    transport.expectDone();
+  });
+
+  it("C035: fails closed without direct squash when the second Linear read is unavailable", async () => {
+    const transport = new ScriptedTransport([
+      { value: pull() },
+      { error: "external_failure" },
+      { value: pull() },
+    ]);
+    const sourceControl = buildMergeGateSourceControl(new GitHubAdapter(transport), {
+      getIssue: () => Promise.resolve(err(domainError("unavailable"))),
+    });
+
+    const result = await sourceControl.enableAutoMerge(reference, sha, mutation, externalIssueId);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        outcome: "mutation_failed",
+        stage: "authorization",
+        error: { code: "unavailable" },
+        mutations: [{ kind: "enable_auto_merge", outcome: "outcome_unknown" }],
+      },
+    });
     transport.expectDone();
   });
 });

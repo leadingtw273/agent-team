@@ -86,12 +86,12 @@ const issue = issueSchema.parse({
   title: "Ship the thing",
 });
 
-function changeRequest() {
+function changeRequest(state: "closed" | "merged" = "closed") {
   return {
     id: "PR_kwDOTvUUF877drQL",
     number: 42,
     url: "https://example.test/pr/42",
-    state: "closed" as const,
+    state,
     draft: false,
     baseBranch: "main",
     headBranch: "agent-team/job-1",
@@ -102,11 +102,11 @@ function changeRequest() {
   };
 }
 
-function prepareRequest() {
+function prepareRequest(state: "closed" | "merged" = "closed") {
   return {
     project,
     externalIssueId,
-    changeRequest: changeRequest(),
+    changeRequest: changeRequest(state),
     issue,
     preserveBranchAndWorktree: true as const,
   };
@@ -132,6 +132,40 @@ describe("JobProgressLifecycleCancellationAdapter", () => {
       value: { activeWorkStopped: true, checkpoint: "not_required" },
     });
     await expect(readdir(join(directory, "checkpoints")).catch(() => [])).resolves.toEqual([]);
+  });
+
+  it("C035: persists a distinct cancellation_after_merge cause for a merged race", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory);
+    const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+    await store.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "claude-opus",
+      stage: { kind: "merging" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/sandbox-worktree",
+    });
+    const adapter = new JobProgressLifecycleCancellationAdapter({
+      progress: store,
+      store: checkpointStore(directory),
+    });
+
+    const result = await adapter.prepare(prepareRequest("merged"), {
+      idempotencyKey: "cancel-after-merge-1",
+    });
+
+    expect(result.ok).toBe(true);
+    const reloaded = await store.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toMatchObject({
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "cancellation_after_merge" },
+      });
+    }
   });
 
   it("CAS-transitions a non-terminal record for this issue to requires_manual and preserves a real, disk-readable F008 checkpoint", async () => {
@@ -166,7 +200,14 @@ describe("JobProgressLifecycleCancellationAdapter", () => {
     const reloaded = await store.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) {
-      expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+      expect(reloaded.value?.stage).toEqual({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "work_item_canceled",
+          attempts: { count: 1 },
+        },
+      });
       expect(reloaded.value?.revision).toBe(1);
     }
 
@@ -283,7 +324,16 @@ describe("JobProgressLifecycleCancellationAdapter", () => {
     // that half of "prepare" is not undone by a downstream persistence failure.
     const reloaded = await store.load(jobId);
     expect(reloaded.ok).toBe(true);
-    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "requires_manual" });
+    if (reloaded.ok) {
+      expect(reloaded.value?.stage).toEqual({
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "work_item_canceled",
+          attempts: { count: 1 },
+        },
+      });
+    }
   });
 
   it("fails closed before mutating anything when more than one active job-progress record exists for the same issue (ambiguous, never guessed)", async () => {
