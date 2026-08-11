@@ -111,7 +111,7 @@ export class LinearWorkManagementAdapter implements Pick<
   ): Promise<Result<WorkManagementIssueSnapshot, DomainError>> {
     const context = await this.#context(options);
     if (!context.ok) return context;
-    const read = await this.#readModel.readIssue(context.value, reference.externalIssueId);
+    const read = await this.#readModel.readIssue(context.value, reference.externalIssueId, options);
     if (!read.ok) return read;
     return toWorkManagementSnapshot(reference.project.id, read.value);
   }

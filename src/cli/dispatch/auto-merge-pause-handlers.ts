@@ -70,7 +70,7 @@ export function createDispatchAutoMergeResumeHandler(
         operation: "dispatch_auto_merge_resume",
         state: "blocked",
         reason: "auto_merge_pause_read_failed",
-        error: before.error,
+        errorCode: before.error.code,
       });
     }
     if (before.value === undefined || before.value.status.state === "active") {
@@ -87,7 +87,7 @@ export function createDispatchAutoMergeResumeHandler(
         operation: "dispatch_auto_merge_resume",
         state: "blocked",
         reason: "auto_merge_pause_write_failed",
-        error: resolved.error,
+        errorCode: resolved.error.code,
       });
     }
 

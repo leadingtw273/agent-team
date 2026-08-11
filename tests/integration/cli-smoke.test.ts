@@ -80,10 +80,16 @@ describe("compiled CLI smoke", () => {
       reclaimedLeaseCount: 0,
       targetCounts: { healthy: 0, resumed: 0, blocked: 0, failed: 0 },
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
+      jobProgressResume: { outcomes: [], blocked: [] },
+      jobProgressBlocked: [],
       modelResumeAttempts: 0,
-      // T02B: production also has a read-only durable progress inventory. Resume remains T03B.
       scopeDisclosure: {
-        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
+        wiredCapabilities: [
+          "lease_reclaim",
+          "job_update",
+          "durable_progress_inventory",
+          "durable_progress_resume",
+        ],
         unwiredCapabilities: [
           "active_job_snapshot",
           "provider_readback",
@@ -125,7 +131,12 @@ describe("compiled CLI smoke", () => {
       jobProgressCounts: { resumable: 1, blocked: 1, terminal: 1, total: 3 },
       modelResumeAttempts: 0,
       scopeDisclosure: {
-        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
+        wiredCapabilities: [
+          "lease_reclaim",
+          "job_update",
+          "durable_progress_inventory",
+          "durable_progress_resume",
+        ],
       },
     });
   });

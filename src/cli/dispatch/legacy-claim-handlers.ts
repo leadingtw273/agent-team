@@ -120,7 +120,7 @@ export function createDispatchResolveLegacyClaimHandler(
         operation: "dispatch_resolve_legacy_claim",
         state: "blocked",
         reason: "job_progress_read_failed",
-        error: existingRecord.error,
+        errorCode: existingRecord.error.code,
       });
     }
     if (existingRecord.value !== undefined) {
@@ -137,7 +137,7 @@ export function createDispatchResolveLegacyClaimHandler(
         operation: "dispatch_resolve_legacy_claim",
         state: "blocked",
         reason: "admission_read_failed",
-        error: claim.error,
+        errorCode: claim.error.code,
       });
     }
     if (claim.value === undefined) {
@@ -179,7 +179,7 @@ export function createDispatchResolveLegacyClaimHandler(
         operation: "dispatch_resolve_legacy_claim",
         state: "blocked",
         reason: "admission_release_failed",
-        error: released.error,
+        errorCode: released.error.code,
       });
     }
 

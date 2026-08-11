@@ -355,42 +355,52 @@ export class LinearReadModel {
   async readIssue(
     context: LinearProjectContext,
     issueId: string,
+    options: ReadOptions = {},
   ): Promise<Result<LinearIssueSnapshot, DomainError>> {
-    const baseResult = await this.transport.request<unknown, { issueId: string }>({
-      operationName: "AgentTeamReadIssue",
-      query: issueBaseQuery,
-      variables: { issueId },
-    });
+    const baseResult = await this.transport.request<unknown, { issueId: string }>(
+      {
+        operationName: "AgentTeamReadIssue",
+        query: issueBaseQuery,
+        variables: { issueId },
+      },
+      options,
+    );
     if (!baseResult.ok) return baseResult;
     const base = parse(issueBaseSchema, baseResult.value);
     if (!base.ok) return base;
     if (base.value.issue === null) return failure("not_found");
 
-    const labels = await this.transport.paginate<unknown, { readonly id: string }>({
-      operationName: "AgentTeamReadIssueLabels",
-      query: issueLabelsQuery,
-      variables: { issueId },
-      selectConnection: (data) => {
-        const page = issueLabelsPageSchema.parse(data);
-        if (page.issue === null) throw new Error("linear_issue_not_found");
-        return page.issue.labels;
+    const labels = await this.transport.paginate<unknown, { readonly id: string }>(
+      {
+        operationName: "AgentTeamReadIssueLabels",
+        query: issueLabelsQuery,
+        variables: { issueId },
+        selectConnection: (data) => {
+          const page = issueLabelsPageSchema.parse(data);
+          if (page.issue === null) throw new Error("linear_issue_not_found");
+          return page.issue.labels;
+        },
       },
-    });
+      options,
+    );
     if (!labels.ok) return labels;
-    const outbound = await this.readRelations(issueId, "outbound");
+    const outbound = await this.readRelations(issueId, "outbound", options);
     if (!outbound.ok) return outbound;
-    const inbound = await this.readRelations(issueId, "inbound");
+    const inbound = await this.readRelations(issueId, "inbound", options);
     if (!inbound.ok) return inbound;
-    const comments = await this.transport.paginate<unknown, z.infer<typeof commentNodeSchema>>({
-      operationName: "AgentTeamReadIssueComments",
-      query: issueCommentsQuery,
-      variables: { issueId },
-      selectConnection: (data) => {
-        const page = commentsPageSchema.parse(data);
-        if (page.issue === null) throw new Error("linear_issue_not_found");
-        return page.issue.comments;
+    const comments = await this.transport.paginate<unknown, z.infer<typeof commentNodeSchema>>(
+      {
+        operationName: "AgentTeamReadIssueComments",
+        query: issueCommentsQuery,
+        variables: { issueId },
+        selectConnection: (data) => {
+          const page = commentsPageSchema.parse(data);
+          if (page.issue === null) throw new Error("linear_issue_not_found");
+          return page.issue.comments;
+        },
       },
-    });
+      options,
+    );
     if (!comments.ok) return comments;
 
     const raw = base.value.issue;
@@ -418,25 +428,29 @@ export class LinearReadModel {
   private async readRelations(
     issueId: string,
     direction: "outbound" | "inbound",
+    options: ReadOptions,
   ): Promise<Result<readonly LinearRelationRecord[], DomainError>> {
-    const result = await this.transport.paginate<unknown, z.infer<typeof relationNodeSchema>>({
-      operationName:
-        direction === "outbound"
-          ? "AgentTeamReadIssueRelations"
-          : "AgentTeamReadIssueInverseRelations",
-      query: direction === "outbound" ? issueRelationsQuery : issueInverseRelationsQuery,
-      variables: { issueId },
-      selectConnection: (data) => {
-        if (direction === "outbound") {
-          const page = relationsPageSchema.parse(data);
+    const result = await this.transport.paginate<unknown, z.infer<typeof relationNodeSchema>>(
+      {
+        operationName:
+          direction === "outbound"
+            ? "AgentTeamReadIssueRelations"
+            : "AgentTeamReadIssueInverseRelations",
+        query: direction === "outbound" ? issueRelationsQuery : issueInverseRelationsQuery,
+        variables: { issueId },
+        selectConnection: (data) => {
+          if (direction === "outbound") {
+            const page = relationsPageSchema.parse(data);
+            if (page.issue === null) throw new Error("linear_issue_not_found");
+            return page.issue.relations;
+          }
+          const page = inverseRelationsPageSchema.parse(data);
           if (page.issue === null) throw new Error("linear_issue_not_found");
-          return page.issue.relations;
-        }
-        const page = inverseRelationsPageSchema.parse(data);
-        if (page.issue === null) throw new Error("linear_issue_not_found");
-        return page.issue.inverseRelations;
+          return page.issue.inverseRelations;
+        },
       },
-    });
+      options,
+    );
     if (!result.ok) return result;
     return ok(
       Object.freeze(

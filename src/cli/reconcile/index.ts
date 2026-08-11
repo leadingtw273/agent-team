@@ -6,12 +6,10 @@ import type {
   ReconcileTargetOutcome,
 } from "../../application/reconcile/index.js";
 import type { DomainError, Result } from "../../domain/foundation/index.js";
+import type { JobProgressRecord } from "../../adapters/dispatch/job-progress-store.js";
+import type { ResumeJobOutcome } from "../dispatch/resume-composition.js";
 import type { CliCommandOutcome } from "../program.js";
-import {
-  countJobProgressInventory,
-  type JobProgressInventory,
-  type JobProgressInventoryCounts,
-} from "./active-job-inventory.js";
+import { countJobProgressInventory, type JobProgressInventory } from "./active-job-inventory.js";
 
 export const manualReconcileEvidenceCodes = [
   "manual_reconcile_completed",
@@ -39,6 +37,7 @@ export const reconcileCapabilityIds = [
   "job_update",
   "active_job_snapshot",
   "durable_progress_inventory",
+  "durable_progress_resume",
   "provider_readback",
   "event_repair",
   "process_inspect",
@@ -58,8 +57,20 @@ export interface ReconcileDisclosedScope {
 export interface ManualReconcileUseCase {
   readonly reconcileAll: (request: ReconcileAllRequest) => Promise<ReconcileAllOutcome>;
   readonly readJobProgressInventory: () => Promise<Result<JobProgressInventory, DomainError>>;
+  readonly resumeJobProgress: (
+    records: readonly JobProgressRecord[],
+  ) => Promise<JobProgressResumeBatch>;
   /** E010c: which `ReconcilePorts` capabilities this use case's composition actually backed. */
   readonly disclosedScope: ReconcileDisclosedScope;
+}
+
+export interface JobProgressResumeBatch {
+  readonly outcomes: readonly ResumeJobOutcome[];
+  readonly blocked: readonly Readonly<{
+    projectId: string;
+    jobId: string;
+    reason: string;
+  }>[];
 }
 
 export interface CreateManualReconcileHandlerOptions {
@@ -128,10 +139,24 @@ function failedEvidence(
   }
 }
 
+function safeResumeBatch(batch: JobProgressResumeBatch): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    outcomes: Object.freeze(
+      batch.outcomes.map((candidate) => {
+        const withPossibleError = candidate as ResumeJobOutcome & { readonly error?: DomainError };
+        const { error, ...safe } = withPossibleError;
+        return Object.freeze(error === undefined ? safe : { ...safe, errorCode: error.code });
+      }),
+    ),
+    blocked: batch.blocked,
+  });
+}
+
 function renderReconcileOutcome(
   result: ReconcileAllOutcome,
   disclosedScope: ReconcileDisclosedScope,
-  jobProgressCounts: JobProgressInventoryCounts,
+  inventory: JobProgressInventory,
+  resumed: JobProgressResumeBatch,
 ): CliCommandOutcome {
   if (result.state === "failed") {
     return outcome("failed", {
@@ -144,9 +169,21 @@ function renderReconcileOutcome(
   // T02B: a coordinator pass is not globally complete while durable progress remains unresolved.
   // Keep target counts separate (the generic coordinator still has no safe ReconcileTarget bridge),
   // but downgrade the command instead of preserving the old false-green empty-target result.
+  const jobProgressCounts = countJobProgressInventory(inventory);
   const hasUnresolvedProgress = jobProgressCounts.resumable + jobProgressCounts.blocked > 0;
+  const unresolvedJobIds = new Set<string>(
+    [...inventory.resumable, ...inventory.blocked].map((record) => record.jobId),
+  );
+  const resumeDidNotConverge =
+    resumed.blocked.some((candidate) => unresolvedJobIds.has(candidate.jobId)) ||
+    resumed.outcomes.some(
+      (candidate) =>
+        unresolvedJobIds.has(candidate.jobId) &&
+        candidate.outcome !== "completed" &&
+        candidate.outcome !== "merge_reconciled",
+    );
   const effectiveState =
-    result.state === "degraded" || hasUnresolvedProgress
+    result.state === "degraded" || hasUnresolvedProgress || resumeDidNotConverge
       ? ("degraded" as const)
       : ("completed" as const);
   const payload = {
@@ -159,6 +196,15 @@ function renderReconcileOutcome(
     reclaimedLeaseCount: result.reclaimedLeaseIds.length,
     targetCounts: countTargets(result.targets),
     jobProgressCounts,
+    jobProgressResume: safeResumeBatch(resumed),
+    jobProgressBlocked: inventory.blocked.map((record) => ({
+      projectId: record.projectId,
+      jobId: record.jobId,
+      stage: record.stage.kind,
+      ...(record.stage.kind === "requires_manual" && record.stage.cause !== undefined
+        ? { reasonCode: record.stage.cause.reasonCode }
+        : {}),
+    })),
     modelResumeAttempts: result.modelResumeAttempts,
     scopeDisclosure: disclosedScope,
   };
@@ -184,10 +230,35 @@ export function createManualReconcileHandler(
           evidenceCode: "manual_reconcile_failed_jobs",
         });
       }
+      const reconciled = await options.reconcile.reconcileAll(createRequest());
+      if (reconciled.state === "failed") {
+        return renderReconcileOutcome(
+          reconciled,
+          options.reconcile.disclosedScope,
+          inventory.value,
+          {
+            outcomes: [],
+            blocked: [],
+          },
+        );
+      }
+      const resumed =
+        reconciled.state === "completed"
+          ? await options.reconcile.resumeJobProgress(inventory.value.resumable)
+          : Object.freeze({ outcomes: Object.freeze([]), blocked: Object.freeze([]) });
+      const finalInventory = await options.reconcile.readJobProgressInventory();
+      if (!finalInventory.ok) {
+        return outcome("failed", {
+          operation: "manual_reconcile",
+          state: "failed",
+          evidenceCode: "manual_reconcile_failed_jobs",
+        });
+      }
       return renderReconcileOutcome(
-        await options.reconcile.reconcileAll(createRequest()),
+        reconciled,
         options.reconcile.disclosedScope,
-        countJobProgressInventory(inventory.value),
+        finalInventory.value,
+        resumed,
       );
     } catch {
       return outcome("failed", {

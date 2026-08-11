@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 /**
  * O009 decision #5: probe webhook secrets come from
@@ -74,4 +74,28 @@ export function readLinearApiKey(
   return trimmed.length === 0
     ? Object.freeze({ ok: false, reason: "missing" })
     : Object.freeze({ ok: true, value: trimmed });
+}
+
+export function defaultLinearApiKeyPath(agentTeamHome: string): string {
+  return join(agentTeamHome, "secrets", "linear-api-key");
+}
+
+/** Environment wins for explicit one-shot runs; the 0600 host file enables the scrubbed systemd
+ * Runtime without placing a credential in the unit environment. Neither failure path reveals
+ * whether the file exists or why it was rejected. */
+export async function readLinearApiKeyWithFileFallback(
+  agentTeamHome: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): Promise<ReadLinearApiKeyResult> {
+  const fromEnvironment = readLinearApiKey(environment);
+  if (fromEnvironment.ok) return fromEnvironment;
+  const fromFile = await readSecretFile(defaultLinearApiKeyPath(agentTeamHome));
+  if (!fromFile.ok) return Object.freeze({ ok: false, reason: "missing" as const });
+  try {
+    return readLinearApiKey({
+      LINEAR_API_KEY: new TextDecoder("utf-8", { fatal: true }).decode(fromFile.value),
+    });
+  } catch {
+    return Object.freeze({ ok: false, reason: "missing" as const });
+  }
 }

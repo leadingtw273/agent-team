@@ -142,18 +142,26 @@ function snapshot(overrides: Partial<LinearIssueSnapshot> = {}): LinearIssueSnap
 
 class FakeReadModel implements LinearWorkManagementReadModel {
   contextCalls = 0;
+  readonly contextOptions: unknown[] = [];
+  readonly issueOptions: unknown[] = [];
   constructor(
     private readonly ctx = context(),
     private readonly issue = snapshot(),
     private readonly failContext = false,
   ) {}
 
-  readContext(): ReturnType<LinearWorkManagementReadModel["readContext"]> {
+  readContext(
+    ...args: Parameters<LinearWorkManagementReadModel["readContext"]>
+  ): ReturnType<LinearWorkManagementReadModel["readContext"]> {
     this.contextCalls += 1;
+    this.contextOptions.push(args[2]);
     return Promise.resolve(this.failContext ? err(domainError("external_failure")) : ok(this.ctx));
   }
 
-  readIssue(): ReturnType<LinearWorkManagementReadModel["readIssue"]> {
+  readIssue(
+    ...args: Parameters<LinearWorkManagementReadModel["readIssue"]>
+  ): ReturnType<LinearWorkManagementReadModel["readIssue"]> {
+    this.issueOptions.push(args[2]);
     return Promise.resolve(ok(this.issue));
   }
 }
@@ -213,6 +221,23 @@ describe("LinearWorkManagementAdapter", () => {
     expect(result.value.issue.projectId).toBe(project().id);
     expect(result.value.issue.externalId).toBe("linear-issue-1");
     expect(result.value.workStatus).toBe("in_review");
+  });
+
+  it("passes the same AbortSignal through both Linear context and issue multi-read", async () => {
+    const readModel = new FakeReadModel();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel,
+      mutationClient: new FakeMutationClient(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+    const controller = new AbortController();
+
+    const result = await adapter.getIssue(reference(), { signal: controller.signal });
+
+    expect(result.ok).toBe(true);
+    expect(readModel.contextOptions).toEqual([{ signal: controller.signal }]);
+    expect(readModel.issueOptions).toEqual([{ signal: controller.signal }]);
   });
 
   it("propagates a readContext failure without ever reaching readIssue", async () => {
