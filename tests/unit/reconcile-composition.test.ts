@@ -12,9 +12,8 @@
  * never spawn a model process (the coordinator's per-target loop, the only place any of those four
  * ports would ever be called, is structurally unreachable while `listActive` returns `[]`).
  *
- * E010c adds: `buildManualReconcileUseCase(...).disclosedScope` reports this same wired/unwired
- * split as CLI-consumable data (see `describeDisclosedScope` in composition.ts), so the CLI output
- * can say so instead of a `completed` verdict silently implying full coverage.
+ * E010c adds disclosed scope. T02B additionally proves the production use case reads the durable
+ * progress directory once and reports active/terminal inventory without reaching any model port.
  */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -65,6 +64,36 @@ const expiredLease = Object.freeze({
   acquiredAt: "2020-01-01T00:00:00.000Z",
   expiresAt: "2020-01-01T00:05:00.000Z",
 });
+
+async function writeProgressFixture(
+  agentTeamHome: string,
+  jobId: string,
+  stage: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  const directory = join(agentTeamHome, "state", "dispatch", "progress");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(directory, `${jobId}.json`),
+    JSON.stringify(
+      {
+        schemaVersion: 1,
+        revision: 0,
+        jobId,
+        projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+        issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+        externalIssueId: "ENG-1",
+        model: "test-model",
+        stage,
+        branch: `agent-team/${jobId}`,
+        worktreePath: `/tmp/${jobId}`,
+        updatedAt: "2026-08-11T12:00:00.000Z",
+      },
+      null,
+      2,
+    ),
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
 
 describe("E010b manual reconcile production composition", () => {
   it("reclaims a real expired lease from the shared FileLeaseRepository", async () => {
@@ -139,15 +168,40 @@ describe("E010b manual reconcile production composition", () => {
       targets: [],
       modelResumeAttempts: 0,
     });
+    await expect(useCase.readJobProgressInventory()).resolves.toEqual({
+      ok: true,
+      value: { resumable: [], blocked: [], terminal: [] },
+    });
+  });
+
+  it("reads resumable, blocked and terminal durable progress without invoking generic target ports", async () => {
+    const agentTeamHome = await temporaryHome();
+    await writeProgressFixture(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678901", {
+      kind: "ci_waiting",
+    });
+    await writeProgressFixture(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678902", {
+      kind: "implementing",
+    });
+    await writeProgressFixture(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678903", {
+      kind: "completed",
+    });
+
+    const useCase = buildManualReconcileUseCase({ agentTeamHome });
+    const inventory = await useCase.readJobProgressInventory();
+    expect(inventory.ok).toBe(true);
+    if (!inventory.ok) return;
+    expect(inventory.value.resumable.map((record) => record.stage.kind)).toEqual(["ci_waiting"]);
+    expect(inventory.value.blocked.map((record) => record.stage.kind)).toEqual(["implementing"]);
+    expect(inventory.value.terminal.map((record) => record.stage.kind)).toEqual(["completed"]);
   });
 
   describe("E010c disclosed-scope derivation", () => {
-    it("reports exactly the two ports with real production backing as wired, everything else unwired", async () => {
+    it("reports durable progress inventory separately from the unwired coordinator target snapshot", async () => {
       const agentTeamHome = await temporaryHome();
       const useCase = buildManualReconcileUseCase({ agentTeamHome });
 
       expect(useCase.disclosedScope).toEqual({
-        wiredCapabilities: ["lease_reclaim", "job_update"],
+        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
         unwiredCapabilities: [
           "active_job_snapshot",
           "provider_readback",
@@ -170,7 +224,7 @@ describe("E010b manual reconcile production composition", () => {
       // `ReconcileCapabilityId` surface derived from `describeDisclosedScope`'s accessor table.
       const all = [...wiredCapabilities, ...unwiredCapabilities];
       expect(new Set(all).size).toBe(all.length);
-      expect(all).toHaveLength(10);
+      expect(all).toHaveLength(11);
       const overlap = wiredCapabilities.filter((id) => unwiredCapabilities.includes(id));
       expect(overlap).toEqual([]);
     });

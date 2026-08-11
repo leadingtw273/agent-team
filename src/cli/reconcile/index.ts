@@ -5,7 +5,13 @@ import type {
   ReconcileAllRequest,
   ReconcileTargetOutcome,
 } from "../../application/reconcile/index.js";
+import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { CliCommandOutcome } from "../program.js";
+import {
+  countJobProgressInventory,
+  type JobProgressInventory,
+  type JobProgressInventoryCounts,
+} from "./active-job-inventory.js";
 
 export const manualReconcileEvidenceCodes = [
   "manual_reconcile_completed",
@@ -21,7 +27,8 @@ export type ManualReconcileEvidenceCode = (typeof manualReconcileEvidenceCodes)[
 
 /**
  * E010c: closed enum of every capability `ReconcilePorts` (src/application/reconcile/model.ts)
- * exposes -- one entry per port method, no aggregation. A composition root (e.g.
+ * exposes -- one entry per port method, no aggregation -- plus CLI-owned production capabilities
+ * such as T02B's durable progress inventory. A composition root (e.g.
  * `composition.ts`'s `buildManualReconcileUseCase`) reports, per request, which of these it
  * actually backed with production logic ("wired") versus which fail closed with an honest
  * `"unavailable"` error today ("unwired"). This lets the CLI payload disclose scope honestly
@@ -31,6 +38,7 @@ export const reconcileCapabilityIds = [
   "lease_reclaim",
   "job_update",
   "active_job_snapshot",
+  "durable_progress_inventory",
   "provider_readback",
   "event_repair",
   "process_inspect",
@@ -49,6 +57,7 @@ export interface ReconcileDisclosedScope {
 
 export interface ManualReconcileUseCase {
   readonly reconcileAll: (request: ReconcileAllRequest) => Promise<ReconcileAllOutcome>;
+  readonly readJobProgressInventory: () => Promise<Result<JobProgressInventory, DomainError>>;
   /** E010c: which `ReconcilePorts` capabilities this use case's composition actually backed. */
   readonly disclosedScope: ReconcileDisclosedScope;
 }
@@ -122,6 +131,7 @@ function failedEvidence(
 function renderReconcileOutcome(
   result: ReconcileAllOutcome,
   disclosedScope: ReconcileDisclosedScope,
+  jobProgressCounts: JobProgressInventoryCounts,
 ): CliCommandOutcome {
   if (result.state === "failed") {
     return outcome("failed", {
@@ -131,22 +141,28 @@ function renderReconcileOutcome(
     });
   }
 
-  // E010c: `completed`/`degraded` are the verdicts an operator is most likely to skim past --
-  // disclose scope here so `completed` reads as "the wired capabilities finished cleanly", never
-  // as "every reconcile capability ran". Verdict/evidenceCode/state are unchanged from E010b.
+  // T02B: a coordinator pass is not globally complete while durable progress remains unresolved.
+  // Keep target counts separate (the generic coordinator still has no safe ReconcileTarget bridge),
+  // but downgrade the command instead of preserving the old false-green empty-target result.
+  const hasUnresolvedProgress = jobProgressCounts.resumable + jobProgressCounts.blocked > 0;
+  const effectiveState =
+    result.state === "degraded" || hasUnresolvedProgress
+      ? ("degraded" as const)
+      : ("completed" as const);
   const payload = {
     operation: "manual_reconcile",
-    state: result.state,
+    state: effectiveState,
     evidenceCode:
-      result.state === "completed"
+      effectiveState === "completed"
         ? ("manual_reconcile_completed" as const)
         : ("manual_reconcile_degraded" as const),
     reclaimedLeaseCount: result.reclaimedLeaseIds.length,
     targetCounts: countTargets(result.targets),
+    jobProgressCounts,
     modelResumeAttempts: result.modelResumeAttempts,
     scopeDisclosure: disclosedScope,
   };
-  return outcome(result.state === "completed" ? "success" : "blocked", payload);
+  return outcome(effectiveState === "completed" ? "success" : "blocked", payload);
 }
 
 /**
@@ -160,9 +176,18 @@ export function createManualReconcileHandler(
   const createRequest = options.createRequest ?? createDefaultRequest;
   return async () => {
     try {
+      const inventory = await options.reconcile.readJobProgressInventory();
+      if (!inventory.ok) {
+        return outcome("failed", {
+          operation: "manual_reconcile",
+          state: "failed",
+          evidenceCode: "manual_reconcile_failed_jobs",
+        });
+      }
       return renderReconcileOutcome(
         await options.reconcile.reconcileAll(createRequest()),
         options.reconcile.disclosedScope,
+        countJobProgressInventory(inventory.value),
       );
     } catch {
       return outcome("failed", {

@@ -727,6 +727,21 @@ export class FileJobProgressStore {
     if (!parsedProjectId.ok || options.signal?.aborted === true) {
       return err(domainError("invariant_violation"));
     }
+
+    const all = await this.listAll(options);
+    if (!all.ok) return all;
+    return ok(Object.freeze(all.value.filter((record) => record.projectId === projectId)));
+  }
+
+  /**
+   * Returns one global, read-only snapshot of every durable progress record. Classification is
+   * deliberately left to the reconcile/dispatch caller: the store validates persistence shape and
+   * filename identity, but does not decide which stages are resumable or terminal.
+   */
+  async listAll(
+    options: ReadOptions = {},
+  ): Promise<Result<readonly JobProgressRecord[], DomainError>> {
+    if (options.signal?.aborted === true) return err(domainError("invariant_violation"));
     let entries: string[];
     try {
       entries = (await readdir(this.#directory)).filter((name) => name.endsWith(".json"));
@@ -748,12 +763,10 @@ export class FileJobProgressStore {
         join(this.#directory, entry),
         jobProgressRecordSchema,
       );
-      if (!loaded.ok) {
-        if (isNotFound(loaded.error)) continue;
-        return loaded;
-      }
+      // Once `readdir` included an entry, losing it before read-back invalidates this snapshot.
+      // Silently skipping it could turn unresolved durable work into an empty, false-green result.
+      if (!loaded.ok) return loaded;
       if (`${loaded.value.jobId}.json` !== entry) return err(domainError("invariant_violation"));
-      if (loaded.value.projectId !== projectId) continue;
       records.push(loaded.value);
     }
     return ok(Object.freeze(records));
