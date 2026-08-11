@@ -503,14 +503,14 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as {
       pipeline: string;
       pipelineReason: string;
-      error: { code: string };
+      errorCode: string;
     };
     expect(payload.pipeline).toBe("failed");
     // C019 fix (item 2): the write itself succeeded here -- reporting
     // `job_progress_write_failed` would falsely tell an operator that nothing was persisted, when
     // a resolvable `requires_manual` record (asserted below) genuinely exists.
     expect(payload.pipelineReason).toBe("invalid_head_sha");
-    expect(payload.error.code).toBe("invariant_violation");
+    expect(payload.errorCode).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const records = await progress.listForProject(projectId);
@@ -584,11 +584,11 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       const payload = JSON.parse(outcome.message ?? "{}") as {
         pipeline: string;
         pipelineReason: string;
-        error: { code: string };
+        errorCode: string;
       };
       expect(payload.pipeline).toBe("failed");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
-      expect(payload.error.code).toBe("permission_denied");
+      expect(payload.errorCode).toBe("permission_denied");
     } finally {
       await chmod(progressDirectory, 0o700);
     }
@@ -765,13 +765,13 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as {
       pipeline: string;
       pipelineReason: string;
-      error: { code: string };
+      errorCode: string;
     };
     expect(payload.pipeline).toBe("failed");
     // C019 fix (item 2): the write itself succeeded here -- see the sibling `invalid_head_sha`
     // test's own comment above for the full rationale.
     expect(payload.pipelineReason).toBe("invalid_checkpoint_id");
-    expect(payload.error.code).toBe("invariant_violation");
+    expect(payload.errorCode).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const records = await progress.listForProject(projectId);
@@ -824,11 +824,11 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       const payload = JSON.parse(outcome.message ?? "{}") as {
         pipeline: string;
         pipelineReason: string;
-        error: { code: string };
+        errorCode: string;
       };
       expect(payload.pipeline).toBe("failed");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
-      expect(payload.error.code).toBe("permission_denied");
+      expect(payload.errorCode).toBe("permission_denied");
     } finally {
       await chmod(progressDirectory, 0o700);
     }
@@ -929,14 +929,14 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       pipeline: string;
       stage: string;
       pipelineReason: string;
-      error: { code: string };
+      errorCode: string;
     };
     expect(payload.pipeline).toBe("failed");
     expect(payload.stage).toBe("request");
     expect(payload.pipelineReason).toBe("implementer_pipeline_request_rejected");
     // The engine's own error code is preserved verbatim, not overwritten by the new CLI-layer
     // reason.
-    expect(payload.error.code).toBe("invariant_violation");
+    expect(payload.errorCode).toBe("invariant_violation");
   });
 
   /**
@@ -1060,11 +1060,11 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       const payload = JSON.parse(outcome.message ?? "{}") as {
         pipeline: string;
         pipelineReason: string;
-        error: { code: string };
+        errorCode: string;
       };
       expect(payload.pipeline).toBe("failed");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
-      expect(payload.error.code).toBe("permission_denied");
+      expect(payload.errorCode).toBe("permission_denied");
       expect(buildImplementerPipeline).not.toHaveBeenCalled();
     } finally {
       await chmod(progressDirectory, 0o700);
@@ -1427,13 +1427,13 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const payload = JSON.parse(outcome.message ?? "{}") as {
       pipeline: string;
       pipelineReason: string;
-      error: { code: string };
+      errorCode: string;
     };
     expect(payload.pipeline).toBe("failed");
     // C019 fix (item 2): the write itself succeeded here -- see `invalid_head_sha`'s own sibling
     // test comment above for the full rationale.
     expect(payload.pipelineReason).toBe("invalid_base_revision");
-    expect(payload.error.code).toBe("invariant_violation");
+    expect(payload.errorCode).toBe("invariant_violation");
 
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const records = await progress.listForProject(projectId);
@@ -1508,11 +1508,11 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       const payload = JSON.parse(outcome.message ?? "{}") as {
         pipeline: string;
         pipelineReason: string;
-        error: { code: string };
+        errorCode: string;
       };
       expect(payload.pipeline).toBe("failed");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
-      expect(payload.error.code).toBe("permission_denied");
+      expect(payload.errorCode).toBe("permission_denied");
     } finally {
       await chmod(progressDirectory, 0o700);
     }
