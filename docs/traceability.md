@@ -7,6 +7,43 @@
 - `已驗證`：實作已合併，且有本機 Gate、獨立 Review 或真 CI 證據。
 - `已規劃`：Task 與驗收方式已核可，但尚未執行。
 - 狀態不得由 Agent 自述單獨改為已驗證；必須附 Git、CI、Test、Probe 或 Read-back。
+- 上述單一狀態只表示原始 Task／規格追蹤，不代表 production 已可達。2026-08-11 起，當前能力一律先看下方四層真值表：`code`、`test`、`production`、`live` 不得互相代替。
+
+## 2026-08-11 路線校正：能力真值表
+
+基準：main `2bc269b`；最新 GitHub Actions Run `31398014580` 的 `Quality gates` 成功。`live narrative` 代表交接與人工 read-back 有紀錄，但 repo 內尚無可重播、去敏 case artifact，因此不能算 release evidence。
+
+| 能力 | code | test | production | live | 當前裁決 |
+|---|---:|---:|---:|---:|---|
+| Domain／Schema／Provider-neutral Ports | 是 | 是 | 不適用 | 不適用 | 可信基礎 |
+| Linear／GitHub／Git Adapters | 是 | 是 | 是 | narrative | 高度可信，缺可重播 artifact |
+| Registration Setup／Activation | 是 | 是 | CLI 可達 | narrative | 高度可信，缺可重播 artifact |
+| Proactive Registration Probe | 是 | 是 | CLI 可達 | narrative | 高度可信，缺可重播 artifact |
+| Implementer dispatch | 是 | 是 | 可達 | E101 narrative | 核心 Happy Path 已形成 |
+| Code Review | 是 | 是 | 內嵌 resume 可達 | E101 narrative | code 可信，live 證據待版本化 |
+| Visual／Dual Review | 是 | 是 | config 完整時可達 | E102 narrative | 不列入第一輪 Smoke Test |
+| CI repair | 是 | 是 | 可達 | E103 narrative | 不列入第一輪 Smoke Test |
+| Merge／Lifecycle | 是 | 是 | 可達 | E115 暴露取消／合併缺口 | **P0：取消工單仍可能被合併** |
+| Quota enforcement | policy／UI model 有 | 是 | 未接可信 sample | 無 | **未完成；unknown admission 不可信** |
+| Reconcile／Watchdog | 是 | 是 | active jobs 固定為空 | 無 | **未完成；無法真正復航** |
+| Danger approval | classifier／UI model 有 | 是 | production 一律拒絕，無核可 bridge | 無 | 安全但不可用；第一輪不觸發 |
+| `project` CLI | 介面有 | 是 | blocked default | 無 | **未完成** |
+| localhost UI | 元件有 | 是 | blocked default／fixture read model | 無 | **未完成** |
+| Dependency／Concurrency | Domain 有 | 是 | resolver 未接 | 無 | 半完成；第一輪不測 |
+| Integration role | Domain／角色定義有 | 是 | dispatch 不可達 | 無 | 不得宣稱 v1 已可獨立調度 |
+| Team Manager entry | 角色契約有 | 零散 | Host contract 未文件化 | 無 | **第一輪前需明確定義** |
+| Live case evidence | harness／validator 有 | 是 | production writer 未閉環 | narrative | **缺 versioned redacted artifact** |
+
+### 當前執行優先序
+
+1. 取消工單的 Merge revocation boundary。
+2. Codex／Claude quota capability 重驗與 production admission gate。
+3. Durable active-job inventory、Reconcile resume 與 systemd live proof。
+4. `project` production read model 與最小 localhost UI。
+5. Team Manager host contract、Smoke Runbook、live artifact、internal canary。
+6. leadi 第一輪 Sandbox Smoke Test。
+
+完整 Task、依賴與第一輪邊界見 [`roadmap-to-first-sandbox-test.md`](roadmap-to-first-sandbox-test.md)。診斷細化、逐 artifact transcript、root-file broker、review context 診斷、secret scanner corpus 微調與合成 E2E 擴張在第一輪前暫停。
 
 ## 規格章節對應
 

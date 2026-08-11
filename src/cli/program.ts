@@ -168,9 +168,7 @@ export function createProgram(
 
   program
     .command("run")
-    .description(
-      "輪詢 Linear 待執行工單、評估 eligibility、取租約並建立 Job（C015a：接單半場，不執行模型／不啟動 pipeline）",
-    )
+    .description("輪詢 Linear 待執行工單、恢復既有 Job，並驅動 implementer pipeline")
     .requiredOption("--project <project-id>", "專案識別碼")
     .option("--dry-run", "只印出候選與 eligibility 結果，不取租約、不建 Job")
     .action((options: { readonly project: string; readonly dryRun?: boolean }) =>

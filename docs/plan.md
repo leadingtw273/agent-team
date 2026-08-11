@@ -6,6 +6,8 @@
 需求 SHA-256：`d64ccc6e7e653a44fc7d043b6dd668156585628a4cb9bfcb75f8b23b7060f70f`  
 規格裁決：需求規格優先於本 Plan；若兩者衝突，停止該 Task、Checkpoint 並回報，不可自行改規格。
 
+> 2026-08-11 路線校正：本檔保留為 v1 需求與歷史 Task 基線；從目前進度走到 leadi 第一輪 Sandbox 測試的實際優先序，以 [`roadmap-to-first-sandbox-test.md`](roadmap-to-first-sandbox-test.md) 為準。Roadmap 不刪除本 Plan 的後續需求，只調整第一個可交付出口。
+
 ## 1. Plan 的目的與執行邊界
 
 本 Plan 將需求基線轉為可逐項執行、可獨立驗收的 Task。它同時是新 `agent-team` 尚未能自我管理前的 Bootstrap 工作清單。

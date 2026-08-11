@@ -1,6 +1,6 @@
 # Agent Team 本機第一版需求規格
 
-狀態：待使用者最終核可  
+狀態：已核可，實作中；2026-08-11 起依路線校正版 Roadmap 收斂第一輪 Sandbox Smoke Test  
 日期：2026-08-04  
 規格來源：leadi 與 Codex 的逐題需求釐清  
 

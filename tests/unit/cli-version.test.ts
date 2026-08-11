@@ -66,8 +66,7 @@ describe("agent-team CLI contract", () => {
         -h, --help                   display help for command
 
       Commands:
-        run [options]                輪詢 Linear 待執行工單、評估 eligibility、取租約並建立
-                                     Job（C015a：接單半場，不執行模型／不啟動 pipeline）
+        run [options]                輪詢 Linear 待執行工單、恢復既有 Job，並驅動 implementer pipeline
         dispatch                     C015o：手動收斂卡住的 dispatch job
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
