@@ -63,9 +63,6 @@ import {
   buildAutoMergePauseStore,
   buildIssueAdmissionStore,
   buildJobProgressStore,
-  buildReviewReportDiagnosticsSidecar,
-  isResumeCandidate,
-  runResumeCycle,
   type ResumeJobOutcome,
 } from "./resume-composition.js";
 import {
@@ -76,6 +73,7 @@ import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
+import { resumeExistingProjectJobs } from "./resume-existing.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -98,6 +96,8 @@ export interface CreateDispatchCliHandlersOptions {
   readonly buildResumeComposition?: (
     options: Parameters<typeof buildResumeComposition>[0],
   ) => Promise<BuildResumeCompositionResult>;
+  /** Injectable for CLI redaction/orchestration tests; production uses the shared resume bridge. */
+  readonly resumeExistingProjectJobs?: typeof resumeExistingProjectJobs;
   /** C015x decision 1: injectable for tests; production defaults to the real
    * `resolveAuthoritativeBaseRevision` (this ticket's fix -- see that file's own header). Existing
    * tests that predate this ticket and only care about the pipeline hand-off (not this resolution
@@ -110,6 +110,18 @@ export interface CreateDispatchCliHandlersOptions {
 const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = Object.freeze({
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
+
+function safeResumeOutcomes(
+  outcomes: readonly ResumeJobOutcome[],
+): readonly Readonly<Record<string, unknown>>[] {
+  return Object.freeze(
+    outcomes.map((candidate) => {
+      const withPossibleError = candidate as ResumeJobOutcome & { readonly error?: DomainError };
+      const { error, ...safe } = withPossibleError;
+      return Object.freeze(error === undefined ? safe : { ...safe, errorCode: error.code });
+    }),
+  );
+}
 
 type DispatchHandlers = Pick<
   CliHandlers,
@@ -186,7 +198,7 @@ function pipelineOutcomePayload(
       return Object.freeze({
         pipeline: "failed",
         stage: outcome.stage,
-        error: outcome.error,
+        errorCode: outcome.error.code,
         // C015j (side item): `ImplementerPipeline.run()`'s own internal request-shape validation
         // (`requestShapeValid`/`validRequest`, src/application/pipelines/implementer.ts) fails
         // closed with a single generic `domainError("invariant_violation")` for every one of the
@@ -332,145 +344,72 @@ export function createDispatchCliHandlers(
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
 
-      // C015c item 2: resume any of this project's own ci_waiting-or-later jobs *before*
-      // considering a fresh dispatch -- never in `--dry-run`, which must stay zero-mutation/
-      // zero-network exactly as C015a/b left it (real GitHub/Linear calls happen inside
-      // `runResumeCycle`). A single `run` invocation either resumes existing work or dispatches
-      // new work, never both -- the next invocation picks up whichever is still outstanding.
+      // Resume-only bridge shared with `reconcile --all`. It can converge to `none`, but never
+      // falls through internally to discovery/new-Job admission.
       if (!dryRun) {
-        const existingProgress = await progress.listForProject(build.value.project.id);
-        if (!existingProgress.ok) {
-          return outcome("failed", {
-            operation: "dispatch_run",
-            state: "blocked",
-            projectId: input.projectId,
-            reason: "job_progress_read_failed",
-            message: "讀取本機 job 進度索引失敗（外部/檔案系統故障，非設定缺失，可重試）。",
-            error: existingProgress.error,
-          });
-        }
-        // C015u decision 1: `isResumeCandidate` -- not `resumableStageKinds` alone -- is the
-        // complete gate. See that function's own header (resume-composition.ts) for exactly why
-        // this drifted stale the moment C015t added its second, narrower candidate class, and why
-        // this stays a pre-flight "is there anything at all" check rather than calling
-        // `runResumeCycle` unconditionally.
-        const hasResumeCandidate = existingProgress.value.some(isResumeCandidate);
-        if (hasResumeCandidate) {
-          const resumeComposition = await (
-            options.buildResumeComposition ?? buildResumeComposition
-          )({
-            agentTeamHome: options.agentTeamHome,
-            claudeConfig: build.value.claude.config,
-            ...(build.value.gemini === undefined ? {} : { geminiConfig: build.value.gemini }),
-            jobs: build.value.jobs,
-            readModel: build.value.discovery.readModel,
-            mutationClient: build.value.discovery.mutationClient,
-            teamId: build.value.discovery.teamId,
-            linearProjectId: build.value.discovery.linearProjectId,
-            progress,
-            // E115cap: a real `LeaseCoordinator` over this run's own `LeaseRepository` -- so a
-            // Linear cancellation observed by `LifecyclePipeline` can release the lease it holds.
-            leases: new LeaseCoordinator(build.value.leases),
-            autoMergePause,
-            // E102-5: the same transport `readModel`/`mutationClient` above already share -- see
-            // `BuildResumeCompositionOptions.linearTransport`'s own header.
-            linearTransport: build.value.discovery.linearTransport,
-          });
-          if (resumeComposition.state !== "ready") {
-            return outcome("blocked", {
-              operation: "dispatch_run",
-              state: "blocked",
-              projectId: input.projectId,
-              reason: resumeComposition.reason,
-              message: implementerCompositionBlockedMessages[resumeComposition.reason],
-            });
-          }
-
-          // C015e: a resumed job's worktree lives under the exact same
-          // `${agentTeamHome}/state/dispatch/worktrees` tree a fresh dispatch does -- ensure it
-          // still exists before handing a worktree reference to CiRecoveryPipeline/
-          // ReviewerPipeline, for the same reason a fresh dispatch must (see
-          // worktree-directories.ts's own header).
-          const resumeWorktreeDirectory = await ensureDispatchWorktreesDirectory(
-            options.agentTeamHome,
-          );
-          if (!resumeWorktreeDirectory.ok) {
-            return outcome("failed", {
-              operation: "dispatch_run",
-              state: "blocked",
-              projectId: input.projectId,
-              reason: "worktree_directory_unavailable",
-              message: "無法確保 dispatch worktree 目錄存在（檔案系統故障，非設定缺失，可重試）。",
-              error: resumeWorktreeDirectory.error,
-            });
-          }
-
-          const cycle = await runResumeCycle({
-            progress,
-            jobRepository: build.value.jobs,
-            leases: new LeaseCoordinator(build.value.leases),
-            sourceControl: resumeComposition.value.sourceControl,
-            workManagement: resumeComposition.value.workManagement,
-            readModel: build.value.discovery.readModel,
-            teamId: build.value.discovery.teamId,
-            linearProjectId: build.value.discovery.linearProjectId,
-            project: build.value.project,
-            trustedConfig: build.value.trustedConfig,
-            ciRecovery: resumeComposition.value.ciRecovery,
-            reviewerRecovery: resumeComposition.value.reviewerRecovery,
-            reviewer: resumeComposition.value.reviewer,
-            reviewStatus: resumeComposition.value.reviewStatus,
-            autoMerge: resumeComposition.value.autoMerge,
-            lifecycle: resumeComposition.value.lifecycle,
-            ...(resumeComposition.value.visualEvidence === undefined
-              ? {}
-              : { visualEvidence: resumeComposition.value.visualEvidence }),
-            ...(resumeComposition.value.visualReviewModel === undefined
-              ? {}
-              : { visualReviewModel: resumeComposition.value.visualReviewModel }),
-            ...(resumeComposition.value.linearPublication === undefined
-              ? {}
-              : { linearPublication: resumeComposition.value.linearPublication }),
-            ...(resumeComposition.value.linearPublicationStore === undefined
-              ? {}
-              : { linearPublicationStore: resumeComposition.value.linearPublicationStore }),
-            clock,
-            holderId,
-            reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
-            admission: buildIssueAdmissionStore(options.agentTeamHome),
-            // C015y decision A: only ever exercised when `resumeUnderLease` finds a *legacy*
-            // (pre-C015y) job-progress record with no persisted `baseRevision` -- see
-            // `resolveLegacyBaseRevision`'s own header (resume-composition.ts). Bound to the exact
-            // same `resolveAuthoritativeBaseRevision` fresh dispatch uses just above, with fresh,
-            // stateless port instances for the same reason that call site's own comment gives (cheap,
-            // no shared state to duplicate) -- this is never a second, independently-drifting
-            // implementation of "what counts as authoritative."
-            resolveAuthoritativeBase: (project, resolveOptions) =>
-              (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
-                project,
-                { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
-                resolveOptions,
-              ),
-          });
-          if (!cycle.ok) {
-            return outcome("failed", {
-              operation: "dispatch_run",
-              state: "blocked",
-              projectId: input.projectId,
-              reason: "resume_cycle_failed",
-              message: "恢復既有工作流程時發生非預期錯誤。",
-              error: cycle.error,
-            });
-          }
+        const resumed = await (options.resumeExistingProjectJobs ?? resumeExistingProjectJobs)({
+          agentTeamHome: options.agentTeamHome,
+          ready: build.value,
+          holderId,
+          clock,
+          autoMergePause,
+          ...(options.buildResumeComposition === undefined
+            ? {}
+            : { buildResumeComposition: options.buildResumeComposition }),
+          ...(options.resolveAuthoritativeBase === undefined
+            ? {}
+            : { resolveAuthoritativeBase: options.resolveAuthoritativeBase }),
+        });
+        if (resumed.state === "resumed") {
           return outcome(
-            cycle.value.some((job) => job.outcome === "failed") ? "failed" : "success",
+            resumed.outcomes.some((job) => job.outcome === "failed") ? "failed" : "success",
             {
               operation: "dispatch_run",
               state: "resumed",
               projectId: input.projectId,
-              resumed: cycle.value satisfies readonly ResumeJobOutcome[],
+              resumed: safeResumeOutcomes(resumed.outcomes),
             },
           );
+        }
+        if (resumed.state === "blocked") {
+          switch (resumed.reason) {
+            case "resume_composition_blocked":
+              return outcome("blocked", {
+                operation: "dispatch_run",
+                state: "blocked",
+                projectId: input.projectId,
+                reason: resumed.compositionReason,
+                message: implementerCompositionBlockedMessages[resumed.compositionReason],
+              });
+            case "job_progress_read_failed":
+              return outcome("failed", {
+                operation: "dispatch_run",
+                state: "blocked",
+                projectId: input.projectId,
+                reason: resumed.reason,
+                message: "讀取本機 job 進度索引失敗（外部/檔案系統故障，非設定缺失，可重試）。",
+                errorCode: resumed.error.code,
+              });
+            case "worktree_directory_unavailable":
+              return outcome("failed", {
+                operation: "dispatch_run",
+                state: "blocked",
+                projectId: input.projectId,
+                reason: resumed.reason,
+                message:
+                  "無法確保 dispatch worktree 目錄存在（檔案系統故障，非設定缺失，可重試）。",
+                errorCode: resumed.error.code,
+              });
+            case "resume_cycle_failed":
+              return outcome("failed", {
+                operation: "dispatch_run",
+                state: "blocked",
+                projectId: input.projectId,
+                reason: resumed.reason,
+                message: "恢復既有工作流程時發生非預期錯誤。",
+                errorCode: resumed.error.code,
+              });
+          }
         }
       }
 
@@ -494,7 +433,7 @@ export function createDispatchCliHandlers(
           projectId: input.projectId,
           reason: "discovery_failed",
           message: "讀取 Linear 待執行工單失敗（外部呼叫故障，非設定缺失，可重試）。",
-          error: dispatchOnceOutcome.error,
+          errorCode: dispatchOnceOutcome.error.code,
         });
       }
       const { result, candidates, discoverySkipped, admissionSkipped } = dispatchOnceOutcome;
@@ -594,7 +533,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("success", {
@@ -645,7 +584,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("failed", {
@@ -678,7 +617,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("failed", {
@@ -730,7 +669,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("failed", {
@@ -768,14 +707,14 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
               pipelineReason: "worktree_directory_unavailable",
-              error: worktreeDirectory.error,
+              errorCode: worktreeDirectory.error.code,
             });
           }
 
@@ -814,14 +753,14 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
             return outcome("failed", {
               ...dispatchedPayload,
               pipeline: "failed",
               pipelineReason: "implementer_request_invalid",
-              error: request.error,
+              errorCode: request.error.code,
             });
           }
 
@@ -884,14 +823,14 @@ export function createDispatchCliHandlers(
                   ...dispatchedPayload,
                   pipeline: "failed",
                   pipelineReason: "job_progress_write_failed",
-                  error: requiresManual.error,
+                  errorCode: requiresManual.error.code,
                 });
               }
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "invalid_head_sha",
-                error: { code: "invariant_violation" },
+                errorCode: "invariant_violation",
               });
             }
             // C015y decision A: the same authoritative SHA this dispatch just pinned the worktree
@@ -932,14 +871,14 @@ export function createDispatchCliHandlers(
                   ...dispatchedPayload,
                   pipeline: "failed",
                   pipelineReason: "job_progress_write_failed",
-                  error: requiresManual.error,
+                  errorCode: requiresManual.error.code,
                 });
               }
               return outcome("failed", {
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "invalid_base_revision",
-                error: { code: "invariant_violation" },
+                errorCode: "invariant_violation",
               });
             }
             const recorded = await progress.compareAndSwap(result.job.id, null, {
@@ -965,7 +904,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: recorded.error,
+                errorCode: recorded.error.code,
               });
             }
           }
@@ -1007,14 +946,14 @@ export function createDispatchCliHandlers(
                     ...dispatchedPayload,
                     pipeline: "failed",
                     pipelineReason: "job_progress_write_failed",
-                    error: requiresManual.error,
+                    errorCode: requiresManual.error.code,
                   });
                 }
                 return outcome("failed", {
                   ...dispatchedPayload,
                   pipeline: "failed",
                   pipelineReason: "invalid_checkpoint_id",
-                  error: { code: "invariant_violation" },
+                  errorCode: "invariant_violation",
                 });
               }
               parsedCheckpointId = checkpointId.data;
@@ -1040,7 +979,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: recorded.error,
+                errorCode: recorded.error.code,
               });
             }
           }
@@ -1072,7 +1011,7 @@ export function createDispatchCliHandlers(
                 ...dispatchedPayload,
                 pipeline: "failed",
                 pipelineReason: "job_progress_write_failed",
-                error: requiresManual.error,
+                errorCode: requiresManual.error.code,
               });
             }
           }

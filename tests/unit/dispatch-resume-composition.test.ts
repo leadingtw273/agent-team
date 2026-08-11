@@ -20,7 +20,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   runResumeCycle,
@@ -441,6 +441,7 @@ async function harness(
   overrides: Partial<{
     changeRequestState: Readonly<Record<string, unknown>>;
     ciRecoveryOutcome: CiRecoveryPipelineOutcome;
+    ciRecoveryRun: ResumeCycleDependencies["ciRecovery"]["run"];
     reviewerOutcome: ReviewerPipelineOutcome;
     reviewerRecoveryOutcome: ReviewerRecoveryPipelineOutcome;
     beginOutcome: BeginReviewOutcome;
@@ -448,6 +449,8 @@ async function harness(
     enableOutcome: EnableAutoMergeOutcome;
     lifecycleOutcome: LifecyclePipelineOutcome;
     leaseConflict: boolean;
+    leaseDurationMs: number;
+    leaseHeartbeatIntervalMs: number;
     resolveAuthoritativeBaseOutcome: Awaited<
       ReturnType<ResumeCycleDependencies["resolveAuthoritativeBase"]>
     >;
@@ -496,6 +499,7 @@ async function harness(
   await jobRepository.create(job());
   const leases = new LeaseCoordinator(
     new FileLeaseRepository(join(leaseRoot, "leases.json"), join(leaseRoot, "leases.lock")),
+    overrides.leaseDurationMs === undefined ? {} : { leaseDurationMs: overrides.leaseDurationMs },
   );
   if (overrides.leaseConflict === true) {
     await leases.acquire({ jobId, issueId, holderId: "other-holder" });
@@ -570,8 +574,9 @@ async function harness(
       },
     },
     ciRecovery: {
-      run: () => {
+      run: (request) => {
         calls.push("ciRecovery.run");
+        if (overrides.ciRecoveryRun !== undefined) return overrides.ciRecoveryRun(request);
         return Promise.resolve(
           overrides.ciRecoveryOutcome ??
             ({ state: "ready_for_review", source: "polling", job: job(), checks: {} } as never),
@@ -706,6 +711,9 @@ async function harness(
     },
     clock: createFixedClock(now),
     holderId: "resume-holder",
+    ...(overrides.leaseHeartbeatIntervalMs === undefined
+      ? {}
+      : { leaseHeartbeatIntervalMs: overrides.leaseHeartbeatIntervalMs }),
     // C015y decision A: only ever exercised when a seeded record has no `baseRevision` (the
     // legacy-repair path) -- see `resolveLegacyBaseRevision`'s own header. Returns
     // `baseRevisionValue`, matching `changeRequest()`'s own default `baseSha` so the cross-check
@@ -792,6 +800,159 @@ describe("runResumeCycle", () => {
     const reloaded = await progress.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+  });
+
+  it("selection is bound to the inventory revision and never retries a changed candidate", async () => {
+    const { deps, progress, calls } = await harness();
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    const loaded = await progress.load(jobId);
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok || loaded.value === undefined) return;
+
+    const result = await runResumeCycle(deps, {
+      selections: [{ jobId, expectedRevision: loaded.value.revision + 1 }],
+    });
+
+    expect(result).toEqual(
+      ok([{ jobId, outcome: "candidate_changed", reason: "revision_changed" }]),
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it("revalidates the selected revision after acquiring the lease before any external call", async () => {
+    const { deps, progress, calls } = await harness();
+    const prepare = vi.fn(() => Promise.resolve());
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    const selected = await progress.load(jobId);
+    expect(selected.ok).toBe(true);
+    if (!selected.ok || selected.value === undefined) return;
+    const selectedRecord = selected.value;
+
+    const acquire = deps.leases.acquire.bind(deps.leases);
+    vi.spyOn(deps.leases, "acquire").mockImplementationOnce(async (request) => {
+      const { schemaVersion, revision, updatedAt, ...mutation } = selectedRecord;
+      void schemaVersion;
+      void updatedAt;
+      const changed = await progress.compareAndSwap(jobId, revision, {
+        ...mutation,
+        stage: {
+          kind: "paused",
+          checkpointId: id("checkpoint", "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab"),
+        },
+      });
+      expect(changed.ok).toBe(true);
+      return acquire(request);
+    });
+
+    const result = await runResumeCycle(
+      { ...deps, prepare },
+      {
+        selections: [{ jobId, expectedRevision: selectedRecord.revision }],
+      },
+    );
+
+    expect(result).toEqual(
+      ok([{ jobId, outcome: "candidate_changed", reason: "revision_changed" }]),
+    );
+    expect(prepare).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it("renews the per-job lease while a long provider call is still running", async () => {
+    let finishCi: ((outcome: CiRecoveryPipelineOutcome) => void) | undefined;
+    let observedSignal: AbortSignal | undefined;
+    let markCiStarted: (() => void) | undefined;
+    const ciStarted = new Promise<void>((resolve) => {
+      markCiStarted = resolve;
+    });
+    const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
+      leaseDurationMs: 200,
+      leaseHeartbeatIntervalMs: 20,
+      ciRecoveryRun: (request) => {
+        observedSignal = request.signal;
+        markCiStarted?.();
+        return new Promise((resolve) => {
+          finishCi = resolve;
+        });
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    const renew = vi.spyOn(deps.leases, "renew");
+    const running = runResumeCycle(deps);
+    await ciStarted;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(renew).toHaveBeenCalled();
+    const competing = await deps.leases.acquire({ jobId, issueId, holderId: "second-process" });
+    expect(competing).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal?.aborted).toBe(false);
+
+    finishCi?.({ state: "ready_for_review", source: "polling", job: job(), checks: {} } as never);
+    await expect(running).resolves.toEqual(ok([{ jobId, outcome: "completed" }]));
+  });
+
+  it("aborts the provider request and reports lease_conflict when renewal is lost", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const { deps, progress, calls } = await harness({
+      changeRequestState: { draft: true },
+      leaseHeartbeatIntervalMs: 5,
+      ciRecoveryRun: (request) => {
+        observedSignal = request.signal;
+        return new Promise((resolve) => {
+          request.signal?.addEventListener(
+            "abort",
+            () => {
+              resolve({
+                state: "failed",
+                stage: "provider_run",
+                error: domainError("conflict"),
+                job: job(),
+              });
+            },
+            { once: true },
+          );
+        });
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    vi.spyOn(deps.leases, "renew").mockResolvedValue(err(domainError("external_failure")));
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toEqual(ok([{ jobId, outcome: "lease_conflict" }]));
+    expect(observedSignal?.aborted).toBe(true);
+    expect(calls).not.toContain("reviewer.run");
+    expect(calls).not.toContain("autoMerge.enable");
+  });
+
+  it("stops after a provider ignores abort and returns success after lease renewal is lost", async () => {
+    const { deps, progress, calls } = await harness({
+      changeRequestState: { draft: true },
+      leaseHeartbeatIntervalMs: 5,
+      ciRecoveryRun: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return {
+          state: "ready_for_review",
+          source: "polling",
+          job: job(),
+          checks: {},
+        } as never;
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    vi.spyOn(deps.leases, "renew").mockResolvedValue(err(domainError("external_failure")));
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toEqual(ok([{ jobId, outcome: "lease_conflict" }]));
+    expect(calls).toContain("ciRecovery.run");
+    expect(calls).not.toContain("reviewer.run");
+    expect(calls).not.toContain("autoMerge.enable");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok).toBe(true);
+    if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
   });
 
   it("C035: ci_waiting canceled in Linear stops before CI, review, or merge", async () => {

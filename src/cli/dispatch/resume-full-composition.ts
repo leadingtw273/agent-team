@@ -76,11 +76,11 @@ export type ResumePipelineComposition = Pick<
   | "autoMerge"
   | "workManagement"
   | "lifecycle"
-  | "visualEvidence"
   | "visualReviewModel"
-  | "linearPublication"
-  | "linearPublicationStore"
->;
+> &
+  Required<
+    Pick<ResumeCycleDependencies, "visualEvidence" | "linearPublication" | "linearPublicationStore">
+  >;
 
 export type BuildResumeCompositionResult =
   | Readonly<{ state: "ready"; value: ResumePipelineComposition }>

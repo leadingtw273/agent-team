@@ -45,6 +45,7 @@
  * ticket has no requirement to invent, and a real-looking implementation that is never exercised in
  * production would be untested engine behavior wearing a composition-layer disguise.
  */
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
@@ -61,6 +62,7 @@ import {
   type ReconcileTarget,
 } from "../../application/reconcile/index.js";
 import {
+  createClock,
   domainError,
   err,
   ok,
@@ -69,16 +71,32 @@ import {
 } from "../../domain/foundation/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
-import { defaultJobProgressDirectory } from "../dispatch/resume-composition.js";
+import {
+  buildDispatchComposition,
+  type BuildDispatchCompositionResult,
+} from "../dispatch/composition.js";
+import {
+  resumeExistingProjectJobs,
+  type ResumeExistingProjectJobsResult,
+} from "../dispatch/resume-existing.js";
+import {
+  defaultJobProgressDirectory,
+  type ResumeJobOutcome,
+} from "../dispatch/resume-composition.js";
 import { readJobProgressInventory } from "./active-job-inventory.js";
 import type {
   ManualReconcileUseCase,
+  JobProgressResumeBatch,
   ReconcileCapabilityId,
   ReconcileDisclosedScope,
 } from "./index.js";
 
 export interface BuildManualReconcileCompositionOptions {
   readonly agentTeamHome: string;
+  readonly buildDispatchComposition?: (
+    options: Parameters<typeof buildDispatchComposition>[0],
+  ) => Promise<BuildDispatchCompositionResult>;
+  readonly resumeExistingProjectJobs?: typeof resumeExistingProjectJobs;
 }
 
 function reconcileStateDirectory(agentTeamHome: string): string {
@@ -183,6 +201,7 @@ function buildBlocksPort(): ReconcileBlockPort {
 interface ReconcileRuntimeWiring {
   readonly ports: ReconcilePorts;
   readonly readJobProgressInventory: ManualReconcileUseCase["readJobProgressInventory"];
+  readonly resumeJobProgress: ManualReconcileUseCase["resumeJobProgress"];
 }
 
 const reconcileCapabilityAccessors: readonly Readonly<{
@@ -196,6 +215,7 @@ const reconcileCapabilityAccessors: readonly Readonly<{
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
   { id: "active_job_snapshot", get: ({ ports }) => ports.jobs.listActive },
   { id: "durable_progress_inventory", get: (wiring) => wiring.readJobProgressInventory },
+  { id: "durable_progress_resume", get: (wiring) => wiring.resumeJobProgress },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
   { id: "provider_readback", get: ({ ports }) => ports.providers.readBack },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
@@ -268,10 +288,89 @@ export function buildManualReconcileUseCase(
     defaultJobProgressDirectory(options.agentTeamHome),
   );
   const readInventory = () => readJobProgressInventory(progressStore);
-  const wiring = Object.freeze({ ports, readJobProgressInventory: readInventory });
+  const resumeJobProgress: ManualReconcileUseCase["resumeJobProgress"] = async (records) => {
+    if (records.length === 0) {
+      return Object.freeze({ outcomes: Object.freeze([]), blocked: Object.freeze([]) });
+    }
+    const identities = new Set(records.map((record) => record.jobId));
+    if (identities.size !== records.length) {
+      return Object.freeze({
+        outcomes: Object.freeze([]),
+        blocked: Object.freeze(
+          records.map((record) => ({
+            projectId: record.projectId,
+            jobId: record.jobId,
+            reason: "duplicate_resume_selection",
+          })),
+        ),
+      });
+    }
+
+    const projects = new Map<string, (typeof records)[number][]>();
+    for (const record of records) {
+      const existing = projects.get(record.projectId) ?? [];
+      projects.set(record.projectId, [...existing, record]);
+    }
+    const outcomes: ResumeJobOutcome[] = [];
+    const blocked: JobProgressResumeBatch["blocked"][number][] = [];
+    for (const [projectId, projectRecords] of projects) {
+      const built = await (options.buildDispatchComposition ?? buildDispatchComposition)({
+        agentTeamHome: options.agentTeamHome,
+        projectId,
+      });
+      if (built.state !== "ready") {
+        blocked.push(
+          ...projectRecords.map((record) => ({
+            projectId,
+            jobId: record.jobId,
+            reason: `dispatch_composition:${built.reason}`,
+          })),
+        );
+        continue;
+      }
+      const resumed: ResumeExistingProjectJobsResult = await (
+        options.resumeExistingProjectJobs ?? resumeExistingProjectJobs
+      )({
+        agentTeamHome: options.agentTeamHome,
+        ready: built.value,
+        holderId: `reconcile-resume:${randomUUID()}`,
+        clock: createClock(),
+        selections: projectRecords.map((record) => ({
+          jobId: record.jobId,
+          expectedRevision: record.revision,
+        })),
+      });
+      if (resumed.state === "resumed") {
+        outcomes.push(...resumed.outcomes);
+      } else if (resumed.state === "none") {
+        blocked.push(
+          ...projectRecords.map((record) => ({
+            projectId,
+            jobId: record.jobId,
+            reason: "resume_candidate_disappeared",
+          })),
+        );
+      } else {
+        const reason =
+          resumed.reason === "resume_composition_blocked"
+            ? `${resumed.reason}:${resumed.compositionReason}`
+            : resumed.reason;
+        blocked.push(
+          ...projectRecords.map((record) => ({ projectId, jobId: record.jobId, reason })),
+        );
+      }
+    }
+    return Object.freeze({ outcomes: Object.freeze(outcomes), blocked: Object.freeze(blocked) });
+  };
+  const wiring = Object.freeze({
+    ports,
+    readJobProgressInventory: readInventory,
+    resumeJobProgress,
+  });
   return {
     reconcileAll: (request) => coordinator.reconcileAll(request),
     readJobProgressInventory: readInventory,
+    resumeJobProgress,
     disclosedScope: describeDisclosedScope(wiring),
   };
 }

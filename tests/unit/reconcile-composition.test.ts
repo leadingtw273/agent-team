@@ -19,7 +19,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildManualReconcilePorts,
@@ -69,6 +69,7 @@ async function writeProgressFixture(
   agentTeamHome: string,
   jobId: string,
   stage: Readonly<Record<string, unknown>>,
+  projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
 ): Promise<void> {
   const directory = join(agentTeamHome, "state", "dispatch", "progress");
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -79,7 +80,7 @@ async function writeProgressFixture(
         schemaVersion: 1,
         revision: 0,
         jobId,
-        projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+        projectId,
         issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
         externalIssueId: "ENG-1",
         model: "test-model",
@@ -195,13 +196,61 @@ describe("E010b manual reconcile production composition", () => {
     expect(inventory.value.terminal.map((record) => record.stage.kind)).toEqual(["completed"]);
   });
 
+  it("groups one inventory snapshot by project and invokes the resume-only bridge once per project", async () => {
+    const agentTeamHome = await temporaryHome();
+    const projectA = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+    const projectB = "project_018f47d2-77a4-7cc1-8ef2-0123456789ac";
+    const jobA1 = "job_018f47d2-77a4-7cc1-8ef2-012345678901";
+    const jobA2 = "job_018f47d2-77a4-7cc1-8ef2-012345678902";
+    const jobB = "job_018f47d2-77a4-7cc1-8ef2-012345678903";
+    await writeProgressFixture(agentTeamHome, jobA1, { kind: "ci_waiting" }, projectA);
+    await writeProgressFixture(agentTeamHome, jobA2, { kind: "awaiting_review" }, projectA);
+    await writeProgressFixture(agentTeamHome, jobB, { kind: "ci_waiting" }, projectB);
+    const builtProjects: string[] = [];
+    const resumedSelections: string[][] = [];
+    const buildDispatch = vi.fn((options: { projectId: string }) => {
+      builtProjects.push(options.projectId);
+      return Promise.resolve({ state: "ready" as const, value: {} as never });
+    });
+    const resumeProject = vi.fn((options: { selections?: readonly { jobId: string }[] }) => {
+      resumedSelections.push(options.selections?.map((item) => item.jobId) ?? []);
+      return Promise.resolve({
+        state: "resumed" as const,
+        outcomes: (options.selections ?? []).map((item) => ({
+          jobId: item.jobId,
+          outcome: "completed" as const,
+        })),
+      });
+    });
+    const useCase = buildManualReconcileUseCase({
+      agentTeamHome,
+      buildDispatchComposition: buildDispatch,
+      resumeExistingProjectJobs: resumeProject,
+    });
+    const inventory = await useCase.readJobProgressInventory();
+    expect(inventory.ok).toBe(true);
+    if (!inventory.ok) return;
+
+    const result = await useCase.resumeJobProgress(inventory.value.resumable);
+
+    expect(builtProjects).toEqual([projectA, projectB]);
+    expect(resumedSelections).toEqual([[jobA1, jobA2], [jobB]]);
+    expect(result.blocked).toEqual([]);
+    expect(result.outcomes.map((outcome) => outcome.jobId)).toEqual([jobA1, jobA2, jobB]);
+  });
+
   describe("E010c disclosed-scope derivation", () => {
     it("reports durable progress inventory separately from the unwired coordinator target snapshot", async () => {
       const agentTeamHome = await temporaryHome();
       const useCase = buildManualReconcileUseCase({ agentTeamHome });
 
       expect(useCase.disclosedScope).toEqual({
-        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
+        wiredCapabilities: [
+          "lease_reclaim",
+          "job_update",
+          "durable_progress_inventory",
+          "durable_progress_resume",
+        ],
         unwiredCapabilities: [
           "active_job_snapshot",
           "provider_readback",
@@ -224,7 +273,7 @@ describe("E010b manual reconcile production composition", () => {
       // `ReconcileCapabilityId` surface derived from `describeDisclosedScope`'s accessor table.
       const all = [...wiredCapabilities, ...unwiredCapabilities];
       expect(new Set(all).size).toBe(all.length);
-      expect(all).toHaveLength(11);
+      expect(all).toHaveLength(12);
       const overlap = wiredCapabilities.filter((id) => unwiredCapabilities.includes(id));
       expect(overlap).toEqual([]);
     });

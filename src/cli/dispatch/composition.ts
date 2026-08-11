@@ -94,7 +94,7 @@ import {
   defaultRegistrationDraftPath,
   loadHostRegistrationSetupDraft,
 } from "../registration/draft-store.js";
-import { readLinearApiKey } from "../registration/secrets.js";
+import { readLinearApiKeyWithFileFallback } from "../registration/secrets.js";
 import { observeClaudeRouteCandidates } from "./claude-observation.js";
 import {
   applyProviderLiveness,
@@ -404,7 +404,7 @@ export async function buildDispatchComposition(
     return Object.freeze({ state: "blocked", reason: "draft_unavailable" });
   }
 
-  const linearApiKey = readLinearApiKey(options.environment);
+  const linearApiKey = await readLinearApiKeyWithFileFallback(agentTeamHome, options.environment);
   if (!linearApiKey.ok) {
     return Object.freeze({ state: "blocked", reason: "linear_api_key_missing" });
   }

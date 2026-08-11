@@ -27,7 +27,12 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ok, parseIdentifier, type Identifier } from "../../src/domain/foundation/index.js";
+import {
+  domainError,
+  ok,
+  parseIdentifier,
+  type Identifier,
+} from "../../src/domain/foundation/index.js";
 import type { DomainError, Result } from "../../src/domain/foundation/index.js";
 import { issueSchema, projectSchema, type Issue } from "../../src/domain/project/index.js";
 import type { JobRepository, JobWriteReceipt } from "../../src/application/dispatch/index.js";
@@ -325,6 +330,50 @@ function fakeBuildComposition(stateRoot: string) {
 }
 
 describe("createDispatchCliHandlers dry-run vs real-mode port isolation (C015a FAIL-1)", () => {
+  it("redacts raw resume diagnostics from resumed and blocked CLI payloads", async () => {
+    const marker = "private provider diagnostic";
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition } = fakeBuildComposition(stateRoot);
+    const resume = vi
+      .fn()
+      .mockResolvedValueOnce({
+        state: "resumed" as const,
+        outcomes: [
+          {
+            jobId: "job-1",
+            outcome: "failed" as const,
+            stage: "provider_run",
+            error: { ...domainError("external_failure"), rawMessage: marker } as DomainError,
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        state: "blocked" as const,
+        reason: "resume_cycle_failed" as const,
+        error: { ...domainError("external_failure"), rawMessage: marker } as DomainError,
+      });
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition,
+      resumeExistingProjectJobs: resume,
+    });
+
+    const resumed = await handlers.run({ projectId, dryRun: false });
+    const blocked = await handlers.run({ projectId, dryRun: false });
+
+    expect(resumed.state).toBe("failed");
+    expect(JSON.parse(resumed.message ?? "{}")).toMatchObject({
+      resumed: [{ outcome: "failed", errorCode: "external_failure" }],
+    });
+    expect(blocked.state).toBe("failed");
+    expect(JSON.parse(blocked.message ?? "{}")).toMatchObject({
+      reason: "resume_cycle_failed",
+      errorCode: "external_failure",
+    });
+    expect(resumed.message).not.toContain(marker);
+    expect(blocked.message).not.toContain(marker);
+  });
+
   it("--dry-run never calls the real lease/job repositories, and reports the candidate/eligibility result", async () => {
     const stateRoot = await temporaryStateRoot();
     const { buildComposition, leases, jobs } = fakeBuildComposition(stateRoot);

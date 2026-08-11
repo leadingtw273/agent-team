@@ -113,7 +113,7 @@ export function createDispatchResolveHandler(
         operation: "dispatch_resolve",
         state: "blocked",
         reason: "job_progress_read_failed",
-        error: record.error,
+        errorCode: record.error.code,
       });
     }
     if (record.value === undefined) {
@@ -155,7 +155,7 @@ export function createDispatchResolveHandler(
         operation: "dispatch_resolve",
         state: "blocked",
         reason: "progress_write_failed",
-        error: written.error,
+        errorCode: written.error.code,
       });
     }
 

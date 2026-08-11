@@ -11,7 +11,12 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { readLinearApiKey, readSecretFile } from "../../src/cli/registration/secrets.js";
+import {
+  defaultLinearApiKeyPath,
+  readLinearApiKey,
+  readLinearApiKeyWithFileFallback,
+  readSecretFile,
+} from "../../src/cli/registration/secrets.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -109,5 +114,61 @@ describe("readLinearApiKey", () => {
 
   it("fails closed when LINEAR_API_KEY is blank", () => {
     expect(readLinearApiKey({ LINEAR_API_KEY: "   " })).toEqual({ ok: false, reason: "missing" });
+  });
+});
+
+describe("readLinearApiKeyWithFileFallback", () => {
+  it("prefers the explicit environment and otherwise reads the private host file", async () => {
+    const agentTeamHome = await root();
+    const filePath = defaultLinearApiKeyPath(agentTeamHome);
+    await mkdir(join(agentTeamHome, "secrets"), { recursive: true, mode: 0o700 });
+    await writeFile(filePath, "file-key\n", { mode: 0o600 });
+    await chmod(filePath, 0o600);
+
+    await expect(
+      readLinearApiKeyWithFileFallback(agentTeamHome, { LINEAR_API_KEY: "env-key" }),
+    ).resolves.toEqual({ ok: true, value: "env-key" });
+    await expect(readLinearApiKeyWithFileFallback(agentTeamHome, {})).resolves.toEqual({
+      ok: true,
+      value: "file-key",
+    });
+  });
+
+  it("fails closed for a missing or insecure host file", async () => {
+    const agentTeamHome = await root();
+    await mkdir(join(agentTeamHome, "secrets"), { recursive: true, mode: 0o700 });
+    const filePath = defaultLinearApiKeyPath(agentTeamHome);
+    await writeFile(filePath, "must-not-leak", { mode: 0o644 });
+    await chmod(filePath, 0o644);
+
+    const result = await readLinearApiKeyWithFileFallback(agentTeamHome, {});
+
+    expect(result).toEqual({ ok: false, reason: "missing" });
+    expect(JSON.stringify(result)).not.toContain("must-not-leak");
+  });
+
+  it("fails closed for invalid UTF-8 or a symlinked host file", async () => {
+    const agentTeamHome = await root();
+    const secretsDirectory = join(agentTeamHome, "secrets");
+    await mkdir(secretsDirectory, { recursive: true, mode: 0o700 });
+    const filePath = defaultLinearApiKeyPath(agentTeamHome);
+    await writeFile(filePath, Buffer.from([0xff, 0xfe]), { mode: 0o600 });
+    await chmod(filePath, 0o600);
+
+    await expect(readLinearApiKeyWithFileFallback(agentTeamHome, {})).resolves.toEqual({
+      ok: false,
+      reason: "missing",
+    });
+
+    await rm(filePath);
+    const real = join(secretsDirectory, "real-linear-api-key");
+    await writeFile(real, "must-not-follow", { mode: 0o600 });
+    await chmod(real, 0o600);
+    await symlink(real, filePath);
+
+    await expect(readLinearApiKeyWithFileFallback(agentTeamHome, {})).resolves.toEqual({
+      ok: false,
+      reason: "missing",
+    });
   });
 });

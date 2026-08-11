@@ -36,6 +36,8 @@ const fixtureDisclosedScope: ReconcileDisclosedScope = Object.freeze({
 
 const emptyInventory = () =>
   Promise.resolve(ok(Object.freeze({ resumable: [], blocked: [], terminal: [] })));
+const emptyResume = () =>
+  Promise.resolve(Object.freeze({ outcomes: Object.freeze([]), blocked: Object.freeze([]) }));
 
 describe("O008 manual reconcile CLI adapter", () => {
   it("reports a real completed reconcile rather than manufacturing a generic success", async () => {
@@ -61,6 +63,7 @@ describe("O008 manual reconcile CLI adapter", () => {
       reconcile: {
         reconcileAll,
         readJobProgressInventory: emptyInventory,
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -79,6 +82,8 @@ describe("O008 manual reconcile CLI adapter", () => {
       reclaimedLeaseCount: 1,
       targetCounts: { healthy: 1, resumed: 1, blocked: 0, failed: 0 },
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
+      jobProgressResume: { outcomes: [], blocked: [] },
+      jobProgressBlocked: [],
       modelResumeAttempts: 1,
       scopeDisclosure: fixtureDisclosedScope,
     });
@@ -102,6 +107,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             modelResumeAttempts: 0,
           }),
         readJobProgressInventory: emptyInventory,
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -143,6 +149,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             modelResumeAttempts: 0,
           }),
         readJobProgressInventory: emptyInventory,
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -161,6 +168,8 @@ describe("O008 manual reconcile CLI adapter", () => {
       reclaimedLeaseCount: 0,
       targetCounts: { healthy: 0, resumed: 0, blocked: 1, failed: 0 },
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
+      jobProgressResume: { outcomes: [], blocked: [] },
+      jobProgressBlocked: [],
       modelResumeAttempts: 0,
       scopeDisclosure: fixtureDisclosedScope,
     });
@@ -177,6 +186,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             error: { ...domainError("external_failure"), rawMessage: marker } as DomainError,
           }),
         readJobProgressInventory: emptyInventory,
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -215,12 +225,23 @@ describe("O008 manual reconcile CLI adapter", () => {
           Promise.resolve(
             ok(
               Object.freeze({
-                resumable: [{} as never],
-                blocked: [{} as never],
-                terminal: [{} as never],
+                resumable: [
+                  {
+                    projectId: "project-1",
+                    jobId: "job-1",
+                    stage: { kind: "ci_waiting" },
+                  } as never,
+                ],
+                blocked: [
+                  { projectId: "project-1", jobId: "job-2", stage: { kind: "paused" } } as never,
+                ],
+                terminal: [
+                  { projectId: "project-1", jobId: "job-3", stage: { kind: "completed" } } as never,
+                ],
               }),
             ),
           ),
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
     });
@@ -235,12 +256,162 @@ describe("O008 manual reconcile CLI adapter", () => {
     expect(reconcileAll).toHaveBeenCalledOnce();
   });
 
+  it("runs the resume bridge after lease reclaim and renders the post-resume inventory", async () => {
+    const resumable = {
+      projectId: "project-1",
+      jobId: "job-1",
+      stage: { kind: "ci_waiting" },
+    };
+    const terminal = { ...resumable, stage: { kind: "completed" } };
+    const readJobProgressInventory = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ resumable: [resumable as never], blocked: [], terminal: [] }))
+      .mockResolvedValueOnce(ok({ resumable: [], blocked: [], terminal: [terminal as never] }));
+    const resumeJobProgress = vi.fn(() =>
+      Promise.resolve({
+        outcomes: [{ jobId: "job-1", outcome: "completed" as const }],
+        blocked: [],
+      }),
+    );
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll: () =>
+          Promise.resolve({
+            state: "completed" as const,
+            reclaimedLeaseIds: [],
+            targets: [],
+            modelResumeAttempts: 0,
+          }),
+        readJobProgressInventory,
+        resumeJobProgress,
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const outcome = await handler({ all: true });
+
+    expect(outcome.state).toBe("success");
+    expect(resumeJobProgress).toHaveBeenCalledWith([resumable]);
+    expect(readJobProgressInventory).toHaveBeenCalledTimes(2);
+    expect(payload(outcome.message)).toMatchObject({
+      state: "completed",
+      jobProgressCounts: { resumable: 0, blocked: 0, terminal: 1, total: 1 },
+      jobProgressResume: {
+        outcomes: [{ jobId: "job-1", outcome: "completed" }],
+        blocked: [],
+      },
+    });
+  });
+
+  it("treats the final inventory as authoritative when another process completed a candidate", async () => {
+    const resumable = {
+      projectId: "project-1",
+      jobId: "job-1",
+      stage: { kind: "ci_waiting" },
+    };
+    const readJobProgressInventory = vi
+      .fn()
+      .mockResolvedValueOnce(ok({ resumable: [resumable as never], blocked: [], terminal: [] }))
+      .mockResolvedValueOnce(
+        ok({
+          resumable: [],
+          blocked: [],
+          terminal: [{ ...resumable, stage: { kind: "completed" } }],
+        }),
+      );
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll: () =>
+          Promise.resolve({
+            state: "completed" as const,
+            reclaimedLeaseIds: [],
+            targets: [],
+            modelResumeAttempts: 0,
+          }),
+        readJobProgressInventory,
+        resumeJobProgress: () =>
+          Promise.resolve({
+            outcomes: [
+              {
+                jobId: "job-1",
+                outcome: "candidate_changed" as const,
+                reason: "revision_changed" as const,
+              },
+            ],
+            blocked: [],
+          }),
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const outcome = await handler({ all: true });
+
+    expect(outcome.state).toBe("success");
+    expect(payload(outcome.message)).toMatchObject({
+      state: "completed",
+      jobProgressCounts: { resumable: 0, blocked: 0, terminal: 1, total: 1 },
+    });
+  });
+
+  it("redacts raw resume diagnostics while preserving the fixed error code", async () => {
+    const marker = "secret resume diagnostic";
+    const resumable = {
+      projectId: "project-1",
+      jobId: "job-1",
+      stage: { kind: "ci_waiting" },
+    };
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll: () =>
+          Promise.resolve({
+            state: "completed" as const,
+            reclaimedLeaseIds: [],
+            targets: [],
+            modelResumeAttempts: 0,
+          }),
+        readJobProgressInventory: () =>
+          Promise.resolve(ok({ resumable: [resumable as never], blocked: [], terminal: [] })),
+        resumeJobProgress: () =>
+          Promise.resolve({
+            outcomes: [
+              {
+                jobId: "job-1",
+                outcome: "failed" as const,
+                stage: "provider_run",
+                error: { ...domainError("external_failure"), rawMessage: marker } as DomainError,
+              },
+            ],
+            blocked: [],
+          }),
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const outcome = await handler({ all: true });
+    const body = payload(outcome.message);
+
+    expect(outcome.state).toBe("blocked");
+    expect(body["jobProgressResume"]).toEqual({
+      outcomes: [
+        {
+          jobId: "job-1",
+          outcome: "failed",
+          stage: "provider_run",
+          errorCode: "external_failure",
+        },
+      ],
+      blocked: [],
+    });
+    expect(outcome.message).not.toContain(marker);
+  });
+
   it("fails closed before reconcile mutations when the durable inventory cannot be read", async () => {
     const reconcileAll = vi.fn();
     const handler = createManualReconcileHandler({
       reconcile: {
         reconcileAll,
         readJobProgressInventory: () => Promise.resolve(err(domainError("external_failure"))),
+        resumeJobProgress: emptyResume,
         disclosedScope: fixtureDisclosedScope,
       },
     });

@@ -29,7 +29,7 @@
 import { join } from "node:path";
 
 import type { JobRepository } from "../../application/dispatch/index.js";
-import type { LeaseCoordinator } from "../../application/leases/index.js";
+import { defaultLeaseDurationMs, type LeaseCoordinator } from "../../application/leases/index.js";
 import type {
   CiRecoveryPipeline,
   ReviewerRecoveryPipeline,
@@ -409,6 +409,13 @@ export interface ResumeCycleDependencies {
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
   readonly clock: Clock;
   readonly holderId: string;
+  /** Optional project-scoped lazy initialization, invoked only after this job is leased and
+   * revalidated. The caller may memoize it so multiple jobs share one prepared runtime. */
+  readonly prepare?: () => Promise<void>;
+  /** Per-job lease heartbeat cancellation. Long provider calls receive this signal. */
+  readonly signal?: AbortSignal;
+  /** Test seam; production renews at one third of the five-minute lease TTL. */
+  readonly leaseHeartbeatIntervalMs?: number;
   /** C015y decision A: originally used by `resolveLegacyBaseRevision` to re-resolve the
    * authoritative base when repairing a *legacy* (pre-C015y) job-progress record. C015z decision
    * Q3 removed that repair path outright (a legacy record now always fails closed to
@@ -437,6 +444,11 @@ export interface ResumeCycleDependencies {
 
 export type ResumeJobOutcome =
   | Readonly<{ jobId: string; outcome: "lease_conflict" }>
+  | Readonly<{
+      jobId: string;
+      outcome: "candidate_changed";
+      reason: "missing" | "revision_changed" | "no_longer_resumable";
+    }>
   | Readonly<{ jobId: string; outcome: "requires_manual"; reason: string }>
   | Readonly<{ jobId: string; outcome: "still_ci_waiting" }>
   | Readonly<{ jobId: string; outcome: "still_merging" }>
@@ -572,18 +584,82 @@ export function isResumeCandidate(record: JobProgressRecord): boolean {
   return resumableStageKinds.has(record.stage.kind) || isMergeReconcilable(record);
 }
 
+export interface ResumeCycleSelection {
+  /** Snapshot-bound CAS identities. Records created or changed after inventory cannot join. */
+  readonly selections: readonly Readonly<{
+    jobId: JobProgressRecord["jobId"];
+    expectedRevision: number;
+  }>[];
+}
+
+class ResumeLeaseLostError extends Error {
+  constructor() {
+    super("Resume lease was lost.");
+    this.name = "ResumeLeaseLostError";
+  }
+}
+
+function assertResumeLeaseHeld(deps: ResumeCycleDependencies): void {
+  if (deps.signal?.aborted === true) throw new ResumeLeaseLostError();
+}
+
+async function whileResumeLeaseHeld<T>(
+  deps: ResumeCycleDependencies,
+  operation: () => Promise<T>,
+): Promise<T> {
+  assertResumeLeaseHeld(deps);
+  let value: T;
+  try {
+    value = await operation();
+  } catch (error) {
+    assertResumeLeaseHeld(deps);
+    throw error;
+  }
+  assertResumeLeaseHeld(deps);
+  return value;
+}
+
 /** Runs one resume attempt for every resumable job-progress record belonging to `dependencies.project`,
  * plus (C015t decision 3) a narrow, read-only merge-state reconciliation pass over `requires_manual`
  * records whose cause matches `isMergeReconcilable`. */
 export async function runResumeCycle(
   dependencies: ResumeCycleDependencies,
+  selection?: ResumeCycleSelection,
 ): Promise<Result<readonly ResumeJobOutcome[], DomainError>> {
   const records = await dependencies.progress.listForProject(dependencies.project.id);
   if (!records.ok) return records;
-  const resumable = records.value.filter((record) => resumableStageKinds.has(record.stage.kind));
-  const mergeReconcilable = records.value.filter((record) => isMergeReconcilable(record));
-
   const outcomes: ResumeJobOutcome[] = [];
+  let selected: readonly JobProgressRecord[] = records.value;
+  if (selection !== undefined) {
+    const identities = new Set(selection.selections.map((candidate) => candidate.jobId));
+    if (identities.size !== selection.selections.length) return err(domainError("conflict"));
+    const byJobId = new Map(records.value.map((record) => [record.jobId, record]));
+    const accepted: JobProgressRecord[] = [];
+    for (const candidate of selection.selections) {
+      const record = byJobId.get(candidate.jobId);
+      if (record === undefined) {
+        outcomes.push({ jobId: candidate.jobId, outcome: "candidate_changed", reason: "missing" });
+      } else if (record.revision !== candidate.expectedRevision) {
+        outcomes.push({
+          jobId: candidate.jobId,
+          outcome: "candidate_changed",
+          reason: "revision_changed",
+        });
+      } else if (!isResumeCandidate(record)) {
+        outcomes.push({
+          jobId: candidate.jobId,
+          outcome: "candidate_changed",
+          reason: "no_longer_resumable",
+        });
+      } else {
+        accepted.push(record);
+      }
+    }
+    selected = accepted;
+  }
+  const resumable = selected.filter((record) => resumableStageKinds.has(record.stage.kind));
+  const mergeReconcilable = selected.filter((record) => isMergeReconcilable(record));
+
   for (const record of resumable) {
     outcomes.push(await resumeOneJob(record, dependencies));
   }
@@ -619,14 +695,16 @@ function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
 }
 
 async function transition(
-  progress: FileJobProgressStore,
+  deps: ResumeCycleDependencies,
   record: JobProgressRecord,
   next: Partial<JobProgressRecordMutation>,
 ): Promise<Result<JobProgressRecord, DomainError>> {
-  return progress.compareAndSwap(record.jobId, record.revision, {
-    ...mutationFrom(record),
-    ...next,
-  });
+  return whileResumeLeaseHeld(deps, () =>
+    deps.progress.compareAndSwap(record.jobId, record.revision, {
+      ...mutationFrom(record),
+      ...next,
+    }),
+  );
 }
 
 type PersistedMergeMutation = NonNullable<JobProgressRecord["mergeMutations"]>[number];
@@ -650,7 +728,7 @@ function mergedMutationHistory(
 }
 
 async function persistMergeMutations(
-  progress: FileJobProgressStore,
+  deps: ResumeCycleDependencies,
   initialRecord: JobProgressRecord,
   incoming: CancellationRaceMergeMutations,
 ): Promise<Result<JobProgressRecord, DomainError>> {
@@ -659,9 +737,9 @@ async function persistMergeMutations(
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const mergeMutations = mergedMutationHistory(current.mergeMutations, incoming);
     if (mergeMutations === undefined) return err(domainError("invariant_violation"));
-    const written = await transition(progress, current, { mergeMutations });
+    const written = await transition(deps, current, { mergeMutations });
     if (written.ok || written.error.code !== "conflict") return written;
-    const loaded = await progress.load(current.jobId);
+    const loaded = await whileResumeLeaseHeld(deps, () => deps.progress.load(current.jobId));
     if (!loaded.ok) return loaded;
     if (loaded.value === undefined) return err(domainError("conflict"));
     current = loaded.value;
@@ -680,9 +758,26 @@ async function resumeOneJob(
   });
   if (!lease.ok) return { jobId: record.jobId, outcome: "lease_conflict" };
 
+  const heartbeat = startResumeLeaseHeartbeat(deps, lease.value.value.id);
+  const guardedDeps = { ...deps, signal: heartbeat.signal };
   try {
-    return await resumeUnderLease(record, deps);
+    const current = await revalidateRecordUnderLease(record, guardedDeps, (candidate) =>
+      resumableStageKinds.has(candidate.stage.kind),
+    );
+    if ("outcome" in current) return current;
+    if (guardedDeps.prepare !== undefined) {
+      await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
+    }
+    const resumed = await resumeUnderLease(current.record, guardedDeps);
+    await heartbeat.stop();
+    return heartbeat.signal.aborted ? { jobId: record.jobId, outcome: "lease_conflict" } : resumed;
+  } catch (error) {
+    if (error instanceof ResumeLeaseLostError) {
+      return { jobId: record.jobId, outcome: "lease_conflict" };
+    }
+    throw error;
   } finally {
+    await heartbeat.stop();
     await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
   }
 }
@@ -700,11 +795,105 @@ async function reconcileMergeStateOneJob(
   });
   if (!lease.ok) return { jobId: record.jobId, outcome: "lease_conflict" };
 
+  const heartbeat = startResumeLeaseHeartbeat(deps, lease.value.value.id);
+  const guardedDeps = { ...deps, signal: heartbeat.signal };
   try {
-    return await reconcileMergeStateUnderLease(record, deps);
+    const current = await revalidateRecordUnderLease(record, guardedDeps, isMergeReconcilable);
+    if ("outcome" in current) return current;
+    if (guardedDeps.prepare !== undefined) {
+      await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
+    }
+    const reconciled = await reconcileMergeStateUnderLease(current.record, guardedDeps);
+    await heartbeat.stop();
+    return heartbeat.signal.aborted
+      ? { jobId: record.jobId, outcome: "lease_conflict" }
+      : reconciled;
+  } catch (error) {
+    if (error instanceof ResumeLeaseLostError) {
+      return { jobId: record.jobId, outcome: "lease_conflict" };
+    }
+    throw error;
   } finally {
+    await heartbeat.stop();
     await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
   }
+}
+
+async function revalidateRecordUnderLease(
+  expected: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  eligible: (record: JobProgressRecord) => boolean,
+): Promise<
+  | Readonly<{ record: JobProgressRecord }>
+  | Extract<ResumeJobOutcome, { outcome: "candidate_changed" | "failed" }>
+> {
+  const loaded = await whileResumeLeaseHeld(deps, () => deps.progress.load(expected.jobId));
+  if (!loaded.ok) {
+    return {
+      jobId: expected.jobId,
+      outcome: "failed",
+      stage: "progress_read",
+      error: loaded.error,
+    };
+  }
+  const current = loaded.value;
+  if (current === undefined) {
+    return { jobId: expected.jobId, outcome: "candidate_changed", reason: "missing" };
+  }
+  if (
+    current.revision !== expected.revision ||
+    current.projectId !== expected.projectId ||
+    current.issueId !== expected.issueId ||
+    current.externalIssueId !== expected.externalIssueId
+  ) {
+    return { jobId: expected.jobId, outcome: "candidate_changed", reason: "revision_changed" };
+  }
+  if (!eligible(current)) {
+    return { jobId: expected.jobId, outcome: "candidate_changed", reason: "no_longer_resumable" };
+  }
+  return { record: current };
+}
+
+interface ResumeLeaseHeartbeat {
+  readonly signal: AbortSignal;
+  readonly stop: () => Promise<void>;
+}
+
+/** Keeps the existing five-minute crash-recovery lease alive without weakening its TTL. */
+function startResumeLeaseHeartbeat(
+  deps: ResumeCycleDependencies,
+  leaseId: Parameters<LeaseCoordinator["renew"]>[0]["leaseId"],
+): ResumeLeaseHeartbeat {
+  const controller = new AbortController();
+  const intervalMs = deps.leaseHeartbeatIntervalMs ?? Math.floor(defaultLeaseDurationMs / 3);
+  if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) {
+    controller.abort();
+    return Object.freeze({ signal: controller.signal, stop: () => Promise.resolve() });
+  }
+  let pending: Promise<void> | undefined;
+  const renew = () => {
+    if (pending !== undefined || controller.signal.aborted) return;
+    pending = deps.leases
+      .renew({ leaseId, holderId: deps.holderId })
+      .then((result) => {
+        if (!result.ok) controller.abort();
+      })
+      .catch(() => {
+        controller.abort();
+      })
+      .finally(() => {
+        pending = undefined;
+      });
+  };
+  const timer = setInterval(renew, intervalMs);
+  timer.unref();
+  return Object.freeze({
+    signal: controller.signal,
+    async stop() {
+      clearInterval(timer);
+      await pending;
+    },
+  });
 }
 
 /**
@@ -739,14 +928,14 @@ async function releaseCompletedAdmission(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
 ): Promise<Result<void, DomainError>> {
-  const claim = await deps.admission.load(deps.project.id, record.issueId);
+  const claim = await whileResumeLeaseHeld(deps, () =>
+    deps.admission.load(deps.project.id, record.issueId),
+  );
   if (!claim.ok) return claim;
   if (claim.value?.state !== "active") return ok(undefined);
-  const released = await deps.admission.release(
-    deps.project.id,
-    record.issueId,
-    claim.value.revision,
-    "completed",
+  const activeClaim = claim.value;
+  const released = await whileResumeLeaseHeld(deps, () =>
+    deps.admission.release(deps.project.id, record.issueId, activeClaim.revision, "completed"),
   );
   if (!released.ok) return released;
   return ok(undefined);
@@ -764,10 +953,12 @@ async function reconcileMergeStateUnderLease(
       error: domainError("invariant_violation"),
     };
   }
-  const current = await deps.sourceControl.getChangeRequest({
-    project: deps.project,
-    changeRequestId,
-  });
+  const current = await whileResumeLeaseHeld(deps, () =>
+    deps.sourceControl.getChangeRequest(
+      { project: deps.project, changeRequestId },
+      deps.signal === undefined ? undefined : { signal: deps.signal },
+    ),
+  );
   if (!current.ok) {
     return {
       jobId: record.jobId,
@@ -787,16 +978,19 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
-  const lifecycleOutcome = await deps.lifecycle.run({
-    project: deps.project,
-    externalIssueId: record.externalIssueId,
-    changeRequestId,
-    idempotencyKeyPrefix: `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`,
-    cancellationRaceAudit: {
-      observedAt: deps.clock.now(),
-      ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
-    },
-  });
+  const lifecycleOutcome = await whileResumeLeaseHeld(deps, () =>
+    deps.lifecycle.run({
+      project: deps.project,
+      externalIssueId: record.externalIssueId,
+      changeRequestId,
+      idempotencyKeyPrefix: `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      cancellationRaceAudit: {
+        observedAt: deps.clock.now(),
+        ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
+      },
+    }),
+  );
   if (lifecycleOutcome.state !== "completed") {
     return {
       jobId: record.jobId,
@@ -808,7 +1002,7 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
-  const completed = await transition(deps.progress, record, { stage: { kind: "completed" } });
+  const completed = await transition(deps, record, { stage: { kind: "completed" } });
   if (!completed.ok) {
     return { jobId: record.jobId, outcome: "progress_write_failed", error: completed.error };
   }
@@ -833,7 +1027,7 @@ async function transitionOrReport(
   next: Partial<JobProgressRecordMutation>,
   onWritten: () => ResumeJobOutcome,
 ): Promise<ResumeJobOutcome> {
-  const written = await transition(deps.progress, record, next);
+  const written = await transition(deps, record, next);
   if (!written.ok) {
     return { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
   }
@@ -1106,7 +1300,10 @@ async function resumeUnderLease(
   }
   const changeRequestId = record.changeRequestId;
   const changeRequestReference = { project: deps.project, changeRequestId };
-  const currentChangeRequest = await deps.sourceControl.getChangeRequest(changeRequestReference);
+  const readOptions = deps.signal === undefined ? undefined : { signal: deps.signal };
+  const currentChangeRequest = await whileResumeLeaseHeld(deps, () =>
+    deps.sourceControl.getChangeRequest(changeRequestReference, readOptions),
+  );
   if (!currentChangeRequest.ok) {
     return requiresManualUnlessRetryable(
       record,
@@ -1116,10 +1313,12 @@ async function resumeUnderLease(
       requiresManualCause("setup", "change_request_unavailable"),
     );
   }
-  const workItem = await deps.workManagement.getIssue({
-    project: deps.project,
-    externalIssueId: record.externalIssueId,
-  });
+  const workItem = await whileResumeLeaseHeld(deps, () =>
+    deps.workManagement.getIssue(
+      { project: deps.project, externalIssueId: record.externalIssueId },
+      readOptions,
+    ),
+  );
   if (!workItem.ok) {
     return requiresManualUnlessRetryable(
       record,
@@ -1195,7 +1394,7 @@ async function resumeUnderLease(
     return resumeMergingStage(record, deps, currentChangeRequest.value);
   }
 
-  const jobs = await deps.jobRepository.readAll();
+  const jobs = await whileResumeLeaseHeld(deps, () => deps.jobRepository.readAll());
   if (!jobs.ok) {
     return requiresManualUnlessRetryable(
       record,
@@ -1215,12 +1414,15 @@ async function resumeUnderLease(
     );
   }
 
-  const issue = await projectIssueByExternalId(
-    deps.project,
-    deps.readModel,
-    deps.teamId,
-    deps.linearProjectId,
-    record.externalIssueId,
+  const issue = await whileResumeLeaseHeld(deps, () =>
+    projectIssueByExternalId(
+      deps.project,
+      deps.readModel,
+      deps.teamId,
+      deps.linearProjectId,
+      record.externalIssueId,
+      readOptions,
+    ),
   );
   if (!issue.ok) {
     return requiresManualUnlessRetryable(
@@ -1298,22 +1500,25 @@ async function resumeUnderLease(
     );
   }
 
-  const ciOutcome = await deps.ciRecovery.run({
-    trigger: { kind: "polling" },
-    job,
-    project: deps.project,
-    trustedConfig: deps.trustedConfig,
-    requirementSnapshot: requirementSnapshot.value,
-    worktree,
-    changeRequest: currentChangeRequest.value,
-    model: record.model,
-    remote: "origin",
-    commitMessage: `${issue.value.title} (${issue.value.externalId}) CI 修復`,
-    controllerDirective: buildDirective(issue.value),
-    externalData: Object.freeze([]),
-    deadlineAt: ciDeadline,
-    idempotencyKeyPrefix: `${idempotencyKeyPrefix}:ci-recovery`,
-  });
+  const ciOutcome = await whileResumeLeaseHeld(deps, () =>
+    deps.ciRecovery.run({
+      trigger: { kind: "polling" },
+      job,
+      project: deps.project,
+      trustedConfig: deps.trustedConfig,
+      requirementSnapshot: requirementSnapshot.value,
+      worktree,
+      changeRequest: currentChangeRequest.value,
+      model: record.model,
+      remote: "origin",
+      commitMessage: `${issue.value.title} (${issue.value.externalId}) CI 修復`,
+      controllerDirective: buildDirective(issue.value),
+      externalData: Object.freeze([]),
+      deadlineAt: ciDeadline,
+      idempotencyKeyPrefix: `${idempotencyKeyPrefix}:ci-recovery`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    }),
+  );
 
   switch (ciOutcome.state) {
     case "ci_waiting": {
@@ -1433,16 +1638,19 @@ async function stopCanceledWork(
   observedMergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
   const mergeMutations = observedMergeMutations ?? persistedMergeMutations(record);
-  const outcome = await deps.lifecycle.run({
-    project: deps.project,
-    externalIssueId: record.externalIssueId,
-    changeRequestId,
-    idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:cancellation`,
-    cancellationRaceAudit: {
-      observedAt: deps.clock.now(),
-      ...(mergeMutations === undefined ? {} : { mergeMutations }),
-    },
-  });
+  const outcome = await whileResumeLeaseHeld(deps, () =>
+    deps.lifecycle.run({
+      project: deps.project,
+      externalIssueId: record.externalIssueId,
+      changeRequestId,
+      idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:cancellation`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      cancellationRaceAudit: {
+        observedAt: deps.clock.now(),
+        ...(mergeMutations === undefined ? {} : { mergeMutations }),
+      },
+    }),
+  );
   if (outcome.state === "canceled") {
     return { jobId: record.jobId, outcome: "requires_manual", reason: "work_item_canceled" };
   }
@@ -1492,11 +1700,13 @@ async function handleReportContractFailure(
   const category: ReportContractFailureCategory =
     reviewOutcome.reportFailureCategory ?? "schema_invalid";
   if (reviewOutcome.rejectedOutput !== undefined) {
-    await deps.reviewReportSidecar.record({
-      jobId: record.jobId,
-      category,
-      rejectedOutput: reviewOutcome.rejectedOutput,
-    });
+    await whileResumeLeaseHeld(deps, () =>
+      deps.reviewReportSidecar.record({
+        jobId: record.jobId,
+        category,
+        rejectedOutput: reviewOutcome.rejectedOutput ?? "",
+      }),
+    );
   }
   const retries = currentReportContractRetries(record) + 1;
   if (retries <= reportContractRetryLimit) {
@@ -1538,12 +1748,15 @@ async function resumeReview(
   },
 ): Promise<ResumeJobOutcome> {
   const expectedHeadSha = context.changeRequest.headSha;
-  const begin = await deps.reviewStatus.begin({
-    project: deps.project,
-    changeRequestId: context.changeRequestId,
-    expectedHeadSha,
-    idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
-  });
+  const begin = await whileResumeLeaseHeld(deps, () =>
+    deps.reviewStatus.begin({
+      project: deps.project,
+      changeRequestId: context.changeRequestId,
+      expectedHeadSha,
+      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    }),
+  );
   if (begin.state === "failed") {
     return requiresManualUnlessRetryable(
       record,
@@ -1642,14 +1855,18 @@ async function resumeReview(
         requiresManualCause("review", "visual_evidence_unavailable"),
       );
     }
-    const built = await deps.visualEvidence.build({
-      worktreePath: context.worktree.path,
-      issueId: context.requirementSnapshot.issue.id,
-      headSha: expectedHeadSha,
-      commands: deps.trustedConfig.commands.visualReview,
-      allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
-      deadlineAt: reviewDeadline,
-    });
+    const visualEvidencePort = deps.visualEvidence;
+    const built = await whileResumeLeaseHeld(deps, () =>
+      visualEvidencePort.build({
+        worktreePath: context.worktree.path,
+        issueId: context.requirementSnapshot.issue.id,
+        headSha: expectedHeadSha,
+        commands: deps.trustedConfig.commands.visualReview,
+        allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+        deadlineAt: reviewDeadline,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      }),
+    );
     if (!built.ok) {
       return requiresManual(
         record,
@@ -1675,7 +1892,15 @@ async function resumeReview(
         requiresManualCause("review", "visual_publication_failed"),
       );
     }
-    const publicationContext = await deps.readModel.readContext(deps.teamId, deps.linearProjectId);
+    const linearPublication = deps.linearPublication;
+    const publishedVisualEvidence = visualEvidence;
+    const publicationContext = await whileResumeLeaseHeld(deps, () =>
+      deps.readModel.readContext(
+        deps.teamId,
+        deps.linearProjectId,
+        deps.signal === undefined ? {} : { signal: deps.signal },
+      ),
+    );
     if (!publicationContext.ok) {
       return requiresManualUnlessRetryable(
         record,
@@ -1685,14 +1910,17 @@ async function resumeReview(
         requiresManualCause("review", "visual_publication_failed"),
       );
     }
-    const published = await deps.linearPublication.publish({
-      context: publicationContext.value,
-      projectId: deps.project.id,
-      issueId: context.requirementSnapshot.issue.id,
-      externalIssueId: record.externalIssueId,
-      worktreePath: context.worktree.path,
-      visualManifest: visualEvidence.visualManifest,
-    });
+    const published = await whileResumeLeaseHeld(deps, () =>
+      linearPublication.publish({
+        context: publicationContext.value,
+        projectId: deps.project.id,
+        issueId: context.requirementSnapshot.issue.id,
+        externalIssueId: record.externalIssueId,
+        worktreePath: context.worktree.path,
+        visualManifest: publishedVisualEvidence.visualManifest,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      }),
+    );
     if (!published.ok) {
       return requiresManual(
         record,
@@ -1707,30 +1935,33 @@ async function resumeReview(
     publicationDigest = aggregateLinearPublicationDigest([published.value.receipt]);
   }
 
-  const reviewOutcome = await deps.reviewer.run({
-    job: context.job,
-    project: deps.project,
-    trustedConfig: deps.trustedConfig,
-    requirementSnapshot: context.requirementSnapshot,
-    worktree: context.worktree,
-    changeRequestId: context.changeRequestId,
-    baseRevision: context.baseRevision,
-    expectedHeadSha,
-    models: {
-      ...(needsCodeReview ? { code: record.model } : {}),
-      // Guarded above: `needsVisualReview` only ever reaches here once `deps.visualReviewModel`
-      // has already been confirmed defined (E102-2's real `gemini.models`-sourced value, never
-      // this job's own Claude `record.model` -- a Gemini `GeminiRunner` would reject that model
-      // string outright, see gemini-factory.ts/reviewer-composition.ts's own headers).
-      ...(needsVisualReview ? { visual: deps.visualReviewModel } : {}),
-    },
-    evidence: visualEvidence?.evidence ?? Object.freeze([]),
-    ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
-    ...(publicationDigest === undefined ? {} : { publicationDigest }),
-    deadlineAt: reviewDeadline,
-    idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
-    ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
-  });
+  const reviewOutcome = await whileResumeLeaseHeld(deps, () =>
+    deps.reviewer.run({
+      job: context.job,
+      project: deps.project,
+      trustedConfig: deps.trustedConfig,
+      requirementSnapshot: context.requirementSnapshot,
+      worktree: context.worktree,
+      changeRequestId: context.changeRequestId,
+      baseRevision: context.baseRevision,
+      expectedHeadSha,
+      models: {
+        ...(needsCodeReview ? { code: record.model } : {}),
+        // Guarded above: `needsVisualReview` only ever reaches here once `deps.visualReviewModel`
+        // has already been confirmed defined (E102-2's real `gemini.models`-sourced value, never
+        // this job's own Claude `record.model` -- a Gemini `GeminiRunner` would reject that model
+        // string outright, see gemini-factory.ts/reviewer-composition.ts's own headers).
+        ...(needsVisualReview ? { visual: deps.visualReviewModel } : {}),
+      },
+      evidence: visualEvidence?.evidence ?? Object.freeze([]),
+      ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
+      ...(publicationDigest === undefined ? {} : { publicationDigest }),
+      deadlineAt: reviewDeadline,
+      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
+    }),
+  );
 
   switch (reviewOutcome.state) {
     case "not_ready": {
@@ -1806,13 +2037,16 @@ async function resumeReview(
       );
     }
     case "clarification_required": {
-      const record$ = await deps.reviewStatus.record({
-        project: deps.project,
-        changeRequestId: context.changeRequestId,
-        expectedHeadSha,
-        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
-        decision: reviewOutcome,
-      });
+      const record$ = await whileResumeLeaseHeld(deps, () =>
+        deps.reviewStatus.record({
+          project: deps.project,
+          changeRequestId: context.changeRequestId,
+          expectedHeadSha,
+          idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
+          decision: reviewOutcome,
+          ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+        }),
+      );
       if (record$.state === "failed") {
         return requiresManualUnlessRetryable(
           record,
@@ -1829,13 +2063,16 @@ async function resumeReview(
       }));
     }
     case "changes_requested": {
-      const record$ = await deps.reviewStatus.record({
-        project: deps.project,
-        changeRequestId: context.changeRequestId,
-        expectedHeadSha,
-        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
-        decision: reviewOutcome,
-      });
+      const record$ = await whileResumeLeaseHeld(deps, () =>
+        deps.reviewStatus.record({
+          project: deps.project,
+          changeRequestId: context.changeRequestId,
+          expectedHeadSha,
+          idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
+          decision: reviewOutcome,
+          ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+        }),
+      );
       if (record$.state === "failed") {
         return requiresManualUnlessRetryable(
           record,
@@ -1854,21 +2091,24 @@ async function resumeReview(
           requiresManualCause("review", "review_paused"),
         );
       }
-      const recoveryOutcome = await deps.reviewerRecovery.run({
-        job: context.job,
-        project: deps.project,
-        trustedConfig: deps.trustedConfig,
-        requirementSnapshot: context.requirementSnapshot,
-        worktree: context.worktree,
-        model: record.model,
-        remote: "origin",
-        commitMessage: `${context.issue.title} (${context.issue.externalId}) Review 修復`,
-        controllerDirective: buildDirective(context.issue),
-        findings: reviewOutcome.findings.filter((finding) => finding.severity === "blocking"),
-        externalData: Object.freeze([]),
-        deadlineAt: recoveryDeadline,
-        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:reviewer-recovery`,
-      });
+      const recoveryOutcome = await whileResumeLeaseHeld(deps, () =>
+        deps.reviewerRecovery.run({
+          job: context.job,
+          project: deps.project,
+          trustedConfig: deps.trustedConfig,
+          requirementSnapshot: context.requirementSnapshot,
+          worktree: context.worktree,
+          model: record.model,
+          remote: "origin",
+          commitMessage: `${context.issue.title} (${context.issue.externalId}) Review 修復`,
+          controllerDirective: buildDirective(context.issue),
+          findings: reviewOutcome.findings.filter((finding) => finding.severity === "blocking"),
+          externalData: Object.freeze([]),
+          deadlineAt: recoveryDeadline,
+          idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:reviewer-recovery`,
+          ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+        }),
+      );
       switch (recoveryOutcome.state) {
         case "repair_pushed": {
           const headSha = parsedHeadSha(recoveryOutcome.push.sha);
@@ -1931,13 +2171,16 @@ async function resumeReview(
       break;
   }
 
-  const recorded = await deps.reviewStatus.record({
-    project: deps.project,
-    changeRequestId: context.changeRequestId,
-    expectedHeadSha,
-    idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
-    decision: reviewOutcome,
-  });
+  const recorded = await whileResumeLeaseHeld(deps, () =>
+    deps.reviewStatus.record({
+      project: deps.project,
+      changeRequestId: context.changeRequestId,
+      expectedHeadSha,
+      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-record`,
+      decision: reviewOutcome,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    }),
+  );
   if (recorded.state !== "approved") {
     return recorded.state === "failed"
       ? requiresManualUnlessRetryable(
@@ -1978,12 +2221,15 @@ async function resumeReview(
         requiresManualCause("merge", "visual_evidence_missing_at_merge"),
       );
     }
-    const verified = await deps.visualEvidence.verifyExisting({
-      worktreePath: context.worktree.path,
-      issueId: context.requirementSnapshot.issue.id,
-      headSha: expectedHeadSha,
-      allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
-    });
+    const visualEvidencePort = deps.visualEvidence;
+    const verified = await whileResumeLeaseHeld(deps, () =>
+      visualEvidencePort.verifyExisting({
+        worktreePath: context.worktree.path,
+        issueId: context.requirementSnapshot.issue.id,
+        headSha: expectedHeadSha,
+        allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+      }),
+    );
     if (!verified.ok) {
       return requiresManual(
         record,
@@ -2002,10 +2248,13 @@ async function resumeReview(
         requiresManualCause("merge", "visual_publication_missing_at_merge"),
       );
     }
-    const receipt = await deps.linearPublicationStore.load(
-      deps.project.id,
-      context.requirementSnapshot.issue.id,
-      expectedHeadSha,
+    const linearPublicationStore = deps.linearPublicationStore;
+    const receipt = await whileResumeLeaseHeld(deps, () =>
+      linearPublicationStore.load(
+        deps.project.id,
+        context.requirementSnapshot.issue.id,
+        expectedHeadSha,
+      ),
     );
     if (!receipt.ok || receipt.value === undefined) {
       return requiresManual(
@@ -2018,23 +2267,26 @@ async function resumeReview(
     currentPublicationDigest = aggregateLinearPublicationDigest([receipt.value]);
   }
 
-  const enabled = await deps.autoMerge.enable({
-    project: deps.project,
-    changeRequestId: context.changeRequestId,
-    expectedHeadSha,
-    idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:auto-merge`,
-    requirementSnapshot: context.requirementSnapshot,
-    baseRevision: context.baseRevision,
-    approval: recorded.approval,
-    ...(currentVisualManifest === undefined ? {} : { currentVisualManifest }),
-    ...(currentPublicationDigest === undefined ? {} : { currentPublicationDigest }),
-  });
+  const enabled = await whileResumeLeaseHeld(deps, () =>
+    deps.autoMerge.enable({
+      project: deps.project,
+      changeRequestId: context.changeRequestId,
+      expectedHeadSha,
+      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:auto-merge`,
+      requirementSnapshot: context.requirementSnapshot,
+      baseRevision: context.baseRevision,
+      approval: recorded.approval,
+      ...(currentVisualManifest === undefined ? {} : { currentVisualManifest }),
+      ...(currentPublicationDigest === undefined ? {} : { currentPublicationDigest }),
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    }),
+  );
   const mutationReceipts = "mutations" in enabled ? (enabled.mutations ?? []) : [];
   if (mutationReceipts.length > 0) {
     // Persist the transport-boundary receipts before Lifecycle, requires-manual handling, or any
     // other side effect. This cannot make GitHub + local disk atomic; it closes the controllable
     // crash window after the GitHub call returned and keeps CAS conflicts fail-closed.
-    const persisted = await persistMergeMutations(deps.progress, record, mutationReceipts);
+    const persisted = await persistMergeMutations(deps, record, mutationReceipts);
     if (!persisted.ok) {
       return { jobId: record.jobId, outcome: "progress_write_failed", error: persisted.error };
     }
@@ -2223,17 +2475,20 @@ async function finishMerged(
   authorizedHeadSha: string | undefined,
   mergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
-  const outcome = await deps.lifecycle.run({
-    project: deps.project,
-    externalIssueId: record.externalIssueId,
-    changeRequestId,
-    ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
-    idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
-    cancellationRaceAudit: {
-      observedAt: deps.clock.now(),
-      ...(mergeMutations === undefined ? {} : { mergeMutations }),
-    },
-  });
+  const outcome = await whileResumeLeaseHeld(deps, () =>
+    deps.lifecycle.run({
+      project: deps.project,
+      externalIssueId: record.externalIssueId,
+      changeRequestId,
+      ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
+      idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
+      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      cancellationRaceAudit: {
+        observedAt: deps.clock.now(),
+        ...(mergeMutations === undefined ? {} : { mergeMutations }),
+      },
+    }),
+  );
   if (outcome.state !== "completed") {
     return outcome.state === "failed"
       ? requiresManualUnlessRetryable(

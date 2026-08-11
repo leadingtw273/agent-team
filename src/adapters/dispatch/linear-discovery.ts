@@ -253,10 +253,11 @@ export async function projectIssueByExternalId(
   teamId: string,
   linearProjectId: string,
   externalIssueId: string,
+  options?: Parameters<LinearReadModel["readContext"]>[2],
 ): Promise<Result<Issue, DomainError>> {
-  const context = await readModel.readContext(teamId, linearProjectId);
+  const context = await readModel.readContext(teamId, linearProjectId, options);
   if (!context.ok) return context;
-  const snapshot = await readModel.readIssue(context.value, externalIssueId);
+  const snapshot = await readModel.readIssue(context.value, externalIssueId, options);
   if (!snapshot.ok) return snapshot;
   const template = parseReadyGateTemplate(snapshot.value.description);
   if (template.dependencies.kind === "unparsed") return err(domainError("conflict"));
