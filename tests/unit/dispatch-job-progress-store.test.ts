@@ -6,7 +6,7 @@
  * `changeRequestId` rejecting a non-decimal (node-id-shaped) value, and every `stage` variant
  * round-tripping through the real schema.
  */
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -310,6 +310,40 @@ describe("FileJobProgressStore", () => {
     const directory = await temporaryDirectory();
     const store = new FileJobProgressStore(join(directory, "never-created"));
     await expect(store.listForProject(projectId)).resolves.toEqual({ ok: true, value: [] });
+  });
+
+  it("listAll reads every project in one deterministic global snapshot", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const otherJobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-1123456789ab");
+    const otherProjectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-1123456789ab");
+    await store.compareAndSwap(
+      otherJobId,
+      null,
+      baseRecord({ jobId: otherJobId, projectId: otherProjectId, stage: { kind: "completed" } }),
+    );
+    await store.compareAndSwap(jobId, null, baseRecord({ stage: { kind: "ci_waiting" } }));
+
+    const all = await store.listAll();
+    expect(all.ok).toBe(true);
+    if (all.ok) {
+      expect(all.value.map((record) => record.jobId)).toEqual([jobId, otherJobId]);
+      expect(all.value.map((record) => record.projectId)).toEqual([projectId, otherProjectId]);
+    }
+  });
+
+  it("listAll returns an empty array when the progress directory does not exist", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(join(directory, "never-created"));
+    await expect(store.listAll()).resolves.toEqual({ ok: true, value: [] });
+  });
+
+  it("fails closed when an entry discovered by the directory scan disappears before read-back", async () => {
+    const directory = await temporaryDirectory();
+    await symlink(join(directory, "missing-target.json"), join(directory, `${jobId}.json`));
+    const result = await new FileJobProgressStore(directory).listAll();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.code).toBe("external_failure");
   });
 
   it("fails closed on a relative directory path", () => {

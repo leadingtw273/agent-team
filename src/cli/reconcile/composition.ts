@@ -4,14 +4,16 @@
  * `createUnwiredManualReconcileHandler()`'s permanent `blocked` stub with a real wiring so
  * `agent-team reconcile --all` genuinely runs the engine against durable, file-backed state.
  *
- * Scope, disclosed rather than hidden: of `ReconcilePorts`' six ports, only two have a real
- * production backing today:
+ * Scope, disclosed rather than hidden: the generic `ReconcileCoordinator` still has only two real
+ * mutation ports, while the CLI also owns one read-only durable progress inventory:
  *
  * - `leases.reclaimExpired` wraps the existing, already-tested `LeaseCoordinator.reclaimExpired`
  *   (src/application/leases/coordinator.ts) over the same `FileLeaseRepository` production
  *   composition already uses for dispatch (composition.ts) -- genuine zombie-lease reclamation,
  *   the exact mechanism E110 ("殭屍租約") needs, against the one shared, global lease store.
  * - `jobs.update` wraps the existing, already-tested `FileJobRepository.update`.
+ * - `readJobProgressInventory` scans `FileJobProgressStore` once and classifies every record as
+ *   resumable, blocked or terminal. It does not invoke a model or any external provider.
  *
  * `jobs.listActive` always resolves to the empty set. This mirrors an already-disclosed pattern in
  * this exact codebase (`dispatch/composition.ts`'s own `dispatchOnce` passing `active: []` to
@@ -45,6 +47,7 @@
  */
 import { join } from "node:path";
 
+import { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import {
   ReconcileCoordinator,
@@ -66,6 +69,8 @@ import {
 } from "../../domain/foundation/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
+import { defaultJobProgressDirectory } from "../dispatch/resume-composition.js";
+import { readJobProgressInventory } from "./active-job-inventory.js";
 import type {
   ManualReconcileUseCase,
   ReconcileCapabilityId,
@@ -163,11 +168,10 @@ function buildBlocksPort(): ReconcileBlockPort {
 /**
  * E010c: one accessor per `ReconcileCapabilityId` (src/cli/reconcile/index.ts) -- the only
  * hand-maintained list this mechanism needs, and it carries no wired/unwired judgment of its own,
- * only "where does this capability's port method live". `describeDisclosedScope` below decides
- * wired vs. unwired by checking, at the *built* `ReconcilePorts` object, whether that method is
- * reference-identical to the `unavailable`/`noActiveJobs` stubs above. So the only way to make a
- * capability report "wired" is to actually stop assigning it a stub in the builders above --
- * there is no separate boolean to edit and forget.
+ * only "where does this capability's implementation live". `describeDisclosedScope` below decides
+ * wired vs. unwired from the built runtime wiring. `active_job_snapshot` deliberately points at the
+ * generic coordinator's structurally incompatible `ReconcileTarget` snapshot stays separately
+ * disclosed as unwired; T03B will consume the durable inventory through a resume-only bridge.
  *
  * Every accessor below reads (never calls) a `ReconcilePorts` method declared with TypeScript's
  * method-shorthand syntax (src/application/reconcile/model.ts, out of this ticket's scope), which
@@ -176,30 +180,36 @@ function buildBlocksPort(): ReconcileBlockPort {
  * of these methods use `this` (the sentinels are plain functions; the two real ones close over
  * repository/coordinator instances by closure, not `this`), so the read is safe.
  */
+interface ReconcileRuntimeWiring {
+  readonly ports: ReconcilePorts;
+  readonly readJobProgressInventory: ManualReconcileUseCase["readJobProgressInventory"];
+}
+
 const reconcileCapabilityAccessors: readonly Readonly<{
   id: ReconcileCapabilityId;
-  get: (ports: ReconcilePorts) => unknown;
+  get: (wiring: ReconcileRuntimeWiring) => unknown;
 }>[] = Object.freeze([
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "lease_reclaim", get: (ports) => ports.leases.reclaimExpired },
+  { id: "lease_reclaim", get: ({ ports }) => ports.leases.reclaimExpired },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "job_update", get: (ports) => ports.jobs.update },
+  { id: "job_update", get: ({ ports }) => ports.jobs.update },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "active_job_snapshot", get: (ports) => ports.jobs.listActive },
+  { id: "active_job_snapshot", get: ({ ports }) => ports.jobs.listActive },
+  { id: "durable_progress_inventory", get: (wiring) => wiring.readJobProgressInventory },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "provider_readback", get: (ports) => ports.providers.readBack },
+  { id: "provider_readback", get: ({ ports }) => ports.providers.readBack },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "event_repair", get: (ports) => ports.events.repairMissing },
+  { id: "event_repair", get: ({ ports }) => ports.events.repairMissing },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "process_inspect", get: (ports) => ports.processes.inspect },
+  { id: "process_inspect", get: ({ ports }) => ports.processes.inspect },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "process_resume", get: (ports) => ports.processes.resumeFromCheckpoint },
+  { id: "process_resume", get: ({ ports }) => ports.processes.resumeFromCheckpoint },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "block_record", get: (ports) => ports.blocks.record },
+  { id: "block_record", get: ({ ports }) => ports.blocks.record },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "lease_recovery_prepare", get: (ports) => ports.leases.prepareRecovery },
+  { id: "lease_recovery_prepare", get: ({ ports }) => ports.leases.prepareRecovery },
   // eslint-disable-next-line @typescript-eslint/unbound-method -- see comment above; read-only reference.
-  { id: "lease_recovery_release", get: (ports) => ports.leases.releaseRecovery },
+  { id: "lease_recovery_release", get: ({ ports }) => ports.leases.releaseRecovery },
 ]);
 
 const unwiredSentinels: ReadonlySet<unknown> = new Set([unavailable, noActiveJobs]);
@@ -209,11 +219,11 @@ const unwiredSentinels: ReadonlySet<unknown> = new Set([unavailable, noActiveJob
  * than from a parallel hardcoded "here's what's wired" list -- see `reconcileCapabilityAccessors`'s
  * own comment for why that avoids drift.
  */
-function describeDisclosedScope(ports: ReconcilePorts): ReconcileDisclosedScope {
+function describeDisclosedScope(wiring: ReconcileRuntimeWiring): ReconcileDisclosedScope {
   const wired: ReconcileCapabilityId[] = [];
   const unwired: ReconcileCapabilityId[] = [];
   for (const capability of reconcileCapabilityAccessors) {
-    const target = unwiredSentinels.has(capability.get(ports)) ? unwired : wired;
+    const target = unwiredSentinels.has(capability.get(wiring)) ? unwired : wired;
     target.push(capability.id);
   }
   return Object.freeze({
@@ -254,8 +264,14 @@ export function buildManualReconcileUseCase(
 ): ManualReconcileUseCase {
   const ports = buildManualReconcilePorts(options);
   const coordinator = new ReconcileCoordinator(ports);
+  const progressStore = new FileJobProgressStore(
+    defaultJobProgressDirectory(options.agentTeamHome),
+  );
+  const readInventory = () => readJobProgressInventory(progressStore);
+  const wiring = Object.freeze({ ports, readJobProgressInventory: readInventory });
   return {
     reconcileAll: (request) => coordinator.reconcileAll(request),
-    disclosedScope: describeDisclosedScope(ports),
+    readJobProgressInventory: readInventory,
+    disclosedScope: describeDisclosedScope(wiring),
   };
 }

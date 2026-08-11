@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -20,6 +20,32 @@ function run(arguments_: readonly string[], environment: NodeJS.ProcessEnv = pro
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
+
+async function writeProgress(
+  agentTeamHome: string,
+  jobId: string,
+  stage: Readonly<Record<string, unknown>>,
+): Promise<void> {
+  const directory = join(agentTeamHome, "state", "dispatch", "progress");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(directory, `${jobId}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      revision: 0,
+      jobId,
+      projectId: "project_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      externalIssueId: "ENG-1",
+      model: "test-model",
+      stage,
+      branch: `agent-team/${jobId}`,
+      worktreePath: `/tmp/${jobId}`,
+      updatedAt: "2026-08-11T12:00:00.000Z",
+    }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
 
 describe("compiled CLI smoke", () => {
   it("executes version and help from the built ESM entrypoint", () => {
@@ -53,11 +79,11 @@ describe("compiled CLI smoke", () => {
       evidenceCode: "manual_reconcile_completed",
       reclaimedLeaseCount: 0,
       targetCounts: { healthy: 0, resumed: 0, blocked: 0, failed: 0 },
+      jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       modelResumeAttempts: 0,
-      // E010c: the real production composition (src/cli/reconcile/composition.ts) only backs
-      // lease reclaim and job update today -- see that file's `describeDisclosedScope`.
+      // T02B: production also has a read-only durable progress inventory. Resume remains T03B.
       scopeDisclosure: {
-        wiredCapabilities: ["lease_reclaim", "job_update"],
+        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
         unwiredCapabilities: [
           "active_job_snapshot",
           "provider_readback",
@@ -68,6 +94,38 @@ describe("compiled CLI smoke", () => {
           "lease_recovery_prepare",
           "lease_recovery_release",
         ],
+      },
+    });
+  });
+
+  it("T02B: restart inventory distinguishes resumable, blocked and terminal progress", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-reconcile-inventory-cli-"));
+    roots.push(root);
+    const agentTeamHome = join(root, ".agent-team");
+    await writeProgress(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678901", {
+      kind: "ci_waiting",
+    });
+    await writeProgress(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678902", {
+      kind: "implementing",
+    });
+    await writeProgress(agentTeamHome, "job_018f47d2-77a4-7cc1-8ef2-012345678903", {
+      kind: "completed",
+    });
+
+    const result = run(["reconcile", "--all"], { ...process.env, AGENT_TEAM_HOME: agentTeamHome });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      operation: "manual_reconcile",
+      state: "degraded",
+      evidenceCode: "manual_reconcile_degraded",
+      targetCounts: { healthy: 0, resumed: 0, blocked: 0, failed: 0 },
+      jobProgressCounts: { resumable: 1, blocked: 1, terminal: 1, total: 3 },
+      modelResumeAttempts: 0,
+      scopeDisclosure: {
+        wiredCapabilities: ["lease_reclaim", "job_update", "durable_progress_inventory"],
       },
     });
   });

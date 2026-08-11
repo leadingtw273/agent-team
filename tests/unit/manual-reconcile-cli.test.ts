@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { domainError, type DomainError } from "../../src/domain/foundation/index.js";
+import { domainError, err, ok, type DomainError } from "../../src/domain/foundation/index.js";
 import {
   createManualReconcileHandler,
   createUnwiredManualReconcileHandler,
@@ -17,7 +17,11 @@ function payload(message: string | undefined): Readonly<Record<string, unknown>>
 // module only exercises the CLI rendering layer, so the fixture's exact split doesn't need to
 // mirror production's -- only that the handler passes it through into the payload untouched.
 const fixtureDisclosedScope: ReconcileDisclosedScope = Object.freeze({
-  wiredCapabilities: Object.freeze(["lease_reclaim", "job_update"] as const),
+  wiredCapabilities: Object.freeze([
+    "lease_reclaim",
+    "job_update",
+    "durable_progress_inventory",
+  ] as const),
   unwiredCapabilities: Object.freeze([
     "active_job_snapshot",
     "provider_readback",
@@ -29,6 +33,9 @@ const fixtureDisclosedScope: ReconcileDisclosedScope = Object.freeze({
     "lease_recovery_release",
   ] as const),
 });
+
+const emptyInventory = () =>
+  Promise.resolve(ok(Object.freeze({ resumable: [], blocked: [], terminal: [] })));
 
 describe("O008 manual reconcile CLI adapter", () => {
   it("reports a real completed reconcile rather than manufacturing a generic success", async () => {
@@ -51,7 +58,11 @@ describe("O008 manual reconcile CLI adapter", () => {
       }),
     );
     const handler = createManualReconcileHandler({
-      reconcile: { reconcileAll, disclosedScope: fixtureDisclosedScope },
+      reconcile: {
+        reconcileAll,
+        readJobProgressInventory: emptyInventory,
+        disclosedScope: fixtureDisclosedScope,
+      },
       createRequest: () => ({
         controllerId: "manual-reconcile",
         idempotencyKeyPrefix: "manual-reconcile:test",
@@ -67,6 +78,7 @@ describe("O008 manual reconcile CLI adapter", () => {
       evidenceCode: "manual_reconcile_completed",
       reclaimedLeaseCount: 1,
       targetCounts: { healthy: 1, resumed: 1, blocked: 0, failed: 0 },
+      jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       modelResumeAttempts: 1,
       scopeDisclosure: fixtureDisclosedScope,
     });
@@ -89,6 +101,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             targets: [],
             modelResumeAttempts: 0,
           }),
+        readJobProgressInventory: emptyInventory,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -107,6 +120,7 @@ describe("O008 manual reconcile CLI adapter", () => {
     const scope = body["scopeDisclosure"] as ReconcileDisclosedScope;
     expect(scope.unwiredCapabilities).toContain("provider_readback");
     expect(scope.unwiredCapabilities).toContain("active_job_snapshot");
+    expect(scope.wiredCapabilities).toContain("durable_progress_inventory");
     expect(scope.wiredCapabilities).not.toContain("provider_readback");
   });
 
@@ -128,6 +142,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             ],
             modelResumeAttempts: 0,
           }),
+        readJobProgressInventory: emptyInventory,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -145,6 +160,7 @@ describe("O008 manual reconcile CLI adapter", () => {
       evidenceCode: "manual_reconcile_degraded",
       reclaimedLeaseCount: 0,
       targetCounts: { healthy: 0, resumed: 0, blocked: 1, failed: 0 },
+      jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       modelResumeAttempts: 0,
       scopeDisclosure: fixtureDisclosedScope,
     });
@@ -160,6 +176,7 @@ describe("O008 manual reconcile CLI adapter", () => {
             stage: "leases",
             error: { ...domainError("external_failure"), rawMessage: marker } as DomainError,
           }),
+        readJobProgressInventory: emptyInventory,
         disclosedScope: fixtureDisclosedScope,
       },
       createRequest: () => ({
@@ -180,6 +197,62 @@ describe("O008 manual reconcile CLI adapter", () => {
       evidenceCode: "manual_reconcile_failed_leases",
     });
     expect(outcome.message).not.toContain(marker);
+  });
+
+  it("reports durable resumable or blocked progress as degraded until the resume bridge handles it", async () => {
+    const reconcileAll = vi.fn(() =>
+      Promise.resolve({
+        state: "completed" as const,
+        reclaimedLeaseIds: [],
+        targets: [],
+        modelResumeAttempts: 0,
+      }),
+    );
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll,
+        readJobProgressInventory: () =>
+          Promise.resolve(
+            ok(
+              Object.freeze({
+                resumable: [{} as never],
+                blocked: [{} as never],
+                terminal: [{} as never],
+              }),
+            ),
+          ),
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const outcome = await handler({ all: true });
+    expect(outcome.state).toBe("blocked");
+    expect(payload(outcome.message)).toMatchObject({
+      state: "degraded",
+      evidenceCode: "manual_reconcile_degraded",
+      jobProgressCounts: { resumable: 1, blocked: 1, terminal: 1, total: 3 },
+    });
+    expect(reconcileAll).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed before reconcile mutations when the durable inventory cannot be read", async () => {
+    const reconcileAll = vi.fn();
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll,
+        readJobProgressInventory: () => Promise.resolve(err(domainError("external_failure"))),
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const outcome = await handler({ all: true });
+    expect(outcome.state).toBe("failed");
+    expect(payload(outcome.message)).toEqual({
+      operation: "manual_reconcile",
+      state: "failed",
+      evidenceCode: "manual_reconcile_failed_jobs",
+    });
+    expect(reconcileAll).not.toHaveBeenCalled();
   });
 
   it("keeps the unwired Runtime fail-closed instead of pretending a manual trigger ran", async () => {
