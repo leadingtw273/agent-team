@@ -69,6 +69,7 @@ import {
   buildResumeComposition,
   type BuildResumeCompositionResult,
 } from "./resume-full-composition.js";
+import { createOperatorCanaryCliHandlers } from "./operator-canary-attestation.js";
 import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
@@ -125,7 +126,7 @@ function safeResumeOutcomes(
 
 type DispatchHandlers = Pick<
   CliHandlers,
-  "run" | "dispatchResolve" | "dispatchResolveLegacyClaim" | "dispatchAutoMergeResume"
+  "run" | "dispatchResolve" | "dispatchResolveLegacyClaim" | "dispatchAutoMergeResume" | "quota"
 >;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
@@ -287,6 +288,10 @@ export function createDispatchCliHandlers(
   const generateHolderId = options.generateHolderId ?? (() => `cli-dispatch:${randomUUID()}`);
   const clock = options.clock ?? createClock();
   const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
+  const quota = createOperatorCanaryCliHandlers({
+    agentTeamHome: options.agentTeamHome,
+    clock,
+  });
 
   // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/
   // admission stores -- there is no `--dry-run` concept for it (it is itself the manual escape
@@ -315,6 +320,7 @@ export function createDispatchCliHandlers(
     dispatchResolve,
     dispatchResolveLegacyClaim,
     dispatchAutoMergeResume,
+    quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
         return outcome("blocked", {
@@ -425,7 +431,9 @@ export function createDispatchCliHandlers(
             admission: buildIssueAdmissionStore(options.agentTeamHome),
           };
 
-      const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId);
+      const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId, {
+        allowOperatorCanary: !dryRun,
+      });
       if (dispatchOnceOutcome.outcome === "discovery_failed") {
         return outcome("failed", {
           operation: "dispatch_run",

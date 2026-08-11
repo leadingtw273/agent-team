@@ -36,8 +36,88 @@ export interface ObserveClaudeRouteCandidatesOptions {
   readonly timeoutMs?: number;
 }
 
+/** A bounded, exact version observation for the one-time operator canary record.  Unlike route
+ * liveness, this deliberately treats any unusual output as unavailable: the persisted version
+ * must be an unambiguous value that can be compared byte-for-byte before consume. */
+export interface ObserveClaudeCliVersionOptions {
+  readonly process: ProcessPort;
+  readonly config: DispatchProviderConfig["claude"];
+  readonly workingDirectory: string;
+  readonly clock?: Clock;
+  readonly timeoutMs?: number;
+}
+
 const defaultCapabilityCheckTimeoutMs = 10_000;
 const capabilityCheckMaxOutputBytes = 4096;
+
+function normalizeSingleVersionLine(bytes: Uint8Array): string | undefined {
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+  const line = decoded.endsWith("\r\n")
+    ? decoded.slice(0, -2)
+    : decoded.endsWith("\n")
+      ? decoded.slice(0, -1)
+      : decoded;
+  return line.length > 0 && line === line.trim() && !/[\u0000-\u001f\u007f]/u.test(line)
+    ? line
+    : undefined;
+}
+
+export async function observeClaudeCliVersion(
+  options: ObserveClaudeCliVersionOptions,
+): Promise<string | undefined> {
+  const clock = options.clock ?? createClock();
+  const timeoutMs = options.timeoutMs ?? defaultCapabilityCheckTimeoutMs;
+  const deadline = instantFromDate(new Date(Date.parse(clock.now()) + timeoutMs));
+  if (!deadline.ok) return undefined;
+  const spawned = await options.process.spawn({
+    executable: options.config.executable,
+    arguments: ["--version"],
+    workingDirectory: options.workingDirectory,
+    deadlineAt: deadline.value,
+    maxOutputBytes: capabilityCheckMaxOutputBytes,
+  });
+  if (!spawned.ok) return undefined;
+
+  const stdout: Uint8Array[] = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let outputInvalid = false;
+  try {
+    for await (const chunk of spawned.value.output) {
+      const bytes = Uint8Array.from(chunk.bytes);
+      if (chunk.stream === "stderr") {
+        stderrBytes += bytes.byteLength;
+      } else {
+        stdoutBytes += bytes.byteLength;
+        if (stdoutBytes <= capabilityCheckMaxOutputBytes) stdout.push(bytes);
+      }
+      if (stdoutBytes + stderrBytes > capabilityCheckMaxOutputBytes) outputInvalid = true;
+    }
+  } catch {
+    return undefined;
+  }
+  const exited = await spawned.value.wait();
+  if (
+    !exited.ok ||
+    exited.value.exitCode !== 0 ||
+    exited.value.signal !== null ||
+    exited.value.outputTruncated ||
+    outputInvalid ||
+    stderrBytes !== 0 ||
+    stdoutBytes === 0 ||
+    stdoutBytes > capabilityCheckMaxOutputBytes
+  ) {
+    return undefined;
+  }
+  return normalizeSingleVersionLine(
+    Uint8Array.from(Buffer.concat(stdout.map((chunk) => Buffer.from(chunk)))),
+  );
+}
 
 export async function observeClaudeRouteCandidates(
   options: ObserveClaudeRouteCandidatesOptions,

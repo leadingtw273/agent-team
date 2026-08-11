@@ -96,10 +96,36 @@ Host 只能引用下表已有命令，不得捏造一般建單命令：
 | `agent-team run --project <id>` | Mutation／啟動 pipeline | 只在 Ready Gate 完整且需求核可後執行 |
 | `agent-team ui` | 啟動本機前景服務 | 目前是唯讀狀態頁，不是需求聊天或危險核可入口 |
 
+### 6.1 Q01：唯一的 Claude canary host 例外
+
+`agent-team quota canary-confirm` 與 `agent-team quota canary-status` 不屬於一般 leadi 手動操作
+流程，也不授權一般 `run`。唯一可呼叫者是 Team Manager host，且只能在 **leadi 當前對話**已明確核可
+「`CONFIRM CLAUDE CANARY FOR 15 MINUTES`」這個一次性意圖後使用。這是 host authority contract；CLI
+不能、也不得宣稱能以 OS 身分或密碼學方式證明對話參與者是 leadi。
+
+呼叫前 host 必須從 Linear 權威 read-back 取得 exact opaque issue node ID（不是人類可讀的
+`LEA-123` identifier），在對話中只以 identifier／title 讓 leadi 確認目標，並在任何 Linear mutation 後
+重新 read-back。兩個 command 都沒有 inline ID、version 或 secret option；host 只以 bounded strict stdin
+JSON 提供 exact project ID 與 opaque issue ID，絕不把該 JSON、raw ID、confirmation phrase、CLI version、
+provider config account、executable path 或 raw stderr 回顯到對話、log、Linear 或 artifact。
+
+confirm 成功後 host 必須立即呼叫 status，且只接受 exit `0`、`source:"operator_canary"`、
+`provider:"claude"`、matching scope/version digest 與 `remainingSeconds` 介於 1 到 900 的去敏 read-back。
+record 僅對該 project、opaque issue 與當下實測 Claude CLI version 有效 15 分鐘，並且只可在一次新的
+non-dry-run Job admission 前消耗；status 是 advisory read-back，不可替代 consume transaction，也不授權
+既有 Job resume、其他 issue、Codex、Gemini 或一般 quota route。
+
+這個例外是 `source:"operator_canary"` 的 private one-time attestation，**不是 danger approval，也不是
+provider quota observation**。它不得被寫入 `QuotaPort`、quota policy、quota UI 或 provider trusted source；
+一般 quota-ready route 若可 admission，仍優先且不消耗 canary record。任何 version／scope／status 不一致、
+expiry、unknown 或不足以完成同次 dispatch 的剩餘時間，都停止並重新向 leadi 取得一次新的當前對話核可，
+不得延長或復活舊 record。
+
 exit `0` 只代表命令成功，host 仍需解析 payload `state`；`degraded` 不是健康或可執行。exit `3` 是
 blocked，不能自動重試成 mutation；exit `1`、`2`、`130` 分別是失敗、用法拒絕、中斷。不得自動呼叫
 `dispatch resolve*`、`auto-merge-resume`、registration setup、systemd、ingest 或 reconcile；它們屬
-operator／復原流程，不是一般需求受理步驟。
+operator／復原流程，不是一般需求受理步驟。前述 Q01 canary commands 是唯一明列例外，且仍受本節 6.1
+所有前置與去敏限制拘束。
 
 `agent-team ui` 固定使用 loopback ephemeral port，stdout fragment bearer 是敏感資料。Host 不複製它到
 Linear、log、artifact 或一般摘要；SIGINT 中斷後預期 exit `130`，而不是可作為需求或危險核可證據。

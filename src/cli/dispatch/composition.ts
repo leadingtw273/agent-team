@@ -58,6 +58,7 @@ import {
   type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
+import { FileOperatorCanaryAttestationStore } from "../../adapters/dispatch/operator-canary-attestation-store.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
 import { LinearMutationClient } from "../../adapters/linear/write.js";
@@ -83,6 +84,7 @@ import {
 } from "../../application/projects/index.js";
 import {
   selectModelRoute,
+  type CandidateObservation,
   type ModelRouteDecision,
   type ModelRoutingConfig,
 } from "../../application/routing/index.js";
@@ -96,6 +98,10 @@ import {
 } from "../registration/draft-store.js";
 import { readLinearApiKeyWithFileFallback } from "../registration/secrets.js";
 import { observeClaudeRouteCandidates } from "./claude-observation.js";
+import {
+  consumeExactOperatorCanaryCandidate,
+  hasNormalModelAdmissionCandidate,
+} from "./operator-canary-attestation.js";
 import {
   applyProviderLiveness,
   createFailClosedNewJobQuotaAdmission,
@@ -167,6 +173,11 @@ export interface DispatchCompositionReady {
    * supplies Provider-owned identity and both required windows. Tests may inject a controlled
    * policy-backed port; config.account is never used as identity. */
   readonly quotaAdmission: NewJobQuotaAdmissionPort;
+  /** Q01's private, issue-scoped canary store. It is not a quota port and is only consulted by a
+   * non-dry dispatch after ordinary quota observations leave all model routes unavailable. */
+  readonly operatorCanary?: {
+    readonly store: FileOperatorCanaryAttestationStore;
+  };
   /** E102-2: the same host provider config file's optional `gemini` key, read alongside `claude`
    * above -- `undefined`/absent when this host has no real visual-review provider configured.
    * Optional here (not merely a possibly-`undefined`-valued required field) so every pre-existing
@@ -195,6 +206,8 @@ export interface BuildDispatchCompositionOptions {
   readonly claudeProcessPort?: ProcessPort;
   /** Test/canary seam only. Production deliberately defaults to collector_unavailable. */
   readonly quotaAdmissionPort?: NewJobQuotaAdmissionPort;
+  /** Test seam for Q01's independent, project-and-opaque-issue scoped attestation store. */
+  readonly operatorCanaryStore?: FileOperatorCanaryAttestationStore;
 }
 
 export interface DispatchOncePorts {
@@ -292,6 +305,7 @@ export async function dispatchOnce(
   ready: DispatchCompositionReady,
   ports: DispatchOncePorts,
   holderId: string,
+  options: Readonly<{ allowOperatorCanary?: boolean }> = {},
 ): Promise<DispatchOnceOutcome> {
   const discovered = await discoverReadyDispatchCandidates({
     project: ready.project,
@@ -321,15 +335,48 @@ export async function dispatchOnce(
     : Object.freeze([]);
   const routeObservations = applyProviderLiveness(quotaObservations, livenessObservations);
 
+  /* Q01 is deliberately downstream of ordinary quota observation and upstream of the first
+   * durable issue-admission claim. A normal ready route always wins: no canary read, version
+   * probe, or consume occurs in that case. For the exceptional route, `consume...` returns one
+   * exact candidate only after a matching, live CLI version has atomically consumed its private
+   * attestation; every other candidate remains outside the admission loop. */
+  let candidatesForAdmission: readonly DispatcherCandidate[] = discovered.value.candidates;
+  let routeObservationsForAdmission: readonly CandidateObservation[] = routeObservations;
+  if (
+    options.allowOperatorCanary === true &&
+    ready.operatorCanary !== undefined &&
+    !hasNormalModelAdmissionCandidate(
+      discovered.value.candidates,
+      ready.routingConfig,
+      routeObservations,
+    )
+  ) {
+    const canary = await consumeExactOperatorCanaryCandidate({
+      store: ready.operatorCanary.store,
+      projectId: ready.project.id,
+      candidates: discovered.value.candidates,
+      routingConfig: ready.routingConfig,
+      claude: {
+        config: ready.claude.config,
+        process: ready.claude.process,
+        workingDirectory: ready.project.localRepositoryPath,
+      },
+    });
+    if (canary.state === "consumed") {
+      candidatesForAdmission = Object.freeze([canary.candidate]);
+      routeObservationsForAdmission = canary.routeObservations;
+    }
+  }
+
   const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
   const claimedRevisions = new Map<string, number>();
   const claimedCandidates: DispatcherCandidate[] = [];
-  for (const candidate of discovered.value.candidates) {
+  for (const candidate of candidatesForAdmission) {
     if (candidate.workKind === "model") {
       const route = selectModelRoute(
         ready.routingConfig,
         candidate.issue.agentRole,
-        routeObservations,
+        routeObservationsForAdmission,
       );
       if (route.kind === "waiting") {
         admissionSkipped.push(
@@ -367,7 +414,7 @@ export async function dispatchOnce(
         registry: ready.registry,
         active: [],
         routingConfig: ready.routingConfig,
-        routeObservations,
+        routeObservations: routeObservationsForAdmission,
       });
 
   const dispatchedIssueId = result.kind === "dispatched" ? result.job.issueId : undefined;
@@ -479,6 +526,9 @@ export async function buildDispatchComposition(
         process: options.claudeProcessPort ?? new ChildProcessRunner(),
       }),
       quotaAdmission: options.quotaAdmissionPort ?? createFailClosedNewJobQuotaAdmission(),
+      operatorCanary: Object.freeze({
+        store: options.operatorCanaryStore ?? new FileOperatorCanaryAttestationStore(agentTeamHome),
+      }),
       gemini: providerConfig.value.gemini,
     }),
   });

@@ -9,8 +9,15 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { observeClaudeRouteCandidates } from "../../src/cli/dispatch/claude-observation.js";
-import type { ProcessPort, ProcessSpawnRequest } from "../../src/application/ports/index.js";
+import {
+  observeClaudeCliVersion,
+  observeClaudeRouteCandidates,
+} from "../../src/cli/dispatch/claude-observation.js";
+import type {
+  ProcessOutputChunk,
+  ProcessPort,
+  ProcessSpawnRequest,
+} from "../../src/application/ports/index.js";
 import {
   createFixedClock,
   ok,
@@ -64,6 +71,55 @@ function fakeProcess(
       );
     },
   };
+}
+
+function versionProcess(
+  input: Readonly<{
+    readonly output?: readonly Readonly<{ stream: "stdout" | "stderr"; bytes: Uint8Array }>[];
+    readonly exitCode?: number | null;
+    readonly signal?: null | "SIGKILL";
+    readonly outputTruncated?: boolean;
+  }>,
+): ProcessPort & { readonly requests: ProcessSpawnRequest[] } {
+  const requests: ProcessSpawnRequest[] = [];
+  return {
+    requests,
+    spawn(request) {
+      requests.push(request);
+      const chunks: readonly ProcessOutputChunk[] = (input.output ?? []).map((chunk, index) => ({
+        sequence: index,
+        stream: chunk.stream,
+        bytes: chunk.bytes,
+        observedAt: now,
+      }));
+      return Promise.resolve(
+        ok({
+          pid: 4242,
+          output: (async function* () {
+            await Promise.resolve();
+            yield* chunks;
+          })(),
+          writeStdin: () => Promise.resolve(ok(undefined)),
+          closeStdin: () => Promise.resolve(ok(undefined)),
+          sendSignal: () => Promise.resolve(ok(undefined)),
+          wait: () =>
+            Promise.resolve(
+              ok({
+                exitCode: input.exitCode ?? 0,
+                signal: input.signal ?? null,
+                startedAt: now,
+                exitedAt: now,
+                outputTruncated: input.outputTruncated === true,
+              }),
+            ),
+        }),
+      );
+    },
+  };
+}
+
+function bytes(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
 }
 
 describe("observeClaudeRouteCandidates", () => {
@@ -135,5 +191,48 @@ describe("observeClaudeRouteCandidates", () => {
     expect(states.has("quota_unknown")).toBe(false);
     expect(states.has("quota_blocked")).toBe(false);
     expect(states.has("provider_slot_full")).toBe(false);
+  });
+});
+
+describe("observeClaudeCliVersion", () => {
+  it("returns exactly one normalized stdout line and never uses provider account metadata", async () => {
+    const process = versionProcess({
+      output: [{ stream: "stdout", bytes: bytes("claude 2.1.0\r\n") }],
+    });
+
+    await expect(
+      observeClaudeCliVersion({ process, config, workingDirectory: "/tmp", clock }),
+    ).resolves.toBe("claude 2.1.0");
+    expect(process.requests).toEqual([
+      expect.objectContaining({
+        executable: "claude",
+        arguments: ["--version"],
+        workingDirectory: "/tmp",
+        maxOutputBytes: 4096,
+      }),
+    ]);
+  });
+
+  it.each([
+    ["empty stdout", {}],
+    ["multiple lines", { output: [{ stream: "stdout", bytes: bytes("claude 1\nextra\n") }] }],
+    ["stderr", { output: [{ stream: "stderr", bytes: bytes("warning") }] }],
+    [
+      "signal",
+      { output: [{ stream: "stdout", bytes: bytes("claude 1\n") }], signal: "SIGKILL" as const },
+    ],
+    ["non-zero", { output: [{ stream: "stdout", bytes: bytes("claude 1\n") }], exitCode: 1 }],
+    [
+      "truncation",
+      { output: [{ stream: "stdout", bytes: bytes("claude 1\n") }], outputTruncated: true },
+    ],
+    ["invalid UTF-8", { output: [{ stream: "stdout", bytes: Uint8Array.of(0xff) }] }],
+    ["control byte", { output: [{ stream: "stdout", bytes: bytes("claude\u0000 1\n") }] }],
+    ["leading whitespace", { output: [{ stream: "stdout", bytes: bytes(" claude 1\n") }] }],
+  ])("fails closed on %s", async (_name, input) => {
+    const process = versionProcess(input as Parameters<typeof versionProcess>[0]);
+    await expect(
+      observeClaudeCliVersion({ process, config, workingDirectory: "/tmp", clock }),
+    ).resolves.toBeUndefined();
   });
 });

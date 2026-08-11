@@ -56,6 +56,10 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
       probeRun: vi.fn(() => Promise.resolve(outcome)),
       probeStatus: vi.fn(() => Promise.resolve(outcome)),
     },
+    quota: {
+      canaryConfirm: vi.fn(() => Promise.resolve(outcome)),
+      canaryStatus: vi.fn(() => Promise.resolve(outcome)),
+    },
   };
 }
 

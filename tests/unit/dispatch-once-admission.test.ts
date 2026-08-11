@@ -23,7 +23,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { dispatchOnce, type DispatchCompositionReady } from "../../src/cli/dispatch/composition.js";
-import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
+import {
+  FileIssueAdmissionStore,
+  type IssueAdmissionPort,
+} from "../../src/adapters/dispatch/issue-admission-store.js";
+import { FileOperatorCanaryAttestationStore } from "../../src/adapters/dispatch/operator-canary-attestation-store.js";
 import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linear-discovery.js";
 import {
   buildLinearReadCatalog,
@@ -36,11 +40,15 @@ import {
   type LinearProjectContext,
   type LinearWorkflowStateRecord,
 } from "../../src/adapters/linear/model.js";
-import { LeaseCoordinator } from "../../src/application/leases/index.js";
+import { LeaseCoordinator, type LeaseRepository } from "../../src/application/leases/index.js";
+import type { JobRepository } from "../../src/application/dispatch/index.js";
 import type { ProjectRegistrySnapshot } from "../../src/application/projects/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
 import {
+  createFixedClock,
+  domainError,
+  err,
   ok,
   parseIdentifier,
   parseInstant,
@@ -224,15 +232,17 @@ C015o 決策 3 驗收。
 `;
 }
 
-function readModel(externalIssueId: string): LinearDiscoveryReadModel {
+function readModel(externalIssueInput: string | readonly string[]): LinearDiscoveryReadModel {
+  const externalIssueIds =
+    typeof externalIssueInput === "string" ? [externalIssueInput] : [...externalIssueInput];
   return {
     readContext: () => Promise.resolve(ok(linearProjectContext())),
-    listIssueIdsInState: () => Promise.resolve(ok([externalIssueId])),
-    readIssue: () =>
+    listIssueIdsInState: () => Promise.resolve(ok(externalIssueIds)),
+    readIssue: (_context, externalIssueId) =>
       Promise.resolve(
         ok({
           id: externalIssueId,
-          identifier: "SBX-1",
+          identifier: `SBX-${String(externalIssueIds.indexOf(externalIssueId) + 1)}`,
           title: "Ship the thing",
           description: readyGateDescription(),
           updatedAt: now,
@@ -250,7 +260,10 @@ function readModel(externalIssueId: string): LinearDiscoveryReadModel {
   };
 }
 
-function readyComposition(stateRoot: string, externalIssueId: string): DispatchCompositionReady {
+function readyComposition(
+  stateRoot: string,
+  externalIssueId: string | readonly string[],
+): DispatchCompositionReady {
   return {
     leases: new FileLeaseRepository(join(stateRoot, "leases.json"), join(stateRoot, "leases.lock")),
     jobs: new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock")),
@@ -289,6 +302,47 @@ class ReadyClaudeProcessPort implements ProcessPort {
         pid: 1,
         output: (async function* () {
           await Promise.resolve();
+        })(),
+        writeStdin: () => Promise.resolve(ok(undefined)),
+        closeStdin: () => Promise.resolve(ok(undefined)),
+        sendSignal: () => Promise.resolve(ok(undefined)),
+        wait: () =>
+          Promise.resolve(
+            ok({
+              exitCode: 0,
+              signal: null,
+              startedAt: now,
+              exitedAt: now,
+              outputTruncated: false,
+            }),
+          ),
+      } as never),
+    );
+  }
+}
+
+/** Q01's exact-version gate drains stdout, unlike the pre-existing normal liveness probe above.
+ * This fake is deliberately separate so old route-liveness assertions keep proving their original
+ * behavior while canary tests can prove the persisted version is measured from the CLI itself. */
+class VersionedClaudeProcessPort implements ProcessPort {
+  calls = 0;
+
+  constructor(private readonly version = "claude 2.1.0") {}
+
+  spawn(): ReturnType<ProcessPort["spawn"]> {
+    this.calls += 1;
+    const output = new TextEncoder().encode(`${this.version}\n`);
+    return Promise.resolve(
+      ok({
+        pid: 2,
+        output: (async function* () {
+          await Promise.resolve();
+          yield {
+            sequence: 0,
+            stream: "stdout" as const,
+            bytes: output,
+            observedAt: now,
+          };
         })(),
         writeStdin: () => Promise.resolve(ok(undefined)),
         closeStdin: () => Promise.resolve(ok(undefined)),
@@ -528,5 +582,252 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     // Released, not stuck -- a later attempt (once the lease is freed) can claim it again.
     const reclaimed = await ports.admission.claim(ready.project.id, issueId);
     expect(reclaimed.ok).toBe(true);
+  });
+
+  it("Q01 consumes the exact Claude candidate before claim, lease, and Job creation", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const events: string[] = [];
+    const canaryClock = createFixedClock(now);
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, { clock: canaryClock });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-canary-exact",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    const originalConsume = canaryStore.consume.bind(canaryStore);
+    (canaryStore as { consume: typeof canaryStore.consume }).consume = async (input) => {
+      const consumed = await originalConsume(input);
+      events.push("consume.end");
+      return consumed;
+    };
+
+    const base = readyComposition(stateRoot, [
+      "linear-issue-canary-exact",
+      "linear-issue-canary-other",
+    ]);
+    const process = new VersionedClaudeProcessPort();
+    const ready: DispatchCompositionReady = {
+      ...base,
+      claude: { ...base.claude, process },
+      quotaAdmission: {
+        resolve: () => Promise.resolve({ state: "quota_unknown" as const, reason: "no_collector" }),
+      },
+      operatorCanary: { store: canaryStore },
+    };
+    const leaseStore = new FileLeaseRepository(
+      join(stateRoot, "ordered-leases.json"),
+      join(stateRoot, "ordered-leases.lock"),
+    );
+    const leases: LeaseRepository = {
+      readAll: () => leaseStore.readAll(),
+      transact: (holder, mutate) => {
+        events.push("lease.acquire.begin");
+        return leaseStore.transact(holder, mutate);
+      },
+    };
+    const jobStore = new FileJobRepository(
+      join(stateRoot, "ordered-jobs.json"),
+      join(stateRoot, "ordered-jobs.lock"),
+    );
+    const jobs: JobRepository = {
+      create: (job) => {
+        events.push("job.create.begin");
+        return jobStore.create(job);
+      },
+    };
+    const admissionStore = new FileIssueAdmissionStore(join(stateRoot, "ordered-admission"));
+    const admission: IssueAdmissionPort = {
+      load: (...input) => admissionStore.load(...input),
+      claim: (...input) => {
+        events.push("admission.claim.begin");
+        return admissionStore.claim(...input);
+      },
+      attachJob: (...input) => admissionStore.attachJob(...input),
+      release: (...input) => admissionStore.release(...input),
+    };
+
+    const ports = { leases: new LeaseCoordinator(leases), jobs, admission };
+    const outcome = await dispatchOnce(ready, ports, "holder-canary-order", {
+      allowOperatorCanary: true,
+    });
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.result.kind).toBe("dispatched");
+    expect(events).toEqual([
+      "consume.end",
+      "admission.claim.begin",
+      "lease.acquire.begin",
+      "job.create.begin",
+    ]);
+    expect(process.calls).toBe(1);
+    const exactCandidate = outcome.candidates.find(
+      (candidate) => candidate.issue.externalId === "linear-issue-canary-exact",
+    );
+    const otherCandidate = outcome.candidates.find(
+      (candidate) => candidate.issue.externalId === "linear-issue-canary-other",
+    );
+    if (exactCandidate === undefined || otherCandidate === undefined) {
+      throw new Error("fixture must discover both candidates");
+    }
+    expect(outcome.result).toMatchObject({
+      kind: "dispatched",
+      job: { issueId: exactCandidate.issue.id },
+    });
+    await expect(admissionStore.load(projectId, otherCandidate.issue.id)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-canary-exact" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
+
+    const replay = await dispatchOnce(ready, ports, "holder-canary-replay", {
+      allowOperatorCanary: true,
+    });
+    expect(replay).toMatchObject({
+      outcome: "ran",
+      result: { kind: "waiting", reason: "no_dispatchable_candidate" },
+    });
+    expect(events).toEqual([
+      "consume.end",
+      "admission.claim.begin",
+      "lease.acquire.begin",
+      "job.create.begin",
+    ]);
+    expect(process.calls).toBe(1);
+    await expect(jobStore.readAll()).resolves.toMatchObject({
+      ok: true,
+      value: [expect.anything()],
+    });
+  });
+
+  it("Q01 leaves an active record untouched when a normal quota-ready route is admissible", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: createFixedClock(now),
+    });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-normal-priority",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    const base = readyComposition(stateRoot, "linear-issue-normal-priority");
+    const ready: DispatchCompositionReady = {
+      ...base,
+      claude: { ...base.claude, process: new VersionedClaudeProcessPort() },
+      operatorCanary: { store: canaryStore },
+    };
+
+    const outcome = await dispatchOnce(ready, buildPorts(stateRoot), "holder-normal-priority", {
+      allowOperatorCanary: true,
+    });
+    expect(outcome).toMatchObject({ outcome: "ran", result: { kind: "dispatched" } });
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-normal-priority" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
+  });
+
+  it("Q01 leaves quota unknown with zero claim when the exact issue or live version does not match", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: createFixedClock(now),
+    });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "different-linear-issue",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    const process = new VersionedClaudeProcessPort("claude 2.1.1");
+    const base = readyComposition(stateRoot, "linear-issue-version-mismatch");
+    const ready: DispatchCompositionReady = {
+      ...base,
+      claude: { ...base.claude, process },
+      quotaAdmission: {
+        resolve: () => Promise.resolve({ state: "quota_unknown" as const, reason: "no_collector" }),
+      },
+      operatorCanary: { store: canaryStore },
+    };
+    const ports = buildPorts(stateRoot);
+
+    const noExact = await dispatchOnce(ready, ports, "holder-no-exact", {
+      allowOperatorCanary: true,
+    });
+    expect(noExact).toMatchObject({ outcome: "ran", result: { kind: "waiting" } });
+    expect(process.calls).toBe(0);
+    if (noExact.outcome !== "ran") throw new Error("fixture discovery must succeed");
+    const candidateId = noExact.candidates[0]?.issue.id;
+    if (candidateId === undefined) throw new Error("fixture candidate must exist");
+    await expect(ports.admission.load(projectId, candidateId)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+
+    const versionIssued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-version-mismatch",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!versionIssued.ok) throw new Error(versionIssued.error.code);
+    const mismatch = await dispatchOnce(ready, ports, "holder-version-mismatch", {
+      allowOperatorCanary: true,
+    });
+    expect(mismatch).toMatchObject({ outcome: "ran", result: { kind: "waiting" } });
+    expect(process.calls).toBe(1);
+    await expect(ports.admission.load(projectId, candidateId)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-version-mismatch" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
+  });
+
+  it("Q01 never revives a consumed record when Job creation fails after admission", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: createFixedClock(now),
+    });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-consumed-after-job-failure",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    const base = readyComposition(stateRoot, "linear-issue-consumed-after-job-failure");
+    const ready: DispatchCompositionReady = {
+      ...base,
+      claude: { ...base.claude, process: new VersionedClaudeProcessPort() },
+      quotaAdmission: {
+        resolve: () => Promise.resolve({ state: "quota_unknown" as const, reason: "no_collector" }),
+      },
+      operatorCanary: { store: canaryStore },
+    };
+    const failedJobs: JobRepository = {
+      create: () => Promise.resolve(err(domainError("external_failure"))),
+    };
+    const ports = {
+      leases: new LeaseCoordinator(
+        new FileLeaseRepository(
+          join(stateRoot, "failed-leases.json"),
+          join(stateRoot, "failed-leases.lock"),
+        ),
+      ),
+      jobs: failedJobs,
+      admission: new FileIssueAdmissionStore(join(stateRoot, "failed-admission")),
+    };
+
+    const outcome = await dispatchOnce(ready, ports, "holder-job-failure", {
+      allowOperatorCanary: true,
+    });
+    expect(outcome).toMatchObject({ outcome: "ran", result: { kind: "waiting" } });
+    await expect(
+      canaryStore.inspect({
+        projectId,
+        linearExternalIssueId: "linear-issue-consumed-after-job-failure",
+      }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
   });
 });
