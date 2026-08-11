@@ -177,7 +177,14 @@ describe("localhost UI browser security layer", () => {
         dispatchEvent: (event: { readonly type: string }) => {
           browserCalls.push(event.type);
         },
-        location: { hash: `#${handle.sessionToken}`, pathname: "/", search: "" },
+        location: {
+          hash: `#${handle.sessionToken}`,
+          pathname: "/",
+          search: "",
+          replace: (path: string) => {
+            browserCalls.push(`location-replaced:${path}`);
+          },
+        },
       },
     });
     await vi.waitFor(() => {
@@ -189,6 +196,7 @@ describe("localhost UI browser security layer", () => {
     ]);
     expect(storedValues).toEqual(["browser-csrf"]);
     expect(browserCalls[1]).not.toContain(`?${handle.sessionToken}`);
+    expect(browserCalls).toContain("location-replaced:/");
 
     const first = await exchange(handle);
     expect(first.response.status).toBe(204);
