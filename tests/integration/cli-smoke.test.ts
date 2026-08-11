@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -15,6 +16,79 @@ function run(arguments_: readonly string[], environment: NodeJS.ProcessEnv = pro
     timeout: 10_000,
     env: environment,
   });
+}
+
+function runGit(cwd: string, arguments_: readonly string[]): void {
+  const result = spawnSync("git", arguments_, { cwd, encoding: "utf8", timeout: 10_000 });
+  if (result.status !== 0 || result.error !== undefined) {
+    throw new Error(
+      `git fixture setup failed: ${
+        result.stderr.length > 0 ? result.stderr : (result.error?.message ?? "unknown")
+      }`,
+    );
+  }
+}
+
+async function treeFingerprint(root: string): Promise<readonly string[]> {
+  const entries: string[] = [];
+  async function visit(directory: string, prefix: string): Promise<void> {
+    const children = await readdir(directory);
+    for (const name of children.sort()) {
+      const path = join(directory, name);
+      const relative = prefix.length === 0 ? name : `${prefix}/${name}`;
+      const metadata = await stat(path);
+      if (metadata.isDirectory()) {
+        entries.push(`${relative}/`);
+        await visit(path, relative);
+      } else if (metadata.isFile()) {
+        const content = await readFile(path);
+        entries.push(`${relative}:${createHash("sha256").update(content).digest("hex")}`);
+      } else {
+        entries.push(`${relative}:non-file`);
+      }
+    }
+  }
+  await visit(root, "");
+  return entries;
+}
+
+function projectDraft(
+  projectId: string,
+  localRepositoryPath: string,
+): Readonly<Record<string, unknown>> {
+  return {
+    schemaVersion: 1,
+    project: {
+      schemaVersion: 1,
+      id: projectId,
+      displayName: "CLI Smoke Project",
+      localRepositoryPath,
+      defaultBranch: "main",
+      workManagement: {
+        provider: "linear",
+        containerId: "linear-container-sentinel",
+        projectId: "linear-project-sentinel",
+      },
+      sourceControl: { provider: "github", repository: "owner/private-repository-sentinel" },
+    },
+    config: {
+      schemaVersion: 1,
+      projectId,
+      defaultBranch: "main",
+      platforms: {
+        workManagement: {
+          provider: "linear",
+          containerId: "linear-container-sentinel",
+          projectId: "linear-project-sentinel",
+        },
+        sourceControl: { provider: "github", repository: "owner/private-repository-sentinel" },
+      },
+      projectRules: ["github_pat_abcdefghijklmnopqrstuvwxyz123456"],
+      roleInstructions: { implementer: ["No secret output."] },
+      commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
+    },
+    linearAuditIssueId: "AUDIT-SENTINEL",
+  };
 }
 
 afterEach(async () => {
@@ -201,5 +275,90 @@ describe("compiled CLI smoke", () => {
     ).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("T05: compiled project list/detail/not-found are read-only and do not leak host or provider data", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-project-cli-"));
+    roots.push(root);
+    const repository = join(root, "repository");
+    const agentTeamHome = join(root, ".agent-team");
+    const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+    await mkdir(repository, { recursive: true });
+    runGit(repository, ["init", "--initial-branch=main"]);
+    runGit(repository, ["config", "user.email", "smoke@example.invalid"]);
+    runGit(repository, ["config", "user.name", "CLI Smoke"]);
+    await writeFile(join(repository, "README.md"), "fixture\n");
+    runGit(repository, ["add", "README.md"]);
+    runGit(repository, ["commit", "-m", "fixture"]);
+    const registrationDirectory = join(agentTeamHome, "config", "registration");
+    await mkdir(registrationDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(registrationDirectory, `${projectId}.draft.json`),
+      JSON.stringify(projectDraft(projectId, repository)),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    await mkdir(join(agentTeamHome, "secrets"), { recursive: true, mode: 0o700 });
+    await writeFile(join(agentTeamHome, "secrets", "must-not-be-read"), "secret-sentinel", {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const before = await Promise.all([treeFingerprint(repository), treeFingerprint(agentTeamHome)]);
+    const environment = { ...process.env, AGENT_TEAM_HOME: agentTeamHome };
+
+    const list = run(["project"], environment);
+    const detail = run(["project", projectId], environment);
+    const missing = run(["project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ac"], environment);
+    const after = await Promise.all([treeFingerprint(repository), treeFingerprint(agentTeamHome)]);
+
+    expect(list).toMatchObject({ status: 0, stderr: "" });
+    expect(detail).toMatchObject({ status: 0, stderr: "" });
+    expect(missing).toMatchObject({ status: 1, stdout: "" });
+    expect(JSON.parse(list.stdout)).toMatchObject({
+      operation: "project_list",
+      schemaVersion: 1,
+      state: "degraded",
+      inventory: { state: "available", rejectedDraftCount: 0 },
+      projects: [
+        {
+          id: projectId,
+          registration: { state: "configuration_incomplete", reason: "trusted_config_missing" },
+        },
+      ],
+    });
+    expect(JSON.parse(detail.stdout)).toMatchObject({
+      operation: "project_detail",
+      schemaVersion: 1,
+      state: "degraded",
+      project: {
+        id: projectId,
+        quota: { state: "unknown", reason: "collector_unavailable" },
+        wakeup: { state: "degraded", mode: "manual_reconcile_only" },
+      },
+    });
+    expect(JSON.parse(missing.stderr)).toEqual({
+      operation: "project_detail",
+      schemaVersion: 1,
+      state: "failed",
+      reason: "project_not_found",
+    });
+    for (const text of [
+      list.stdout,
+      list.stderr,
+      detail.stdout,
+      detail.stderr,
+      missing.stdout,
+      missing.stderr,
+    ]) {
+      for (const sentinel of [
+        "private-repository-sentinel",
+        "linear-container-sentinel",
+        "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        "AUDIT-SENTINEL",
+        "secret-sentinel",
+      ]) {
+        expect(text).not.toContain(sentinel);
+      }
+    }
+    expect(after).toEqual(before);
   });
 });
