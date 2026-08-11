@@ -311,6 +311,9 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
         config: { executable: "claude", models: ["opus"], account: "default" },
         process: new ReadyClaudeProcessPort(),
       },
+      quotaAdmission: {
+        resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
+      },
     };
 
     // === Real discovery (real parseReadyGateTemplate) -> real eligibility -> real dispatch ===

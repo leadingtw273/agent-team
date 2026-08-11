@@ -240,6 +240,36 @@ describe("quota routing policy", () => {
     }
   });
 
+  it("fails closed on runtime-invalid percentages, identity, source, and CLI metadata", () => {
+    const invalidSnapshots: QuotaSnapshot[] = [
+      usageSnapshot("codex", Number.NaN, 50),
+      usageSnapshot("codex", -1, 50),
+      usageSnapshot("codex", 101, 50),
+      usageSnapshot("codex", 50, Number.POSITIVE_INFINITY),
+      { ...usageSnapshot(), accountFingerprint: "" },
+      {
+        ...usageSnapshot(),
+        samples: usageSnapshot().samples.map((sample) => ({ ...sample, source: "" })),
+      },
+      {
+        ...usageSnapshot(),
+        samples: usageSnapshot().samples.map((sample) => ({ ...sample, cliVersion: "" })),
+      },
+    ];
+    for (const snapshot of invalidSnapshots) {
+      expect(evaluateQuotaForNewJob(snapshot, codexIdentity, now, policy).state).toBe(
+        "quota_unknown",
+      );
+      expect(evaluateRunningQuota(snapshot, codexIdentity, now, policy).action).toBe("checkpoint");
+    }
+    expect(
+      evaluateQuotaForNewJob(usageSnapshot(), codexIdentity, now, {
+        ...policy,
+        expectedCliVersions: { ...policy.expectedCliVersions, codex: "" },
+      }).state,
+    ).toBe("quota_unknown");
+  });
+
   it("checkpoints running work at 3%, a five-hour limit, or an unknown signal", () => {
     expect(evaluateRunningQuota(usageSnapshot("codex", 3, 50), codexIdentity, now, policy)).toEqual(
       {

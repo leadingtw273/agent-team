@@ -269,6 +269,9 @@ function readyComposition(stateRoot: string, externalIssueId: string): DispatchC
       config: { executable: "claude", models: ["opus"], account: "default" },
       process: new ReadyClaudeProcessPort(),
     },
+    quotaAdmission: {
+      resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
+    },
   };
 }
 
@@ -277,7 +280,10 @@ function readyComposition(stateRoot: string, externalIssueId: string): DispatchC
  * `ReadyClaudeProcessPort`, reports the Claude capability probe as alive without spawning any
  * real process. */
 class ReadyClaudeProcessPort implements ProcessPort {
+  calls = 0;
+
   spawn(): ReturnType<ProcessPort["spawn"]> {
+    this.calls += 1;
     return Promise.resolve(
       ok({
         pid: 1,
@@ -313,6 +319,96 @@ function buildPorts(stateRoot: string) {
 }
 
 describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
+  it("quota unknown performs zero claim, lease, Job, or Claude liveness process mutation", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const baseReady = readyComposition(stateRoot, "linear-issue-quota-unknown");
+    const process = new ReadyClaudeProcessPort();
+    let quotaCalls = 0;
+    const ready: DispatchCompositionReady = {
+      ...baseReady,
+      claude: { ...baseReady.claude, process },
+      quotaAdmission: {
+        resolve: () => {
+          quotaCalls += 1;
+          return Promise.resolve({ state: "quota_unknown", reason: "fixture_unknown" });
+        },
+      },
+    };
+    const ports = buildPorts(stateRoot);
+
+    const outcome = await dispatchOnce(ready, ports, "holder-quota-unknown");
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.result).toMatchObject({
+      kind: "waiting",
+      reason: "no_dispatchable_candidate",
+    });
+    expect(outcome.admissionSkipped).toEqual([
+      { issueId: outcome.candidates[0]?.issue.id, reason: "quota_unknown" },
+    ]);
+    expect(quotaCalls).toBe(1);
+    expect(process.calls).toBe(0);
+
+    const jobs = await ports.jobs.readAll();
+    const leases = await ports.leases.repository.readAll();
+    expect(jobs).toEqual({ ok: true, value: [] });
+    expect(leases).toEqual({ ok: true, value: [] });
+    const issueId = outcome.candidates[0]?.issue.id;
+    if (issueId === undefined) throw new Error("fixture invariant violated: missing issue id");
+    await expect(ports.admission.load(ready.project.id, issueId)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+  });
+
+  it("keeps an execution-unwired primary unavailable and safely selects a quota-ready Claude fallback", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const baseReady = readyComposition(stateRoot, "linear-issue-quota-fallback");
+    const providerCalls = new Map<string, number>();
+    const ready: DispatchCompositionReady = {
+      ...baseReady,
+      routingConfig: {
+        ...routingConfig,
+        routes: routingConfig.routes.map((route) =>
+          route.role === "implementer"
+            ? {
+                ...route,
+                candidates: [
+                  { provider: "codex" as const, model: "gpt" },
+                  { provider: "claude" as const, model: "opus" },
+                ],
+              }
+            : route,
+        ),
+      },
+      quotaAdmission: {
+        resolve: (provider) => {
+          providerCalls.set(provider, (providerCalls.get(provider) ?? 0) + 1);
+          return Promise.resolve({ state: "ready", reason: "test_fixture" });
+        },
+      },
+    };
+
+    const outcome = await dispatchOnce(ready, buildPorts(stateRoot), "holder-fallback");
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.result.kind).toBe("dispatched");
+    if (outcome.result.kind !== "dispatched") return;
+    expect(outcome.result.decision.model).toMatchObject({
+      candidate: { provider: "claude", model: "opus" },
+      candidateIndex: 1,
+      fallbackUsed: true,
+    });
+    expect(providerCalls).toEqual(
+      new Map([
+        ["codex", 1],
+        ["claude", 1],
+      ]),
+    );
+  });
+
   it("a pre-existing active claim blocks a fresh dispatch attempt for the same issue entirely", async () => {
     const stateRoot = await temporaryStateRoot();
     const ready = readyComposition(stateRoot, "linear-issue-admission-1");

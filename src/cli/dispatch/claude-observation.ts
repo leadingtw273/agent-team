@@ -7,18 +7,11 @@
  * options and never touches a real process, this function is the one place in C015b that
  * genuinely asks "is Claude alive right now."
  *
- * Quota is deliberately NOT attempted. No `QuotaPort` implementation exists for Claude anywhere
- * in this codebase (confirmed by a repo-wide search before writing this file), and
- * `evaluateQuotaForNewJob`/`resolveQuotaForNewJob` (src/application/quota/policy.ts) are pure
- * functions with nothing to feed them real samples -- building a Claude quota-signal reader is a
- * substantial, separate undertaking outside this "minimal path" ticket's scope. This is a
- * disclosed scope decision, not a silently loosened fail-closed policy: this function never
- * fabricates a "ready" or "quota_blocked" state it cannot back up. Every observation it returns
- * is either `"ready"` (the executable answered) or `"provider_unavailable"` (it did not) --
- * `"quota_unknown"`/`"quota_blocked"`/`"provider_slot_full"` never appear here, because nothing
- * in this function ever claims to know the account's quota or slot state; `provider_slot_full`
- * in particular is applied downstream by `decideNextDispatch` itself
- * (src/application/dispatch/decision.ts), not by an observation producer.
+ * Quota is deliberately NOT attempted here. T03A's composition calls this liveness-only probe
+ * solely after a separate trusted quota observation is already ready, then intersects the two
+ * results; this function's `"ready"` therefore means only "the executable answered", never
+ * "admission is safe" on its own. Every observation it returns is either `"ready"` or
+ * `"provider_unavailable"`; quota and provider-slot states belong to their own policy layers.
  */
 import type { ProcessPort } from "../../application/ports/index.js";
 import type { CandidateObservation } from "../../application/routing/index.js";

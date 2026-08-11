@@ -136,6 +136,9 @@ function readyComposition(readModel: LinearDiscoveryReadModel): DispatchComposit
       config: { executable: "claude", models: ["opus"], account: "default" },
       process: new NeverCalledProcessPort(),
     },
+    quotaAdmission: {
+      resolve: () => Promise.reject(new Error("must never be called: discovery failed first")),
+    },
   };
 }
 
