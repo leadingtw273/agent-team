@@ -50,13 +50,11 @@ export function createProjectHandler(
  * discovery, trusted default-branch config/activation read-back, durable progress, Jobs, and
  * Leases. In particular, this deliberately has no Linear, GitHub, provider, or systemd adapter.
  */
-export function createProjectCliHandlers(
-  options: CreateProjectCliHandlersOptions,
-): Pick<CliHandlers, "project"> {
+export function createProjectReadModel(options: CreateProjectCliHandlersOptions): ProjectReadModel {
   const stateRoot = join(options.agentTeamHome, "state");
   const activation = new FileRegistrationSetupActivationRegistry(stateRoot);
   const loader = new TrustedProjectConfigLoader(new LocalGitAdapter(), activation);
-  const model = new ProjectReadModel({
+  return new ProjectReadModel({
     discoverDrafts: () => listHostRegistrationSetupDrafts(options.agentTeamHome),
     registry: new ProjectRegistry(loader),
     progress: new FileJobProgressStore(join(stateRoot, "dispatch", "progress")),
@@ -64,5 +62,11 @@ export function createProjectCliHandlers(
     leases: new FileLeaseRepository(join(stateRoot, "leases.json"), join(stateRoot, "leases.lock")),
     clock: createClock(),
   });
+}
+
+export function createProjectCliHandlers(
+  options: CreateProjectCliHandlersOptions,
+): Pick<CliHandlers, "project"> {
+  const model = createProjectReadModel(options);
   return Object.freeze({ project: createProjectHandler(model) });
 }

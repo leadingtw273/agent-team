@@ -116,6 +116,7 @@ const bootstrapScript = `(() => {
     const csrf = response.headers.get("x-csrf-token");
     if (csrf) sessionStorage.setItem("agent-team-csrf", csrf);
     window.dispatchEvent(new Event("agent-team-session-ready"));
+    if (fragment.length > 0) window.location.replace(window.location.pathname + window.location.search);
   }).catch(() => {
     sessionStorage.removeItem("agent-team-csrf");
     const app = document.getElementById("app");
@@ -344,11 +345,14 @@ export function createUiSecurityPolicy(
     if (target === undefined) return respond(response(400, "Bad Request\n"));
     const { path } = target;
 
-    if (
-      path === "/" &&
-      request.url === path &&
-      (request.method === "GET" || request.method === "HEAD")
-    ) {
+    if (path === "/" && request.url === path && readMethods.has(request.method)) {
+      if (
+        target.route !== undefined &&
+        hasSession(request, activeSession) &&
+        target.route.allowedMethods.includes(request.method as UiSecurityRouteMethod)
+      ) {
+        return allowSession(target.handlerUrl, target.route.response, undefined);
+      }
       return respond(
         responseWithHeaders(200, { "content-type": "text/html; charset=utf-8" }, bootstrapShell),
       );

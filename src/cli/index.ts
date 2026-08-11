@@ -15,6 +15,7 @@ import { buildManualReconcileUseCase } from "./reconcile/composition.js";
 import { createManualReconcileHandler } from "./reconcile/index.js";
 import { createRegistrationCliHandlers } from "./registration/index.js";
 import { createSystemdHandler } from "./systemd/index.js";
+import { createUiCliHandler } from "./ui/index.js";
 
 const require = createRequire(import.meta.url);
 const metadata = require("../../package.json") as PackageMetadata;
@@ -38,4 +39,5 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   }),
   systemd: createSystemdHandler(fileURLToPath(import.meta.url)),
   registration: createRegistrationCliHandlers({ agentTeamHome }),
+  ui: createUiCliHandler({ agentTeamHome }),
 });
