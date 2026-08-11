@@ -42,6 +42,13 @@ export interface RegistrationCliHandlers {
   readonly probeStatus: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
 }
 
+/** Q01's host-only, stdin-bound attestation commands. They deliberately take no IDs, version, or
+ * confirmation phrase from argv, so shell history and process listings never carry those values. */
+export interface QuotaCliHandlers {
+  readonly canaryConfirm: () => Promise<CliCommandOutcome>;
+  readonly canaryStatus: () => Promise<CliCommandOutcome>;
+}
+
 export interface CliHandlers {
   readonly run: (
     input: Readonly<{ projectId?: string; dryRun?: boolean }>,
@@ -72,6 +79,7 @@ export interface CliHandlers {
   readonly ui: () => Promise<CliCommandOutcome>;
   readonly systemd: (input: SystemdCommandInput) => Promise<CliCommandOutcome>;
   readonly registration: RegistrationCliHandlers;
+  readonly quota: QuotaCliHandlers;
 }
 
 export interface CliIo {
@@ -100,6 +108,27 @@ const defaultRegistrationHandlers: RegistrationCliHandlers = Object.freeze({
   probeStatus: () => blocked("registration probe status"),
 });
 
+const defaultQuotaHandlers: QuotaCliHandlers = Object.freeze({
+  canaryConfirm: () =>
+    Promise.resolve({
+      state: "blocked" as const,
+      message: JSON.stringify({
+        operation: "operator_canary_confirm",
+        state: "blocked",
+        reason: "runtime_unavailable",
+      }),
+    }),
+  canaryStatus: () =>
+    Promise.resolve({
+      state: "blocked" as const,
+      message: JSON.stringify({
+        operation: "operator_canary_status",
+        state: "blocked",
+        reason: "runtime_unavailable",
+      }),
+    }),
+});
+
 export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
   dispatchResolve: () => blocked("dispatch resolve"),
@@ -112,6 +141,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   ui: () => blocked("ui"),
   systemd: () => blocked("systemd"),
   registration: defaultRegistrationHandlers,
+  quota: defaultQuotaHandlers,
 });
 
 const defaultIo: CliIo = Object.freeze({
@@ -132,6 +162,25 @@ function outcomeExitCode(outcome: CliCommandOutcome): number {
     case "interrupted":
       return cliExitCodes.interrupted;
   }
+}
+
+/** Commander includes unexpected positional values in its diagnostic text. The two Q01 commands
+ * expressly forbid raw IDs/version/confirmation from argv, so reject surplus argv before the
+ * parser has a chance to echo it to stderr. Exact invocations still flow through Commander and
+ * the strict stdin handlers below. */
+function operatorCanaryArgvRejection(argv: readonly string[]): CliCommandOutcome | undefined {
+  const command = argv[0] === "quota" ? argv[1] : undefined;
+  if (command !== "canary-confirm" && command !== "canary-status") return undefined;
+  if (argv.length === 2) return undefined;
+  return Object.freeze({
+    state: "rejected" as const,
+    message: JSON.stringify({
+      operation:
+        command === "canary-confirm" ? "operator_canary_confirm" : "operator_canary_status",
+      state: "rejected",
+      reason: "invalid_command_input",
+    }),
+  });
 }
 
 function renderOutcome(outcome: CliCommandOutcome, io: CliIo): void {
@@ -251,6 +300,16 @@ export function createProgram(
     .action((options: { readonly project: string }) =>
       action(state, io, () => handlers.dispatchAutoMergeResume({ projectId: options.project }))(),
     );
+
+  const quota = program.command("quota").description("受控的 provider quota host 操作");
+  quota
+    .command("canary-confirm")
+    .description("以嚴格 stdin JSON 建立一次 Claude-only operator canary attestation")
+    .action(action(state, io, handlers.quota.canaryConfirm));
+  quota
+    .command("canary-status")
+    .description("以嚴格 stdin JSON 驗證一次 Claude-only operator canary attestation")
+    .action(action(state, io, handlers.quota.canaryStatus));
 
   program
     .command("ingest")
@@ -417,6 +476,12 @@ export async function runCli(
   if (argv.length === 0) {
     program.outputHelp();
     return cliExitCodes.success;
+  }
+  const canaryArgvRejection = operatorCanaryArgvRejection(argv);
+  if (canaryArgvRejection !== undefined) {
+    state.exitCode = outcomeExitCode(canaryArgvRejection);
+    renderOutcome(canaryArgvRejection, io);
+    return state.exitCode;
   }
   try {
     await program.parseAsync([...argv], { from: "user" });

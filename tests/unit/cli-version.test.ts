@@ -51,6 +51,10 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
       probeRun: vi.fn(() => Promise.resolve(outcome)),
       probeStatus: vi.fn(() => Promise.resolve(outcome)),
     },
+    quota: {
+      canaryConfirm: vi.fn(() => Promise.resolve(outcome)),
+      canaryStatus: vi.fn(() => Promise.resolve(outcome)),
+    },
   } satisfies CliHandlers;
 }
 
@@ -68,6 +72,7 @@ describe("agent-team CLI contract", () => {
       Commands:
         run [options]                輪詢 Linear 待執行工單、恢復既有 Job，並驅動 implementer pipeline
         dispatch                     C015o：手動收斂卡住的 dispatch job
+        quota                        受控的 provider quota host 操作
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
         health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑
@@ -107,6 +112,8 @@ describe("agent-team CLI contract", () => {
     await expect(runCli(metadata, ["health"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["ui"], commands, sink.io)).resolves.toBe(0);
+    await expect(runCli(metadata, ["quota", "canary-confirm"], commands, sink.io)).resolves.toBe(0);
+    await expect(runCli(metadata, ["quota", "canary-status"], commands, sink.io)).resolves.toBe(0);
     await expect(
       runCli(metadata, ["systemd", "install", "--preview"], commands, sink.io),
     ).resolves.toBe(0);
@@ -124,10 +131,12 @@ describe("agent-team CLI contract", () => {
     expect(commands.health).toHaveBeenCalledOnce();
     expect(commands.project).toHaveBeenCalledWith({});
     expect(commands.ui).toHaveBeenCalledOnce();
+    expect(commands.quota.canaryConfirm).toHaveBeenCalledOnce();
+    expect(commands.quota.canaryStatus).toHaveBeenCalledOnce();
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(9));
+    expect(sink.stdout()).toBe("完成\n".repeat(11));
   });
 
   it.each([
@@ -154,12 +163,34 @@ describe("agent-team CLI contract", () => {
     const sink = output();
 
     await expect(runCli(metadata, argv, commands, sink.io)).resolves.toBe(cliExitCodes.usage);
-    const { registration, ...topLevel } = commands;
+    const { registration, quota, ...topLevel } = commands;
     expect(Object.values(topLevel).every((handler) => handler.mock.calls.length === 0)).toBe(true);
     expect(Object.values(registration).every((handler) => handler.mock.calls.length === 0)).toBe(
       true,
     );
+    expect(Object.values(quota).every((handler) => handler.mock.calls.length === 0)).toBe(true);
     expect(sink.stderr()).not.toBe("");
+  });
+
+  it("keeps quota canary IDs, versions, and confirmations out of argv", async () => {
+    const commands = handlers();
+    const sink = output();
+    const opaqueIssueId = "b9567572-6a20-41e2-b20f-0123456789ab";
+
+    await expect(
+      runCli(
+        metadata,
+        ["quota", "canary-confirm", "--project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(cliExitCodes.usage);
+    await expect(
+      runCli(metadata, ["quota", "canary-status", opaqueIssueId], commands, sink.io),
+    ).resolves.toBe(cliExitCodes.usage);
+    expect(commands.quota.canaryConfirm).not.toHaveBeenCalled();
+    expect(commands.quota.canaryStatus).not.toHaveBeenCalled();
+    expect(sink.stderr()).not.toContain(opaqueIssueId);
   });
 
   it("fails closed with exit 3 when a command has not been composed yet", async () => {

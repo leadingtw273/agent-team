@@ -82,6 +82,23 @@ describe("T07 Team Manager host contract", () => {
     );
   });
 
+  it("limits the Claude canary exception to current-conversation host authority and redacted read-back", async () => {
+    const contract = await readFile(contractUrl, "utf8");
+
+    expect(contract).toContain("### 6.1 Q01：唯一的 Claude canary host 例外");
+    expect(contract).toContain("`agent-team quota canary-confirm`");
+    expect(contract).toContain("`agent-team quota canary-status`");
+    expect(contract).toContain("leadi 當前對話");
+    expect(contract).toContain("CONFIRM CLAUDE CANARY FOR 15 MINUTES");
+    expect(contract).toContain("exact opaque issue node ID");
+    expect(contract).toContain("不是 danger approval，也不是\nprovider quota observation");
+    expect(contract).toContain("不把該 JSON、raw ID、confirmation phrase、CLI version");
+    expect(contract).toContain("不得被寫入 `QuotaPort`、quota policy、quota UI");
+    expect(contract).toContain(
+      "一般 quota-ready route 若可 admission，仍優先且不消耗 canary record",
+    );
+  });
+
   it("forbids a chat runtime, plugins, and manual Branch PR CI work while avoiding real secrets", async () => {
     const contract = await readFile(contractUrl, "utf8");
 

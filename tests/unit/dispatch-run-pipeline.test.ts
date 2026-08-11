@@ -17,10 +17,17 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { domainError, err, ok } from "../../src/domain/foundation/index.js";
+import {
+  createFixedClock,
+  domainError,
+  err,
+  ok,
+  parseInstant,
+} from "../../src/domain/foundation/index.js";
 import { LocalGitAdapter } from "../../src/adapters/git/index.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/index.js";
 import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
+import { FileOperatorCanaryAttestationStore } from "../../src/adapters/dispatch/operator-canary-attestation-store.js";
 import {
   createDispatchResolveHandler,
   dispatchResolveConfirmationPhrase,
@@ -250,6 +257,43 @@ class ReadyProcessPort implements ProcessPort {
   }
 }
 
+/** The normal liveness probe above intentionally ignores output. Q01's canary path must instead
+ * persist and re-check the exact local `--version` line, so its fixture supplies that one line. */
+class VersionedProcessPort implements ProcessPort {
+  calls = 0;
+
+  spawn(): ReturnType<ProcessPort["spawn"]> {
+    this.calls += 1;
+    return Promise.resolve(
+      ok({
+        pid: 2,
+        output: (async function* () {
+          await Promise.resolve();
+          yield {
+            sequence: 0,
+            stream: "stdout" as const,
+            bytes: new TextEncoder().encode("claude 2.1.0\n"),
+            observedAt: "2026-08-07T00:00:00.000Z" as never,
+          };
+        })(),
+        writeStdin: () => Promise.resolve(ok(undefined)),
+        closeStdin: () => Promise.resolve(ok(undefined)),
+        sendSignal: () => Promise.resolve(ok(undefined)),
+        wait: () =>
+          Promise.resolve(
+            ok({
+              exitCode: 0,
+              signal: null,
+              startedAt: "2026-08-07T00:00:00.000Z" as never,
+              exitedAt: "2026-08-07T00:00:00.000Z" as never,
+              outputTruncated: false,
+            }),
+          ),
+      }),
+    );
+  }
+}
+
 const unusedReadModel = {
   readContext: () => Promise.reject(new Error("must never be called: discovery is mocked")),
   readIssue: () => Promise.reject(new Error("must never be called: discovery is mocked")),
@@ -266,6 +310,8 @@ function buildHandlers(
     typeof createDispatchCliHandlers
   >[0]["resolveAuthoritativeBase"],
   quotaAdmission?: NewJobQuotaAdmissionPort,
+  operatorCanaryStore?: FileOperatorCanaryAttestationStore,
+  claudeProcess: ProcessPort = new ReadyProcessPort(),
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -294,11 +340,14 @@ function buildHandlers(
         trustedConfig: trustedConfigFixture(),
         claude: {
           config: { executable: "claude", models: ["opus"], account: "default" },
-          process: new ReadyProcessPort(),
+          process: claudeProcess,
         },
         quotaAdmission: quotaAdmission ?? {
           resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
         },
+        ...(operatorCanaryStore === undefined
+          ? {}
+          : { operatorCanary: { store: operatorCanaryStore } }),
       },
     });
   return createDispatchCliHandlers({
@@ -370,16 +419,30 @@ function fakeResolveAuthoritativeBase(repositoryPath: string) {
 }
 
 describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
-  it("quota_unknown stops before pipeline construction and leaves no durable claim or job", async () => {
+  it("Q01 without a record remains quota_unknown, with no version probe, pipeline, claim, or job", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
+    const parsedCanaryNow = parseInstant("2026-08-12T12:00:00.000Z");
+    if (!parsedCanaryNow.ok) throw new Error(parsedCanaryNow.error.code);
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: createFixedClock(parsedCanaryNow.value),
+    });
+    const versionedClaude = new VersionedProcessPort();
     const buildImplementerPipeline = vi.fn(() =>
       Promise.reject(new Error("must never build a pipeline without trusted quota")),
     );
-    const handlers = buildHandlers(stateRoot, repositoryPath, buildImplementerPipeline, undefined, {
-      resolve: () =>
-        Promise.resolve({ state: "quota_unknown" as const, reason: "collector_unavailable" }),
-    });
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      {
+        resolve: () =>
+          Promise.resolve({ state: "quota_unknown" as const, reason: "collector_unavailable" }),
+      },
+      canaryStore,
+      versionedClaude,
+    );
 
     const outcome = await handlers.run({ projectId });
     expect(outcome.state).toBe("success");
@@ -394,6 +457,10 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
       admissionSkipped: [{ issueId, reason: "quota_unknown" }],
     });
     expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    expect(versionedClaude.calls).toBe(0);
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
+    ).resolves.toEqual({ ok: true, value: { state: "absent" } });
 
     const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
     const persistedJobs = await jobs.readAll();
@@ -404,6 +471,165 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
     const persistedProgress = await progress.listForProject(projectId);
     expect(persistedProgress).toEqual({ ok: true, value: [] });
+  });
+
+  it("Q01 never starts a provider or pipeline from an expired record", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const issuedAt = parseInstant("2026-08-12T12:00:00.000Z");
+    const expiresAt = parseInstant("2026-08-12T12:15:00.000Z");
+    if (!issuedAt.ok || !expiresAt.ok) throw new Error("fixture clock must be canonical");
+    let currentCanaryTime = issuedAt.value;
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: { now: () => currentCanaryTime },
+    });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-1",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    currentCanaryTime = expiresAt.value;
+    const versionedClaude = new VersionedProcessPort();
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("expired canary must never construct a pipeline")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      {
+        resolve: () => Promise.resolve({ state: "quota_unknown" as const, reason: "no_collector" }),
+      },
+      canaryStore,
+      versionedClaude,
+    );
+
+    const outcome = await handlers.run({ projectId });
+    expect(outcome).toMatchObject({ state: "success" });
+    expect(versionedClaude.calls).toBe(0);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
+    ).resolves.toEqual({ ok: true, value: { state: "expired" } });
+  });
+
+  it("Q01 consumes before provider start, while dry-run leaves the active canary untouched", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    const parsedCanaryNow = parseInstant("2026-08-12T12:00:00.000Z");
+    if (!parsedCanaryNow.ok) throw new Error(parsedCanaryNow.error.code);
+    const canaryStore = new FileOperatorCanaryAttestationStore(stateRoot, {
+      clock: createFixedClock(parsedCanaryNow.value),
+    });
+    const issued = await canaryStore.issue({
+      projectId,
+      linearExternalIssueId: "linear-issue-1",
+      claudeCliVersion: "claude 2.1.0",
+    });
+    if (!issued.ok) throw new Error(issued.error.code);
+    const events: string[] = [];
+    const originalConsume = canaryStore.consume.bind(canaryStore);
+    (canaryStore as { consume: typeof canaryStore.consume }).consume = async (input) => {
+      const consumed = await originalConsume(input);
+      events.push("consume.end");
+      return consumed;
+    };
+    const providerStart: ProcessPort = {
+      spawn: () => {
+        events.push("provider.spawn.begin");
+        return Promise.resolve(
+          ok({
+            pid: 3,
+            output: (async function* () {
+              await Promise.resolve();
+            })(),
+            writeStdin: () => Promise.resolve(ok(undefined)),
+            closeStdin: () => Promise.resolve(ok(undefined)),
+            sendSignal: () => Promise.resolve(ok(undefined)),
+            wait: () =>
+              Promise.resolve(
+                ok({
+                  exitCode: 0,
+                  signal: null,
+                  startedAt: "2026-08-07T00:00:00.000Z" as never,
+                  exitedAt: "2026-08-07T00:00:00.000Z" as never,
+                  outputTruncated: false,
+                }),
+              ),
+          }),
+        );
+      },
+    };
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.resolve({
+        state: "ready" as const,
+        value: fakePipeline(async () => {
+          await providerStart.spawn({
+            executable: "claude",
+            arguments: ["--print"],
+            workingDirectory: repositoryPath,
+            deadlineAt: "2026-08-07T00:00:00.000Z" as never,
+            maxOutputBytes: 4096,
+          });
+          return {
+            state: "ci_waiting" as const,
+            worktree: {
+              repositoryRoot: repositoryPath,
+              path: "/tmp/q01-provider-worktree",
+              branch: "agent-team/q01",
+              headSha: "a".repeat(40),
+            },
+            commit: { sha: "b".repeat(40), branch: "agent-team/q01" },
+            push: { sha: "b".repeat(40), branch: "agent-team/q01", remote: "origin" },
+            changeRequest: {
+              id: "PR_Q01",
+              number: 1,
+              url: "https://example.invalid/pull/1",
+              state: "open" as const,
+              draft: true,
+              baseBranch: "main",
+              headBranch: "agent-team/q01",
+              headSha: "b".repeat(40),
+              mergeability: "unknown" as const,
+              autoMergeEnabled: false,
+              updatedAt: "2026-08-07T00:00:00.000Z" as never,
+            },
+            checks: { headSha: "b".repeat(40), aggregate: "pending" as const, checks: [] },
+          };
+        }),
+      }),
+    );
+    const versionedClaude = new VersionedProcessPort();
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      {
+        resolve: () => Promise.resolve({ state: "quota_unknown" as const, reason: "no_collector" }),
+      },
+      canaryStore,
+      versionedClaude,
+    );
+
+    const dryRun = await handlers.run({ projectId, dryRun: true });
+    expect(dryRun).toMatchObject({ state: "success" });
+    expect(events).toEqual([]);
+    expect(versionedClaude.calls).toBe(0);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
+
+    const run = await handlers.run({ projectId });
+    expect(run).toMatchObject({ state: "success" });
+    expect(events).toEqual(["consume.end", "provider.spawn.begin"]);
+    expect(versionedClaude.calls).toBe(1);
+    await expect(
+      canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
+    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
   });
 
   it("maps a ci_waiting pipeline outcome to a success payload with the change request URL", async () => {
