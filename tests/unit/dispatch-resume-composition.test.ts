@@ -810,7 +810,14 @@ describe("runResumeCycle", () => {
         checks: { headSha, aggregate: "success", checks: [] },
       },
     });
-    await seedProgressRecord(progress, { kind: "awaiting_review" });
+    await seedProgressRecord(progress, {
+      kind: "requires_manual",
+      cause: {
+        stage: "review",
+        reasonCode: "review_reuse_unimplemented",
+        attempts: { count: 1 },
+      },
+    });
 
     const result = await runResumeCycle(deps);
 

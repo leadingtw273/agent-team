@@ -552,6 +552,21 @@ export function isMergeReconcilable(record: JobProgressRecord): record is JobPro
   );
 }
 
+/** The exact legacy state written before fresh review of an existing approval was implemented.
+ * It is safe to re-enter the normal pipeline because `resumeUnderLease` revalidates the durable
+ * revision, PR/head, Linear work item and current review inputs before any merge mutation. */
+function isReviewReuseReconcilable(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "review_reuse_unimplemented"
+  );
+}
+
+function isPipelineResumable(record: JobProgressRecord): boolean {
+  return resumableStageKinds.has(record.stage.kind) || isReviewReuseReconcilable(record);
+}
+
 /**
  * C015u decision 1: the *complete* predicate for "this record needs `runResumeCycle` to look at it
  * at all" -- `resumableStageKinds.has(...)` alone (the pre-C015t predicate) went stale the moment
@@ -581,7 +596,7 @@ export function isMergeReconcilable(record: JobProgressRecord): record is JobPro
  * the first place.
  */
 export function isResumeCandidate(record: JobProgressRecord): boolean {
-  return resumableStageKinds.has(record.stage.kind) || isMergeReconcilable(record);
+  return isPipelineResumable(record) || isMergeReconcilable(record);
 }
 
 export interface ResumeCycleSelection {
@@ -657,7 +672,7 @@ export async function runResumeCycle(
     }
     selected = accepted;
   }
-  const resumable = selected.filter((record) => resumableStageKinds.has(record.stage.kind));
+  const resumable = selected.filter(isPipelineResumable);
   const mergeReconcilable = selected.filter((record) => isMergeReconcilable(record));
 
   for (const record of resumable) {
@@ -761,9 +776,7 @@ async function resumeOneJob(
   const heartbeat = startResumeLeaseHeartbeat(deps, lease.value.value.id);
   const guardedDeps = { ...deps, signal: heartbeat.signal };
   try {
-    const current = await revalidateRecordUnderLease(record, guardedDeps, (candidate) =>
-      resumableStageKinds.has(candidate.stage.kind),
-    );
+    const current = await revalidateRecordUnderLease(record, guardedDeps, isPipelineResumable);
     if ("outcome" in current) return current;
     if (guardedDeps.prepare !== undefined) {
       await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
