@@ -99,6 +99,19 @@ describe("T07 Team Manager host contract", () => {
     );
   });
 
+  it("keeps the T11 scheduled-only exception narrow and leaves T13 blocked", async () => {
+    const contract = await readFile(contractUrl, "utf8");
+
+    expect(contract).toContain("### 6.2 T11：內部 canary 的狹窄 scheduled-only 例外");
+    expect(contract).toContain("`scheduledReconcile:true`");
+    expect(contract).toContain("唯一 wakeup 缺口是 `webhook_runtime_unknown`");
+    expect(contract).toContain("T10 的其他全部權威前置均已通過");
+    expect(contract).toContain("Q01 的 exact private one-time attestation");
+    expect(contract).toContain("不得推論 webhook healthy");
+    expect(contract).toContain("不得一般化為 scheduled timer 可繞過任何");
+    expect(contract).toContain("T13 仍是 blocked");
+  });
+
   it("forbids a chat runtime, plugins, and manual Branch PR CI work while avoiding real secrets", async () => {
     const contract = await readFile(contractUrl, "utf8");
 

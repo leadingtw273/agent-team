@@ -1,41 +1,31 @@
 import {
   evaluateRegistrationWakeupHealth,
   unknownRegistrationWakeupSources,
-  type RegistrationWakeupSources,
 } from "../../application/registration/index.js";
 import type { CliCommandOutcome } from "../program.js";
-
-export interface RegistrationWakeupSourceReader {
-  readonly read: () => Promise<unknown>;
-}
+import type { RegistrationWakeupStateReader } from "../systemd/index.js";
 
 export interface CreateWakeupHealthHandlerOptions {
-  readonly reader?: RegistrationWakeupSourceReader;
+  readonly reader?: RegistrationWakeupStateReader;
 }
-
-const unwiredRuntimeSources = Object.freeze({
-  systemd: "runtime_unavailable",
-  webhook: "unknown",
-} as const satisfies RegistrationWakeupSources);
 
 function outcome(payload: Readonly<Record<string, unknown>>): CliCommandOutcome {
   return Object.freeze({ state: "success", message: JSON.stringify(payload) });
 }
 
 /**
- * A source reader is injected by later Runtime composition. Until then the
- * compiled CLI knows that its own Reconcile Runtime is unwired, so the systemd
- * path is unavailable; the Webhook path remains unknown. This avoids calling
- * systemctl or a Webhook while still naming the real degraded condition.
+ * The systemd reader is the shared production manager; webhook Runtime remains
+ * unknown until its own authoritative health reader exists. A failed or malformed
+ * systemd read cannot establish a wakeup capability.
  */
 export function createWakeupHealthHandler(
   options: CreateWakeupHealthHandlerOptions = {},
 ): () => Promise<CliCommandOutcome> {
   return async () => {
-    let sources: unknown = unwiredRuntimeSources;
+    let sources: unknown = unknownRegistrationWakeupSources();
     if (options.reader !== undefined) {
       try {
-        sources = await options.reader.read();
+        sources = { systemd: await options.reader.readWakeupState(), webhook: "unknown" };
       } catch {
         sources = unknownRegistrationWakeupSources();
       }

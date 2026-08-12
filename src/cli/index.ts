@@ -14,19 +14,22 @@ import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
 import { buildManualReconcileUseCase } from "./reconcile/composition.js";
 import { createManualReconcileHandler } from "./reconcile/index.js";
 import { createRegistrationCliHandlers } from "./registration/index.js";
-import { createSystemdHandler } from "./systemd/index.js";
+import { createSystemdHandler, createSystemdManager } from "./systemd/index.js";
 import { createUiCliHandler } from "./ui/index.js";
 
 const require = createRequire(import.meta.url);
 const metadata = require("../../package.json") as PackageMetadata;
 
 const agentTeamHome = process.env["AGENT_TEAM_HOME"] ?? join(homedir(), ".agent-team");
+// This compiled production entrypoint wires `buildManualReconcileUseCase` below, so it may attest
+// to the read-only wakeup projection that the timer command is composed in this Runtime.
+const systemdManager = createSystemdManager(fileURLToPath(import.meta.url), process.env, true);
 
 process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ...defaultCliHandlers,
   ...createDispatchCliHandlers({ agentTeamHome }),
-  ...createProjectCliHandlers({ agentTeamHome }),
-  health: createWakeupHealthHandler(),
+  ...createProjectCliHandlers({ agentTeamHome, wakeupReader: systemdManager }),
+  health: createWakeupHealthHandler({ reader: systemdManager }),
   ingest: createLocalWebhookIngestHandler({
     ...(process.env["AGENT_TEAM_HOME"] === undefined ? {} : { agentTeamHome }),
   }),
@@ -37,7 +40,7 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   reconcile: createManualReconcileHandler({
     reconcile: buildManualReconcileUseCase({ agentTeamHome }),
   }),
-  systemd: createSystemdHandler(fileURLToPath(import.meta.url)),
+  systemd: createSystemdHandler(systemdManager),
   registration: createRegistrationCliHandlers({ agentTeamHome }),
   ui: createUiCliHandler({ agentTeamHome }),
 });

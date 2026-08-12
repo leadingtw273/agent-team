@@ -19,6 +19,7 @@ import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } fr
 import { fileURLToPath } from "node:url";
 
 import type { CliCommandOutcome } from "../program.js";
+import type { RegistrationSystemdWakeupState } from "../../application/registration/index.js";
 
 export interface SystemdUnitNames {
   readonly service: string;
@@ -91,9 +92,16 @@ export interface RenderedSystemdUnits {
 
 export interface SystemdManagerOptions {
   readonly runtimeCommand: RuntimeCommand;
+  /** Explicit composition attestation; absence fails closed for read-only wakeup projection. */
+  readonly runtimeAvailable?: boolean;
   readonly commandRunner?: CommandRunner;
   readonly templateDirectory?: string;
   readonly unitNames?: SystemdUnitNames;
+}
+
+/** Read-only projection shared by the systemd, health, and project CLI surfaces. */
+export interface RegistrationWakeupStateReader {
+  readonly readWakeupState: () => Promise<RegistrationSystemdWakeupState>;
 }
 
 type UnitObservationKind = "missing" | "canonical" | "untrusted";
@@ -941,6 +949,7 @@ export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv):
 
 export class SystemdManager {
   readonly #runtimeCommand: RuntimeCommand;
+  readonly #runtimeAvailable: boolean;
   readonly #runtimeEnvironment: NodeJS.ProcessEnv;
   readonly #inheritedEnvironment: NodeJS.ProcessEnv;
   readonly #commandRunner: CommandRunner;
@@ -949,6 +958,7 @@ export class SystemdManager {
 
   constructor(options: SystemdManagerOptions) {
     this.#unitNames = resolveSystemdUnitNames(options.unitNames);
+    this.#runtimeAvailable = options.runtimeAvailable ?? false;
     this.#inheritedEnvironment = Object.freeze({ ...options.runtimeCommand.environment });
     this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
     this.#runtimeCommand = buildRuntimeWrapperCommand(
@@ -1001,6 +1011,35 @@ export class SystemdManager {
         operation: input.action,
         state: "systemd_configuration_error",
       });
+    }
+  }
+
+  /**
+   * Projects the existing authoritative systemd observations into the registration wakeup
+   * vocabulary. This intentionally reuses the same canonical ownership and
+   * `is-enabled`/`is-active`/`is-failed` reads as `systemd status`; it never parses CLI JSON,
+   * spawns `reconcile`, or creates a second probe path. Runtime capability is an explicit
+   * composition attestation so this projection remains read-only.
+   */
+  async readWakeupState(): Promise<RegistrationSystemdWakeupState> {
+    try {
+      const preview = await this.preview();
+      const directory = await this.#directory(preview, false);
+      const observed = await this.#observePair(preview, directory);
+      const installationState = this.#installationState(observed);
+      if (!this.#runtimeAvailable) return "runtime_unavailable";
+      if (installationState === "not_installed") return "not_installed";
+      if (installationState === "untrusted_units") return "untrusted";
+
+      const timer = await this.#queryTimer();
+      if (timer.queryError || timer.enabled === "unknown" || timer.activity === "unknown") {
+        return "unknown";
+      }
+      if (timer.enabled === "enabled" && timer.activity === "active") return "active";
+      if (timer.activity === "failed") return "failed";
+      return timer.activity === "inactive" ? "inactive" : "unknown";
+    } catch {
+      return "unknown";
     }
   }
 
@@ -1485,16 +1524,23 @@ export class SystemdManager {
   }
 }
 
-export function createSystemdHandler(
+export function createSystemdManager(
   runtimeEntrypoint: string,
   environment: NodeJS.ProcessEnv = process.env,
-): (input: SystemdCommandInput) => Promise<CliCommandOutcome> {
-  const manager = new SystemdManager({
+  runtimeAvailable = false,
+): SystemdManager {
+  return new SystemdManager({
     runtimeCommand: Object.freeze({
       executable: process.execPath,
       arguments: Object.freeze([runtimeEntrypoint, "reconcile", "--all"]),
       environment,
     }),
+    runtimeAvailable,
   });
+}
+
+export function createSystemdHandler(
+  manager: Pick<SystemdManager, "handle">,
+): (input: SystemdCommandInput) => Promise<CliCommandOutcome> {
   return (input) => manager.handle(input);
 }

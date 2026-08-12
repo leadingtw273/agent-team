@@ -13,7 +13,12 @@ import type {
   ProjectRegistrySnapshot,
   TrustedProjectConfig,
 } from "../../src/application/projects/index.js";
-import type { RegistrationSetupDraft } from "../../src/application/registration/index.js";
+import {
+  evaluateRegistrationWakeupHealth,
+  registrationSystemdWakeupStates,
+  registrationWebhookWakeupStates,
+  type RegistrationSetupDraft,
+} from "../../src/application/registration/index.js";
 import { createClock, domainError, err, ok } from "../../src/domain/foundation/index.js";
 import { jobSchema, leaseSchema, type Job, type Lease } from "../../src/domain/jobs/index.js";
 import { projectSchema, type Project } from "../../src/domain/project/index.js";
@@ -532,6 +537,165 @@ describe("T05 project read model", () => {
     ]) {
       expect(text).not.toContain(forbidden);
     }
+  });
+
+  it("projects a shared active systemd reader as scheduled-only and fails closed on bad reads", async () => {
+    const activeReader = { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) };
+    const activeResult = await model({ wakeupReader: activeReader }).read({
+      projectId: projectOne.id,
+    });
+    const activePayload = payload(activeResult);
+    const activeWakeup = (activePayload["project"] as Record<string, unknown>)["wakeup"];
+
+    expect(activeReader.readWakeupState).toHaveBeenCalledTimes(1);
+    expect(activeWakeup).toEqual({
+      state: "degraded",
+      mode: "scheduled_reconcile_only",
+      capabilities: { scheduledReconcile: true, eventDrivenIngress: false, unattended: false },
+      sources: {
+        systemd: { state: "available", evidenceCode: "systemd_timer_active" },
+        webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
+      },
+      evidenceCodes: [
+        "systemd_timer_active",
+        "webhook_runtime_unknown",
+        "manual_reconcile_required",
+      ],
+    });
+
+    const malformedReader = {
+      readWakeupState: vi.fn(() => Promise.resolve("not-a-systemd-state" as never)),
+    };
+    const malformed = await model({ wakeupReader: malformedReader }).read({
+      projectId: projectOne.id,
+    });
+    const throwingReader = {
+      readWakeupState: vi.fn(() => Promise.reject(new Error("project-wakeup-reader-secret"))),
+    };
+    const thrown = await model({ wakeupReader: throwingReader }).read({ projectId: projectOne.id });
+
+    for (const result of [malformed, thrown]) {
+      const text = serializeProjectPayload(result.payload);
+      expect(JSON.parse(text)).toMatchObject({
+        project: { wakeup: { mode: "manual_reconcile_only" } },
+      });
+      expect(text).not.toContain("project-wakeup-reader-secret");
+    }
+  });
+
+  it("accepts the evaluator's complete wakeup matrix at the sole project serializer boundary", async () => {
+    const rendered = payload(await model().read({ projectId: projectOne.id }));
+
+    for (const systemd of registrationSystemdWakeupStates) {
+      for (const webhook of registrationWebhookWakeupStates) {
+        const candidate = structuredClone(rendered);
+        const project = candidate["project"] as Record<string, unknown>;
+        project["wakeup"] = evaluateRegistrationWakeupHealth({ systemd, webhook });
+
+        expect(() => serializeProjectPayload(candidate)).not.toThrow();
+      }
+    }
+  });
+
+  it("rejects every scheduled-only capability and evidence forgery at the serializer boundary", async () => {
+    const rendered = payload(
+      await model({
+        wakeupReader: { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) },
+      }).read({ projectId: projectOne.id }),
+    );
+    const forge = (mutate: (wakeup: Record<string, unknown>) => void): Record<string, unknown> => {
+      const candidate = structuredClone(rendered);
+      const project = candidate["project"] as Record<string, unknown>;
+      const wakeup = project["wakeup"] as Record<string, unknown>;
+      mutate(wakeup);
+      return candidate;
+    };
+
+    const cases: readonly [string, Record<string, unknown>][] = [
+      [
+        "scheduled reconcile disabled",
+        forge((wakeup) => {
+          (wakeup["capabilities"] as Record<string, unknown>)["scheduledReconcile"] = false;
+        }),
+      ],
+      [
+        "event ingress enabled",
+        forge((wakeup) => {
+          (wakeup["capabilities"] as Record<string, unknown>)["eventDrivenIngress"] = true;
+        }),
+      ],
+      [
+        "unattended enabled",
+        forge((wakeup) => {
+          (wakeup["capabilities"] as Record<string, unknown>)["unattended"] = true;
+        }),
+      ],
+      [
+        "systemd evidence changed",
+        forge((wakeup) => {
+          ((wakeup["sources"] as Record<string, unknown>)["systemd"] as Record<string, unknown>)[
+            "evidenceCode"
+          ] = "systemd_timer_inactive";
+        }),
+      ],
+      [
+        "webhook evidence changed",
+        forge((wakeup) => {
+          ((wakeup["sources"] as Record<string, unknown>)["webhook"] as Record<string, unknown>)[
+            "evidenceCode"
+          ] = "webhook_runtime_verified";
+        }),
+      ],
+      [
+        "evidence order changed",
+        forge((wakeup) => {
+          wakeup["evidenceCodes"] = [
+            "webhook_runtime_unknown",
+            "systemd_timer_active",
+            "manual_reconcile_required",
+          ];
+        }),
+      ],
+      [
+        "evidence content changed",
+        forge((wakeup) => {
+          wakeup["evidenceCodes"] = [
+            "systemd_timer_active",
+            "webhook_runtime_unknown",
+            "unattended_wakeup_available",
+          ];
+        }),
+      ],
+      [
+        "healthy state asserted",
+        forge((wakeup) => {
+          wakeup["state"] = "healthy";
+        }),
+      ],
+    ];
+
+    for (const [name, malformed] of cases) {
+      expect(() => serializeProjectPayload(malformed), name).toThrow(
+        "invalid_registration_wakeup_projection",
+      );
+    }
+  });
+
+  it("keeps a scheduled-only projection distinct from all other evaluator modes", () => {
+    const modes = new Set(
+      registrationSystemdWakeupStates.flatMap((systemd) =>
+        registrationWebhookWakeupStates.map(
+          (webhook) => evaluateRegistrationWakeupHealth({ systemd, webhook }).mode,
+        ),
+      ),
+    );
+
+    expect([...modes].sort()).toEqual([
+      "event_ingest_only",
+      "manual_reconcile_only",
+      "scheduled_reconcile_only",
+      "unattended",
+    ]);
   });
 
   it.each([

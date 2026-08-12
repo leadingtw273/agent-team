@@ -215,20 +215,22 @@ describe("compiled CLI smoke", () => {
     });
   });
 
-  it("previews safely and reports the unwired Runtime without touching a user unit directory", async () => {
+  it("previews safely and reports an absent timer without depending on runner D-Bus", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-cli-"));
     roots.push(root);
     const environment = {
       ...process.env,
       HOME: join(root, "home"),
       XDG_CONFIG_HOME: join(root, "xdg-config"),
+      AGENT_TEAM_HOME: join(root, ".agent-team"),
     };
     const unitDirectory = join(environment.XDG_CONFIG_HOME, "systemd", "user");
+    await mkdir(environment.AGENT_TEAM_HOME, { recursive: true, mode: 0o700 });
+    const beforeHealth = await treeFingerprint(environment.AGENT_TEAM_HOME);
     const preview = run(["systemd", "install", "--dry-run"], environment);
     const uninstallPreview = run(["systemd", "uninstall", "--dry-run"], environment);
-    const install = run(["systemd", "install"], environment);
-    const status = run(["systemd", "status"], environment);
     const health = run(["health"], environment);
+    const afterHealth = await treeFingerprint(environment.AGENT_TEAM_HOME);
 
     expect(preview.status).toBe(0);
     expect(JSON.parse(preview.stdout)).toMatchObject({ operation: "install", dryRun: true });
@@ -237,13 +239,6 @@ describe("compiled CLI smoke", () => {
       operation: "uninstall",
       dryRun: true,
       state: "not_installed",
-    });
-    expect(install.status).toBe(3);
-    expect(JSON.parse(install.stderr)).toMatchObject({ state: "runtime_unavailable" });
-    expect(status.status).toBe(0);
-    expect(JSON.parse(status.stdout)).toMatchObject({
-      installation: "not_installed",
-      runtime: "runtime_unavailable",
     });
     expect(health.status).toBe(0);
     expect(JSON.parse(health.stdout)).toEqual({
@@ -256,15 +251,16 @@ describe("compiled CLI smoke", () => {
         unattended: false,
       },
       sources: {
-        systemd: { state: "unavailable", evidenceCode: "systemd_runtime_unavailable" },
+        systemd: { state: "unavailable", evidenceCode: "systemd_timer_not_installed" },
         webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
       },
       evidenceCodes: [
-        "systemd_runtime_unavailable",
+        "systemd_timer_not_installed",
         "webhook_runtime_unknown",
         "manual_reconcile_required",
       ],
     });
+    expect(afterHealth).toEqual(beforeHealth);
     await expect(
       readFile(join(unitDirectory, "agent-team-reconcile.service"), "utf8"),
     ).rejects.toMatchObject({
@@ -275,6 +271,115 @@ describe("compiled CLI smoke", () => {
     ).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("projects a fake active canonical timer through compiled health and project without spawning reconcile", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-active-cli-"));
+    roots.push(root);
+    const repository = join(root, "repository");
+    const agentTeamHome = join(root, ".agent-team");
+    const fakeBin = join(root, "fake-bin");
+    const counter = join(root, "systemctl-counter");
+    const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+    const environment = {
+      ...process.env,
+      HOME: join(root, "home"),
+      XDG_CONFIG_HOME: join(root, "xdg-config"),
+      AGENT_TEAM_HOME: agentTeamHome,
+      PATH: fakeBin,
+    };
+    const unitDirectory = join(environment.XDG_CONFIG_HOME, "systemd", "user");
+    await mkdir(fakeBin, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(fakeBin, "systemctl"),
+      `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(counter)}
+case "$1:$2:$3" in
+  "--user:is-enabled:agent-team-reconcile.timer") printf 'enabled\\n'; exit 0 ;;
+  "--user:is-active:agent-team-reconcile.timer") printf 'active\\n'; exit 0 ;;
+  "--user:is-failed:agent-team-reconcile.timer") printf 'inactive\\n'; exit 1 ;;
+esac
+exit 64
+`,
+      { encoding: "utf8", mode: 0o755 },
+    );
+    await mkdir(repository, { recursive: true });
+    runGit(repository, ["init", "--initial-branch=main"]);
+    runGit(repository, ["config", "user.email", "smoke@example.invalid"]);
+    runGit(repository, ["config", "user.name", "CLI Smoke"]);
+    await writeFile(join(repository, "README.md"), "fixture\n");
+    runGit(repository, ["add", "README.md"]);
+    runGit(repository, ["commit", "-m", "fixture"]);
+    await mkdir(join(agentTeamHome, "config", "registration"), { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(agentTeamHome, "config", "registration", `${projectId}.draft.json`),
+      JSON.stringify(projectDraft(projectId, repository)),
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    const preview = run(["systemd", "install", "--dry-run"], environment);
+    expect(preview.status).toBe(0);
+    const rendered = JSON.parse(preview.stdout) as Record<string, unknown>;
+    const service = rendered["service"];
+    const timer = rendered["timer"];
+    if (typeof service !== "string" || typeof timer !== "string") {
+      throw new Error("compiled_systemd_preview_missing_canonical_units");
+    }
+    await mkdir(unitDirectory, { recursive: true, mode: 0o700 });
+    await Promise.all([
+      writeFile(join(unitDirectory, "agent-team-reconcile.service"), service, {
+        encoding: "utf8",
+        mode: 0o644,
+      }),
+      writeFile(join(unitDirectory, "agent-team-reconcile.timer"), timer, {
+        encoding: "utf8",
+        mode: 0o644,
+      }),
+    ]);
+    const before = await treeFingerprint(agentTeamHome);
+
+    const health = run(["health"], environment);
+    const detail = run(["project", projectId], environment);
+    const after = await treeFingerprint(agentTeamHome);
+
+    const expectedWakeup = {
+      state: "degraded",
+      mode: "scheduled_reconcile_only",
+      capabilities: { scheduledReconcile: true, eventDrivenIngress: false, unattended: false },
+      sources: {
+        systemd: { state: "available", evidenceCode: "systemd_timer_active" },
+        webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
+      },
+      evidenceCodes: [
+        "systemd_timer_active",
+        "webhook_runtime_unknown",
+        "manual_reconcile_required",
+      ],
+    };
+    expect(health).toMatchObject({ status: 0, stderr: "" });
+    expect(JSON.parse(health.stdout)).toEqual({
+      operation: "reconcile_wakeup_status",
+      ...expectedWakeup,
+    });
+    expect(detail).toMatchObject({ status: 0, stderr: "" });
+    expect(JSON.parse(detail.stdout)).toMatchObject({
+      operation: "project_detail",
+      state: "degraded",
+      project: { wakeup: expectedWakeup },
+    });
+    expect(after).toEqual(before);
+
+    const calls = (await readFile(counter, "utf8")).trim().split("\n").sort();
+    expect(calls).toEqual(
+      [
+        "--user is-active agent-team-reconcile.timer",
+        "--user is-active agent-team-reconcile.timer",
+        "--user is-enabled agent-team-reconcile.timer",
+        "--user is-enabled agent-team-reconcile.timer",
+        "--user is-failed agent-team-reconcile.timer",
+        "--user is-failed agent-team-reconcile.timer",
+      ].sort(),
+    );
   });
 
   it("T05: compiled project list/detail/not-found are read-only and do not leak host or provider data", async () => {

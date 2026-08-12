@@ -1,5 +1,12 @@
 import { z } from "zod";
 
+import {
+  evaluateRegistrationWakeupHealth,
+  registrationSystemdWakeupStates,
+  registrationWebhookWakeupStates,
+  type RegistrationWakeupHealth,
+} from "../../application/registration/index.js";
+
 import { requiresManualReasonCodeSchema } from "../../adapters/dispatch/job-progress-store.js";
 import { canonicalInstantPattern } from "../../domain/foundation/index.js";
 import { projectIdSchema } from "../../domain/project/index.js";
@@ -184,40 +191,69 @@ const quotaSchema = z
   })
   .strict();
 
+const validWakeupHealths = Object.freeze(
+  registrationSystemdWakeupStates.flatMap((systemd) =>
+    registrationWebhookWakeupStates.map((webhook) =>
+      evaluateRegistrationWakeupHealth({ systemd, webhook }),
+    ),
+  ),
+);
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Readonly<Record<string, unknown>>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+const registrationWakeupModeSchema = z.enum([
+  "unattended",
+  "scheduled_reconcile_only",
+  "event_ingest_only",
+  "manual_reconcile_only",
+]);
+
 const wakeupSchema = z
   .object({
-    state: z.literal("degraded"),
-    mode: z.literal("manual_reconcile_only"),
+    state: z.enum(["healthy", "degraded"]),
+    mode: registrationWakeupModeSchema,
     capabilities: z
       .object({
-        scheduledReconcile: z.literal(false),
-        eventDrivenIngress: z.literal(false),
-        unattended: z.literal(false),
+        scheduledReconcile: z.boolean(),
+        eventDrivenIngress: z.boolean(),
+        unattended: z.boolean(),
       })
       .strict(),
     sources: z
       .object({
         systemd: z
           .object({
-            state: z.literal("unknown"),
-            evidenceCode: z.literal("systemd_status_unknown"),
+            state: z.enum(["available", "unavailable", "unknown"]),
+            evidenceCode: z.string(),
           })
           .strict(),
         webhook: z
           .object({
-            state: z.literal("unknown"),
-            evidenceCode: z.literal("webhook_runtime_unknown"),
+            state: z.enum(["available", "unavailable", "unknown"]),
+            evidenceCode: z.string(),
           })
           .strict(),
       })
       .strict(),
-    evidenceCodes: z.tuple([
-      z.literal("systemd_status_unknown"),
-      z.literal("webhook_runtime_unknown"),
-      z.literal("manual_reconcile_required"),
-    ]),
+    evidenceCodes: z.array(z.string()).length(3),
   })
-  .strict();
+  .strict()
+  .superRefine((candidate, context) => {
+    const serializedCandidate = stableJson(candidate);
+    if (!validWakeupHealths.some((expected) => stableJson(expected) === serializedCandidate)) {
+      context.addIssue({ code: "custom", message: "invalid_registration_wakeup_projection" });
+    }
+  }) as z.ZodType<RegistrationWakeupHealth>;
 
 const projectIdentitySchema = z
   .object({

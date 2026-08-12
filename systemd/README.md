@@ -48,10 +48,14 @@ deadline sends `SIGTERM` to the whole group, waits a bounded grace period, then 
 the whole group and waits for the direct child to settle. Output remains capped. Platforms without
 POSIX process-group termination fail closed before spawning a command.
 
-Current activation is deliberately fail-closed: until Runtime composition wires
-`agent-team reconcile --all`, install rejects the unavailable command and leaves no unit behind.
-`agent-team health` reports that condition using fixed degraded evidence codes; this installer does
-not claim that a timer has made the unwired Runtime autonomous. When health reports a partial or
-missing wake-up path, an operator may run `agent-team reconcile --all` manually. That command uses
-the same Reconcile application contract as the timer and reports completed, degraded, failed, or
-unwired Runtime status rather than manufacturing success.
+Install is preflighted using the exact command that the timer will run. `agent-team health` and
+`agent-team project` use the same manager's explicit read-only Runtime capability attestation,
+canonical ownership, and timer read-back: a canonical enabled/active timer is reported as scheduled
+reconcile availability, while missing, inactive, failed, untrusted, or indeterminate observations
+remain unavailable or unknown. Their read-only projection never spawns `reconcile`.
+Webhook Runtime is not inferred from a timer. Until its own authoritative reader exists, an active
+timer therefore reports the degraded `scheduled_reconcile_only` mode—not `unattended`—with the
+fixed `webhook_runtime_unknown` and `manual_reconcile_required` evidence. When health reports a
+partial or missing wake-up path, an operator may run `agent-team reconcile --all` manually. That
+command uses the same Reconcile application contract as the timer and reports completed, degraded,
+failed, or unwired Runtime status rather than manufacturing success.
