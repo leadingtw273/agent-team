@@ -7,12 +7,16 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { createControllerCycleHandler, createNoopControllerCycleStages } from "./cycle/index.js";
+import {
+  createManualReconcileControllerCycleStage,
+  createRegisteredProjectsControllerCycleStage,
+} from "./cycle/projects.js";
 import { createDispatchCliHandlers } from "./dispatch/index.js";
 import { createWakeupHealthHandler } from "./health/index.js";
 import { createWebhookAttestationRuntime } from "./health/webhook-attestation.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
 import { createProductionInboxControllerCycleStage } from "./inbox/index.js";
-import { createProjectCliHandlers } from "./project/index.js";
+import { createProjectHandler, createProjectReadModel } from "./project/index.js";
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
 import { buildManualReconcileUseCase } from "./reconcile/composition.js";
 import { createManualReconcileHandler } from "./reconcile/index.js";
@@ -29,15 +33,20 @@ const agentTeamHome = process.env["AGENT_TEAM_HOME"] ?? join(homedir(), ".agent-
 const systemdManager = createSystemdManager(fileURLToPath(import.meta.url), process.env, true);
 const webhookAttestation = createWebhookAttestationRuntime({ agentTeamHome });
 const controllerCycleStages = createNoopControllerCycleStages();
+const dispatchHandlers = createDispatchCliHandlers({ agentTeamHome });
+const projectReadModel = createProjectReadModel({
+  agentTeamHome,
+  systemdReader: systemdManager,
+  webhookReader: webhookAttestation.reader,
+});
+const manualReconcile = createManualReconcileHandler({
+  reconcile: buildManualReconcileUseCase({ agentTeamHome }),
+});
 
 process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ...defaultCliHandlers,
-  ...createDispatchCliHandlers({ agentTeamHome }),
-  ...createProjectCliHandlers({
-    agentTeamHome,
-    systemdReader: systemdManager,
-    webhookReader: webhookAttestation.reader,
-  }),
+  ...dispatchHandlers,
+  project: createProjectHandler(projectReadModel),
   health: createWakeupHealthHandler({
     systemdReader: systemdManager,
     webhookReader: webhookAttestation.reader,
@@ -49,15 +58,20 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   // header for exactly which of `ReconcilePorts`' six ports are genuinely real today (leases reap
   // and job updates) versus disclosed, honest-fail-closed gaps (providers/events/processes/blocks,
   // structurally unreachable while `jobs.listActive` always returns `[]`).
-  reconcile: createManualReconcileHandler({
-    reconcile: buildManualReconcileUseCase({ agentTeamHome }),
-  }),
+  reconcile: manualReconcile,
   cycle: createControllerCycleHandler({
     agentTeamHome,
     stages: Object.freeze({
       ...controllerCycleStages,
       webhookHealth: webhookAttestation.stage,
       inbox: createProductionInboxControllerCycleStage({ agentTeamHome }),
+      reconcile: createManualReconcileControllerCycleStage({
+        reconcile: (input) => manualReconcile(input),
+      }),
+      projects: createRegisteredProjectsControllerCycleStage({
+        projectReadModel,
+        run: (input) => dispatchHandlers.run(input),
+      }),
     }),
   }),
   systemd: createSystemdHandler(systemdManager),

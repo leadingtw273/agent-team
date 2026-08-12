@@ -50,11 +50,16 @@ const emptyCyclePayload = {
       failures: [],
     },
     { stage: "reconcile", state: "completed" },
-    { stage: "projects", state: "completed" },
+    {
+      stage: "projects",
+      state: "completed",
+      counts: { registered: 0, attempted: 0, completed: 0, degraded: 0, failed: 0 },
+      projects: [],
+    },
   ],
 };
 
-describe("C01/C02 compiled cycle CLI smoke", () => {
+describe("C01/C02/C03 compiled cycle CLI smoke", () => {
   it("runs the compiled exact cycle contract against an empty isolated home and is reentrant", async () => {
     const environment = await isolatedEnvironment();
     const first = run(["cycle", "--all"], environment);
@@ -103,7 +108,12 @@ describe("C01/C02 compiled cycle CLI smoke", () => {
           failures: [],
         },
         { stage: "reconcile", state: "completed" },
-        { stage: "projects", state: "completed" },
+        {
+          stage: "projects",
+          state: "completed",
+          counts: { registered: 0, attempted: 0, completed: 0, degraded: 0, failed: 0 },
+          projects: [],
+        },
       ],
     });
     expect(replay.status).toBe(0);
@@ -120,7 +130,12 @@ describe("C01/C02 compiled cycle CLI smoke", () => {
           failures: [],
         },
         { stage: "reconcile", state: "completed" },
-        { stage: "projects", state: "completed" },
+        {
+          stage: "projects",
+          state: "completed",
+          counts: { registered: 0, attempted: 0, completed: 0, degraded: 0, failed: 0 },
+          projects: [],
+        },
       ],
     });
     if (!events.ok) throw new Error(events.error.code);

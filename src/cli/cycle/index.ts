@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { InboxProcessingFailureStage } from "../../application/inbox/index.js";
 import { domainErrorDefinitions, type DomainErrorCode } from "../../domain/foundation/index.js";
+import { projectIdSchema } from "../../domain/project/index.js";
 import type { CliCommandOutcome, CliHandlers } from "../program.js";
 import {
   acquireControllerCycleLock,
@@ -40,14 +41,62 @@ export interface ControllerCycleInboxSummary {
   readonly failures: readonly ControllerCycleInboxFailure[];
 }
 
+export const controllerCycleProjectRunReasonCodes = [
+  "run_blocked",
+  "run_interrupted",
+  "run_failed",
+  "run_rejected",
+] as const;
+
+export type ControllerCycleProjectRunReasonCode =
+  (typeof controllerCycleProjectRunReasonCodes)[number];
+
+export const controllerCycleProjectsStageReasonCodes = [
+  "inventory_unavailable",
+  "inventory_invalid",
+  "project_iteration_interrupted",
+] as const;
+
+export type ControllerCycleProjectsStageReasonCode =
+  (typeof controllerCycleProjectsStageReasonCodes)[number];
+
+export interface ControllerCycleProjectsCounts {
+  readonly registered: number;
+  readonly attempted: number;
+  readonly completed: number;
+  readonly degraded: number;
+  readonly failed: number;
+}
+
+export type ControllerCycleProjectRunOutcome = Readonly<
+  | { projectId: string; state: "completed" }
+  | {
+      projectId: string;
+      state: "degraded";
+      reasonCode: Extract<ControllerCycleProjectRunReasonCode, "run_blocked" | "run_interrupted">;
+    }
+  | {
+      projectId: string;
+      state: "failed";
+      reasonCode: Extract<ControllerCycleProjectRunReasonCode, "run_failed" | "run_rejected">;
+    }
+>;
+
+export interface ControllerCycleProjectsSummary {
+  readonly counts: ControllerCycleProjectsCounts;
+  readonly projects: readonly ControllerCycleProjectRunOutcome[];
+  readonly reasonCode?: ControllerCycleProjectsStageReasonCode;
+}
+
 /**
- * Stages may return only their fixed state, except for the concrete Inbox stage which may attach
- * the typed, redacted summary below. The coordinator validates and re-materializes this shape
- * before it ever reaches a public payload.
+ * Stages may return only their fixed state, except for concrete Inbox/Projects stages which may
+ * attach their typed, redacted summaries below. The coordinator validates and re-materializes
+ * these shapes before either can reach a public payload.
  */
 export type ControllerCycleStageOutcome = Readonly<
   | { state: ControllerCycleStageState }
   | { state: ControllerCycleStageState; inbox: ControllerCycleInboxSummary }
+  | { state: ControllerCycleStageState; projects: ControllerCycleProjectsSummary }
 >;
 
 export type ControllerCycleStageOutcomeReport = Readonly<
@@ -57,6 +106,13 @@ export type ControllerCycleStageOutcomeReport = Readonly<
       state: ControllerCycleStageState;
       counts: ControllerCycleInboxCounts;
       failures: readonly ControllerCycleInboxFailure[];
+    }
+  | {
+      stage: "projects";
+      state: ControllerCycleStageState;
+      counts: ControllerCycleProjectsCounts;
+      projects: readonly ControllerCycleProjectRunOutcome[];
+      reasonCode?: ControllerCycleProjectsStageReasonCode;
     }
 >;
 
@@ -180,7 +236,7 @@ function hasExactOwnKeys(
   value: Readonly<Record<string, unknown>>,
   keys: readonly string[],
 ): boolean {
-  const actual = Object.keys(value).sort();
+  const actual = Object.getOwnPropertyNames(value).sort();
   const expected = [...keys].sort();
   return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
@@ -313,6 +369,177 @@ function readInboxSummary(value: unknown): ControllerCycleInboxSummary | undefin
   });
 }
 
+function hasOptionalReasonCode(
+  value: Readonly<Record<string, unknown>>,
+  baseKeys: readonly string[],
+): boolean {
+  return hasExactOwnKeys(value, baseKeys) || hasExactOwnKeys(value, [...baseKeys, "reasonCode"]);
+}
+
+function isControllerCycleProjectsStageReasonCode(
+  value: unknown,
+): value is ControllerCycleProjectsStageReasonCode {
+  return (
+    value === "inventory_unavailable" ||
+    value === "inventory_invalid" ||
+    value === "project_iteration_interrupted"
+  );
+}
+
+function compareProjectRunOutcomes(
+  left: ControllerCycleProjectRunOutcome,
+  right: ControllerCycleProjectRunOutcome,
+): number {
+  if (left.projectId < right.projectId) return -1;
+  if (left.projectId > right.projectId) return 1;
+  return 0;
+}
+
+function readProjectRunOutcome(value: unknown): ControllerCycleProjectRunOutcome | undefined {
+  if (!isPlainDataRecord(value)) return undefined;
+  const parsedProjectId = projectIdSchema.safeParse(value["projectId"]);
+  if (!parsedProjectId.success || !isStageState(value["state"])) return undefined;
+  switch (value["state"]) {
+    case "completed":
+      return hasExactOwnKeys(value, ["projectId", "state"])
+        ? Object.freeze({ projectId: parsedProjectId.data, state: "completed" })
+        : undefined;
+    case "degraded":
+      return hasExactOwnKeys(value, ["projectId", "state", "reasonCode"]) &&
+        (value["reasonCode"] === "run_blocked" || value["reasonCode"] === "run_interrupted")
+        ? Object.freeze({
+            projectId: parsedProjectId.data,
+            state: "degraded",
+            reasonCode: value["reasonCode"],
+          })
+        : undefined;
+    case "failed":
+      return hasExactOwnKeys(value, ["projectId", "state", "reasonCode"]) &&
+        (value["reasonCode"] === "run_failed" || value["reasonCode"] === "run_rejected")
+        ? Object.freeze({
+            projectId: parsedProjectId.data,
+            state: "failed",
+            reasonCode: value["reasonCode"],
+          })
+        : undefined;
+  }
+}
+
+function projectRunStateCounts(
+  projects: readonly ControllerCycleProjectRunOutcome[],
+): Readonly<{ completed: number; degraded: number; failed: number }> {
+  let completed = 0;
+  let degraded = 0;
+  let failed = 0;
+  for (const project of projects) {
+    if (project.state === "completed") completed += 1;
+    else if (project.state === "degraded") degraded += 1;
+    else failed += 1;
+  }
+  return Object.freeze({ completed, degraded, failed });
+}
+
+function readProjectsSummary(value: unknown): ControllerCycleProjectsSummary | undefined {
+  if (
+    !isPlainDataRecord(value) ||
+    !hasOptionalReasonCode(value, ["counts", "projects"]) ||
+    !isPlainDataRecord(value["counts"]) ||
+    !Array.isArray(value["projects"])
+  ) {
+    return undefined;
+  }
+  const reasonCode = Object.hasOwn(value, "reasonCode") ? value["reasonCode"] : undefined;
+  if (reasonCode !== undefined && !isControllerCycleProjectsStageReasonCode(reasonCode)) {
+    return undefined;
+  }
+
+  const rawCounts = value["counts"];
+  if (
+    !hasExactOwnKeys(rawCounts, ["registered", "attempted", "completed", "degraded", "failed"]) ||
+    !isSafeCount(rawCounts["registered"]) ||
+    !isSafeCount(rawCounts["attempted"]) ||
+    !isSafeCount(rawCounts["completed"]) ||
+    !isSafeCount(rawCounts["degraded"]) ||
+    !isSafeCount(rawCounts["failed"])
+  ) {
+    return undefined;
+  }
+  const counts: ControllerCycleProjectsCounts = Object.freeze({
+    registered: rawCounts["registered"],
+    attempted: rawCounts["attempted"],
+    completed: rawCounts["completed"],
+    degraded: rawCounts["degraded"],
+    failed: rawCounts["failed"],
+  });
+  const attempted = sumSafeCounts([counts.completed, counts.degraded, counts.failed]);
+  if (
+    attempted === undefined ||
+    attempted !== counts.attempted ||
+    counts.attempted > counts.registered
+  )
+    return undefined;
+
+  const projects: ControllerCycleProjectRunOutcome[] = [];
+  for (const candidate of value["projects"]) {
+    const project = readProjectRunOutcome(candidate);
+    if (project === undefined) return undefined;
+    projects.push(project);
+  }
+  const stateCounts = projectRunStateCounts(projects);
+  if (
+    projects.length !== counts.attempted ||
+    stateCounts.completed !== counts.completed ||
+    stateCounts.degraded !== counts.degraded ||
+    stateCounts.failed !== counts.failed ||
+    projects.some((project, index) => {
+      const previous = index === 0 ? undefined : projects.at(index - 1);
+      return previous !== undefined && compareProjectRunOutcomes(previous, project) >= 0;
+    })
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    counts,
+    projects: Object.freeze(projects),
+    ...(reasonCode === undefined ? {} : { reasonCode }),
+  });
+}
+
+function isValidProjectsStageOutcome(
+  state: ControllerCycleStageState,
+  projects: ControllerCycleProjectsSummary,
+): boolean {
+  const { counts, reasonCode } = projects;
+  if (state === "failed") {
+    return (
+      counts.registered === 0 &&
+      counts.attempted === 0 &&
+      counts.completed === 0 &&
+      counts.degraded === 0 &&
+      counts.failed === 0 &&
+      projects.projects.length === 0 &&
+      (reasonCode === "inventory_unavailable" || reasonCode === "inventory_invalid")
+    );
+  }
+  if (state === "completed") {
+    return (
+      reasonCode === undefined &&
+      counts.attempted === counts.registered &&
+      counts.completed === counts.registered &&
+      counts.degraded === 0 &&
+      counts.failed === 0
+    );
+  }
+  if (reasonCode === "project_iteration_interrupted") {
+    return counts.attempted < counts.registered;
+  }
+  return (
+    reasonCode === undefined &&
+    counts.attempted === counts.registered &&
+    (counts.degraded > 0 || counts.failed > 0)
+  );
+}
+
 function toStageOutcomeReport(
   stage: ControllerCycleStageId,
   value: unknown,
@@ -321,24 +548,36 @@ function toStageOutcomeReport(
   if (hasExactOwnKeys(value, ["state"])) {
     return Object.freeze({ stage, state: value["state"] });
   }
-  if (stage !== "inbox" || !hasExactOwnKeys(value, ["state", "inbox"])) return undefined;
-  const inbox = readInboxSummary(value["inbox"]);
-  const sourceFailure =
-    inbox !== undefined && isCanonicalSourceFailure(inbox.counts, inbox.failures);
-  if (
-    inbox === undefined ||
-    (value["state"] === "completed" && inbox.counts.failed !== 0) ||
-    (value["state"] !== "completed" && inbox.counts.failed === 0) ||
-    (sourceFailure && value["state"] !== "failed") ||
-    (!sourceFailure && value["state"] === "failed")
-  ) {
-    return undefined;
+  if (stage === "inbox" && hasExactOwnKeys(value, ["state", "inbox"])) {
+    const inbox = readInboxSummary(value["inbox"]);
+    const sourceFailure =
+      inbox !== undefined && isCanonicalSourceFailure(inbox.counts, inbox.failures);
+    if (
+      inbox === undefined ||
+      (value["state"] === "completed" && inbox.counts.failed !== 0) ||
+      (value["state"] !== "completed" && inbox.counts.failed === 0) ||
+      (sourceFailure && value["state"] !== "failed") ||
+      (!sourceFailure && value["state"] === "failed")
+    ) {
+      return undefined;
+    }
+    return Object.freeze({
+      stage: "inbox",
+      state: value["state"],
+      counts: inbox.counts,
+      failures: inbox.failures,
+    });
   }
+  if (stage !== "projects" || !hasExactOwnKeys(value, ["state", "projects"])) return undefined;
+  const projects = readProjectsSummary(value["projects"]);
+  if (projects === undefined || !isValidProjectsStageOutcome(value["state"], projects))
+    return undefined;
   return Object.freeze({
-    stage: "inbox",
+    stage: "projects",
     state: value["state"],
-    counts: inbox.counts,
-    failures: inbox.failures,
+    counts: projects.counts,
+    projects: projects.projects,
+    ...(projects.reasonCode === undefined ? {} : { reasonCode: projects.reasonCode }),
   });
 }
 
