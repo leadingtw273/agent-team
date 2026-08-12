@@ -127,6 +127,12 @@ blocked，不能自動重試成 mutation；exit `1`、`2`、`130` 分別是失�
 operator／復原流程，不是一般需求受理步驟。前述 Q01 canary commands 是唯一明列例外，且仍受本節 6.1
 所有前置與去敏限制拘束。
 
+`auto-merge-resume` 的固定確認會先解除該 project 的 durable pause，再只將同 project、exact
+`auto_merge_paused_out_of_process_merge` 原因的 Job 以 revision CAS 恢復到 `awaiting_review`。已 active
+時仍執行這個冪等修復，以關閉「pause 已解除、Job CAS 尚未完成」的中斷窗口。後續只能由既有 resume
+pipeline 重新讀回 PR/head、Linear、CI、Reviewer evidence 與 merge gate；不得直接合併、不得重跑
+implementer，也不得放行其他 `requires_manual` 原因。
+
 `agent-team ui` 固定使用 loopback ephemeral port，stdout fragment bearer 是敏感資料。Host 不複製它到
 Linear、log、artifact 或一般摘要；SIGINT 中斷後預期 exit `130`，而不是可作為需求或危險核可證據。
 

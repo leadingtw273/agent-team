@@ -314,7 +314,10 @@ export function createDispatchCliHandlers(
   // `buildResumeComposition` -> `AutoMergeGate`'s gate check) -- exactly one store instance per
   // process, mirroring `progress`'s own single-instance-per-process convention just above.
   const autoMergePause = buildAutoMergePauseStore(options.agentTeamHome);
-  const dispatchAutoMergeResume = createDispatchAutoMergeResumeHandler({ store: autoMergePause });
+  const dispatchAutoMergeResume = createDispatchAutoMergeResumeHandler({
+    store: autoMergePause,
+    progress: buildJobProgressStore(options.agentTeamHome),
+  });
 
   return Object.freeze({
     dispatchResolve,
