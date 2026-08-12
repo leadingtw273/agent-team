@@ -7,7 +7,7 @@
  * rather than an error, and the real end-to-end round trip against a disk-backed
  * `FileAutoMergePauseStore`.
  */
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -19,7 +19,13 @@ import {
 } from "../../src/cli/dispatch/auto-merge-pause-handlers.js";
 import { FileAutoMergePauseStore } from "../../src/adapters/dispatch/auto-merge-pause-store.js";
 import {
+  FileJobProgressStore,
+  type JobProgressRecord,
+  type JobProgressRecordMutation,
+} from "../../src/adapters/dispatch/job-progress-store.js";
+import {
   createFixedClock,
+  domainError,
   parseIdentifier,
   type Identifier,
 } from "../../src/domain/foundation/index.js";
@@ -67,12 +73,68 @@ async function* neverRead(): AsyncIterable<string> {
   throw new Error("must never be read");
 }
 
+function progressPort(records: readonly JobProgressRecord[] = []): {
+  port: Pick<FileJobProgressStore, "compareAndSwap" | "listForProject">;
+  writes: JobProgressRecordMutation[];
+} {
+  const writes: JobProgressRecordMutation[] = [];
+  return {
+    writes,
+    port: {
+      listForProject: () => Promise.resolve({ ok: true, value: records }),
+      compareAndSwap: (_jobId, _revision, next) => {
+        writes.push(next);
+        return Promise.resolve({
+          ok: true,
+          value: { ...next, schemaVersion: 1, revision: 1, updatedAt: now },
+        } as never);
+      },
+    },
+  };
+}
+
+function blockedRecord(reasonCode = "auto_merge_paused_out_of_process_merge"): JobProgressRecord {
+  return {
+    schemaVersion: 1,
+    revision: 0,
+    updatedAt: now,
+    jobId: id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab"),
+    projectId,
+    issueId: id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab"),
+    externalIssueId: "linear-issue-1",
+    model: "claude-opus",
+    branch: "agent-team/job-1",
+    worktreePath: "/tmp/job-1",
+    changeRequestId: "47",
+    headSha,
+    baseRevision: "b".repeat(40),
+    stage: {
+      kind: "requires_manual",
+      cause: { stage: "merge", reasonCode, attempts: { count: 1 } },
+    },
+  } as unknown as JobProgressRecord;
+}
+
+function recordMutation(record: JobProgressRecord): JobProgressRecordMutation {
+  const {
+    schemaVersion: _schemaVersion,
+    revision: _revision,
+    updatedAt: _updatedAt,
+    ...mutation
+  } = record;
+  void _schemaVersion;
+  void _revision;
+  void _updatedAt;
+  return mutation;
+}
+
 describe("createDispatchAutoMergeResumeHandler", () => {
   it("rejects a wrong confirmation phrase with zero side effects -- the pause flag is left untouched", async () => {
     const store = await temporaryStore();
     await store.pause(projectId, { changeRequestId: "1", mergedHeadSha: headSha });
     const handler = createDispatchAutoMergeResumeHandler({
       store,
+      progress: progressPort().port,
       stdin: stdinOf("wrong phrase"),
     });
 
@@ -88,6 +150,7 @@ describe("createDispatchAutoMergeResumeHandler", () => {
     await store.pause(projectId, { changeRequestId: "7", mergedHeadSha: headSha });
     const handler = createDispatchAutoMergeResumeHandler({
       store,
+      progress: progressPort().port,
       stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
     });
 
@@ -99,6 +162,7 @@ describe("createDispatchAutoMergeResumeHandler", () => {
       state: "resumed",
       projectId,
       pausedEvidence: { changeRequestId: "7", mergedHeadSha: headSha },
+      recoveredJobCount: 0,
     });
     const loaded = await store.load(projectId);
     expect(loaded).toEqual({
@@ -117,6 +181,7 @@ describe("createDispatchAutoMergeResumeHandler", () => {
     const store = await temporaryStore();
     const handler = createDispatchAutoMergeResumeHandler({
       store,
+      progress: progressPort().port,
       stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
     });
 
@@ -136,6 +201,7 @@ describe("createDispatchAutoMergeResumeHandler", () => {
     await store.resolve(projectId);
     const handler = createDispatchAutoMergeResumeHandler({
       store,
+      progress: progressPort().port,
       stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
     });
 
@@ -146,11 +212,108 @@ describe("createDispatchAutoMergeResumeHandler", () => {
 
   it("rejects an empty --project before ever reading stdin", async () => {
     const store = await temporaryStore();
-    const handler = createDispatchAutoMergeResumeHandler({ store, stdin: neverRead() });
+    const handler = createDispatchAutoMergeResumeHandler({
+      store,
+      progress: progressPort().port,
+      stdin: neverRead(),
+    });
 
     const outcome = await handler({ projectId: "" });
 
     expect(outcome.state).toBe("rejected");
     expect(payload(outcome)).toMatchObject({ reason: "project_id_required" });
+  });
+
+  it("recovers only the exact project-pause reason after resolving the durable pause", async () => {
+    const store = await temporaryStore();
+    await store.pause(projectId, { changeRequestId: "7", mergedHeadSha: headSha });
+    const matching = blockedRecord();
+    const unrelated = blockedRecord("review_not_approved");
+    const progress = progressPort([matching, unrelated]);
+    const handler = createDispatchAutoMergeResumeHandler({
+      store,
+      progress: progress.port,
+      stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ projectId });
+
+    expect(payload(result)).toMatchObject({ state: "resumed", recoveredJobCount: 1 });
+    expect(progress.writes).toHaveLength(1);
+    expect(progress.writes[0]).toMatchObject({
+      jobId: matching.jobId,
+      projectId,
+      stage: { kind: "awaiting_review" },
+      changeRequestId: "47",
+      headSha,
+    });
+  });
+
+  it("finishes the pending Job CAS when a retry finds the project already active", async () => {
+    const store = await temporaryStore();
+    await store.pause(projectId, { changeRequestId: "7", mergedHeadSha: headSha });
+    await store.resolve(projectId);
+    const progress = progressPort([blockedRecord()]);
+    const handler = createDispatchAutoMergeResumeHandler({
+      store,
+      progress: progress.port,
+      stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ projectId });
+
+    expect(payload(result)).toMatchObject({ state: "already_active", recoveredJobCount: 1 });
+    expect(progress.writes).toHaveLength(1);
+  });
+
+  it("round-trips the recovery through the real durable progress schema and CAS", async () => {
+    const root = await temporaryDirectory();
+    const progressDirectory = join(root, "state", "dispatch", "progress");
+    await mkdir(progressDirectory, { recursive: true, mode: 0o700 });
+    const store = new FileAutoMergePauseStore(root, undefined, createFixedClock(now));
+    const progress = new FileJobProgressStore(progressDirectory, undefined, createFixedClock(now));
+    const record = blockedRecord();
+    const seeded = await progress.compareAndSwap(record.jobId, null, recordMutation(record));
+    expect(seeded.ok, JSON.stringify(seeded)).toBe(true);
+    await store.pause(projectId, { changeRequestId: "7", mergedHeadSha: headSha });
+    const handler = createDispatchAutoMergeResumeHandler({
+      store,
+      progress,
+      stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ projectId });
+    const loaded = await progress.load(record.jobId);
+
+    expect(payload(result)).toMatchObject({ state: "resumed", recoveredJobCount: 1 });
+    expect(loaded.ok && loaded.value?.stage).toEqual({ kind: "awaiting_review" });
+    expect(loaded.ok && loaded.value?.revision).toBe(1);
+  });
+
+  it("fails closed after resolving the pause when progress cannot be read, so a retry can repair it", async () => {
+    const store = await temporaryStore();
+    await store.pause(projectId, { changeRequestId: "7", mergedHeadSha: headSha });
+    const handler = createDispatchAutoMergeResumeHandler({
+      store,
+      progress: {
+        listForProject: () =>
+          Promise.resolve({ ok: false, error: domainError("external_failure") }),
+        compareAndSwap: () => {
+          throw new Error("must not write");
+        },
+      },
+      stdin: stdinOf(dispatchAutoMergeResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ projectId });
+    const pause = await store.load(projectId);
+
+    expect(result.state).toBe("failed");
+    expect(payload(result)).toMatchObject({
+      state: "blocked",
+      reason: "job_progress_read_failed",
+      errorCode: "external_failure",
+    });
+    expect(pause.ok && pause.value?.status.state).toBe("active");
   });
 });
