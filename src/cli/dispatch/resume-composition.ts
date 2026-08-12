@@ -17,13 +17,13 @@
  * (wasted `reviewRuns` attempts on an already-approved change), so a `"merging"` job only ever
  * re-checks whether the change request has since become `"merged"`.
  *
- * Two follow-on findings are disclosed here rather than silently worked around:
- * - `ReviewStatusCoordinator.begin()`'s `"already_approved"` outcome (commit-only-change reuse)
- *   is not handled -- this resume path never leaves a job sitting in a state where that could be
- *   reached (it drives straight from `"approved"` to the merge gate in the same cycle), so the
- *   branch below fails closed to `requires_manual` if it is somehow hit, rather than guessing.
- * - A blocking `changes_requested` verdict is first recorded for traceability, then passed to the
- *   original implementer through `ReviewerRecoveryPipeline`; only `clarification_required` keeps
+ * A pre-existing success review status never supplies the in-memory `RecordedReviewApproval`
+ * required by `AutoMergeGate.enable()`. Rather than parse an external comment or guess that the
+ * current Linear requirements still match it, `"already_approved"` deliberately continues into a
+ * fresh Reviewer run. The fresh decision is recorded and becomes the sole approval used by this
+ * merge attempt. A blocking `changes_requested` verdict is first recorded for traceability, then
+ * passed to the original implementer through `ReviewerRecoveryPipeline`; only
+ * `clarification_required` keeps
  *   the pre-existing `fix_round` transition because it does not carry a blocking repair request.
  */
 import { join } from "node:path";
@@ -552,6 +552,21 @@ export function isMergeReconcilable(record: JobProgressRecord): record is JobPro
   );
 }
 
+/** The exact legacy state written before fresh review of an existing approval was implemented.
+ * It is safe to re-enter the normal pipeline because `resumeUnderLease` revalidates the durable
+ * revision, PR/head, Linear work item and current review inputs before any merge mutation. */
+function isReviewReuseReconcilable(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "review_reuse_unimplemented"
+  );
+}
+
+function isPipelineResumable(record: JobProgressRecord): boolean {
+  return resumableStageKinds.has(record.stage.kind) || isReviewReuseReconcilable(record);
+}
+
 /**
  * C015u decision 1: the *complete* predicate for "this record needs `runResumeCycle` to look at it
  * at all" -- `resumableStageKinds.has(...)` alone (the pre-C015t predicate) went stale the moment
@@ -581,7 +596,7 @@ export function isMergeReconcilable(record: JobProgressRecord): record is JobPro
  * the first place.
  */
 export function isResumeCandidate(record: JobProgressRecord): boolean {
-  return resumableStageKinds.has(record.stage.kind) || isMergeReconcilable(record);
+  return isPipelineResumable(record) || isMergeReconcilable(record);
 }
 
 export interface ResumeCycleSelection {
@@ -657,7 +672,7 @@ export async function runResumeCycle(
     }
     selected = accepted;
   }
-  const resumable = selected.filter((record) => resumableStageKinds.has(record.stage.kind));
+  const resumable = selected.filter(isPipelineResumable);
   const mergeReconcilable = selected.filter((record) => isMergeReconcilable(record));
 
   for (const record of resumable) {
@@ -761,9 +776,7 @@ async function resumeOneJob(
   const heartbeat = startResumeLeaseHeartbeat(deps, lease.value.value.id);
   const guardedDeps = { ...deps, signal: heartbeat.signal };
   try {
-    const current = await revalidateRecordUnderLease(record, guardedDeps, (candidate) =>
-      resumableStageKinds.has(candidate.stage.kind),
-    );
+    const current = await revalidateRecordUnderLease(record, guardedDeps, isPipelineResumable);
     if ("outcome" in current) return current;
     if (guardedDeps.prepare !== undefined) {
       await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
@@ -1787,17 +1800,10 @@ async function resumeReview(
       outcome: "still_ci_waiting",
     }));
   }
-  if (begin.state === "already_approved") {
-    // Disclosed limitation (see file header): this resume path never leaves a job in a state
-    // that should reach commit-only-change reuse -- fail closed rather than guess at an approval
-    // this code has no fresh evidence for.
-    return requiresManual(
-      record,
-      deps,
-      "already_approved_reuse_unimplemented",
-      requiresManualCause("review", "review_reuse_unimplemented"),
-    );
-  }
+  // `already_approved` intentionally falls through to the same fresh Reviewer path as `pending`.
+  // Its successful status proves only that this head was reviewed before; it is not a
+  // `RecordedReviewApproval` and cannot authorize this merge without re-evaluating current
+  // requirements and recording a fresh, transport-bound decision.
 
   const reviewDeadline = computeProviderDeadline(deps.clock);
   if (reviewDeadline === undefined) {
