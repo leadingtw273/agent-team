@@ -10,6 +10,7 @@ import {
 import {
   evaluateRegistrationWakeupHealth,
   type RegistrationSetupDraft,
+  unknownRegistrationWakeupSources,
 } from "../../application/registration/index.js";
 import type { Clock, Result } from "../../domain/foundation/index.js";
 import { leaseState, type Job, type Lease } from "../../domain/jobs/index.js";
@@ -18,6 +19,7 @@ import { containsSensitiveValue, redactedValue } from "../../infrastructure/reda
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import type { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import type { ListHostRegistrationSetupDraftsResult } from "../registration/draft-store.js";
+import type { RegistrationWakeupStateReader } from "../systemd/index.js";
 import {
   classifyJobProgressRecord,
   type JobProgressDisposition,
@@ -32,6 +34,7 @@ export interface ProjectReadModelOptions {
   readonly jobs: Pick<FileJobRepository, "readAll">;
   readonly leases: Pick<FileLeaseRepository, "readAll">;
   readonly clock: Clock;
+  readonly wakeupReader?: RegistrationWakeupStateReader;
 }
 
 export type ProjectReadResult =
@@ -268,62 +271,6 @@ async function safelyRead<Value>(
   }
 }
 
-function wakeupProjection(): Readonly<{
-  state: "degraded";
-  mode: "manual_reconcile_only";
-  capabilities: Readonly<{
-    scheduledReconcile: false;
-    eventDrivenIngress: false;
-    unattended: false;
-  }>;
-  sources: Readonly<{
-    systemd: Readonly<{ state: "unknown"; evidenceCode: "systemd_status_unknown" }>;
-    webhook: Readonly<{ state: "unknown"; evidenceCode: "webhook_runtime_unknown" }>;
-  }>;
-  evidenceCodes: readonly [
-    "systemd_status_unknown",
-    "webhook_runtime_unknown",
-    "manual_reconcile_required",
-  ];
-}> {
-  // T05 deliberately performs no systemctl / webhook probe. Unknown local observations are fed to
-  // the existing pure evaluator, which yields only the degraded manual-reconcile path.
-  const wakeup = evaluateRegistrationWakeupHealth({ systemd: "unknown", webhook: "unknown" });
-  if (
-    wakeup.state !== "degraded" ||
-    wakeup.mode !== "manual_reconcile_only" ||
-    wakeup.capabilities.scheduledReconcile ||
-    wakeup.capabilities.eventDrivenIngress ||
-    wakeup.capabilities.unattended ||
-    wakeup.sources.systemd.state !== "unknown" ||
-    wakeup.sources.systemd.evidenceCode !== "systemd_status_unknown" ||
-    wakeup.sources.webhook.state !== "unknown" ||
-    wakeup.sources.webhook.evidenceCode !== "webhook_runtime_unknown" ||
-    wakeup.evidenceCodes.join("\0") !==
-      ["systemd_status_unknown", "webhook_runtime_unknown", "manual_reconcile_required"].join("\0")
-  ) {
-    throw new Error("unexpected_wakeup_evaluator_projection");
-  }
-  return Object.freeze({
-    state: "degraded",
-    mode: "manual_reconcile_only",
-    capabilities: Object.freeze({
-      scheduledReconcile: false,
-      eventDrivenIngress: false,
-      unattended: false,
-    }),
-    sources: Object.freeze({
-      systemd: Object.freeze({ state: "unknown", evidenceCode: "systemd_status_unknown" }),
-      webhook: Object.freeze({ state: "unknown", evidenceCode: "webhook_runtime_unknown" }),
-    }),
-    evidenceCodes: Object.freeze([
-      "systemd_status_unknown",
-      "webhook_runtime_unknown",
-      "manual_reconcile_required",
-    ] as const),
-  });
-}
-
 function quotaProjection(): Readonly<Record<string, unknown>> {
   return Object.freeze({ state: "unknown", reason: "collector_unavailable" });
 }
@@ -407,7 +354,7 @@ export class ProjectReadModel {
         safelyRead(() => this.options.leases.readAll()),
       ]);
       const observedAt = this.options.clock.now();
-      const wakeup = wakeupProjection();
+      const wakeup = await this.#wakeupProjection();
 
       if (requested === undefined) {
         const registrations = groups.map((group) => registrationFor(group, registry));
@@ -496,5 +443,20 @@ export class ProjectReadModel {
     } catch {
       return undefined;
     }
+  }
+
+  async #wakeupProjection() {
+    let sources: unknown = unknownRegistrationWakeupSources();
+    if (this.options.wakeupReader !== undefined) {
+      try {
+        sources = {
+          systemd: await this.options.wakeupReader.readWakeupState(),
+          webhook: "unknown",
+        };
+      } catch {
+        sources = unknownRegistrationWakeupSources();
+      }
+    }
+    return evaluateRegistrationWakeupHealth(sources);
   }
 }

@@ -130,6 +130,21 @@ operator／復原流程，不是一般需求受理步驟。前述 Q01 canary com
 `agent-team ui` 固定使用 loopback ephemeral port，stdout fragment bearer 是敏感資料。Host 不複製它到
 Linear、log、artifact 或一般摘要；SIGINT 中斷後預期 exit `130`，而不是可作為需求或危險核可證據。
 
+### 6.2 T11：內部 canary 的狹窄 scheduled-only 例外
+
+T11 的**內部 canary**只可在 `agent-team health` 或 `agent-team project` 的權威 read-back 顯示
+`scheduledReconcile:true`、唯一 wakeup 缺口是 `webhook_runtime_unknown`，且沒有宣稱 webhook 或
+`unattended` 時，避免把已確認的 scheduled reconcile 誤說成 manual-only。這不是一般 host、一般
+`run` 或一般 admission 的擴權；host 仍必須把狀態描述為 `scheduled_reconcile_only` 與 degraded。
+
+即使符合上述唯一 wakeup 缺口，T11 也只有在 **T10 的其他全部權威前置均已通過**，並持有第 6.1 節
+Q01 的 exact private one-time attestation 時才可使用。它不得推論 webhook healthy、不得延長 Q01、
+不得作為其他 project／issue／provider／版本的證據，也不得一般化為 scheduled timer 可繞過任何
+Controller、Ready Gate、quota、lease、pipeline、merge 或 danger-approval 規則。
+
+T13 仍是 blocked；本例外不解除 T13、production approval route 或任何未知／衝突／解析失敗的
+fail-closed 行為。
+
 ## 7. 執行監看與狀態翻譯
 
 Host 讀取 Controller、CLI、Linear 與 GitHub 已存在的權威摘要，將 blocked、degraded、unknown、失敗與

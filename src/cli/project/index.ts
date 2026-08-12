@@ -9,6 +9,7 @@ import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import type { CliCommandOutcome, CliHandlers } from "../program.js";
 import { listHostRegistrationSetupDrafts } from "../registration/draft-store.js";
+import type { RegistrationWakeupStateReader } from "../systemd/index.js";
 
 import { ProjectReadModel, type ProjectReadResult } from "./read-model.js";
 import { serializeProjectPayload } from "./schema.js";
@@ -18,6 +19,7 @@ export * from "./schema.js";
 
 export interface CreateProjectCliHandlersOptions {
   readonly agentTeamHome: string;
+  readonly wakeupReader?: RegistrationWakeupStateReader;
 }
 
 function render(result: ProjectReadResult): CliCommandOutcome {
@@ -61,6 +63,7 @@ export function createProjectReadModel(options: CreateProjectCliHandlersOptions)
     jobs: new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock")),
     leases: new FileLeaseRepository(join(stateRoot, "leases.json"), join(stateRoot, "leases.lock")),
     clock: createClock(),
+    ...(options.wakeupReader === undefined ? {} : { wakeupReader: options.wakeupReader }),
   });
 }
 

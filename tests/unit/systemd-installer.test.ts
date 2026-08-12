@@ -15,8 +15,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { createWakeupHealthHandler } from "../../src/cli/health/index.js";
 import {
   SystemdManager,
   runtimeEnvironmentNames,
@@ -68,6 +69,18 @@ function spawnError(): CommandRunResult {
   };
 }
 
+function timeout(): CommandRunResult {
+  return {
+    classification: "timeout",
+    exitCode: null,
+    stdout: "",
+    stderr: "",
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    signal: "SIGKILL",
+  };
+}
+
 function isRuntimePreflight(request: CommandRunRequest): boolean {
   return (
     request.executable === "/usr/bin/env" &&
@@ -99,6 +112,7 @@ async function setup(
   responder: Responder = () => exited(),
   overrides: EnvironmentOverrides = () => ({}),
   unitNames?: SystemdUnitNames,
+  runtimeAvailable = true,
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-unit-"));
   roots.push(root);
@@ -140,6 +154,7 @@ async function setup(
         environment,
       },
       commandRunner,
+      runtimeAvailable,
       ...(unitNames === undefined ? {} : { unitNames }),
     }),
     calls,
@@ -1122,6 +1137,130 @@ describe("systemd installer security boundary", () => {
 
     expect(payload(result.message)).toMatchObject({
       timer: { state: "queried", enabled: "unknown" },
+    });
+  });
+
+  it.each([
+    {
+      name: "an enabled active canonical timer",
+      expected: "active",
+      responder: (request: CommandRunRequest) => {
+        if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+        if (request.arguments[1] === "is-active") return exited(0, "active\n");
+        if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+        return exited();
+      },
+    },
+    {
+      name: "an inactive canonical timer",
+      expected: "inactive",
+      responder: (request: CommandRunRequest) => {
+        if (request.arguments[1] === "is-enabled") return exited(1, "disabled\n");
+        if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+        if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+        return exited();
+      },
+    },
+    {
+      name: "a failed canonical timer",
+      expected: "failed",
+      responder: (request: CommandRunRequest) => {
+        if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+        if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
+        if (request.arguments[1] === "is-failed") return exited(0, "failed\n");
+        return exited();
+      },
+    },
+    {
+      name: "an unexpected query result",
+      expected: "unknown",
+      responder: (request: CommandRunRequest) =>
+        request.arguments[1] === "is-enabled" ? exited(5) : exited(),
+    },
+    {
+      name: "a spawned query failure",
+      expected: "unknown",
+      responder: (request: CommandRunRequest) =>
+        request.arguments[1] === "is-active" ? spawnError() : exited(),
+    },
+    {
+      name: "a timed out query",
+      expected: "unknown",
+      responder: (request: CommandRunRequest) =>
+        request.arguments[1] === "is-failed" ? timeout() : exited(),
+    },
+  ])("maps %s to the registration wakeup state", async ({ expected, responder }) => {
+    const fixture = await setup(responder);
+    await writeCanonical(fixture, await fixture.manager.preview());
+
+    await expect(fixture.manager.readWakeupState()).resolves.toBe(expected);
+  });
+
+  it("maps missing and untrusted unit ownership without a second systemd probe", async () => {
+    const missing = await setup();
+    await expect(missing.manager.readWakeupState()).resolves.toBe("not_installed");
+    expect(missing.calls.filter((call) => call.executable === "systemctl")).toEqual([]);
+
+    const untrusted = await setup();
+    const preview = await untrusted.manager.preview();
+    await mkdir(untrusted.unitDirectory, { recursive: true });
+    await Promise.all([
+      writeFile(preview.servicePath, "foreign service\n", "utf8"),
+      writeFile(preview.timerPath, "foreign timer\n", "utf8"),
+    ]);
+    await expect(untrusted.manager.readWakeupState()).resolves.toBe("untrusted");
+    expect(untrusted.calls.filter((call) => call.executable === "systemctl")).toEqual([]);
+  });
+
+  it("fails closed when a read-only Runtime capability attestation was not injected", async () => {
+    const fixture = await setup(undefined, () => ({}), undefined, false);
+
+    await expect(fixture.manager.readWakeupState()).resolves.toBe("runtime_unavailable");
+    expect(fixture.calls).toEqual([]);
+  });
+
+  it("uses only readonly systemctl queries for the shared wakeup reader", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+      if (request.arguments[1] === "is-active") return exited(0, "active\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      return exited();
+    });
+    await writeCanonical(fixture, await fixture.manager.preview());
+
+    await expect(fixture.manager.readWakeupState()).resolves.toBe("active");
+    expect(fixture.calls.map((call) => [call.executable, ...call.arguments])).toEqual([
+      ["systemctl", "--user", "is-enabled", systemdUnitNames.timer],
+      ["systemctl", "--user", "is-active", systemdUnitNames.timer],
+      ["systemctl", "--user", "is-failed", systemdUnitNames.timer],
+    ]);
+  });
+
+  it("reports an active timer as scheduled-only health until webhook Runtime is authoritative", async () => {
+    const reader = { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) };
+    const handler = createWakeupHealthHandler({ reader });
+
+    const result = await handler();
+
+    expect(reader.readWakeupState).toHaveBeenCalledTimes(1);
+    expect(payload(result.message)).toEqual({
+      operation: "reconcile_wakeup_status",
+      state: "degraded",
+      mode: "scheduled_reconcile_only",
+      capabilities: {
+        scheduledReconcile: true,
+        eventDrivenIngress: false,
+        unattended: false,
+      },
+      sources: {
+        systemd: { state: "available", evidenceCode: "systemd_timer_active" },
+        webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
+      },
+      evidenceCodes: [
+        "systemd_timer_active",
+        "webhook_runtime_unknown",
+        "manual_reconcile_required",
+      ],
     });
   });
 });
