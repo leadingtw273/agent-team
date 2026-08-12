@@ -4,6 +4,14 @@
 日期：2026-08-11  
 基準：main `2bc269be3387fc72ceddf378997ce7f050ab62e5`
 
+## 0. 2026-08-12 執行狀態
+
+- T00～T11 已完成；T11 internal canary 實際走完 Linear Ready → Implementer → PR → CI → Fresh Review → Squash Merge → Linear Done。
+- T11 四來源去敏 artifact 已由 official collector／validator／atomic writer 產生並合併；replay PASS。
+- T12 fresh-context 唯讀驗收 PASS，blocking finding=0；限制與裁決見 [`evidence/t12-first-sandbox-acceptance.md`](evidence/t12-first-sandbox-acceptance.md)。
+- T13 使用者第一輪測試包已提供，見 [`first-user-test-guide.md`](first-user-test-guide.md)。
+- 「可開始第一輪使用者測試」不代表 v1 全部情境完成；額度自動監測、Webhook Runtime、危險操作 UI 與非 Happy Path 仍依第 7 節邊界延後。
+
 ## 1. 目標出口
 
 leadi 只透過外層 Codex／Claude 所承載的「團隊管理者」提出並核可一個安全、簡單的代碼需求；Agent Team 在 `agent-team-sandbox` 真實走完：
@@ -92,4 +100,4 @@ T11 internal canary → T12 fresh acceptance → T13 使用者測試包
 
 ## 8. Review 限制
 
-本 Roadmap 依 2026-08-11 fresh-context 全方向審查重排。Codex 起草後，Claude CLI Plan review 在限定窗口內零輸出而中止；因此不能宣稱本版跨模型複審通過。leadi 已核可開始執行，T00 仍須由獨立驗證 pass 與 GitHub CI 證明。
+本 Roadmap 依 2026-08-11 fresh-context 全方向審查重排。Codex 起草後，Claude CLI Plan review 在限定窗口內零輸出而中止；因此不能宣稱 Roadmap 原稿曾跨模型複審通過。這是歷史 review 限制，不覆蓋第 0 節的最新執行證據；T12 fresh acceptance 驗的是 T11 產物，也不倒推補作當時的 Plan review。
