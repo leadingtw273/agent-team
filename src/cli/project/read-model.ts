@@ -10,7 +10,6 @@ import {
 import {
   evaluateRegistrationWakeupHealth,
   type RegistrationSetupDraft,
-  unknownRegistrationWakeupSources,
 } from "../../application/registration/index.js";
 import type { Clock, Result } from "../../domain/foundation/index.js";
 import { leaseState, type Job, type Lease } from "../../domain/jobs/index.js";
@@ -20,6 +19,10 @@ import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import type { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import type { ListHostRegistrationSetupDraftsResult } from "../registration/draft-store.js";
 import type { RegistrationWakeupStateReader } from "../systemd/index.js";
+import type {
+  GlobalWebhookWakeupStateReader,
+  ProjectWebhookWakeupStateReader,
+} from "../health/webhook-attestation.js";
 import {
   classifyJobProgressRecord,
   type JobProgressDisposition,
@@ -34,7 +37,8 @@ export interface ProjectReadModelOptions {
   readonly jobs: Pick<FileJobRepository, "readAll">;
   readonly leases: Pick<FileLeaseRepository, "readAll">;
   readonly clock: Clock;
-  readonly wakeupReader?: RegistrationWakeupStateReader;
+  readonly systemdReader?: RegistrationWakeupStateReader;
+  readonly webhookReader?: GlobalWebhookWakeupStateReader & ProjectWebhookWakeupStateReader;
 }
 
 export type ProjectReadResult =
@@ -354,7 +358,7 @@ export class ProjectReadModel {
         safelyRead(() => this.options.leases.readAll()),
       ]);
       const observedAt = this.options.clock.now();
-      const wakeup = await this.#wakeupProjection();
+      const wakeup = await this.#wakeupProjection(input.projectId);
 
       if (requested === undefined) {
         const registrations = groups.map((group) => registrationFor(group, registry));
@@ -445,18 +449,26 @@ export class ProjectReadModel {
     }
   }
 
-  async #wakeupProjection() {
-    let sources: unknown = unknownRegistrationWakeupSources();
-    if (this.options.wakeupReader !== undefined) {
+  async #wakeupProjection(projectId: string | undefined) {
+    let systemd: unknown = "unknown";
+    let webhook: unknown = "unknown";
+    if (this.options.systemdReader !== undefined) {
       try {
-        sources = {
-          systemd: await this.options.wakeupReader.readWakeupState(),
-          webhook: "unknown",
-        };
+        systemd = await this.options.systemdReader.readWakeupState();
       } catch {
-        sources = unknownRegistrationWakeupSources();
+        systemd = "unknown";
       }
     }
-    return evaluateRegistrationWakeupHealth(sources);
+    if (this.options.webhookReader !== undefined) {
+      try {
+        webhook =
+          projectId === undefined
+            ? await this.options.webhookReader.readGlobalWebhookWakeupState()
+            : await this.options.webhookReader.readProjectWebhookWakeupState(projectId);
+      } catch {
+        webhook = "unknown";
+      }
+    }
+    return evaluateRegistrationWakeupHealth({ systemd, webhook });
   }
 }

@@ -1,12 +1,15 @@
-import {
-  evaluateRegistrationWakeupHealth,
-  unknownRegistrationWakeupSources,
-} from "../../application/registration/index.js";
+import { evaluateRegistrationWakeupHealth } from "../../application/registration/index.js";
 import type { CliCommandOutcome } from "../program.js";
 import type { RegistrationWakeupStateReader } from "../systemd/index.js";
 
+import {
+  webhookAttestationVerificationScope,
+  type GlobalWebhookWakeupStateReader,
+} from "./webhook-attestation.js";
+
 export interface CreateWakeupHealthHandlerOptions {
-  readonly reader?: RegistrationWakeupStateReader;
+  readonly systemdReader?: RegistrationWakeupStateReader;
+  readonly webhookReader?: GlobalWebhookWakeupStateReader;
 }
 
 function outcome(payload: Readonly<Record<string, unknown>>): CliCommandOutcome {
@@ -14,23 +17,34 @@ function outcome(payload: Readonly<Record<string, unknown>>): CliCommandOutcome 
 }
 
 /**
- * The systemd reader is the shared production manager; webhook Runtime remains
- * unknown until its own authoritative health reader exists. A failed or malformed
- * systemd read cannot establish a wakeup capability.
+ * Readers remain separate because the timer and webhook transports are independently
+ * authoritative. A failed or malformed read cannot establish its own capability.
  */
 export function createWakeupHealthHandler(
   options: CreateWakeupHealthHandlerOptions = {},
 ): () => Promise<CliCommandOutcome> {
   return async () => {
-    let sources: unknown = unknownRegistrationWakeupSources();
-    if (options.reader !== undefined) {
+    let systemd: unknown = "unknown";
+    let webhook: unknown = "unknown";
+    if (options.systemdReader !== undefined) {
       try {
-        sources = { systemd: await options.reader.readWakeupState(), webhook: "unknown" };
+        systemd = await options.systemdReader.readWakeupState();
       } catch {
-        sources = unknownRegistrationWakeupSources();
+        systemd = "unknown";
       }
     }
-    const health = evaluateRegistrationWakeupHealth(sources);
-    return outcome({ operation: "reconcile_wakeup_status", ...health });
+    if (options.webhookReader !== undefined) {
+      try {
+        webhook = await options.webhookReader.readGlobalWebhookWakeupState();
+      } catch {
+        webhook = "unknown";
+      }
+    }
+    const health = evaluateRegistrationWakeupHealth({ systemd, webhook });
+    return outcome({
+      operation: "reconcile_wakeup_status",
+      webhookVerificationScope: webhookAttestationVerificationScope,
+      ...health,
+    });
   };
 }

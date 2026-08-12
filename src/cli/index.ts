@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { createControllerCycleHandler, createNoopControllerCycleStages } from "./cycle/index.js";
 import { createDispatchCliHandlers } from "./dispatch/index.js";
 import { createWakeupHealthHandler } from "./health/index.js";
+import { createWebhookAttestationRuntime } from "./health/webhook-attestation.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
 import { createProductionInboxControllerCycleStage } from "./inbox/index.js";
 import { createProjectCliHandlers } from "./project/index.js";
@@ -26,12 +27,21 @@ const agentTeamHome = process.env["AGENT_TEAM_HOME"] ?? join(homedir(), ".agent-
 // This compiled production entrypoint wires `buildManualReconcileUseCase` below, so it may attest
 // to the read-only wakeup projection that the timer command is composed in this Runtime.
 const systemdManager = createSystemdManager(fileURLToPath(import.meta.url), process.env, true);
+const webhookAttestation = createWebhookAttestationRuntime({ agentTeamHome });
+const controllerCycleStages = createNoopControllerCycleStages();
 
 process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ...defaultCliHandlers,
   ...createDispatchCliHandlers({ agentTeamHome }),
-  ...createProjectCliHandlers({ agentTeamHome, wakeupReader: systemdManager }),
-  health: createWakeupHealthHandler({ reader: systemdManager }),
+  ...createProjectCliHandlers({
+    agentTeamHome,
+    systemdReader: systemdManager,
+    webhookReader: webhookAttestation.reader,
+  }),
+  health: createWakeupHealthHandler({
+    systemdReader: systemdManager,
+    webhookReader: webhookAttestation.reader,
+  }),
   ingest: createLocalWebhookIngestHandler({
     ...(process.env["AGENT_TEAM_HOME"] === undefined ? {} : { agentTeamHome }),
   }),
@@ -45,7 +55,8 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   cycle: createControllerCycleHandler({
     agentTeamHome,
     stages: Object.freeze({
-      ...createNoopControllerCycleStages(),
+      ...controllerCycleStages,
+      webhookHealth: webhookAttestation.stage,
       inbox: createProductionInboxControllerCycleStage({ agentTeamHome }),
     }),
   }),
