@@ -43,6 +43,7 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
+    cycle: vi.fn(() => Promise.resolve(outcome)),
     health: vi.fn(() => Promise.resolve(outcome)),
     project: vi.fn(() => Promise.resolve(outcome)),
     ui: vi.fn(() => Promise.resolve(outcome)),
