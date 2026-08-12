@@ -390,7 +390,7 @@ function inspectionState(
     return "unknown";
   }
   if (nowMs >= expiresAt) return "unhealthy";
-  return expiresAt - nowMs < webhookAttestationRefreshWindowMs ? "unhealthy" : "verified";
+  return "verified";
 }
 
 /**

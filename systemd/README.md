@@ -58,9 +58,13 @@ drifted, or foreign pair is never overwritten. `agent-team health` and
 canonical ownership, and timer read-back: a canonical enabled/active timer is reported as scheduled
 reconcile availability, while missing, inactive, failed, untrusted, or indeterminate observations
 remain unavailable or unknown. Their read-only projection never spawns a Controller cycle.
-Webhook Runtime is not inferred from a timer. Until its own authoritative reader exists, an active
-timer therefore reports the degraded `scheduled_reconcile_only` mode—not `unattended`—with the
-fixed `webhook_runtime_unknown` and `manual_reconcile_required` evidence. When health reports a
-partial or missing wake-up path, an operator may run `agent-team cycle --all` manually. That
-command is the same Controller entrypoint as the timer and reports completed, degraded, failed, or
-unwired Runtime status rather than manufacturing success.
+Webhook Runtime is not inferred from a timer. Its separate, read-only attestation reader reports
+`verified` only for strict, config-consistent, dual-provider evidence that has not expired; this
+still does not establish provider subscription read-back. A valid near-expiry attestation remains
+`verified`; the under-five-minute window only makes the next Controller cycle refresh it. An active
+timer without verified evidence therefore still reports the degraded `scheduled_reconcile_only`
+mode—not `unattended`—with the applicable fixed webhook evidence and
+`manual_reconcile_required`. When health reports a partial or missing wake-up path, an operator may
+run `agent-team cycle --all` manually. That command is the same Controller entrypoint as the timer
+and reports completed, degraded, failed, or unwired Runtime status rather than manufacturing
+success.
