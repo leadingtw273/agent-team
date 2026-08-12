@@ -6,10 +6,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { domainError, err } from "../../src/domain/foundation/index.js";
 import {
+  controllerCycleStageIds,
   createControllerCycleHandler,
   createNoopControllerCycleStages,
   type ControllerCycleSignalScope,
   type ControllerCycleStage,
+  type ControllerCycleStageOutcome,
+  type ControllerCycleStageState,
   type ControllerCycleStages,
 } from "../../src/cli/cycle/index.js";
 import {
@@ -59,6 +62,14 @@ function payload(message: string | undefined): Readonly<Record<string, unknown>>
   return JSON.parse(message ?? "") as Readonly<Record<string, unknown>>;
 }
 
+function basicStageOutcomes(states: readonly ControllerCycleStageState[]) {
+  return states.map((state, index) => {
+    const stage = controllerCycleStageIds.at(index);
+    if (stage === undefined) throw new Error("too many stage outcomes");
+    return { stage, state };
+  });
+}
+
 describe("C01 Controller cycle CLI and singleton lock", () => {
   it("renders already_running only for an independently confirmed active conflict", async () => {
     const agentTeamHome = await temporaryHome();
@@ -105,6 +116,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
         state: "failed",
         reasonCode: "lock_acquire_failed",
         stageCounts: { completed: 0, degraded: 0, failed: 0 },
+        stageOutcomes: basicStageOutcomes([]),
       });
       expect(inspect).toHaveBeenCalledOnce();
       expect(webhookHealth).not.toHaveBeenCalled();
@@ -129,6 +141,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_acquire_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes([]),
     });
     expect(outcome.message).not.toContain(unsafe);
     expect(outcome.message).not.toContain(agentTeamHome);
@@ -155,6 +168,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_acquire_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes([]),
     });
     expect(inspect).not.toHaveBeenCalled();
     expect(webhookHealth).not.toHaveBeenCalled();
@@ -191,6 +205,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_acquire_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes([]),
     });
     expect(inspect).toHaveBeenCalledOnce();
     expect(webhookHealth).not.toHaveBeenCalled();
@@ -217,6 +232,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_acquire_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes([]),
     });
     expect(inspect).not.toHaveBeenCalled();
   });
@@ -270,6 +286,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       operation: "controller_cycle",
       state: "completed",
       stageCounts: { completed: 4, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes(["completed", "completed", "completed", "completed"]),
     });
     expect(calls).toEqual(["webhook_health", "inbox", "reconcile", "projects"]);
   });
@@ -283,6 +300,12 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
     const lockPath = controllerCycleLockPath(agentTeamHome);
 
     expect(outcome.state).toBe("success");
+    expect(payload(outcome.message)).toEqual({
+      operation: "controller_cycle",
+      state: "completed",
+      stageCounts: { completed: 4, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes(["completed", "completed", "completed", "completed"]),
+    });
     expect((await stat(join(agentTeamHome, "state"))).mode & 0o777).toBe(0o700);
     expect((await stat(lockPath)).mode & 0o777).toBe(0o600);
   });
@@ -323,6 +346,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
         state: "failed",
         reasonCode: "lock_acquire_failed",
         stageCounts: { completed: 0, degraded: 0, failed: 0 },
+        stageOutcomes: basicStageOutcomes([]),
       });
       expect(webhookHealth).not.toHaveBeenCalled();
     }
@@ -352,6 +376,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_release_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 1 },
+      stageOutcomes: basicStageOutcomes(["failed"]),
     });
     expect(neverStarts).not.toHaveBeenCalled();
   });
@@ -374,8 +399,44 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "stage_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 1 },
+      stageOutcomes: basicStageOutcomes(["failed"]),
     });
     expect(neverStarts).not.toHaveBeenCalled();
+  });
+
+  it("rejects arbitrary Inbox stage details instead of copying them into the public payload", async () => {
+    const agentTeamHome = await temporaryHome();
+    const unsafe = "https://internal.example/inbox?deliveryId=private&secret=raw-error";
+    const neverStarts = vi.fn(() => Promise.resolve({ state: "completed" as const }));
+    const outcome = await createControllerCycleHandler({
+      agentTeamHome,
+      stages: stages({
+        inbox: stage("inbox", () =>
+          Promise.resolve({
+            state: "degraded",
+            inbox: {
+              counts: { discovered: 0, processed: 0, alreadyCompleted: 0, failed: 0 },
+              failures: [],
+              details: unsafe,
+            },
+          } as unknown as ControllerCycleStageOutcome),
+        ),
+        reconcile: stage("reconcile", neverStarts),
+      }),
+      createSignalScope: signalScope,
+    })({ all: true });
+
+    expect(outcome.state).toBe("failed");
+    expect(payload(outcome.message)).toEqual({
+      operation: "controller_cycle",
+      state: "failed",
+      reasonCode: "stage_execution_failed",
+      stageCounts: { completed: 1, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes(["completed"]),
+    });
+    expect(neverStarts).not.toHaveBeenCalled();
+    expect(outcome.message).not.toContain(unsafe);
+    expect(outcome.message).not.toContain("deliveryId=private");
   });
 
   it("stops before the next stage after SIGINT or SIGTERM-equivalent abort and releases safely", async () => {
@@ -401,6 +462,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
         operation: "controller_cycle",
         state: "interrupted",
         stageCounts: { completed: 1, degraded: 0, failed: 0 },
+        stageOutcomes: basicStageOutcomes(["completed"]),
       });
       expect(inbox).not.toHaveBeenCalled();
 
@@ -432,6 +494,7 @@ describe("C01 Controller cycle CLI and singleton lock", () => {
       state: "failed",
       reasonCode: "lock_acquire_failed",
       stageCounts: { completed: 0, degraded: 0, failed: 0 },
+      stageOutcomes: basicStageOutcomes([]),
     });
     expect(outcome.message).not.toContain(unsafe);
     expect(outcome.message).not.toContain(agentTeamHome);

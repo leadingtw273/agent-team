@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { createControllerCycleHandler } from "./cycle/index.js";
+import { createControllerCycleHandler, createNoopControllerCycleStages } from "./cycle/index.js";
 import { createDispatchCliHandlers } from "./dispatch/index.js";
 import { createWakeupHealthHandler } from "./health/index.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
+import { createProductionInboxControllerCycleStage } from "./inbox/index.js";
 import { createProjectCliHandlers } from "./project/index.js";
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
 import { buildManualReconcileUseCase } from "./reconcile/composition.js";
@@ -41,7 +42,13 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   reconcile: createManualReconcileHandler({
     reconcile: buildManualReconcileUseCase({ agentTeamHome }),
   }),
-  cycle: createControllerCycleHandler({ agentTeamHome }),
+  cycle: createControllerCycleHandler({
+    agentTeamHome,
+    stages: Object.freeze({
+      ...createNoopControllerCycleStages(),
+      inbox: createProductionInboxControllerCycleStage({ agentTeamHome }),
+    }),
+  }),
   systemd: createSystemdHandler(systemdManager),
   registration: createRegistrationCliHandlers({ agentTeamHome }),
   ui: createUiCliHandler({ agentTeamHome }),
