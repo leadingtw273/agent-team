@@ -565,7 +565,7 @@ describe("H02 authoritative, read-only webhook health reader", () => {
     expect(reads).toHaveBeenCalled();
   });
 
-  it("fails closed on near-expiry, future-clock, unavailable inventory, and durable read uncertainty without initiating a probe or write", async () => {
+  it("keeps strict near-expiry evidence verified while failing closed on future-clock, unavailable inventory, and durable read uncertainty", async () => {
     const agentTeamHome = await root();
     const config = hostConfig();
     const writer = new FileWebhookAttestationStore(agentTeamHome, { clock: clock(startMs) });
@@ -579,7 +579,8 @@ describe("H02 authoritative, read-only webhook health reader", () => {
       }),
       clock: clock(startMs + webhookAttestationTtlMs - webhookAttestationRefreshWindowMs + 1),
     });
-    expect(await nearExpiry.readProjectWebhookWakeupState(projectA)).toBe("unhealthy");
+    expect(await nearExpiry.readProjectWebhookWakeupState(projectA)).toBe("verified");
+    expect(await nearExpiry.readGlobalWebhookWakeupState()).toBe("verified");
 
     const rollback = new WebhookAttestationHealthReader({
       projects: projects([projectA]),
