@@ -160,7 +160,7 @@ interface RemovalResult {
 
 interface RollbackResult {
   readonly rolledBack: boolean;
-  readonly reason?: "disable_failed" | "remove_failed" | "reload_failed";
+  readonly reason?: "disable_failed" | "remove_failed" | "reload_failed" | "restore_state_failed";
 }
 
 interface TimerQueryResult {
@@ -193,6 +193,28 @@ const maximumSystemdUnitNameLength = 255;
 const supportsDetachedProcessGroups = process.platform !== "win32";
 const runtimeEnvironmentExecutable = "/usr/bin/env";
 const systemdUnitNamePattern = /^[A-Za-z0-9:_.-]+$/u;
+const legacyReconcileServiceTemplate = `# agent-team-managed: agent-team-reconcile.service v1
+[Unit]
+Description=Agent Team deterministic reconcile
+
+[Service]
+Type=oneshot
+ExecStart={{EXEC_START}}
+`;
+const legacyReconcileTimerTemplate = `# agent-team-managed: agent-team-reconcile.timer v1
+[Unit]
+Description=Run Agent Team reconcile every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Unit={{SERVICE_UNIT}}
+
+[Install]
+WantedBy=timers.target
+`;
+
+type ControllerCommandAction = "cycle" | "reconcile";
 
 function assertSafeSystemdUnitName(
   kind: "service" | "timer",
@@ -548,17 +570,87 @@ function quoteSystemdArgument(value: string): string {
   return `"${escaped}"`;
 }
 
-function renderExecStart(runtimeCommand: RuntimeCommand): string {
-  const arguments_ = runtimeCommand.arguments;
-  const argumentCount = arguments_.length;
-  if (
-    argumentCount < 2 ||
-    arguments_[argumentCount - 2] !== "reconcile" ||
-    arguments_[argumentCount - 1] !== "--all"
-  ) {
-    throw new Error("Systemd unit must execute reconcile --all.");
+function assertSafeAbsoluteCommandPath(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || !isAbsolute(value) || /[\u0000\r\n]/u.test(value)) {
+    throw new Error(`${label} must be an absolute safe path.`);
   }
-  return [runtimeCommand.executable, ...arguments_].map(quoteSystemdArgument).join(" ");
+}
+
+function assertExactControllerCommand(
+  runtimeCommand: RuntimeCommand,
+  action: ControllerCommandAction,
+): void {
+  assertSafeAbsoluteCommandPath(runtimeCommand.executable, "Runtime executable");
+  const arguments_ = runtimeCommand.arguments;
+  const expectedAction = action === "cycle" ? "cycle" : "reconcile";
+  if (
+    arguments_.length !== 3 ||
+    !isAbsolute(arguments_[0] ?? "") ||
+    /[\u0000\r\n]/u.test(arguments_[0] ?? "") ||
+    arguments_[1] !== expectedAction ||
+    arguments_[2] !== "--all"
+  ) {
+    throw new Error(`Systemd unit must execute exact ${expectedAction} --all.`);
+  }
+}
+
+function assertExactRuntimeWrapperCommand(
+  runtimeCommand: RuntimeCommand,
+  action: ControllerCommandAction,
+): void {
+  if (runtimeCommand.executable !== runtimeEnvironmentExecutable) {
+    throw new Error("Systemd unit must use the Runtime environment wrapper.");
+  }
+  const arguments_ = runtimeCommand.arguments;
+  if (arguments_[0] !== "-i") {
+    throw new Error("Systemd Runtime wrapper must clear the inherited environment.");
+  }
+  let index = 1;
+  for (const name of ["PATH", "HOME", "XDG_CONFIG_HOME"] as const) {
+    const assignment = arguments_[index];
+    if (typeof assignment !== "string" || !assignment.startsWith(`${name}=`)) {
+      throw new Error(`Systemd Runtime wrapper is missing ${name}.`);
+    }
+    assertSafeEnvironmentValue(name, assignment.slice(`${name}=`.length));
+    index += 1;
+  }
+  for (const name of ["XDG_RUNTIME_DIR", "AGENT_TEAM_HOME"] as const) {
+    const assignment = arguments_[index];
+    if (typeof assignment === "string" && assignment.startsWith(`${name}=`)) {
+      assertSafeEnvironmentValue(name, assignment.slice(`${name}=`.length));
+      index += 1;
+    }
+  }
+  const executable = arguments_[index];
+  const entrypoint = arguments_[index + 1];
+  assertSafeAbsoluteCommandPath(executable, "Wrapped Runtime executable");
+  assertSafeAbsoluteCommandPath(entrypoint, "Compiled CLI entrypoint");
+  const expectedAction = action === "cycle" ? "cycle" : "reconcile";
+  if (
+    arguments_[index + 2] !== expectedAction ||
+    arguments_[index + 3] !== "--all" ||
+    arguments_.length !== index + 4
+  ) {
+    throw new Error(`Systemd unit must execute exact ${expectedAction} --all.`);
+  }
+}
+
+function renderExecStart(runtimeCommand: RuntimeCommand, action: ControllerCommandAction): string {
+  assertExactRuntimeWrapperCommand(runtimeCommand, action);
+  return [runtimeCommand.executable, ...runtimeCommand.arguments]
+    .map(quoteSystemdArgument)
+    .join(" ");
+}
+
+function createLegacyReconcileRuntimeCommand(runtimeCommand: RuntimeCommand): RuntimeCommand {
+  assertExactControllerCommand(runtimeCommand, "cycle");
+  const entrypoint = runtimeCommand.arguments[0];
+  if (entrypoint === undefined) throw new Error("Compiled CLI entrypoint is unavailable.");
+  return Object.freeze({
+    executable: runtimeCommand.executable,
+    arguments: Object.freeze([entrypoint, "reconcile", "--all"]),
+    environment: runtimeCommand.environment,
+  });
 }
 
 function buildRuntimeWrapperCommand(
@@ -597,6 +689,13 @@ function renderTemplate(template: string, replacements: Readonly<Record<string, 
     throw new Error("Systemd template contains an unresolved placeholder.");
   }
   return rendered;
+}
+
+function assertRenderedExactCycleService(service: string, execStart: string): void {
+  const execStartLines = service.split("\n").filter((line) => line.startsWith("ExecStart="));
+  if (execStartLines.length !== 1 || execStartLines[0] !== `ExecStart=${execStart}`) {
+    throw new Error("Systemd service must contain one exact cycle ExecStart.");
+  }
 }
 
 function fileIdentity(entry: BigIntStats): FileIdentity {
@@ -938,6 +1037,30 @@ async function removeCanonicalUnits(
   }
 }
 
+async function discardQuarantinedUnits(
+  quarantined: readonly QuarantinedUnit[],
+  directory: DirectoryIdentity,
+): Promise<boolean> {
+  try {
+    for (const entry of quarantined) {
+      const current = await observeUnit(entry.quarantinePath, entry.unit.expected, directory);
+      if (
+        current.kind !== "canonical" ||
+        current.unit === undefined ||
+        entry.identity === undefined ||
+        !sameFileIdentity(current.unit.identity, entry.identity)
+      ) {
+        return false;
+      }
+      await unlink(entry.quarantinePath);
+    }
+    await syncDirectory(directory.path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv): string {
   const runtimeEnvironment = buildRuntimeEnvironment(environment);
   const configHome = runtimeEnvironment["XDG_CONFIG_HOME"];
@@ -949,6 +1072,7 @@ export function resolveSystemdUserUnitDirectory(environment: NodeJS.ProcessEnv):
 
 export class SystemdManager {
   readonly #runtimeCommand: RuntimeCommand;
+  readonly #legacyRuntimeCommand: RuntimeCommand;
   readonly #runtimeAvailable: boolean;
   readonly #runtimeEnvironment: NodeJS.ProcessEnv;
   readonly #inheritedEnvironment: NodeJS.ProcessEnv;
@@ -958,11 +1082,17 @@ export class SystemdManager {
 
   constructor(options: SystemdManagerOptions) {
     this.#unitNames = resolveSystemdUnitNames(options.unitNames);
+    assertExactControllerCommand(options.runtimeCommand, "cycle");
     this.#runtimeAvailable = options.runtimeAvailable ?? false;
     this.#inheritedEnvironment = Object.freeze({ ...options.runtimeCommand.environment });
     this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
     this.#runtimeCommand = buildRuntimeWrapperCommand(
       options.runtimeCommand,
+      this.#runtimeEnvironment,
+      this.#inheritedEnvironment,
+    );
+    this.#legacyRuntimeCommand = buildRuntimeWrapperCommand(
+      createLegacyReconcileRuntimeCommand(options.runtimeCommand),
       this.#runtimeEnvironment,
       this.#inheritedEnvironment,
     );
@@ -976,9 +1106,9 @@ export class SystemdManager {
       readFile(join(this.#templateDirectory, systemdUnitNames.timer), "utf8"),
     ]);
     const unitDirectory = resolveSystemdUserUnitDirectory(this.#runtimeEnvironment);
-    const service = renderTemplate(serviceTemplate, {
-      "{{EXEC_START}}": renderExecStart(this.#runtimeCommand),
-    });
+    const execStart = renderExecStart(this.#runtimeCommand, "cycle");
+    const service = renderTemplate(serviceTemplate, { "{{EXEC_START}}": execStart });
+    assertRenderedExactCycleService(service, execStart);
     const timer = renderTemplate(timerTemplate, {
       "{{SERVICE_UNIT}}": this.#unitNames.service,
     });
@@ -993,6 +1123,24 @@ export class SystemdManager {
         ...this.#runtimeCommand.arguments,
       ]),
       runtimeEnvironment: this.#runtimeEnvironment,
+    });
+  }
+
+  #legacyPreview(preview: RenderedSystemdUnits): RenderedSystemdUnits {
+    const service = renderTemplate(legacyReconcileServiceTemplate, {
+      "{{EXEC_START}}": renderExecStart(this.#legacyRuntimeCommand, "reconcile"),
+    });
+    const timer = renderTemplate(legacyReconcileTimerTemplate, {
+      "{{SERVICE_UNIT}}": this.#unitNames.service,
+    });
+    return Object.freeze({
+      ...preview,
+      service,
+      timer,
+      runtimeCommand: Object.freeze([
+        this.#legacyRuntimeCommand.executable,
+        ...this.#legacyRuntimeCommand.arguments,
+      ]),
     });
   }
 
@@ -1018,7 +1166,7 @@ export class SystemdManager {
    * Projects the existing authoritative systemd observations into the registration wakeup
    * vocabulary. This intentionally reuses the same canonical ownership and
    * `is-enabled`/`is-active`/`is-failed` reads as `systemd status`; it never parses CLI JSON,
-   * spawns `reconcile`, or creates a second probe path. Runtime capability is an explicit
+   * spawns a Controller cycle, or creates a second probe path. Runtime capability is an explicit
    * composition attestation so this projection remains read-only.
    */
   async readWakeupState(): Promise<RegistrationSystemdWakeupState> {
@@ -1087,6 +1235,20 @@ export class SystemdManager {
       : undefined;
   }
 
+  async #legacyCanonicalPair(
+    preview: RenderedSystemdUnits,
+    directory: DirectoryIdentity | undefined,
+  ): Promise<
+    Readonly<{ preview: RenderedSystemdUnits; pair: UnitPair<CanonicalUnit> }> | undefined
+  > {
+    if (directory === undefined) return undefined;
+    const legacyPreview = this.#legacyPreview(preview);
+    const legacyPair = this.#canonicalPair(await this.#observePair(legacyPreview, directory));
+    return legacyPair === undefined
+      ? undefined
+      : Object.freeze({ preview: legacyPreview, pair: legacyPair });
+  }
+
   #sameCanonicalPair(
     observed: UnitPair<UnitObservation>,
     expected: UnitPair<CanonicalUnit>,
@@ -1107,12 +1269,9 @@ export class SystemdManager {
     return this.#commandRunner.run({ ...request, environment: this.#runtimeEnvironment });
   }
 
-  async #runPreflight(): Promise<CommandRunResult> {
-    return this.#commandRunner.run({
-      executable: this.#runtimeCommand.executable,
-      arguments: this.#runtimeCommand.arguments,
-      environment: this.#inheritedEnvironment,
-    });
+  #safePreflight(preview: RenderedSystemdUnits): void {
+    const execStart = renderExecStart(this.#runtimeCommand, "cycle");
+    assertRenderedExactCycleService(preview.service, execStart);
   }
 
   async #verify(preview: RenderedSystemdUnits): Promise<CommandRunResult> {
@@ -1188,9 +1347,46 @@ export class SystemdManager {
     return { rolledBack: false, reason: "reload_failed" };
   }
 
+  async #rollbackLegacyUpgrade(
+    created: readonly CanonicalUnit[],
+    quarantined: readonly QuarantinedUnit[],
+    directory: DirectoryIdentity,
+    requiresDisable: boolean,
+    originalTimer: TimerQueryResult | undefined,
+  ): Promise<RollbackResult> {
+    if (originalTimer === undefined) return { rolledBack: false, reason: "restore_state_failed" };
+    if (requiresDisable) {
+      const disable = await this.#systemctl(["disable", "--now", this.#unitNames.timer]);
+      if (!successful(disable)) return { rolledBack: false, reason: "disable_failed" };
+    }
+    if (created.length > 0) {
+      const removal = await removeCanonicalUnits(created, directory);
+      if (!removal.removed) return { rolledBack: false, reason: "remove_failed" };
+    }
+    if (!(await restoreTransaction([], quarantined, directory))) {
+      return { rolledBack: false, reason: "remove_failed" };
+    }
+    const reload = await this.#reloadUserManager();
+    if (!successful(reload)) return { rolledBack: false, reason: "reload_failed" };
+    if (originalTimer.enabled === "enabled" && originalTimer.activity === "active") {
+      const enable = await this.#systemctl(["enable", "--now", this.#unitNames.timer]);
+      if (!successful(enable)) return { rolledBack: false, reason: "restore_state_failed" };
+    }
+    const restoredTimer = await this.#queryTimer();
+    if (
+      restoredTimer.queryError ||
+      restoredTimer.enabled !== originalTimer.enabled ||
+      restoredTimer.activity !== originalTimer.activity
+    ) {
+      return { rolledBack: false, reason: "restore_state_failed" };
+    }
+    return { rolledBack: true };
+  }
+
   async #install(dryRun: boolean): Promise<CliCommandOutcome> {
     const preview = await this.preview();
     await this.#directory(preview, false);
+    this.#safePreflight(preview);
     if (dryRun) {
       return outcome("success", {
         operation: "install",
@@ -1204,22 +1400,17 @@ export class SystemdManager {
       });
     }
 
-    const preflight = await this.#runPreflight();
-    if (!successful(preflight)) {
-      return outcome("blocked", {
-        operation: "install",
-        state: "runtime_unavailable",
-        preflight: commandSummary(preflight),
-      });
-    }
-
     const directory = await this.#directory(preview, true);
     if (directory === undefined) {
       return outcome("failed", { operation: "install", state: "unit_directory_unavailable" });
     }
     const observed = await this.#observePair(preview, directory);
     const installationState = this.#installationState(observed);
-    if (installationState === "untrusted_units") {
+    const legacy =
+      installationState === "untrusted_units"
+        ? await this.#legacyCanonicalPair(preview, directory)
+        : undefined;
+    if (installationState === "untrusted_units" && legacy === undefined) {
       return outcome("blocked", {
         operation: "install",
         state: "untrusted_units",
@@ -1228,35 +1419,48 @@ export class SystemdManager {
     }
 
     const existingPair = this.#canonicalPair(observed);
-    if (installationState === "installed") {
-      if (existingPair === undefined) {
+    const existingTimer =
+      installationState === "installed" || legacy !== undefined
+        ? await this.#queryTimer()
+        : undefined;
+    if (installationState === "installed" || legacy !== undefined) {
+      if (installationState === "installed" && existingPair === undefined) {
         return outcome("blocked", { operation: "install", state: "untrusted_units" });
       }
-      const timerQuery = await this.#queryTimer();
+      if (existingTimer === undefined) {
+        return outcome("blocked", { operation: "install", state: "timer_state_unknown" });
+      }
       if (
-        timerQuery.queryError ||
-        timerQuery.enabled === "unknown" ||
-        timerQuery.activity === "unknown"
+        existingTimer.queryError ||
+        existingTimer.enabled === "unknown" ||
+        existingTimer.activity === "unknown"
       ) {
         return outcome("blocked", {
           operation: "install",
           state: "timer_state_unknown",
-          timer: this.#timerQuerySummary(timerQuery),
+          timer: this.#timerQuerySummary(existingTimer),
         });
       }
-      if (timerQuery.enabled === "enabled" && timerQuery.activity === "active") {
+      if (
+        installationState === "installed" &&
+        existingTimer.enabled === "enabled" &&
+        existingTimer.activity === "active"
+      ) {
         return outcome("success", {
           operation: "install",
           state: "already_installed",
           unitDirectory: preview.unitDirectory,
-          timer: this.#timerQuerySummary(timerQuery),
+          timer: this.#timerQuerySummary(existingTimer),
         });
       }
-      if (timerQuery.enabled !== "disabled" || timerQuery.activity !== "inactive") {
+      if (!(
+        (existingTimer.enabled === "enabled" && existingTimer.activity === "active") ||
+        (existingTimer.enabled === "disabled" && existingTimer.activity === "inactive")
+      )) {
         return outcome("blocked", {
           operation: "install",
           state: "timer_state_inconsistent",
-          timer: this.#timerQuerySummary(timerQuery),
+          timer: this.#timerQuerySummary(existingTimer),
         });
       }
     }
@@ -1271,10 +1475,66 @@ export class SystemdManager {
     }
 
     const created: CanonicalUnit[] = [];
+    let quarantined: readonly QuarantinedUnit[] = [];
     let enableAttempted = false;
     try {
       let expectedPair = existingPair;
-      if (installationState === "not_installed") {
+      if (legacy !== undefined) {
+        const quarantine = await quarantineUnits(
+          [legacy.pair.service, legacy.pair.timer],
+          directory,
+        );
+        if (quarantine.entries === undefined) {
+          return outcome("failed", {
+            operation: "install",
+            state: quarantine.restored ? "safe_write_failed" : "rollback_failed",
+          });
+        }
+        quarantined = quarantine.entries;
+        const service = await writeNewCanonicalUnit(
+          preview.servicePath,
+          Buffer.from(preview.service, "utf8"),
+          directory,
+        );
+        if (service === "exists") {
+          const rollback = await this.#rollbackLegacyUpgrade(
+            created,
+            quarantined,
+            directory,
+            false,
+            existingTimer,
+          );
+          return outcome("blocked", {
+            operation: "install",
+            state: rollback.rolledBack ? "unit_write_conflict" : "rollback_failed",
+            unit: this.#unitNames.service,
+            ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
+          });
+        }
+        created.push(service);
+        const timer = await writeNewCanonicalUnit(
+          preview.timerPath,
+          Buffer.from(preview.timer, "utf8"),
+          directory,
+        );
+        if (timer === "exists") {
+          const rollback = await this.#rollbackLegacyUpgrade(
+            created,
+            quarantined,
+            directory,
+            false,
+            existingTimer,
+          );
+          return outcome("blocked", {
+            operation: "install",
+            state: rollback.rolledBack ? "unit_write_conflict" : "rollback_failed",
+            unit: this.#unitNames.timer,
+            ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
+          });
+        }
+        created.push(timer);
+        expectedPair = { service, timer };
+      } else if (installationState === "not_installed") {
         const service = await writeNewCanonicalUnit(
           preview.servicePath,
           Buffer.from(preview.service, "utf8"),
@@ -1322,9 +1582,17 @@ export class SystemdManager {
       }
       if (!successful(reload)) {
         const rollback =
-          created.length === 0
-            ? { rolledBack: true as const }
-            : await this.#rollbackInstall(created, directory, false);
+          legacy === undefined
+            ? created.length === 0
+              ? { rolledBack: true as const }
+              : await this.#rollbackInstall(created, directory, false)
+            : await this.#rollbackLegacyUpgrade(
+                created,
+                quarantined,
+                directory,
+                false,
+                existingTimer,
+              );
         return outcome("failed", {
           operation: "install",
           state: rollback.rolledBack ? "daemon_reload_failed" : "rollback_failed",
@@ -1353,7 +1621,16 @@ export class SystemdManager {
         });
       }
       if (!successful(enable)) {
-        const rollback = await this.#rollbackInstall(created, directory, true);
+        const rollback =
+          legacy === undefined
+            ? await this.#rollbackInstall(created, directory, true)
+            : await this.#rollbackLegacyUpgrade(
+                created,
+                quarantined,
+                directory,
+                true,
+                existingTimer,
+              );
         return outcome("failed", {
           operation: "install",
           state: rollback.rolledBack ? "timer_enable_failed" : "rollback_failed",
@@ -1361,15 +1638,31 @@ export class SystemdManager {
           ...(rollback.reason === undefined ? {} : { rollbackReason: rollback.reason }),
         });
       }
+      if (legacy !== undefined && !(await discardQuarantinedUnits(quarantined, directory))) {
+        return outcome("failed", { operation: "install", state: "legacy_cleanup_failed" });
+      }
       return outcome("success", {
         operation: "install",
         state:
-          installationState === "not_installed" ? "installed" : "enabled_existing_installation",
+          legacy !== undefined
+            ? "upgraded_legacy_installation"
+            : installationState === "not_installed"
+              ? "installed"
+              : "enabled_existing_installation",
         unitDirectory: preview.unitDirectory,
         timer: this.#unitNames.timer,
       });
     } catch {
-      const rollback = await this.#rollbackInstall(created, directory, enableAttempted);
+      const rollback =
+        legacy === undefined
+          ? await this.#rollbackInstall(created, directory, enableAttempted)
+          : await this.#rollbackLegacyUpgrade(
+              created,
+              quarantined,
+              directory,
+              enableAttempted,
+              existingTimer,
+            );
       return outcome("failed", {
         operation: "install",
         state: rollback.rolledBack ? "safe_write_failed" : "rollback_failed",
@@ -1482,22 +1775,14 @@ export class SystemdManager {
     const directory = await this.#directory(preview, false);
     const observed = await this.#observePair(preview, directory);
     const installationState = this.#installationState(observed);
-    const preflight = await this.#runPreflight();
-    if (!successful(preflight)) {
-      return outcome("success", {
-        operation: "status",
-        installation: installationState,
-        units: this.#unitSummary(observed),
-        runtime: "runtime_unavailable",
-        preflight: commandSummary(preflight),
-      });
-    }
+    this.#safePreflight(preview);
     if (installationState !== "installed") {
       return outcome("success", {
         operation: "status",
         installation: installationState,
         units: this.#unitSummary(observed),
-        runtime: "available",
+        runtime: "configured",
+        preflight: "exact_cycle_preview",
         timer: "not_checked",
       });
     }
@@ -1518,7 +1803,8 @@ export class SystemdManager {
       operation: "status",
       installation: installationState,
       units: this.#unitSummary(observed),
-      runtime: "available",
+      runtime: "configured",
+      preflight: "exact_cycle_preview",
       timer,
     });
   }
@@ -1532,7 +1818,7 @@ export function createSystemdManager(
   return new SystemdManager({
     runtimeCommand: Object.freeze({
       executable: process.execPath,
-      arguments: Object.freeze([runtimeEntrypoint, "reconcile", "--all"]),
+      arguments: Object.freeze([runtimeEntrypoint, "cycle", "--all"]),
       environment,
     }),
     runtimeAvailable,

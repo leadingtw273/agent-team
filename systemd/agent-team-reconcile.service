@@ -1,6 +1,6 @@
-# agent-team-managed: agent-team-reconcile.service v1
+# agent-team-managed: agent-team-reconcile.service v2
 [Unit]
-Description=Agent Team deterministic reconcile
+Description=Agent Team Controller cycle
 
 [Service]
 Type=oneshot
