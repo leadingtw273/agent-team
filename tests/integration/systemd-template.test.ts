@@ -31,7 +31,7 @@ describe("rendered systemd templates", () => {
       const manager = new SystemdManager({
         runtimeCommand: {
           executable: process.execPath,
-          arguments: [resolve("dist/cli/index.js"), "reconcile", "--all"],
+          arguments: [resolve("dist/cli/index.js"), "cycle", "--all"],
           environment: {
             PATH: process.env["PATH"] ?? "/usr/bin:/bin",
             HOME: join(root, "home"),
@@ -53,6 +53,8 @@ describe("rendered systemd templates", () => {
 
       expect(preview.timer).toContain("OnUnitInactiveSec=5min");
       expect(preview.service).toContain("AGENT_TEAM_HOME=");
+      expect(preview.service).toContain('"cycle" "--all"');
+      expect(preview.service).not.toContain('"reconcile" "--all"');
       expect(preview.service).toContain("agent-$$home");
       expect(preview.service).not.toContain("\nEnvironment=");
       expect(preview.service).not.toContain("must-not-render");
@@ -72,7 +74,7 @@ describe("rendered systemd templates", () => {
       const manager = new SystemdManager({
         runtimeCommand: {
           executable: process.execPath,
-          arguments: [resolve("dist/cli/index.js"), "reconcile", "--all"],
+          arguments: [resolve("dist/cli/index.js"), "cycle", "--all"],
           environment: {
             PATH: process.env["PATH"] ?? "/usr/bin:/bin",
             HOME: join(root, "home"),
@@ -93,6 +95,8 @@ describe("rendered systemd templates", () => {
 
       expect(preview.servicePath).toContain(canaryUnitNames.service);
       expect(preview.timerPath).toContain(canaryUnitNames.timer);
+      expect(preview.service).toContain('"cycle" "--all"');
+      expect(preview.service).not.toContain('"reconcile" "--all"');
       expect(preview.timer).toContain(`Unit=${canaryUnitNames.service}`);
       expect(preview.timer).not.toContain(`Unit=${systemdUnitNames.service}`);
       const verification = spawnSync("systemd-analyze", ["verify", servicePath, timerPath], {
@@ -123,7 +127,7 @@ describe("rendered systemd templates", () => {
     const manager = new SystemdManager({
       runtimeCommand: {
         executable: process.execPath,
-        arguments: [probePath, "reconcile", "--all"],
+        arguments: [probePath, "cycle", "--all"],
         environment,
       },
     });

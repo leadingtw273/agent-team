@@ -86,11 +86,11 @@ function timeout(): CommandRunResult {
   };
 }
 
-function isRuntimePreflight(request: CommandRunRequest): boolean {
+function isCycleCommand(request: CommandRunRequest): boolean {
   return (
     request.executable === "/usr/bin/env" &&
     request.arguments.includes("/tmp/fake-node") &&
-    request.arguments.at(-2) === "reconcile" &&
+    request.arguments.at(-2) === "cycle" &&
     request.arguments.at(-1) === "--all"
   );
 }
@@ -155,7 +155,7 @@ async function setup(
     manager: new SystemdManager({
       runtimeCommand: {
         executable: "/tmp/fake-node",
-        arguments: ["/tmp/fake-agent-team", "reconcile", "--all"],
+        arguments: ["/tmp/fake-agent-team", "cycle", "--all"],
         environment,
       },
       commandRunner,
@@ -170,6 +170,30 @@ async function writeCanonical(fixture: Fixture, preview: RenderedSystemdUnits): 
   await mkdir(fixture.unitDirectory, { recursive: true });
   await Promise.all([
     writeFile(preview.servicePath, preview.service, "utf8"),
+    writeFile(preview.timerPath, preview.timer, "utf8"),
+  ]);
+}
+
+function legacyService(preview: RenderedSystemdUnits): string {
+  return preview.service
+    .replace(
+      "# agent-team-managed: agent-team-reconcile.service v2",
+      "# agent-team-managed: agent-team-reconcile.service v1",
+    )
+    .replace(
+      "Description=Agent Team Controller cycle",
+      "Description=Agent Team deterministic reconcile",
+    )
+    .replace('"cycle" "--all"', '"reconcile" "--all"');
+}
+
+async function writeLegacyCanonical(
+  fixture: Fixture,
+  preview: RenderedSystemdUnits,
+): Promise<void> {
+  await mkdir(fixture.unitDirectory, { recursive: true });
+  await Promise.all([
+    writeFile(preview.servicePath, legacyService(preview), "utf8"),
     writeFile(preview.timerPath, preview.timer, "utf8"),
   ]);
 }
@@ -403,7 +427,7 @@ describe("systemd installer security boundary", () => {
         new SystemdManager({
           runtimeCommand: {
             executable: "/tmp/fake-node",
-            arguments: ["/tmp/fake-agent-team", "reconcile", "--all"],
+            arguments: ["/tmp/fake-agent-team", "cycle", "--all"],
             environment,
           },
           commandRunner,
@@ -418,7 +442,50 @@ describe("systemd installer security boundary", () => {
     });
   });
 
-  it("preflights the exact compiled command, verifies, writes canonical bytes, reloads, and enables", async () => {
+  it.each([
+    ["legacy reconcile action", "/tmp/fake-node", ["/tmp/fake-agent-team", "reconcile", "--all"]],
+    ["extra argv", "/tmp/fake-node", ["/tmp/fake-agent-team", "cycle", "--all", "extra"]],
+    ["relative compiled entrypoint", "/tmp/fake-node", ["agent-team", "cycle", "--all"]],
+    [
+      "control character in entrypoint",
+      "/tmp/fake-node",
+      ["/tmp/fake\nagent-team", "cycle", "--all"],
+    ],
+    ["relative Runtime executable", "node", ["/tmp/fake-agent-team", "cycle", "--all"]],
+  ])(
+    "rejects nonexact %s before preview writes or command execution",
+    async (_name, executable, arguments_) => {
+      const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-invalid-command-"));
+      roots.push(root);
+      const environment: NodeJS.ProcessEnv = {
+        PATH: "/test/bin",
+        HOME: join(root, "home"),
+        XDG_CONFIG_HOME: join(root, "xdg-config"),
+      };
+      const calls: CommandRunRequest[] = [];
+
+      expect(
+        () =>
+          new SystemdManager({
+            runtimeCommand: { executable, arguments: arguments_, environment },
+            commandRunner: {
+              run: (request) => {
+                calls.push(request);
+                return Promise.resolve(exited());
+              },
+            },
+          }),
+      ).toThrow(/exact cycle|absolute safe/);
+      expect(calls).toEqual([]);
+      await expect(
+        lstat(join(environment["XDG_CONFIG_HOME"] ?? "", "systemd", "user")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    },
+  );
+
+  it("previews the exact compiled cycle command without dispatch, verifies, writes canonical bytes, reloads, and enables", async () => {
     const fixture = await setup();
     const preview = await fixture.manager.preview();
     const result = await fixture.manager.handle({ action: "install", dryRun: false });
@@ -427,28 +494,17 @@ describe("systemd installer security boundary", () => {
     expect(payload(result.message)).toMatchObject({ operation: "install", state: "installed" });
     await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
     await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
-    expect(fixture.calls[0]).toMatchObject({ executable: "/usr/bin/env" });
-    expect([fixture.calls[0]?.executable, ...(fixture.calls[0]?.arguments ?? [])]).toEqual(
-      preview.runtimeCommand,
-    );
-    expect(fixture.calls[0]?.arguments).toContain("PATH=/test/bin");
-    expect(fixture.calls[0]?.arguments).not.toContain(
-      "SECRET_ACCESS_TOKEN=never-render-or-run-with-this",
-    );
-    expect(fixture.calls[0]?.environment).toHaveProperty(
-      "SECRET_ACCESS_TOKEN",
-      "never-render-or-run-with-this",
-    );
+    expect(preview.runtimeCommand).toContain("cycle");
+    expect(preview.runtimeCommand).not.toContain("reconcile");
+    expect(fixture.calls.some(isCycleCommand)).toBe(false);
     expect(
-      fixture.calls
-        .slice(1)
-        .every((call) =>
-          Object.keys(call.environment).every((name) =>
-            runtimeEnvironmentNames.includes(name as never),
-          ),
+      fixture.calls.every((call) =>
+        Object.keys(call.environment).every((name) =>
+          runtimeEnvironmentNames.includes(name as never),
         ),
+      ),
     ).toBe(true);
-    expect(fixture.calls.slice(1)).toMatchObject([
+    expect(fixture.calls).toMatchObject([
       {
         executable: "systemd-analyze",
         arguments: ["verify", expect.any(String), expect.any(String)],
@@ -481,17 +537,90 @@ describe("systemd installer security boundary", () => {
     expect((await stat(preview.servicePath)).ino).toBe(initialService.ino);
     expect((await stat(preview.timerPath)).ino).toBe(initialTimer.ino);
     expect(fixture.calls.map((call) => call.executable)).toEqual([
-      "/usr/bin/env",
       "systemctl",
       "systemctl",
       "systemctl",
     ]);
     expect(fixture.calls.map((call) => call.arguments[1])).toEqual([
-      "PATH=/test/bin",
       "is-enabled",
       "is-active",
       "is-failed",
     ]);
+  });
+
+  it("upgrades only an exact owned v1 reconcile pair to the same cycle unit", async () => {
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+      if (request.arguments[1] === "is-active") return exited(0, "active\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    await writeLegacyCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("success");
+    expect(payload(result.message)).toMatchObject({ state: "upgraded_legacy_installation" });
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
+    expect(fixture.calls.some(isCycleCommand)).toBe(false);
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "enable",
+        "--now",
+        systemdUnitNames.timer,
+      ]),
+    ).toBe(true);
+  });
+
+  it("restores exact legacy bytes and active state when legacy upgrade enable fails", async () => {
+    let enableCalls = 0;
+    const fixture = await setup((request) => {
+      if (request.arguments[1] === "is-enabled") return exited(0, "enabled\n");
+      if (request.arguments[1] === "is-active") return exited(0, "active\n");
+      if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
+      if (request.arguments[1] === "enable") {
+        enableCalls += 1;
+        return exited(enableCalls === 1 ? 1 : 0);
+      }
+      return exited();
+    });
+    const preview = await fixture.manager.preview();
+    const originalService = legacyService(preview);
+    await writeLegacyCanonical(fixture, preview);
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("failed");
+    expect(payload(result.message)).toMatchObject({ state: "timer_enable_failed" });
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(originalService);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
+    expect(enableCalls).toBe(2);
+    expect(
+      hasCommandCall(fixture.calls, "systemctl", [
+        "--user",
+        "disable",
+        "--now",
+        systemdUnitNames.timer,
+      ]),
+    ).toBe(true);
+    expect(fixture.calls.some(isCycleCommand)).toBe(false);
+  });
+
+  it("does not upgrade a marker-like or drifted legacy pair", async () => {
+    const fixture = await setup();
+    const preview = await fixture.manager.preview();
+    await writeLegacyCanonical(fixture, preview);
+    await writeFile(preview.servicePath, `${legacyService(preview)}# drift\n`, "utf8");
+
+    const result = await fixture.manager.handle({ action: "install", dryRun: false });
+
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toMatchObject({ state: "untrusted_units" });
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toContain("# drift");
+    expect(fixture.calls).toEqual([]);
   });
 
   it("enables an existing canonical timer only from explicit disabled and inactive state", async () => {
@@ -515,7 +644,6 @@ describe("systemd installer security boundary", () => {
           : call.executable,
       ),
     ).toEqual([
-      "/usr/bin/env",
       "systemctl:is-enabled",
       "systemctl:is-active",
       "systemctl:is-failed",
@@ -550,7 +678,6 @@ describe("systemd installer security boundary", () => {
           : call.executable,
       ),
     ).toEqual([
-      "/usr/bin/env",
       "systemctl:is-enabled",
       "systemctl:is-active",
       "systemctl:is-failed",
@@ -577,7 +704,7 @@ describe("systemd installer security boundary", () => {
 
     expect(result.state).toBe("blocked");
     expect(payload(result.message)).toMatchObject({ state: "timer_state_unknown" });
-    expect(fixture.calls).toHaveLength(4);
+    expect(fixture.calls).toHaveLength(3);
     expect(fixture.calls.some((call) => call.executable === "systemd-analyze")).toBe(false);
     expect(fixture.calls.some((call) => call.arguments[1] === "enable")).toBe(false);
     expect(fixture.calls.some((call) => call.arguments[1] === "disable")).toBe(false);
@@ -597,7 +724,7 @@ describe("systemd installer security boundary", () => {
 
     expect(result.state).toBe("blocked");
     expect(payload(result.message)).toMatchObject({ state: "timer_state_inconsistent" });
-    expect(fixture.calls).toHaveLength(4);
+    expect(fixture.calls).toHaveLength(3);
     expect(fixture.calls.some((call) => call.arguments[1] === "enable")).toBe(false);
     expect(fixture.calls.some((call) => call.arguments[1] === "disable")).toBe(false);
   });
@@ -668,19 +795,16 @@ describe("systemd installer security boundary", () => {
     await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
   });
 
-  it("fails closed before directory writes or systemctl when Runtime preflight is unavailable", async () => {
-    const fixture = await setup((request) => (isRuntimePreflight(request) ? exited(3) : exited()));
+  it("never invokes cycle as installer preflight", async () => {
+    const fixture = await setup((request) => (isCycleCommand(request) ? exited(3) : exited()));
     const preview = await fixture.manager.preview();
     const result = await fixture.manager.handle({ action: "install", dryRun: false });
 
-    expect(result.state).toBe("blocked");
-    expect(payload(result.message)).toMatchObject({
-      state: "runtime_unavailable",
-      preflight: { classification: "exited", exitCode: 3 },
-    });
-    expect(fixture.calls).toHaveLength(1);
-    await expect(readFile(preview.servicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(preview.timerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(result.state).toBe("success");
+    expect(payload(result.message)).toMatchObject({ state: "installed" });
+    expect(fixture.calls.some(isCycleCommand)).toBe(false);
+    await expect(readFile(preview.servicePath, "utf8")).resolves.toBe(preview.service);
+    await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
   });
 
   it("treats marker spoofing and canonical-byte drift as untrusted without overwrite", async () => {
@@ -702,7 +826,7 @@ describe("systemd installer security boundary", () => {
       units: { service: "untrusted", timer: "untrusted" },
     });
     await expect(readFile(preview.servicePath, "utf8")).resolves.toContain("/usr/bin/foreign");
-    expect(fixture.calls.map((call) => call.executable)).toEqual(["/usr/bin/env"]);
+    expect(fixture.calls).toEqual([]);
   });
 
   it("rejects hardlinked canonical-looking units during install and uninstall", async () => {
@@ -722,7 +846,7 @@ describe("systemd installer security boundary", () => {
     expect(payload(uninstall.message)).toMatchObject({ state: "untrusted_units" });
     expect((await stat(preview.servicePath)).nlink).toBe(2);
     await expect(readFile(preview.timerPath, "utf8")).resolves.toBe(preview.timer);
-    expect(fixture.calls.map((call) => call.executable)).toEqual(["/usr/bin/env"]);
+    expect(fixture.calls).toEqual([]);
   });
 
   it("never disables or deletes a mixed canonical and drifted pair during uninstall", async () => {
@@ -1056,7 +1180,6 @@ describe("systemd installer security boundary", () => {
 
   it("reports disabled, inactive, and failed states separately from systemd query errors", async () => {
     const fixture = await setup((request) => {
-      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(1, "disabled\n");
       if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
       if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
@@ -1069,35 +1192,28 @@ describe("systemd installer security boundary", () => {
 
     expect(result.state).toBe("success");
     expect(payload(result.message)).toMatchObject({
-      runtime: "available",
+      runtime: "configured",
+      preflight: "exact_cycle_preview",
       timer: { state: "queried", enabled: "disabled", activity: "inactive" },
     });
   });
 
-  it("reports unavailable Runtime status without treating it as a systemd state", async () => {
-    const fixture = await setup((request) => (isRuntimePreflight(request) ? exited(3) : exited()));
+  it("reports configured exact-cycle preview without executing Runtime", async () => {
+    const fixture = await setup((request) => (isCycleCommand(request) ? exited(3) : exited()));
 
     const result = await fixture.manager.handle({ action: "status" });
 
     expect(result.state).toBe("success");
     expect(payload(result.message)).toMatchObject({
       installation: "not_installed",
-      runtime: "runtime_unavailable",
-      preflight: { classification: "exited", exitCode: 3 },
+      runtime: "configured",
+      preflight: "exact_cycle_preview",
     });
-    expect(fixture.calls).toHaveLength(1);
-    expect(fixture.calls[0]?.environment).toHaveProperty(
-      "SECRET_ACCESS_TOKEN",
-      "never-render-or-run-with-this",
-    );
-    expect(fixture.calls[0]?.arguments).not.toContain(
-      "SECRET_ACCESS_TOKEN=never-render-or-run-with-this",
-    );
+    expect(fixture.calls).toEqual([]);
   });
 
   it("does not collapse a DBus/spawn error into disabled", async () => {
     const fixture = await setup((request) => {
-      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return spawnError();
       return exited();
     });
@@ -1113,7 +1229,6 @@ describe("systemd installer security boundary", () => {
 
   it("reports an unexpected nonzero is-enabled result as unknown rather than disabled", async () => {
     const fixture = await setup((request) => {
-      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(5);
       if (request.arguments[1] === "is-active") return exited(3, "inactive\n");
       if (request.arguments[1] === "is-failed") return exited(1, "inactive\n");
@@ -1131,7 +1246,6 @@ describe("systemd installer security boundary", () => {
 
   it("does not treat a nonzero D-Bus diagnostic as disabled without an explicit state", async () => {
     const fixture = await setup((request) => {
-      if (isRuntimePreflight(request)) return exited();
       if (request.arguments[1] === "is-enabled") return exited(1, "Failed to connect to bus\n");
       return exited();
     });

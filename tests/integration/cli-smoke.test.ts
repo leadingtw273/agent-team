@@ -233,7 +233,10 @@ describe("compiled CLI smoke", () => {
     const afterHealth = await treeFingerprint(environment.AGENT_TEAM_HOME);
 
     expect(preview.status).toBe(0);
-    expect(JSON.parse(preview.stdout)).toMatchObject({ operation: "install", dryRun: true });
+    const renderedInstall = JSON.parse(preview.stdout) as Readonly<Record<string, unknown>>;
+    expect(renderedInstall).toMatchObject({ operation: "install", dryRun: true });
+    expect(renderedInstall["service"]).toContain('"cycle" "--all"');
+    expect(renderedInstall["service"]).not.toContain('"reconcile" "--all"');
     expect(uninstallPreview.status).toBe(0);
     expect(JSON.parse(uninstallPreview.stdout)).toMatchObject({
       operation: "uninstall",
