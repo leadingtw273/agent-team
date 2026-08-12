@@ -802,6 +802,31 @@ describe("runResumeCycle", () => {
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
   });
 
+  it("reruns a fresh Reviewer for an existing success status before merge instead of reusing it", async () => {
+    const { deps, progress, calls } = await harness({
+      beginOutcome: {
+        state: "already_approved",
+        changeRequest: changeRequest(),
+        checks: { headSha, aggregate: "success", checks: [] },
+      },
+    });
+    await seedProgressRecord(progress, { kind: "awaiting_review" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toEqual(ok([{ jobId, outcome: "completed" }]));
+    expect(calls).toEqual([
+      "getChangeRequest",
+      "reviewStatus.begin",
+      "reviewer.run",
+      "reviewStatus.record",
+      "autoMerge.enable",
+      "lifecycle.run",
+    ]);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toEqual({ kind: "completed" });
+  });
+
   it("selection is bound to the inventory revision and never retries a changed candidate", async () => {
     const { deps, progress, calls } = await harness();
     await seedProgressRecord(progress, { kind: "ci_waiting" });
