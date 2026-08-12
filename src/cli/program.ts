@@ -74,6 +74,7 @@ export interface CliHandlers {
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly reconcile: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
+  readonly cycle: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
   readonly health: () => Promise<CliCommandOutcome>;
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
   readonly ui: () => Promise<CliCommandOutcome>;
@@ -136,6 +137,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
+  cycle: () => blocked("cycle"),
   health: () => blocked("health"),
   project: () => blocked("project"),
   ui: () => blocked("ui"),
@@ -177,6 +179,21 @@ function operatorCanaryArgvRejection(argv: readonly string[]): CliCommandOutcome
     message: JSON.stringify({
       operation:
         command === "canary-confirm" ? "operator_canary_confirm" : "operator_canary_status",
+      state: "rejected",
+      reason: "invalid_command_input",
+    }),
+  });
+}
+
+/** `cycle` is an operator-free, fixed invocation: reject every non-exact argv before Commander
+ * can echo an unexpected value or invoke a handler that may create the singleton lock. */
+function controllerCycleArgvRejection(argv: readonly string[]): CliCommandOutcome | undefined {
+  if (argv[0] !== "cycle") return undefined;
+  if (argv.length === 2 && argv[1] === "--all") return undefined;
+  return Object.freeze({
+    state: "rejected" as const,
+    message: JSON.stringify({
+      operation: "controller_cycle",
       state: "rejected",
       reason: "invalid_command_input",
     }),
@@ -329,6 +346,12 @@ export function createProgram(
     .action(() => action(state, io, () => handlers.reconcile({ all: true }))());
 
   program
+    .command("cycle")
+    .description("執行一次全域互斥的 Controller 收斂輪次")
+    .addOption(new Option("--all", "收斂所有已註冊專案").makeOptionMandatory())
+    .action(() => action(state, io, () => handlers.cycle({ all: true }))());
+
+  program
     .command("health")
     .description("顯示 Reconcile 喚醒來源、降級原因與手動路徑")
     .action(action(state, io, handlers.health));
@@ -477,10 +500,10 @@ export async function runCli(
     program.outputHelp();
     return cliExitCodes.success;
   }
-  const canaryArgvRejection = operatorCanaryArgvRejection(argv);
-  if (canaryArgvRejection !== undefined) {
-    state.exitCode = outcomeExitCode(canaryArgvRejection);
-    renderOutcome(canaryArgvRejection, io);
+  const argvRejection = controllerCycleArgvRejection(argv) ?? operatorCanaryArgvRejection(argv);
+  if (argvRejection !== undefined) {
+    state.exitCode = outcomeExitCode(argvRejection);
+    renderOutcome(argvRejection, io);
     return state.exitCode;
   }
   try {

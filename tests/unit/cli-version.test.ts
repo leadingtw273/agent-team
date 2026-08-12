@@ -38,6 +38,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
+    cycle: vi.fn(() => Promise.resolve(outcome)),
     health: vi.fn(() => Promise.resolve(outcome)),
     project: vi.fn(() => Promise.resolve(outcome)),
     ui: vi.fn(() => Promise.resolve(outcome)),
@@ -75,6 +76,7 @@ describe("agent-team CLI contract", () => {
         quota                        受控的 provider quota host 操作
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
         reconcile [options]          對帳本機狀態、事件與權威服務
+        cycle [options]              執行一次全域互斥的 Controller 收斂輪次
         health                       顯示 Reconcile 喚醒來源、降級原因與手動路徑
         project [project-id]         讀取指定專案或列出專案摘要
         ui                           啟動按需 localhost 管理介面
@@ -109,6 +111,7 @@ describe("agent-team CLI contract", () => {
       ),
     ).resolves.toBe(0);
     await expect(runCli(metadata, ["reconcile", "--all"], commands, sink.io)).resolves.toBe(0);
+    await expect(runCli(metadata, ["cycle", "--all"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["health"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["ui"], commands, sink.io)).resolves.toBe(0);
@@ -128,6 +131,7 @@ describe("agent-team CLI contract", () => {
       headersFile: "/tmp/headers.json",
     });
     expect(commands.reconcile).toHaveBeenCalledWith({ all: true });
+    expect(commands.cycle).toHaveBeenCalledWith({ all: true });
     expect(commands.health).toHaveBeenCalledOnce();
     expect(commands.project).toHaveBeenCalledWith({});
     expect(commands.ui).toHaveBeenCalledOnce();
@@ -136,7 +140,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(11));
+    expect(sink.stdout()).toBe("完成\n".repeat(12));
   });
 
   it.each([
