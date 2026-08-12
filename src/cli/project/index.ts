@@ -10,6 +10,10 @@ import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import type { CliCommandOutcome, CliHandlers } from "../program.js";
 import { listHostRegistrationSetupDrafts } from "../registration/draft-store.js";
 import type { RegistrationWakeupStateReader } from "../systemd/index.js";
+import type {
+  GlobalWebhookWakeupStateReader,
+  ProjectWebhookWakeupStateReader,
+} from "../health/webhook-attestation.js";
 
 import { ProjectReadModel, type ProjectReadResult } from "./read-model.js";
 import { serializeProjectPayload } from "./schema.js";
@@ -19,7 +23,8 @@ export * from "./schema.js";
 
 export interface CreateProjectCliHandlersOptions {
   readonly agentTeamHome: string;
-  readonly wakeupReader?: RegistrationWakeupStateReader;
+  readonly systemdReader?: RegistrationWakeupStateReader;
+  readonly webhookReader?: GlobalWebhookWakeupStateReader & ProjectWebhookWakeupStateReader;
 }
 
 function render(result: ProjectReadResult): CliCommandOutcome {
@@ -49,8 +54,9 @@ export function createProjectHandler(
 
 /**
  * Production composition for the `project` read model. Every port is local and read-only: draft
- * discovery, trusted default-branch config/activation read-back, durable progress, Jobs, and
- * Leases. In particular, this deliberately has no Linear, GitHub, provider, or systemd adapter.
+ * discovery, trusted default-branch config/activation read-back, durable progress, Jobs, Leases,
+ * and independently injected timer/webhook evidence readers. It never constructs a provider or
+ * Runtime adapter.
  */
 export function createProjectReadModel(options: CreateProjectCliHandlersOptions): ProjectReadModel {
   const stateRoot = join(options.agentTeamHome, "state");
@@ -63,7 +69,8 @@ export function createProjectReadModel(options: CreateProjectCliHandlersOptions)
     jobs: new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock")),
     leases: new FileLeaseRepository(join(stateRoot, "leases.json"), join(stateRoot, "leases.lock")),
     clock: createClock(),
-    ...(options.wakeupReader === undefined ? {} : { wakeupReader: options.wakeupReader }),
+    ...(options.systemdReader === undefined ? {} : { systemdReader: options.systemdReader }),
+    ...(options.webhookReader === undefined ? {} : { webhookReader: options.webhookReader }),
   });
 }
 

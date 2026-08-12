@@ -541,7 +541,7 @@ describe("T05 project read model", () => {
 
   it("projects a shared active systemd reader as scheduled-only and fails closed on bad reads", async () => {
     const activeReader = { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) };
-    const activeResult = await model({ wakeupReader: activeReader }).read({
+    const activeResult = await model({ systemdReader: activeReader }).read({
       projectId: projectOne.id,
     });
     const activePayload = payload(activeResult);
@@ -566,13 +566,15 @@ describe("T05 project read model", () => {
     const malformedReader = {
       readWakeupState: vi.fn(() => Promise.resolve("not-a-systemd-state" as never)),
     };
-    const malformed = await model({ wakeupReader: malformedReader }).read({
+    const malformed = await model({ systemdReader: malformedReader }).read({
       projectId: projectOne.id,
     });
     const throwingReader = {
       readWakeupState: vi.fn(() => Promise.reject(new Error("project-wakeup-reader-secret"))),
     };
-    const thrown = await model({ wakeupReader: throwingReader }).read({ projectId: projectOne.id });
+    const thrown = await model({ systemdReader: throwingReader }).read({
+      projectId: projectOne.id,
+    });
 
     for (const result of [malformed, thrown]) {
       const text = serializeProjectPayload(result.payload);
@@ -597,10 +599,34 @@ describe("T05 project read model", () => {
     }
   });
 
+  it("projects all 28 independently injected timer/webhook states through the detail read path", async () => {
+    for (const systemd of registrationSystemdWakeupStates) {
+      for (const webhook of registrationWebhookWakeupStates) {
+        const systemdReader = {
+          readWakeupState: vi.fn(() => Promise.resolve(systemd)),
+        };
+        const webhookReader = {
+          readGlobalWebhookWakeupState: vi.fn(() => Promise.resolve(webhook)),
+          readProjectWebhookWakeupState: vi.fn(() => Promise.resolve(webhook)),
+        };
+
+        const rendered = payload(
+          await model({ systemdReader, webhookReader }).read({ projectId: projectOne.id }),
+        );
+        const project = rendered["project"] as Record<string, unknown>;
+
+        expect(project["wakeup"]).toEqual(evaluateRegistrationWakeupHealth({ systemd, webhook }));
+        expect(systemdReader.readWakeupState).toHaveBeenCalledTimes(1);
+        expect(webhookReader.readProjectWebhookWakeupState).toHaveBeenCalledWith(projectOne.id);
+        expect(webhookReader.readGlobalWebhookWakeupState).not.toHaveBeenCalled();
+      }
+    }
+  });
+
   it("rejects every scheduled-only capability and evidence forgery at the serializer boundary", async () => {
     const rendered = payload(
       await model({
-        wakeupReader: { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) },
+        systemdReader: { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) },
       }).read({ projectId: projectOne.id }),
     );
     const forge = (mutate: (wakeup: Record<string, unknown>) => void): Record<string, unknown> => {

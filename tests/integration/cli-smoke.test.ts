@@ -243,6 +243,7 @@ describe("compiled CLI smoke", () => {
     expect(health.status).toBe(0);
     expect(JSON.parse(health.stdout)).toEqual({
       operation: "reconcile_wakeup_status",
+      webhookVerificationScope: "transport_runtime_ingest_inbox_only_not_provider_subscription",
       state: "degraded",
       mode: "manual_reconcile_only",
       capabilities: {
@@ -252,11 +253,11 @@ describe("compiled CLI smoke", () => {
       },
       sources: {
         systemd: { state: "unavailable", evidenceCode: "systemd_timer_not_installed" },
-        webhook: { state: "unknown", evidenceCode: "webhook_runtime_unknown" },
+        webhook: { state: "unavailable", evidenceCode: "webhook_runtime_unconfigured" },
       },
       evidenceCodes: [
         "systemd_timer_not_installed",
-        "webhook_runtime_unknown",
+        "webhook_runtime_unconfigured",
         "manual_reconcile_required",
       ],
     });
@@ -356,16 +357,29 @@ exit 64
         "manual_reconcile_required",
       ],
     };
+    const expectedDetailWakeup = {
+      ...expectedWakeup,
+      sources: {
+        systemd: { state: "available", evidenceCode: "systemd_timer_active" },
+        webhook: { state: "unavailable", evidenceCode: "webhook_runtime_unconfigured" },
+      },
+      evidenceCodes: [
+        "systemd_timer_active",
+        "webhook_runtime_unconfigured",
+        "manual_reconcile_required",
+      ],
+    };
     expect(health).toMatchObject({ status: 0, stderr: "" });
     expect(JSON.parse(health.stdout)).toEqual({
       operation: "reconcile_wakeup_status",
+      webhookVerificationScope: "transport_runtime_ingest_inbox_only_not_provider_subscription",
       ...expectedWakeup,
     });
     expect(detail).toMatchObject({ status: 0, stderr: "" });
     expect(JSON.parse(detail.stdout)).toMatchObject({
       operation: "project_detail",
       state: "degraded",
-      project: { wakeup: expectedWakeup },
+      project: { wakeup: expectedDetailWakeup },
     });
     expect(after).toEqual(before);
 

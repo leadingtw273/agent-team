@@ -19,6 +19,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createWakeupHealthHandler } from "../../src/cli/health/index.js";
 import {
+  evaluateRegistrationWakeupHealth,
+  registrationSystemdWakeupStates,
+  registrationWebhookWakeupStates,
+} from "../../src/application/registration/index.js";
+import {
   SystemdManager,
   runtimeEnvironmentNames,
   systemdUnitNames,
@@ -1238,13 +1243,14 @@ describe("systemd installer security boundary", () => {
 
   it("reports an active timer as scheduled-only health until webhook Runtime is authoritative", async () => {
     const reader = { readWakeupState: vi.fn(() => Promise.resolve("active" as const)) };
-    const handler = createWakeupHealthHandler({ reader });
+    const handler = createWakeupHealthHandler({ systemdReader: reader });
 
     const result = await handler();
 
     expect(reader.readWakeupState).toHaveBeenCalledTimes(1);
     expect(payload(result.message)).toEqual({
       operation: "reconcile_wakeup_status",
+      webhookVerificationScope: "transport_runtime_ingest_inbox_only_not_provider_subscription",
       state: "degraded",
       mode: "scheduled_reconcile_only",
       capabilities: {
@@ -1262,5 +1268,43 @@ describe("systemd installer security boundary", () => {
         "manual_reconcile_required",
       ],
     });
+  });
+
+  it("projects all 28 separately injected timer/webhook health combinations without widening either reader", async () => {
+    for (const systemd of registrationSystemdWakeupStates) {
+      for (const webhook of registrationWebhookWakeupStates) {
+        const systemdReader = {
+          readWakeupState: vi.fn(() => Promise.resolve(systemd)),
+        };
+        const webhookReader = {
+          readGlobalWebhookWakeupState: vi.fn(() => Promise.resolve(webhook)),
+        };
+        const result = await createWakeupHealthHandler({ systemdReader, webhookReader })();
+
+        expect(payload(result.message)).toEqual({
+          operation: "reconcile_wakeup_status",
+          webhookVerificationScope: "transport_runtime_ingest_inbox_only_not_provider_subscription",
+          ...evaluateRegistrationWakeupHealth({ systemd, webhook }),
+        });
+        expect(systemdReader.readWakeupState).toHaveBeenCalledTimes(1);
+        expect(webhookReader.readGlobalWebhookWakeupState).toHaveBeenCalledTimes(1);
+      }
+    }
+  });
+
+  it("fails closed when either independently injected reader returns a malformed state", async () => {
+    const malformedSystemd = createWakeupHealthHandler({
+      systemdReader: { readWakeupState: () => Promise.resolve("forged" as never) },
+      webhookReader: { readGlobalWebhookWakeupState: () => Promise.resolve("verified") },
+    });
+    const malformedWebhook = createWakeupHealthHandler({
+      systemdReader: { readWakeupState: () => Promise.resolve("active") },
+      webhookReader: { readGlobalWebhookWakeupState: () => Promise.resolve("forged" as never) },
+    });
+
+    const malformedSystemdResult = await malformedSystemd();
+    const malformedWebhookResult = await malformedWebhook();
+    expect(malformedSystemdResult.message).toContain("systemd_status_unknown");
+    expect(malformedWebhookResult.message).toContain("webhook_runtime_unknown");
   });
 });
