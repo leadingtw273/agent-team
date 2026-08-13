@@ -8,8 +8,9 @@
  *
  * Scope: this wires discovery -> eligibility -> quota admission -> provider liveness -> issue
  * admission -> lease -> job creation. T03A adds a fail-closed quota boundary before every durable
- * claim. The default production composition has no trusted collector yet, so model work remains
- * waiting with `quota_unknown`; tests and controlled canaries may inject a policy-backed port.
+ * claim. QP02 supplies the Claude-only production collector when the private host config is
+ * trusted; absent/invalid/stale evidence remains `quota_unknown`. Tests may still inject a
+ * controlled policy-backed port.
  *
  * A real invocation against typical Linear-discovered work can still end in `kind:"waiting"` for
  * independent reasons -- do not assume fixing one fixes the others:
@@ -59,6 +60,7 @@ import {
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
 import { FileOperatorCanaryAttestationStore } from "../../adapters/dispatch/operator-canary-attestation-store.js";
+import type { ClaudeQuotaCollector } from "../../adapters/providers/claude/index.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
 import { LinearMutationClient } from "../../adapters/linear/write.js";
@@ -89,7 +91,7 @@ import {
   type ModelRoutingConfig,
 } from "../../application/routing/index.js";
 import type { JobRepository } from "../../application/dispatch/index.js";
-import type { DomainError } from "../../domain/foundation/index.js";
+import type { Clock, DomainError } from "../../domain/foundation/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import {
@@ -102,11 +104,8 @@ import {
   consumeExactOperatorCanaryCandidate,
   hasNormalModelAdmissionCandidate,
 } from "./operator-canary-attestation.js";
-import {
-  applyProviderLiveness,
-  createFailClosedNewJobQuotaAdmission,
-  observeQuotaRouteCandidates,
-} from "./quota-admission.js";
+import { applyProviderLiveness, observeQuotaRouteCandidates } from "./quota-admission.js";
+import { createProductionQuotaAdmission } from "./quota-composition.js";
 import {
   defaultDispatchProviderConfigPath,
   loadHostDispatchProviderConfig,
@@ -206,6 +205,9 @@ export interface BuildDispatchCompositionOptions {
   readonly claudeProcessPort?: ProcessPort;
   /** Test/canary seam only. Production deliberately defaults to collector_unavailable. */
   readonly quotaAdmissionPort?: NewJobQuotaAdmissionPort;
+  /** QP02 test seams; production always uses the real Claude collector and wall clock. */
+  readonly quotaCollector?: ClaudeQuotaCollector;
+  readonly quotaClock?: Clock;
   /** Test seam for Q01's independent, project-and-opaque-issue scoped attestation store. */
   readonly operatorCanaryStore?: FileOperatorCanaryAttestationStore;
 }
@@ -500,6 +502,17 @@ export async function buildDispatchComposition(
     join(stateRoot, "leases.lock"),
   );
   const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
+  const claudeProcess = options.claudeProcessPort ?? new ChildProcessRunner();
+  const quotaAdmission =
+    options.quotaAdmissionPort ??
+    (await createProductionQuotaAdmission({
+      agentTeamHome,
+      claudeProcess,
+      claudeExecutable: providerConfig.value.claude.executable,
+      workingDirectory: readyEntry.project.localRepositoryPath,
+      ...(options.quotaCollector === undefined ? {} : { collector: options.quotaCollector }),
+      ...(options.quotaClock === undefined ? {} : { clock: options.quotaClock }),
+    }));
 
   return Object.freeze({
     state: "ready",
@@ -523,9 +536,9 @@ export async function buildDispatchComposition(
       trustedConfig: readyEntry.config,
       claude: Object.freeze({
         config: providerConfig.value.claude,
-        process: options.claudeProcessPort ?? new ChildProcessRunner(),
+        process: claudeProcess,
       }),
-      quotaAdmission: options.quotaAdmissionPort ?? createFailClosedNewJobQuotaAdmission(),
+      quotaAdmission,
       operatorCanary: Object.freeze({
         store: options.operatorCanaryStore ?? new FileOperatorCanaryAttestationStore(agentTeamHome),
       }),

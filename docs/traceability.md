@@ -156,6 +156,7 @@ Foundation Gate 在同步 main 上完成 lint、typecheck、unit、contract、in
 | R008 | PR #44，Merge `8b9f8fe` | 七大危險類別、相似命令同類、未知 fail-closed、專案長期允許仍稽核、Process 前攔截 |
 | R009 | PR #45，Merge `9dc10e5` | Preflight→WIP Commit／Push→私有 YAML→Linear 摘要；Push／Crash 失敗仍保留可復航 Checkpoint |
 | QP01 | Quota Probe Spec v2／本分支 | Claude Status Line＋stable auth/version bounded epoch；Codex App Server weekly-only partial；private `quota probe-status` 零 admission／Job／Lease／model turn |
+| QP02 | Quota Probe Spec v2／本分支 | Claude full/fresh接既有policy-backed new-Job admission；quota先於liveness/claim/Lease/Job；Codex未接admission；Q01 exact fallback語意不變 |
 
 Track B Gate 在 main `9dc10e5` 上重跑 10 個相關測試檔、97／97 通過；R009 合併後 main CI Run `30957008043` 通過完整品質 Gate。R007-R009 各 PR 均綁定精確 Head SHA、CI 與 `agent-team/review` status；因本 session 的 Claude review 路徑持續回傳空結果，這三張採目前 Agent 的獨立 AC pass，並已在各 PR 證據留言揭露非 fresh-context 限制。
 

@@ -168,6 +168,12 @@ regular、single-link、mode `0600` 的strict v1 JSON。`full`／`partial`／`un
 不是既有domain quota decision。QP01不讀、不建立、不延長Q01 canary attestation，也不建立claim、Lease、
 Job或provider work。
 
+QP02 production dispatch只在同次Claude collection得到`full`、CLI version/account一致，且`observedAt`
+未超過private config freshness時，才把樣本交給既有policy-backed admission。weekly used達80%或five-hour
+remaining為0時blocked；partial、stale、config/schema/account/version不可信時都在provider liveness、claim、
+Lease與Job之前回`quota_unknown`。Codex仍只是diagnostic，不接production admission。一般route不可用時，
+既有Q01 exact one-time fallback仍是唯一例外，且normal ready route永不讀或消耗Q01。
+
 ## 7. 執行監看與狀態翻譯
 
 Host 讀取 Controller、CLI、Linear 與 GitHub 已存在的權威摘要，將 blocked、degraded、unknown、失敗與
