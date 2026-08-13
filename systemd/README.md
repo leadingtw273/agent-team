@@ -10,6 +10,25 @@ and compiled CLI entrypoint that passed the zero-side-effect install preview.
 It is the fallback for a missing or failed Webhook wake-up, not a second scheduler: Webhook Runtime
 and this timer enter the same short-lived, singleton Controller cycle.
 
+## Node or nvm upgrades
+
+Canonical unit bytes are deliberately bound to the absolute `process.execPath` used by the
+installer, including its directory's first `PATH` segment. If that Node executable or path changes
+(including an nvm version switch), run `agent-team systemd install` using the new Node; changing a
+symlink or expecting `status` to accept the old unit is not a supported upgrade path.
+
+Keep the old Node available until the new unit has completed a one-shot Controller cycle
+successfully. The operator-owned cutover sequence is:
+
+1. Run `agent-team systemd install --dry-run` (or `--preview`) with the new Node and inspect the
+   exact rendered `cycle --all` command.
+2. Run `agent-team systemd install` with that same new Node.
+3. Run `agent-team systemd status` and read back the unit: it must retain the exact `cycle --all`
+   command and report an enabled, active timer.
+
+If the installer reports `untrusted_units`, stop. It must not overwrite the existing pair; use an
+operator-owned migration or rollback procedure instead of forcing a replacement.
+
 Use `agent-team systemd install --dry-run` (or `--preview`) to inspect the rendered unit contents
 without writing files or running systemd commands. Ownership is the complete canonical bytes of
 both rendered units, not the public comment marker. A missing, mixed, drifted, symlinked, or
@@ -29,7 +48,9 @@ complete identity immediately after proving the remaining generation fields are 
 later pre-delete check uses that new complete identity.
 
 The service does not use `Environment=` as an allowlist. Its `ExecStart` is an exact absolute
-`/usr/bin/env -i` command: `-i` is followed by `PATH`, `HOME`,
+`/usr/bin/env -i` command: `-i` is followed by a machine-stable `PATH` made from the
+currently executing Node binary directory, `$HOME/.local/bin`, and fixed standard Linux
+directories (never the invoking shell's `PATH`), then `HOME`,
 `XDG_CONFIG_HOME`, and, when set, `XDG_RUNTIME_DIR` and `AGENT_TEAM_HOME`, then the absolute Node
 and compiled CLI paths followed by only `cycle --all`. The install preflight is the rendered exact
 command check; it never starts a cycle or dispatches work. Every argument uses systemd `ExecStart`

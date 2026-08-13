@@ -282,7 +282,7 @@ describe("compiled CLI smoke", () => {
     roots.push(root);
     const repository = join(root, "repository");
     const agentTeamHome = join(root, ".agent-team");
-    const fakeBin = join(root, "fake-bin");
+    const fakeBin = join(root, "home", ".local", "bin");
     const counter = join(root, "systemctl-counter");
     const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
     const environment = {
@@ -290,7 +290,7 @@ describe("compiled CLI smoke", () => {
       HOME: join(root, "home"),
       XDG_CONFIG_HOME: join(root, "xdg-config"),
       AGENT_TEAM_HOME: agentTeamHome,
-      PATH: fakeBin,
+      PATH: join(root, "caller-path-that-must-not-render"),
     };
     const unitDirectory = join(environment.XDG_CONFIG_HOME, "systemd", "user");
     await mkdir(fakeBin, { recursive: true, mode: 0o700 });
