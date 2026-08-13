@@ -17,6 +17,9 @@
 import { randomUUID } from "node:crypto";
 
 import type { CliHandlers } from "../program.js";
+import { createClaudeQuotaCollector } from "../../adapters/providers/claude/index.js";
+import { createCodexQuotaCollector } from "../../adapters/providers/codex/index.js";
+import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
@@ -75,6 +78,7 @@ import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { resumeExistingProjectJobs } from "./resume-existing.js";
+import { createQuotaProbeStatusHandler } from "../quota/index.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -288,9 +292,22 @@ export function createDispatchCliHandlers(
   const generateHolderId = options.generateHolderId ?? (() => `cli-dispatch:${randomUUID()}`);
   const clock = options.clock ?? createClock();
   const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
-  const quota = createOperatorCanaryCliHandlers({
+  const operatorCanary = createOperatorCanaryCliHandlers({
     agentTeamHome: options.agentTeamHome,
     clock,
+  });
+  const quota = Object.freeze({
+    ...operatorCanary,
+    probeStatus: createQuotaProbeStatusHandler({
+      agentTeamHome: options.agentTeamHome,
+      clock,
+      claude: createClaudeQuotaCollector({
+        process: new ChildProcessRunner(),
+        workingDirectory: process.cwd(),
+        clock,
+      }),
+      codex: createCodexQuotaCollector({ clock }),
+    }),
   });
 
   // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/

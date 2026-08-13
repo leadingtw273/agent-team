@@ -47,6 +47,9 @@ export interface RegistrationCliHandlers {
 export interface QuotaCliHandlers {
   readonly canaryConfirm: () => Promise<CliCommandOutcome>;
   readonly canaryStatus: () => Promise<CliCommandOutcome>;
+  readonly probeStatus?: (
+    input: Readonly<{ provider: "claude" | "codex" | "all" }>,
+  ) => Promise<CliCommandOutcome>;
 }
 
 export interface CliHandlers {
@@ -128,6 +131,15 @@ const defaultQuotaHandlers: QuotaCliHandlers = Object.freeze({
         reason: "runtime_unavailable",
       }),
     }),
+  probeStatus: () =>
+    Promise.resolve({
+      state: "blocked" as const,
+      message: JSON.stringify({
+        schema: "agent-team-quota-probe-status",
+        version: 1,
+        results: [{ provider: "all", state: "unknown", reason: "runtime_unavailable" }],
+      }),
+    }),
 });
 
 export const defaultCliHandlers: CliHandlers = Object.freeze({
@@ -179,6 +191,28 @@ function operatorCanaryArgvRejection(argv: readonly string[]): CliCommandOutcome
     message: JSON.stringify({
       operation:
         command === "canary-confirm" ? "operator_canary_confirm" : "operator_canary_status",
+      state: "rejected",
+      reason: "invalid_command_input",
+    }),
+  });
+}
+
+/** The diagnostic provider is a closed allowlist. Reject every other argv shape before Commander
+ * can echo an operator-supplied value into stderr. */
+function quotaProbeArgvRejection(argv: readonly string[]): CliCommandOutcome | undefined {
+  if (argv[0] !== "quota" || argv[1] !== "probe-status") return undefined;
+  if (
+    argv.length === 4 &&
+    argv[2] === "--provider" &&
+    (argv[3] === "claude" || argv[3] === "codex" || argv[3] === "all")
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    state: "rejected" as const,
+    message: JSON.stringify({
+      schema: "agent-team-quota-probe-status",
+      version: 1,
       state: "rejected",
       reason: "invalid_command_input",
     }),
@@ -327,6 +361,24 @@ export function createProgram(
     .command("canary-status")
     .description("以嚴格 stdin JSON 驗證一次 Claude-only operator canary attestation")
     .action(action(state, io, handlers.quota.canaryStatus));
+  quota
+    .command("probe-status")
+    .description("唯讀觀測官方 Claude／Codex 額度來源，不建立 model turn")
+    .addOption(
+      new Option("--provider <provider>", "額度來源")
+        .choices(["claude", "codex", "all"])
+        .makeOptionMandatory(),
+    )
+    .action((options: Readonly<{ provider: "claude" | "codex" | "all" }>) =>
+      action(
+        state,
+        io,
+        () =>
+          (handlers.quota.probeStatus ?? defaultQuotaHandlers.probeStatus)?.({
+            provider: options.provider,
+          }) ?? blocked("quota probe-status"),
+      )(),
+    );
 
   program
     .command("ingest")
@@ -500,7 +552,10 @@ export async function runCli(
     program.outputHelp();
     return cliExitCodes.success;
   }
-  const argvRejection = controllerCycleArgvRejection(argv) ?? operatorCanaryArgvRejection(argv);
+  const argvRejection =
+    controllerCycleArgvRejection(argv) ??
+    operatorCanaryArgvRejection(argv) ??
+    quotaProbeArgvRejection(argv);
   if (argvRejection !== undefined) {
     state.exitCode = outcomeExitCode(argvRejection);
     renderOutcome(argvRejection, io);

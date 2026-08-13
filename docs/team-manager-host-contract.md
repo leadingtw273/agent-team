@@ -151,6 +151,23 @@ Controller、Ready Gate、quota、lease、pipeline、merge 或 danger-approval �
 T13 仍是 blocked；本例外不解除 T13、production approval route 或任何未知／衝突／解析失敗的
 fail-closed 行為。
 
+### 6.3 QP01：被動 quota diagnostic
+
+`agent-team quota probe-status --provider claude|codex|all` 是 private、唯讀的 host diagnostic。
+Claude collector 固定在同一 bounded epoch 讀取 `auth status --json`、exact CLI version 與 owner-only
+Status Line snapshot，再重讀 version／auth；它不呼叫 `claude -p`、不建立 prompt，也不把 email、org id、
+session id、snapshot path 或 raw stderr輸出。Status Line 只會隨既有真 Claude response更新；stale時回
+`unknown`，host不得為刷新而偷偷建立 model turn。
+
+Codex collector只使用官方 App Server `initialize`、`account/read`、`account/rateLimits/read` 與第二次
+`account/read`；不得建立 thread、turn、prompt或使用 reset credit。目前即使讀到weekly bucket也固定是
+`partial`，不具有 admission authority；未來觀察到five-hour仍不得由本命令自動升為full。
+
+設定檔固定為 `${AGENT_TEAM_HOME}/config/quota.json`，必須是canonical absolute path下、effective uid所有、
+regular、single-link、mode `0600` 的strict v1 JSON。`full`／`partial`／`unknown`是diagnostic taxonomy，
+不是既有domain quota decision。QP01不讀、不建立、不延長Q01 canary attestation，也不建立claim、Lease、
+Job或provider work。
+
 ## 7. 執行監看與狀態翻譯
 
 Host 讀取 Controller、CLI、Linear 與 GitHub 已存在的權威摘要，將 blocked、degraded、unknown、失敗與
