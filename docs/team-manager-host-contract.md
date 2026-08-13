@@ -174,6 +174,20 @@ remaining為0時blocked；partial、stale、config/schema/account/version不可�
 Lease與Job之前回`quota_unknown`。Codex仍只是diagnostic，不接production admission。一般route不可用時，
 既有Q01 exact one-time fallback仍是唯一例外，且normal ready route永不讀或消耗Q01。
 
+QP03只擴充上述**新 Job admission**，不改QP01診斷命令：當owner-only quota config明確啟用
+`claude.activeRefresh`，且strict snapshot缺失／不可信或`observedAt`已超過60秒，Controller會在claim、Lease、
+Job與provider liveness之前，以受控PTY啟動一個Haiku無工具單回合。固定prompt只要求`OK`；模型文字、ANSI／
+TUI與`rate_limit_event`都不是額度證據。只有Status Line寫出晚於本輪開始、且重新通過strict檔案、雙bucket、
+A2/V2 account/version guard的snapshot才可交給既有policy。45秒內未完成、process非零／signal、snapshot未前進、
+單bucket、auth/version漂移一律`quota_unknown`。同一process的並行admission共用singleflight，60秒內的Webhook
+重送不得再花一個model turn。
+
+`activeRefresh.workingDirectory`必須是canonical absolute受控目錄，避免用Linear issue所屬repo或外部內容作
+probe context。互動式Claude可能留下本機resumable session metadata；固定name為
+`agent-team-quota-refresh`，不得把session URL／id或TUI寫入log。Claude CLI仍採exact受信版本：升版後先跑固定
+fake PTY、strict snapshot及一次operator live smoke，通過後才更新private config；不得用未驗證semver range
+自動放行。
+
 ## 7. 執行監看與狀態翻譯
 
 Host 讀取 Controller、CLI、Linear 與 GitHub 已存在的權威摘要，將 blocked、degraded、unknown、失敗與

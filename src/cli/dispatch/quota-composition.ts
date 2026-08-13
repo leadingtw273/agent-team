@@ -1,7 +1,9 @@
 import {
   createClaudeQuotaCollector,
+  createClaudeQuotaRefresher,
   type ClaudeQuotaCollector,
   type ClaudeQuotaDiagnosticResult,
+  type ClaudeQuotaRefresher,
 } from "../../adapters/providers/claude/index.js";
 import type {
   PlatformIdentity,
@@ -23,6 +25,7 @@ import {
 import { createFailClosedNewJobQuotaAdmission } from "./quota-admission.js";
 
 type ClaudeFullResult = Extract<ClaudeQuotaDiagnosticResult, { state: "full" }>;
+const activeRefreshAfterMs = 60_000;
 
 function snapshot(result: ClaudeFullResult): QuotaSnapshot {
   const identity = Object.freeze({
@@ -63,19 +66,48 @@ function snapshot(result: ClaudeFullResult): QuotaSnapshot {
  * immediate readCached call; failures clear it. Concurrent callers share one in-flight epoch. */
 class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
   readonly #collector: ClaudeQuotaCollector;
+  readonly #refresher: ClaudeQuotaRefresher | undefined;
   readonly #config: QuotaHostConfig["claude"];
+  readonly #clock: Clock;
   #inFlight: Promise<ClaudeFullResult | undefined> | undefined;
   #latest: ClaudeFullResult | undefined;
 
-  constructor(collector: ClaudeQuotaCollector, config: QuotaHostConfig["claude"]) {
+  constructor(
+    collector: ClaudeQuotaCollector,
+    config: QuotaHostConfig["claude"],
+    clock: Clock,
+    refresher?: ClaudeQuotaRefresher,
+  ) {
     this.#collector = collector;
     this.#config = config;
+    this.#clock = clock;
+    this.#refresher = refresher;
+  }
+
+  #needsActiveRefresh(result: ClaudeQuotaDiagnosticResult): boolean {
+    if (this.#refresher === undefined) return false;
+    if (result.state === "unknown") {
+      return result.reason === "snapshot_stale" || result.reason === "snapshot_unavailable";
+    }
+    const age = Date.parse(this.#clock.now()) - Date.parse(result.observedAt);
+    return Number.isFinite(age) && age > activeRefreshAfterMs;
   }
 
   async #collect(): Promise<ClaudeFullResult | undefined> {
     if (this.#inFlight !== undefined) return this.#inFlight;
     const epoch = this.#collector
       .collect(this.#config)
+      .then(async (initial) => {
+        if (!this.#needsActiveRefresh(initial) || this.#refresher === undefined) return initial;
+        const refreshed = await this.#refresher.refresh(this.#config);
+        return refreshed.state === "refreshed"
+          ? this.#collector.collect(this.#config)
+          : Object.freeze({
+              provider: "claude" as const,
+              state: "unknown" as const,
+              reason: "snapshot_unavailable" as const,
+            });
+      })
       .then((result) => {
         const full = result.state === "full" ? result : undefined;
         this.#latest = full;
@@ -134,6 +166,7 @@ export interface CreateProductionQuotaAdmissionOptions {
   readonly workingDirectory: string;
   readonly clock?: Clock;
   readonly collector?: ClaudeQuotaCollector;
+  readonly refresher?: ClaudeQuotaRefresher;
 }
 
 export async function createProductionQuotaAdmission(
@@ -150,7 +183,20 @@ export async function createProductionQuotaAdmission(
       workingDirectory: options.workingDirectory,
       clock,
     });
-  const bridge = new ClaudeQuotaEpochBridge(collector, config.value.claude);
+  const activeRefresh = config.value.claude.activeRefresh;
+  const refresher =
+    options.refresher ??
+    (options.collector === undefined && activeRefresh?.enabled === true
+      ? createClaudeQuotaRefresher({
+          process: options.claudeProcess,
+          ...(options.claudeExecutable === undefined
+            ? {}
+            : { claudeExecutable: options.claudeExecutable }),
+          workingDirectory: activeRefresh.workingDirectory,
+          clock,
+        })
+      : undefined);
+  const bridge = new ClaudeQuotaEpochBridge(collector, config.value.claude, clock, refresher);
   return new PolicyBackedNewJobQuotaAdmission(
     bridge,
     bridge,

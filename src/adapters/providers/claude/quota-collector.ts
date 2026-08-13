@@ -294,20 +294,21 @@ function fingerprint(orgId: string): string {
     .digest("hex");
 }
 
-async function readSnapshot(
-  path: string,
-  expectedUid: number,
-  now: Instant,
-  maxSampleAgeMs: number,
-): Promise<
+export type ClaudeStatusSnapshotReadResult =
   | Readonly<{
       state: "ready";
       observedAt: Instant;
       weekly: Readonly<{ remainingPercent: number; resetsAt: Instant }>;
       fiveHour: Readonly<{ remainingPercent: number; resetsAt: Instant }>;
     }>
-  | Readonly<{ state: "unavailable" | "stale" }>
-> {
+  | Readonly<{ state: "unavailable" | "stale" }>;
+
+export async function readClaudeStatusSnapshot(
+  path: string,
+  expectedUid: number,
+  now: Instant,
+  maxSampleAgeMs: number,
+): Promise<ClaudeStatusSnapshotReadResult> {
   try {
     const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
@@ -428,7 +429,7 @@ export function createClaudeQuotaCollector(
           reason: "version_unavailable",
         });
       }
-      const snapshot = await readSnapshot(
+      const snapshot = await readClaudeStatusSnapshot(
         config.statusSnapshotPath,
         expectedUid,
         clock.now(),

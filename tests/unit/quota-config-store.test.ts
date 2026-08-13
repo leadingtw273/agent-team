@@ -18,6 +18,10 @@ function value() {
       weeklyUsageLimitPercent: 80,
       terminalRemainingPercent: 3,
       maxSampleAgeMs: 300_000,
+      activeRefresh: {
+        enabled: true,
+        workingDirectory: "/operator/agent-team",
+      },
     },
     codex: { diagnosticEnabled: true, expectedCliVersion: "0.147.0" },
   };
@@ -50,12 +54,15 @@ describe("quota host config", () => {
     const noncanonicalValue = value();
     noncanonicalValue.claude.statusSnapshotPath = "/operator/a/../latest.json";
     const noncanonical = await fixture(noncanonicalValue);
+    const noncanonicalRefreshValue = value();
+    noncanonicalRefreshValue.claude.activeRefresh.workingDirectory = "/operator/a/../agent-team";
+    const noncanonicalRefresh = await fixture(noncanonicalRefreshValue);
     const insecure = await fixture();
     await chmod(insecure, 0o644);
     const target = await fixture();
     const link = join(target, "..", "quota-link.json");
     await symlink(target, link);
-    for (const path of [extra, noncanonical, insecure, link]) {
+    for (const path of [extra, noncanonical, noncanonicalRefresh, insecure, link]) {
       await expect(readQuotaHostConfig(path)).resolves.toEqual({
         ok: false,
         reason: "config_unavailable",

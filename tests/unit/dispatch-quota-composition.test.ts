@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ClaudeQuotaCollector,
   ClaudeQuotaDiagnosticResult,
+  ClaudeQuotaRefresher,
 } from "../../src/adapters/providers/claude/index.js";
 import type { ProcessPort } from "../../src/application/ports/index.js";
 import { createProductionQuotaAdmission } from "../../src/cli/dispatch/quota-composition.js";
@@ -83,11 +84,100 @@ function collector(
   return { collect: vi.fn(implementation) };
 }
 
+function refresher(
+  implementation: ClaudeQuotaRefresher["refresh"],
+): ClaudeQuotaRefresher & { refresh: ReturnType<typeof vi.fn> } {
+  return { refresh: vi.fn(implementation) };
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
 describe("production Claude quota admission composition", () => {
+  it("actively refreshes evidence older than 60 seconds and singleflights concurrent resolves", async () => {
+    const old = parseInstant("2026-08-13T07:13:59.000Z");
+    if (!old.ok) throw new Error(old.error.code);
+    let collected = 0;
+    const source = collector(() =>
+      Promise.resolve(collected++ === 0 ? full(90, 80, old.value) : full()),
+    );
+    const active = refresher(() =>
+      Promise.resolve({ state: "refreshed", reason: "snapshot_refreshed" }),
+    );
+    const admission = await createProductionQuotaAdmission({
+      agentTeamHome: await home(),
+      claudeProcess: neverProcess,
+      workingDirectory: "/tmp",
+      collector: source,
+      refresher: active,
+      clock,
+    });
+
+    await expect(
+      Promise.all([
+        admission.resolve("claude"),
+        admission.resolve("claude"),
+        admission.resolve("claude"),
+      ]),
+    ).resolves.toEqual([
+      { state: "ready", reason: "quota_confirmed" },
+      { state: "ready", reason: "quota_confirmed" },
+      { state: "ready", reason: "quota_confirmed" },
+    ]);
+    expect(active.refresh.mock.calls).toHaveLength(1);
+    expect(source.collect.mock.calls).toHaveLength(2);
+  });
+
+  it("does not refresh evidence exactly 60 seconds old", async () => {
+    const boundary = parseInstant("2026-08-13T07:14:00.000Z");
+    if (!boundary.ok) throw new Error(boundary.error.code);
+    const active = refresher(() => {
+      throw new Error("boundary evidence must be reused");
+    });
+    const admission = await createProductionQuotaAdmission({
+      agentTeamHome: await home(),
+      claudeProcess: neverProcess,
+      workingDirectory: "/tmp",
+      collector: collector(() => Promise.resolve(full(90, 80, boundary.value))),
+      refresher: active,
+      clock,
+    });
+    await expect(admission.resolve("claude")).resolves.toEqual({
+      state: "ready",
+      reason: "quota_confirmed",
+    });
+    expect(active.refresh.mock.calls).toHaveLength(0);
+  });
+
+  it("fails closed when active refresh cannot produce evidence", async () => {
+    const active = refresher(() =>
+      Promise.resolve({ state: "failed", reason: "snapshot_not_refreshed" }),
+    );
+    let collected = 0;
+    const source = collector(() =>
+      Promise.resolve(
+        collected++ === 0
+          ? { provider: "claude", state: "unknown", reason: "snapshot_stale" }
+          : full(),
+      ),
+    );
+    const admission = await createProductionQuotaAdmission({
+      agentTeamHome: await home(),
+      claudeProcess: neverProcess,
+      workingDirectory: "/tmp",
+      collector: source,
+      refresher: active,
+      clock,
+    });
+    await expect(admission.resolve("claude")).resolves.toEqual({
+      state: "quota_unknown",
+      reason: "runtime_context_unavailable",
+    });
+    expect(active.refresh.mock.calls).toHaveLength(1);
+    expect(source.collect.mock.calls).toHaveLength(1);
+  });
+
   it("admits a fresh full snapshot and singleflights concurrent resolutions", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {

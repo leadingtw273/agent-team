@@ -27,6 +27,13 @@ export const quotaHostConfigSchema = z
         weeklyUsageLimitPercent: z.number().positive().max(100),
         terminalRemainingPercent: z.number().min(0).max(100),
         maxSampleAgeMs: z.number().int().positive(),
+        activeRefresh: z
+          .object({
+            enabled: z.boolean(),
+            workingDirectory: canonicalAbsolutePath,
+          })
+          .strict()
+          .optional(),
       })
       .strict(),
     codex: z

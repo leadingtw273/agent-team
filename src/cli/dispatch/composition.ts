@@ -60,7 +60,10 @@ import {
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
 import { FileOperatorCanaryAttestationStore } from "../../adapters/dispatch/operator-canary-attestation-store.js";
-import type { ClaudeQuotaCollector } from "../../adapters/providers/claude/index.js";
+import type {
+  ClaudeQuotaCollector,
+  ClaudeQuotaRefresher,
+} from "../../adapters/providers/claude/index.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
 import { LinearMutationClient } from "../../adapters/linear/write.js";
@@ -207,6 +210,7 @@ export interface BuildDispatchCompositionOptions {
   readonly quotaAdmissionPort?: NewJobQuotaAdmissionPort;
   /** QP02 test seams; production always uses the real Claude collector and wall clock. */
   readonly quotaCollector?: ClaudeQuotaCollector;
+  readonly quotaRefresher?: ClaudeQuotaRefresher;
   readonly quotaClock?: Clock;
   /** Test seam for Q01's independent, project-and-opaque-issue scoped attestation store. */
   readonly operatorCanaryStore?: FileOperatorCanaryAttestationStore;
@@ -511,6 +515,7 @@ export async function buildDispatchComposition(
       claudeExecutable: providerConfig.value.claude.executable,
       workingDirectory: readyEntry.project.localRepositoryPath,
       ...(options.quotaCollector === undefined ? {} : { collector: options.quotaCollector }),
+      ...(options.quotaRefresher === undefined ? {} : { refresher: options.quotaRefresher }),
       ...(options.quotaClock === undefined ? {} : { clock: options.quotaClock }),
     }));
 
