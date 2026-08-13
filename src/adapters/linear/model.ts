@@ -116,6 +116,7 @@ export interface LinearIssueSnapshot {
 export const linearWorkStatusNames = {
   backlog: "待辦",
   ready: "待執行",
+  requires_manual: "需人工",
   in_progress: "進行中",
   in_review: "審查中",
   completed: "已完成",

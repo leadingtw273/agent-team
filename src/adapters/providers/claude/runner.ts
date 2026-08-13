@@ -22,6 +22,7 @@ import {
   type DomainError,
   type Result,
 } from "../../../domain/foundation/index.js";
+import { claudeAllowedToolsForRole } from "./write-policy.js";
 
 const pinnedCliVersion = "2.1.221";
 const knownEventTypes = new Set(["system", "assistant", "user", "result", "rate_limit_event"]);
@@ -207,32 +208,6 @@ function toolsForRole(role: ProviderRunRequest["role"]): string {
  * that is expected whitelist maintenance, not a matcher-syntax problem. Never widen this back to
  * `./**`, never add `.github` to it, and never add a bare root `Write(./*)`/`Edit(./*)`.
  */
-const writableDirectories = Object.freeze([
-  "docs",
-  "fixtures",
-  "roles",
-  "schemas",
-  "scripts",
-  "spikes",
-  "src",
-  "systemd",
-  "tests",
-]);
-
-function allowedToolsForRole(role: ProviderRunRequest["role"]): readonly string[] {
-  const scopedRead = Object.freeze(["Read(./*)", "Read(./**)"]);
-  if (role === "implementer" || role === "integration_engineer") {
-    const scopedWriteEdit = writableDirectories.flatMap((directory) => [
-      `Write(./${directory}/*)`,
-      `Write(./${directory}/**)`,
-      `Edit(./${directory}/*)`,
-      `Edit(./${directory}/**)`,
-    ]);
-    return Object.freeze([...scopedRead, ...scopedWriteEdit]);
-  }
-  return scopedRead;
-}
-
 interface ParsedResult {
   readonly isError: boolean;
   readonly text: string;
@@ -513,7 +488,7 @@ export class ClaudeRunner implements ProviderPort {
           "--tools",
           toolsForRole(request.role),
           "--allowedTools",
-          ...allowedToolsForRole(request.role),
+          ...claudeAllowedToolsForRole(request.role),
           "--no-session-persistence",
           "--model",
           request.model,

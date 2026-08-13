@@ -68,7 +68,7 @@ Host 不得把 fragment bearer、session cookie、CSRF、authorization header、
 5. 資訊尚未收斂時可建立或更新 Backlog，但不得標為 Ready。一次向使用者給出工單／拆單預覽與 Ready
    Gate 結論。
 
-只有完整且安全的工單才可 Ready。使用者在對話核可需求後，host 才可移入「待執行」；使用者直接在
+只有完整且安全、依目前 provider 寫入政策可自動完成的工單才可 Ready。需要人工修改受保護區域的工單必須移入「需人工」並標記 Agent「已阻塞」，不得留在 Ready。使用者在對話核可需求後，host 才可移入「待執行」；使用者直接在
 Linear 移動亦有效。每次 Linear mutation 後必須重新讀取權威資料；API success、CLI exit 0 或 host
 自述都不能取代 read-back。Controller 才負責 eligibility、排程、lease、pipeline、merge gate 與狀態
 轉換。

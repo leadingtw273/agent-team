@@ -17,6 +17,7 @@ describe("workflow state", () => {
     expect(workStatuses).toEqual([
       "backlog",
       "ready",
+      "requires_manual",
       "in_progress",
       "in_review",
       "completed",
@@ -29,6 +30,8 @@ describe("workflow state", () => {
   it.each([
     ["backlog", "ready", "ready_gate_passed"],
     ["ready", "in_progress", "work_started"],
+    ["ready", "requires_manual", "policy_requires_manual"],
+    ["requires_manual", "ready", "ready_gate_passed"],
     ["in_progress", "in_review", "review_started"],
     ["in_review", "in_progress", "changes_requested"],
     ["in_progress", "backlog", "requirements_changed"],
@@ -36,7 +39,7 @@ describe("workflow state", () => {
     expect(transitionWorkStatus(current, { target, cause })).toEqual({ ok: true, value: target });
   });
 
-  it.each(["backlog", "ready", "in_progress", "in_review"] as const)(
+  it.each(["backlog", "ready", "requires_manual", "in_progress", "in_review"] as const)(
     "only a GitHub merge moves %s to completed",
     (current) => {
       expect(
@@ -52,6 +55,7 @@ describe("workflow state", () => {
         "review_started",
         "changes_requested",
         "requirements_changed",
+        "policy_requires_manual",
         "user_canceled",
         "automation_reconcile",
       ] as const) {
@@ -110,6 +114,7 @@ describe("workflow state", () => {
       ["backlog", "in_progress", "work_started"],
       ["ready", "in_review", "review_started"],
       ["in_progress", "ready", "automation_reconcile"],
+      ["requires_manual", "in_progress", "work_started"],
       ["in_review", "backlog", "changes_requested"],
     ];
 

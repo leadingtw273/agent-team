@@ -1,6 +1,7 @@
 export const workStatuses = [
   "backlog",
   "ready",
+  "requires_manual",
   "in_progress",
   "in_review",
   "completed",

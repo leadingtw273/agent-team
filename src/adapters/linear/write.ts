@@ -246,6 +246,16 @@ export class LinearMutationClient {
     });
   }
 
+  async requireManualIntervention(
+    context: LinearProjectContext,
+    issueId: string,
+  ): Promise<Result<LinearIssueSnapshot, DomainError>> {
+    return this.transitionWorkStatus(context, issueId, {
+      target: "requires_manual",
+      cause: "policy_requires_manual",
+    });
+  }
+
   async cancelIssueByUser(
     context: LinearProjectContext,
     issueId: string,

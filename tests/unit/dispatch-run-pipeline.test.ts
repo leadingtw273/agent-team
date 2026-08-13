@@ -10,7 +10,7 @@
  * routing path matters here.
  */
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -66,6 +66,9 @@ const candidateRoleOverride = vi.hoisted(() => ({ current: undefined as string |
 const candidateWorkKindOverride = vi.hoisted(() => ({
   current: undefined as "model" | "mechanical" | undefined,
 }));
+const candidateChangeRegionsOverride = vi.hoisted(() => ({
+  current: undefined as Issue["changeRegions"],
+}));
 
 vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/adapters/dispatch/index.js")>();
@@ -98,6 +101,7 @@ afterEach(async () => {
   discoverSpy.mockClear();
   candidateRoleOverride.current = undefined;
   candidateWorkKindOverride.current = undefined;
+  candidateChangeRegionsOverride.current = undefined;
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -195,7 +199,9 @@ function eligibleIssue(role = "implementer"): Issue {
     agentRole: role,
     reviewRequirement: "code_review",
     estimatedMinutes: 30,
-    changeRegions: [{ path: "src/feature.ts", coverage: "exact" }],
+    changeRegions: candidateChangeRegionsOverride.current ?? [
+      { path: "src/feature.ts", coverage: "exact" },
+    ],
   });
 }
 
@@ -312,6 +318,9 @@ function buildHandlers(
   quotaAdmission?: NewJobQuotaAdmissionPort,
   operatorCanaryStore?: FileOperatorCanaryAttestationStore,
   claudeProcess: ProcessPort = new ReadyProcessPort(),
+  protectedRegionWorkManagement?: Parameters<
+    typeof createDispatchCliHandlers
+  >[0]["protectedRegionWorkManagement"],
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -356,6 +365,7 @@ function buildHandlers(
     resolveAuthoritativeBase:
       resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
     ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
+    ...(protectedRegionWorkManagement === undefined ? {} : { protectedRegionWorkManagement }),
   });
 }
 
@@ -419,6 +429,167 @@ function fakeResolveAuthoritativeBase(repositoryPath: string) {
 }
 
 describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
+  it("moves a protected implementer issue out of Ready before pipeline/worktree/provider start", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    candidateChangeRegionsOverride.current = [
+      { path: "src/feature.ts", coverage: "exact" },
+      { path: ".github/workflows/ci.yml", coverage: "exact" },
+    ];
+    const calls: string[] = [];
+    const protectedRegionWorkManagement = {
+      setWorkStatus: (_reference: unknown, status: string) => {
+        calls.push(`workflow:${status}`);
+        return Promise.resolve(ok({} as never));
+      },
+      setAgentCondition: (_reference: unknown, condition: { status: string }) => {
+        calls.push(`agent:${condition.status}`);
+        return Promise.resolve(ok({} as never));
+      },
+      appendComment: (_reference: unknown, body: string) => {
+        calls.push(`comment:${body}`);
+        return Promise.resolve(ok({} as never));
+      },
+    } as never;
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("protected work must never build a pipeline")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      undefined,
+      undefined,
+      new ReadyProcessPort(),
+      protectedRegionWorkManagement,
+    );
+
+    const dryRun = await handlers.run({ projectId, dryRun: true });
+    expect(JSON.parse(dryRun.message ?? "{}")).toMatchObject({
+      state: "dry_run",
+      protectedRegionPrediction: {
+        state: "blocked",
+        reason: "protected_region_requires_human",
+      },
+    });
+    expect(calls).toEqual([]);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+
+    const result = await handlers.run({ projectId });
+    const payload = JSON.parse(result.message ?? "{}") as {
+      state: string;
+      jobId: string;
+      leaseId: string;
+      pipelineReason: string;
+      handoff: Readonly<Record<string, string>>;
+    };
+    expect(result.state).toBe("success");
+    expect(payload).toMatchObject({
+      state: "requires_manual",
+      pipelineReason: "protected_region_requires_human",
+      handoff: {
+        workflowState: "confirmed",
+        agentCondition: "confirmed",
+        comment: "confirmed",
+        leaseRelease: "confirmed",
+      },
+    });
+    expect(calls.slice(0, 2)).toEqual(["workflow:requires_manual", "agent:blocked"]);
+    expect(calls[2]).toContain("未啟動模型、未建立 PR");
+    expect(calls[2]).not.toContain(".github/workflows/ci.yml");
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    await expect(readdir(join(stateRoot, "state", "dispatch", "worktrees"))).rejects.toThrow();
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    await expect(progress.load(payload.jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: { reasonCode: "protected_region_requires_human" },
+        },
+        protectedRegionHandoff: {
+          workflowState: "confirmed",
+          agentCondition: "confirmed",
+          comment: "confirmed",
+          leaseRelease: "confirmed",
+        },
+      },
+    });
+    const leaseRepository = new FileLeaseRepository(
+      join(stateRoot, "leases.json"),
+      join(stateRoot, "leases.lock"),
+    );
+    const leases = await leaseRepository.readAll();
+    expect(leases.ok).toBe(true);
+    if (!leases.ok) throw new Error(leases.error.code);
+    expect(leases.value[0]?.id).toBe(payload.leaseId);
+    expect(leases.value[0]?.releasedAt).toEqual(expect.any(String));
+    const admission = new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(stateRoot));
+    await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "active", jobId: payload.jobId },
+    });
+  });
+
+  it("replays an incomplete protected-region Linear handoff without re-running the model", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    candidateChangeRegionsOverride.current = [
+      { path: ".github/workflows/ci.yml", coverage: "exact" },
+    ];
+    let workflowAttempts = 0;
+    const protectedRegionWorkManagement = {
+      setWorkStatus: () => {
+        workflowAttempts += 1;
+        return Promise.resolve(
+          workflowAttempts === 1 ? err(domainError("external_failure")) : ok({} as never),
+        );
+      },
+      setAgentCondition: () => Promise.resolve(ok({} as never)),
+      appendComment: () => Promise.resolve(ok({} as never)),
+    } as never;
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("protected work must never build a pipeline")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      undefined,
+      undefined,
+      new ReadyProcessPort(),
+      protectedRegionWorkManagement,
+    );
+
+    const first = await handlers.run({ projectId });
+    const firstPayload = JSON.parse(first.message ?? "{}") as {
+      jobId: string;
+      pipelineReason: string;
+    };
+    expect(first.state).toBe("failed");
+    expect(firstPayload.pipelineReason).toBe("protected_region_sync_failed");
+
+    const second = await handlers.run({ projectId });
+    expect(second.state).toBe("success");
+    expect(workflowAttempts).toBe(2);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    await expect(progress.load(firstPayload.jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        protectedRegionHandoff: {
+          workflowState: "confirmed",
+          agentCondition: "confirmed",
+          comment: "confirmed",
+          leaseRelease: "confirmed",
+        },
+      },
+    });
+  });
+
   it("Q01 without a record remains quota_unknown, with no version probe, pipeline, claim, or job", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();

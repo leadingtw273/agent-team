@@ -101,17 +101,18 @@ Monorepo 第一版仍視為一個專案，以工單範圍指定目錄；同 Repo
 
 ```text
 待辦 → 待執行 → 進行中 → 審查中 → 已完成
-                       ↑       │
-                       └───────┘ 審查未通過
+          │            ↑       │
+          └→ 需人工 ───┘       └──── 審查未通過
 ```
 
 - 待辦：需求可整理，不會自動執行。
 - 待執行：Ready Gate 已通過；等待資源時維持此狀態。
+- 需人工：Controller 在模型啟動前確認工單無法依目前安全政策自動完成；工單離開 Ready，等待人工處理或拆單。恢復時先 resolve 舊 admission claim，再重新通過 Ready Gate。
 - 進行中：實作、測試、CI 修正、Reviewer 修正。
 - 審查中：CI 已綠，Reviewer 執行中或等待 Auto-merge。
 - 已完成：只能由 GitHub merged 事件觸發。
 - 已取消：只能由使用者透過團隊管理者或 Linear 明確要求；Controller 不會因逾時、失敗或 PR 異常自動取消。取消時停止、Checkpoint、關閉未合併 PR；第一版不自動刪除 Branch／Worktree。
-- 暫停與阻塞不另建主要狀態，使用 Agent 狀態與阻塞原因表達。
+- 執行中的暫停與一般阻塞仍使用 Agent 狀態與阻塞原因；已知必須由人處理、不可自動啟動的工單使用主要狀態「需人工」。
 
 ### 5.3 原生欄位與 Label Group
 

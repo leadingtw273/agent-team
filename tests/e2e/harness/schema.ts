@@ -70,7 +70,15 @@ export const linearEvidenceDataSchema = z
     issueId: z.string().min(1),
     identifier: z.string().min(1),
     title: z.string(),
-    workStatus: z.enum(["backlog", "ready", "in_progress", "in_review", "completed", "canceled"]),
+    workStatus: z.enum([
+      "backlog",
+      "ready",
+      "requires_manual",
+      "in_progress",
+      "in_review",
+      "completed",
+      "canceled",
+    ]),
     updatedAt: z.string().min(1),
     comments: z.array(linearCommentEvidenceSchema),
   })

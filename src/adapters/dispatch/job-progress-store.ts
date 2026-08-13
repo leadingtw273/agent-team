@@ -48,7 +48,12 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
-import { jobIdSchema, projectIdSchema, issueIdSchema } from "../../domain/jobs/index.js";
+import {
+  issueIdSchema,
+  jobIdSchema,
+  leaseIdSchema,
+  projectIdSchema,
+} from "../../domain/jobs/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
 import { reportContractFailureCategorySchema } from "../../application/pipelines/reviewer-model.js";
 import {
@@ -304,6 +309,7 @@ export const requiresManualReasonCodeSchema = z.enum([
   // an actual failure reasonCode would mislead whoever reads this record later via `dispatch
   // resolve`.
   "role_pipeline_unavailable",
+  "protected_region_requires_human",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 
@@ -525,6 +531,18 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
 
 export type JobProgressStage = z.infer<typeof jobProgressStageSchema>;
 
+export const protectedRegionHandoffSchema = z
+  .object({
+    leaseId: leaseIdSchema,
+    holderId: z.string().trim().min(1).max(255),
+    workflowState: z.enum(["pending", "confirmed"]),
+    agentCondition: z.enum(["pending", "confirmed"]),
+    comment: z.enum(["pending", "confirmed"]),
+    leaseRelease: z.enum(["pending", "confirmed"]),
+  })
+  .strict();
+export type ProtectedRegionHandoff = z.infer<typeof protectedRegionHandoffSchema>;
+
 export const jobProgressRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -543,6 +561,10 @@ export const jobProgressRecordSchema = z
      * `CiRecoveryPipelineRequest`/`ReviewerPipelineRequest`. */
     model: z.string().trim().min(1).max(255),
     stage: jobProgressStageSchema,
+    /** Durable component receipts for the protected-region human handoff. Optional for every
+     * legacy/non-policy record; when present, the stage reason below must identify this exact
+     * policy so a later controller cycle can safely replay only the unfinished external writes. */
+    protectedRegionHandoff: protectedRegionHandoffSchema.optional(),
     branch: z.string().trim().min(1).max(255),
     worktreePath: z.string().startsWith("/").min(2).max(1024),
     changeRequestId: changeRequestNumberSchema.optional(),
@@ -590,7 +612,20 @@ export const jobProgressRecordSchema = z
     baseRevision: headShaSchema.optional(),
     updatedAt: instantSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((record, context) => {
+    const protectedReason =
+      record.stage.kind === "requires_manual" &&
+      record.stage.cause?.stage === "dispatch" &&
+      record.stage.cause.reasonCode === "protected_region_requires_human";
+    if ((record.protectedRegionHandoff !== undefined) !== protectedReason) {
+      context.addIssue({
+        code: "custom",
+        path: ["protectedRegionHandoff"],
+        message: "protected-region handoff receipts must match the protected dispatch reason",
+      });
+    }
+  });
 
 export type JobProgressRecord = z.infer<typeof jobProgressRecordSchema>;
 /** The caller never supplies `schemaVersion` (always `1`, stamped by the store itself -- see

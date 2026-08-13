@@ -153,7 +153,7 @@ export interface DispatchCompositionReady {
      * can fake this with a plain object instead of a real `LinearMutationClient` instance. */
     readonly mutationClient: Pick<
       LinearMutationClient,
-      "observeGithubMerge" | "setAgentCondition" | "appendComment"
+      "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
     >;
     /** E102-5: the same transport `readModel`/`mutationClient` above already share -- threaded
      * through `handlers.ts` to `buildResumeComposition` so it can construct a real

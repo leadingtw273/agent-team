@@ -202,6 +202,8 @@ describe("buildLifecyclePipeline production-composition seam (E116cap: now FileA
           }),
         );
       },
+      requireManualIntervention: () =>
+        Promise.reject(new Error("must never be called: merge path only")),
       setAgentCondition: () => Promise.reject(new Error("must never be called: merge path only")),
       appendComment: (_context, _issueId, body) => {
         calls.push("appendComment");

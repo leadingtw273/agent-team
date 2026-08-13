@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { ClaudeRunner } from "../../src/adapters/providers/claude/index.js";
+import {
+  ClaudeRunner,
+  claudeWritableDirectories,
+} from "../../src/adapters/providers/claude/index.js";
 import type {
   ChildProcessHandle,
   ProcessExit,
@@ -562,6 +565,10 @@ describe("Claude stream-json runner", () => {
         const allowedToolsIndex = arguments_.indexOf("--allowedTools");
         const noSessionIndex = arguments_.indexOf("--no-session-persistence");
         const grants = arguments_.slice(allowedToolsIndex + 1, noSessionIndex);
+        const actualDirectories = grants
+          .filter((grant) => grant.startsWith("Write(./") && grant.endsWith("/*)"))
+          .map((grant) => grant.slice("Write(./".length, -"/*)".length));
+        expect(actualDirectories).toEqual(claudeWritableDirectories);
 
         // The C015h-1 baseline this ticket replaced was exactly `Write(./**)`/`Edit(./**)` --
         // that bare recursive-from-root pattern is what let `.github/workflows/**` be rewritten.

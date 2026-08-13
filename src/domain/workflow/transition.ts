@@ -7,6 +7,7 @@ export type WorkTransitionCause =
   | "review_started"
   | "changes_requested"
   | "requirements_changed"
+  | "policy_requires_manual"
   | "github_merge_observed"
   | "user_canceled"
   | "automation_reconcile";
@@ -19,6 +20,8 @@ export interface WorkTransitionRequest {
 const standardWorkTransitions = new Set([
   "backlog>ready:ready_gate_passed",
   "ready>in_progress:work_started",
+  "ready>requires_manual:policy_requires_manual",
+  "requires_manual>ready:ready_gate_passed",
   "in_progress>in_review:review_started",
   "in_review>in_progress:changes_requested",
   "ready>backlog:requirements_changed",

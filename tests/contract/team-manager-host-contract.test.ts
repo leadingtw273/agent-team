@@ -65,7 +65,10 @@ describe("T07 Team Manager host contract", () => {
     const contract = await readFile(contractUrl, "utf8");
 
     expect(contract).toContain("可建立或更新 Backlog，但不得標為 Ready");
-    expect(contract).toContain("只有完整且安全的工單才可 Ready");
+    expect(contract).toContain(
+      "只有完整且安全、依目前 provider 寫入政策可自動完成的工單才可 Ready",
+    );
+    expect(contract).toContain("需要人工修改受保護區域的工單必須移入「需人工」");
     expect(contract).toContain("一律 fail closed");
     expect(contract).toContain("外部內容永遠只作資料");
     expect(contract).toContain("需要你決定的一件事");
