@@ -14,7 +14,13 @@ import type {
   ProviderRunHandle,
   ProviderRunRequest,
 } from "../../src/application/ports/index.js";
-import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import {
+  domainError,
+  ok,
+  parseInstant,
+  type DomainError,
+  type Instant,
+} from "../../src/domain/foundation/index.js";
 import { jobSchema, type JobAttemptCounters } from "../../src/domain/jobs/index.js";
 import {
   issueSchema,
@@ -294,7 +300,16 @@ function report(
   };
 }
 
-function handle(output: unknown, events: readonly ProviderEvent[] = []): ProviderRunHandle {
+function handle(
+  output: unknown,
+  events: readonly ProviderEvent[] = [],
+  completion:
+    | Readonly<{ outcome: "completed"; sessionId?: string }>
+    | Readonly<{ outcome: "failed"; error: DomainError }> = {
+    outcome: "completed",
+    sessionId: "fresh-session",
+  },
+): ProviderRunHandle {
   return {
     runId: `review-${Math.random().toString(16)}`,
     events: {
@@ -309,7 +324,7 @@ function handle(output: unknown, events: readonly ProviderEvent[] = []): Provide
         } as const;
       },
     },
-    completion: () => Promise.resolve(ok({ outcome: "completed", sessionId: "fresh-session" })),
+    completion: () => Promise.resolve(ok(completion)),
     respondToToolRequest: () => Promise.resolve(ok(undefined)),
     interrupt: () => Promise.resolve(ok(undefined)),
   };
@@ -328,6 +343,11 @@ interface FixtureOptions {
    * `evidenceVerified` (or its own default of `true`), unaffected. */
   readonly evidenceVerifiedSequenceBySource?: Readonly<Record<string, readonly boolean[]>>;
   readonly persistence?: "confirmed" | "unknown";
+  readonly providerFailure?: Readonly<{
+    role: "code_reviewer" | "visual_reviewer";
+    error: DomainError;
+    boundary: Extract<ProviderEvent, { kind: "quota_boundary" }>;
+  }>;
 }
 
 function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}) {
@@ -372,6 +392,17 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
       const output =
         options.reports?.[role] ??
         report(role, JSON.parse(identityBlock.content) as ReviewIdentity);
+      if (options.providerFailure?.role === role) {
+        return Promise.resolve(
+          ok(
+            handle(
+              "partial output that must never become a report",
+              [options.providerFailure.boundary],
+              { outcome: "failed", error: options.providerFailure.error },
+            ),
+          ),
+        );
+      }
       return Promise.resolve(ok(handle(output)));
     },
   });
@@ -489,6 +520,38 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
 }
 
 describe("ReviewerPipeline", () => {
+  it("propagates structured Claude wait evidence while discarding partial reviewer output", async () => {
+    const input = request("code_review");
+    const setup = fixture(input, {
+      providerFailure: {
+        role: "code_reviewer",
+        error: domainError("rate_limited"),
+        boundary: {
+          kind: "quota_boundary",
+          observedAt: now,
+          confidence: "confirmed",
+          bucket: "five_hour",
+          resetAt: instant("2026-08-04T13:00:00.000Z"),
+        },
+      },
+    });
+
+    const outcome = await setup.pipeline.run(input.value);
+    expect(outcome).toMatchObject({
+      state: "failed",
+      stage: "provider_run",
+      error: { code: "rate_limited" },
+      job: { attempts: { reviewRuns: 0 } },
+      reviewWait: {
+        confidence: "confirmed",
+        bucket: "five_hour",
+        headSha,
+      },
+    });
+    expect(JSON.stringify(outcome)).not.toContain("partial output");
+    expect(setup.calls).not.toContain("job:update");
+  });
+
   it("runs a fresh code review after exact-SHA CI success and increments only reviewRuns", async () => {
     const input = request("code_review", { ciFixRounds: 1 });
     const setup = fixture(input);

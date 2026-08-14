@@ -102,7 +102,7 @@ describe("Codex App Server quota collector", () => {
     ).resolves.toMatchObject({ state: "unknown", reason: "app_server_unavailable" });
   });
 
-  it("rejects rate-limit window schema drift", async () => {
+  it("tolerates additive fields while retaining the required window contract", async () => {
     const value = epoch();
     const limits = (value.rateLimits as { rateLimits: Record<string, unknown> }).rateLimits;
     limits["primary"] = {
@@ -113,6 +113,102 @@ describe("Codex App Server quota collector", () => {
       createCodexQuotaCollector({ epoch: source(value), clock: createFixedClock(now) }).collect({
         expectedCliVersion: "0.147.0",
       }),
-    ).resolves.toEqual({ provider: "codex", state: "unknown", reason: "app_server_unavailable" });
+    ).resolves.toMatchObject({
+      provider: "codex",
+      state: "partial",
+      buckets: { weekly: { remainingPercent: 93 } },
+    });
+  });
+
+  it("reads the official multi-bucket view without relying on a hard-coded limit id", async () => {
+    const value = epoch({
+      rateLimits: {
+        rateLimitsByLimitId: {
+          arbitrary_week_bucket: {
+            limitId: "server-owned-week-id",
+            primary: {
+              usedPercent: 15,
+              windowDurationMins: 10_080,
+              resetsAt: nowSeconds + 86_400,
+            },
+          },
+          arbitrary_short_bucket: {
+            limitId: "server-owned-short-id",
+            secondary: {
+              usedPercent: 20,
+              windowDurationMins: 300,
+              resetsAt: nowSeconds + 1_800,
+            },
+          },
+        },
+      },
+    });
+    await expect(
+      createCodexQuotaCollector({ epoch: source(value), clock: createFixedClock(now) }).collect({
+        expectedCliVersion: "0.147.0",
+      }),
+    ).resolves.toMatchObject({
+      state: "partial",
+      buckets: { weekly: { remainingPercent: 85 }, fiveHour: { remainingPercent: 80 } },
+    });
+  });
+
+  it("uses the official single view when multi-bucket data also contains an independent model meter", async () => {
+    const base = epoch();
+    const single = (base.rateLimits as { rateLimits: Record<string, unknown> }).rateLimits;
+    const value = epoch({
+      rateLimits: {
+        rateLimits: single,
+        rateLimitsByLimitId: {
+          opaque_model_meter: {
+            limitId: "server-owned-model-id",
+            limitName: "A separately metered model",
+            primary: {
+              usedPercent: 0,
+              windowDurationMins: 10_080,
+              resetsAt: nowSeconds + 86_400,
+            },
+          },
+          ordinary_mirror: single,
+        },
+      },
+    });
+    await expect(
+      createCodexQuotaCollector({ epoch: source(value), clock: createFixedClock(now) }).collect({
+        expectedCliVersion: "0.147.0",
+      }),
+    ).resolves.toMatchObject({
+      state: "partial",
+      reason: "five_hour_unavailable",
+      buckets: { weekly: { remainingPercent: 93 } },
+    });
+  });
+
+  it("fails closed when two buckets claim conflicting values for the same window", async () => {
+    const value = epoch({
+      rateLimits: {
+        rateLimitsByLimitId: {
+          first: {
+            primary: {
+              usedPercent: 15,
+              windowDurationMins: 10_080,
+              resetsAt: nowSeconds + 86_400,
+            },
+          },
+          second: {
+            primary: {
+              usedPercent: 16,
+              windowDurationMins: 10_080,
+              resetsAt: nowSeconds + 86_400,
+            },
+          },
+        },
+      },
+    });
+    await expect(
+      createCodexQuotaCollector({ epoch: source(value), clock: createFixedClock(now) }).collect({
+        expectedCliVersion: "0.147.0",
+      }),
+    ).resolves.toMatchObject({ state: "unknown", reason: "app_server_unavailable" });
   });
 });

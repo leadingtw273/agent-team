@@ -85,10 +85,14 @@ describe("T07 Team Manager host contract", () => {
     );
   });
 
-  it("limits the Claude canary exception to current-conversation host authority and redacted read-back", async () => {
+  it("retires the Claude execution canary from normal routing while preserving its fail-closed boundary", async () => {
     const contract = await readFile(contractUrl, "utf8");
 
-    expect(contract).toContain("### 6.1 Q01：唯一的 Claude canary host 例外");
+    expect(contract).toContain(
+      "### 6.1 Q01：歷史 Claude execution canary（ADR-009 後不再是一般入口）",
+    );
+    expect(contract).toContain("production routing 沒有可消耗 Q01 的 Claude execution candidate");
+    expect(contract).toContain("不得把它重新解讀為 Claude Reviewer quota 授權");
     expect(contract).toContain("`agent-team quota canary-confirm`");
     expect(contract).toContain("`agent-team quota canary-status`");
     expect(contract).toContain("leadi 當前對話");
@@ -102,17 +106,20 @@ describe("T07 Team Manager host contract", () => {
     );
   });
 
-  it("keeps the T11 scheduled-only exception narrow and leaves T13 blocked", async () => {
+  it("keeps the closed T11 exception historical without granting new-run authority", async () => {
     const contract = await readFile(contractUrl, "utf8");
 
-    expect(contract).toContain("### 6.2 T11：內部 canary 的狹窄 scheduled-only 例外");
+    expect(contract).toContain("### 6.2 T11：歷史 internal canary 例外（已關閉）");
+    expect(contract).toContain("不得拿來授權新的 Job");
+    expect(contract).toContain("新 run 一律依當下 `health`、Codex quota admission");
     expect(contract).toContain("`scheduledReconcile:true`");
     expect(contract).toContain("唯一 wakeup 缺口是 `webhook_runtime_unknown`");
     expect(contract).toContain("T10 的其他全部權威前置均已通過");
     expect(contract).toContain("Q01 的 exact private one-time attestation");
     expect(contract).toContain("不得推論 webhook healthy");
     expect(contract).toContain("不得一般化為 scheduled timer 可繞過任何");
-    expect(contract).toContain("T13 仍是 blocked");
+    expect(contract).toContain("T13 後續已交付使用者測試包");
+    expect(contract).toContain("不會追溯擴大 T11");
   });
 
   it("forbids a chat runtime, plugins, and manual Branch PR CI work while avoiding real secrets", async () => {

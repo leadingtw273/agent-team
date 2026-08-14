@@ -18,12 +18,15 @@ function value() {
       weeklyUsageLimitPercent: 80,
       terminalRemainingPercent: 3,
       maxSampleAgeMs: 300_000,
-      activeRefresh: {
-        enabled: true,
-        workingDirectory: "/operator/agent-team",
-      },
     },
-    codex: { diagnosticEnabled: true, expectedCliVersion: "0.147.0" },
+    codex: {
+      enabled: true,
+      diagnosticEnabled: true,
+      expectedCliVersion: "0.147.0",
+      weeklyUsageLimitPercent: 80,
+      terminalRemainingPercent: 3,
+      maxSampleAgeMs: 300_000,
+    },
   };
 }
 
@@ -54,19 +57,32 @@ describe("quota host config", () => {
     const noncanonicalValue = value();
     noncanonicalValue.claude.statusSnapshotPath = "/operator/a/../latest.json";
     const noncanonical = await fixture(noncanonicalValue);
-    const noncanonicalRefreshValue = value();
-    noncanonicalRefreshValue.claude.activeRefresh.workingDirectory = "/operator/a/../agent-team";
-    const noncanonicalRefresh = await fixture(noncanonicalRefreshValue);
     const insecure = await fixture();
     await chmod(insecure, 0o644);
     const target = await fixture();
     const link = join(target, "..", "quota-link.json");
     await symlink(target, link);
-    for (const path of [extra, noncanonical, noncanonicalRefresh, insecure, link]) {
+    for (const path of [extra, noncanonical, insecure, link]) {
       await expect(readQuotaHostConfig(path)).resolves.toEqual({
         ok: false,
         reason: "config_unavailable",
       });
     }
+  });
+
+  it("rejects the retired Claude active refresh field with a migration-specific reason", async () => {
+    const legacy = value() as ReturnType<typeof value> & {
+      claude: ReturnType<typeof value>["claude"] & {
+        activeRefresh: { enabled: boolean; workingDirectory: string };
+      };
+    };
+    legacy.claude.activeRefresh = {
+      enabled: true,
+      workingDirectory: "/operator/agent-team",
+    };
+    await expect(readQuotaHostConfig(await fixture(legacy))).resolves.toEqual({
+      ok: false,
+      reason: "active_refresh_superseded",
+    });
   });
 });

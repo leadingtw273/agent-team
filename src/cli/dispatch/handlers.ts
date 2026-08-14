@@ -27,10 +27,12 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import type { ModelRoutingConfig } from "../../application/routing/index.js";
 import type {
   FileJobProgressStore,
   JobProgressRecord,
   JobProgressRecordMutation,
+  JobProviderAssignments,
   ProtectedRegionHandoff,
   RequiresManualReasonCode,
 } from "../../adapters/dispatch/job-progress-store.js";
@@ -82,6 +84,7 @@ import { createOperatorCanaryCliHandlers } from "./operator-canary-attestation.j
 import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
+import { createReviewerResumeHandler } from "./reviewer-resume-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { resumeExistingProjectJobs } from "./resume-existing.js";
 import { createQuotaProbeStatusHandler } from "../quota/index.js";
@@ -149,6 +152,9 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
     issueId: record.issueId,
     externalIssueId: record.externalIssueId,
     model: record.model,
+    ...(record.providerAssignments === undefined
+      ? {}
+      : { providerAssignments: record.providerAssignments }),
     stage: record.stage,
     branch: record.branch,
     worktreePath: record.worktreePath,
@@ -159,6 +165,19 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
     ...(record.headSha === undefined ? {} : { headSha: record.headSha }),
     ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
     ...(record.baseRevision === undefined ? {} : { baseRevision: record.baseRevision }),
+  });
+}
+
+function providerAssignmentsForNewJob(
+  execution: Readonly<{ provider: string; model: string }> | undefined,
+  routingConfig: ModelRoutingConfig,
+): JobProviderAssignments | undefined {
+  const codeReview = routingConfig.routes.find((route) => route.role === "code_reviewer")
+    ?.candidates[0];
+  if (execution?.provider !== "codex" || codeReview?.provider !== "claude") return undefined;
+  return Object.freeze({
+    execution: Object.freeze({ provider: "codex", model: execution.model }),
+    codeReview: Object.freeze({ provider: "claude", model: codeReview.model }),
   });
 }
 
@@ -259,7 +278,12 @@ function safeResumeOutcomes(
 
 type DispatchHandlers = Pick<
   CliHandlers,
-  "run" | "dispatchResolve" | "dispatchResolveLegacyClaim" | "dispatchAutoMergeResume" | "quota"
+  | "run"
+  | "dispatchResolve"
+  | "dispatchResolveLegacyClaim"
+  | "dispatchAutoMergeResume"
+  | "dispatchReviewerResume"
+  | "quota"
 >;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
@@ -463,11 +487,16 @@ export function createDispatchCliHandlers(
     store: autoMergePause,
     progress: buildJobProgressStore(options.agentTeamHome),
   });
+  const dispatchReviewerResume = createReviewerResumeHandler({
+    progress: buildJobProgressStore(options.agentTeamHome),
+    clock,
+  });
 
   return Object.freeze({
     dispatchResolve,
     dispatchResolveLegacyClaim,
     dispatchAutoMergeResume,
+    dispatchReviewerResume,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
@@ -720,6 +749,12 @@ export function createDispatchCliHandlers(
             (candidate) => candidate.issue.id === result.job.issueId,
           )?.issue;
           const model = result.decision.model?.candidate.model;
+          const providerAssignments = providerAssignmentsForNewJob(
+            result.decision.model?.candidate,
+            build.value.routingConfig,
+          );
+          const providerAssignmentFields =
+            providerAssignments === undefined ? {} : { providerAssignments };
 
           // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
           // Reviewer/integration/etc. pipelines are separate, unbuilt C-series tickets.
@@ -749,6 +784,7 @@ export function createDispatchCliHandlers(
                   result.job.issueId,
                 ),
                 model: model ?? "unresolved",
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -800,6 +836,7 @@ export function createDispatchCliHandlers(
                 // exists purely so this record can still be written at all, and `dispatch resolve`
                 // can still find and release the claim.
                 model: model ?? "unresolved",
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -838,6 +875,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
                 protectedRegionHandoff: pendingHandoff,
@@ -872,7 +910,7 @@ export function createDispatchCliHandlers(
 
           const pipelineComposition = await buildPipelineComposition({
             agentTeamHome: options.agentTeamHome,
-            claudeConfig: build.value.claude.config,
+            codexConfig: build.value.codex.config,
           });
           if (pipelineComposition.state !== "ready") {
             const requiresManual = await writeDispatchRequiresManual(
@@ -884,6 +922,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -936,6 +975,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -974,6 +1014,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -1020,6 +1061,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -1082,6 +1124,7 @@ export function createDispatchCliHandlers(
                   issueId: result.job.issueId,
                   externalIssueId: issue.externalId,
                   model,
+                  ...providerAssignmentFields,
                   branch: request.value.branch,
                   worktreePath: request.value.worktreePath,
                   changeRequestId: String(pipelineOutcome.changeRequest.number),
@@ -1133,6 +1176,7 @@ export function createDispatchCliHandlers(
                   issueId: result.job.issueId,
                   externalIssueId: issue.externalId,
                   model,
+                  ...providerAssignmentFields,
                   branch: request.value.branch,
                   worktreePath: request.value.worktreePath,
                   changeRequestId: String(pipelineOutcome.changeRequest.number),
@@ -1163,6 +1207,7 @@ export function createDispatchCliHandlers(
               issueId: result.job.issueId,
               externalIssueId: issue.externalId,
               model,
+              ...providerAssignmentFields,
               stage: { kind: "ci_waiting" },
               branch: request.value.branch,
               worktreePath: request.value.worktreePath,
@@ -1209,6 +1254,7 @@ export function createDispatchCliHandlers(
                     issueId: result.job.issueId,
                     externalIssueId: issue.externalId,
                     model,
+                    ...providerAssignmentFields,
                     branch: request.value.branch,
                     worktreePath: request.value.worktreePath,
                   },
@@ -1240,6 +1286,7 @@ export function createDispatchCliHandlers(
               issueId: result.job.issueId,
               externalIssueId: issue.externalId,
               model,
+              ...providerAssignmentFields,
               stage: {
                 kind: "paused",
                 pauseReason: pipelineOutcome.reason,
@@ -1278,6 +1325,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch: request.value.branch,
                 worktreePath: request.value.worktreePath,
               },

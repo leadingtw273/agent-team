@@ -81,7 +81,7 @@ function createUseCase(store: RoleModelSettingsStore = new InMemoryRoleModelSett
       {
         jobId: "job-running-implementer",
         role: "implementer",
-        candidate: { provider: "claude", model: "sonnet" },
+        candidate: { provider: "codex", model: "gpt-5.6-sol" },
         candidateIndex: 1,
       },
     ]),
@@ -125,23 +125,23 @@ describe("role model settings use case", () => {
     const implementer = saved.value.routes.find((route) => route.role === "implementer");
     expect(
       implementer?.candidates.map((candidate) => `${candidate.provider}:${candidate.model}`),
-    ).toEqual(["claude:sonnet", "codex:gpt-5.6-terra"]);
+    ).toEqual(["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"]);
     expect(saved.value.activeAssignments).toEqual([
       {
         jobId: "job-running-implementer",
         role: "implementer",
-        candidate: { provider: "claude", model: "sonnet" },
+        candidate: { provider: "codex", model: "gpt-5.6-sol" },
         candidateIndex: 1,
       },
     ]);
 
     const nextJob = selectModelRoute(saved.value.config, "implementer", [
       { provider: "codex", model: "gpt-5.6-terra", state: "ready" },
-      { provider: "claude", model: "sonnet", state: "ready" },
+      { provider: "codex", model: "gpt-5.6-sol", state: "ready" },
     ]);
     expect(nextJob).toMatchObject({
       kind: "selected",
-      candidate: { provider: "claude", model: "sonnet" },
+      candidate: { provider: "codex", model: "gpt-5.6-sol" },
       candidateIndex: 0,
     });
 

@@ -73,6 +73,9 @@ export interface CliHandlers {
   readonly dispatchAutoMergeResume: (
     input: Readonly<{ projectId: string }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchReviewerResume: (
+    input: Readonly<{ jobId: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -147,6 +150,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchResolve: () => blocked("dispatch resolve"),
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
+  dispatchReviewerResume: () => blocked("dispatch reviewer-resume"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   cycle: () => blocked("cycle"),
@@ -309,6 +313,17 @@ export function createProgram(
               : { supersededByJobId: options.supersededBy }),
           }),
         )(),
+    );
+
+  dispatch
+    .command("reviewer-resume")
+    .description(
+      "在確認 Claude 可用後，將無可信 reset 的 reviewer_waiting job 受控移回 awaiting_review；" +
+        "不釋放 admission，也不重跑 implementer",
+    )
+    .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
+    .action((options: { readonly job: string }) =>
+      action(state, io, () => handlers.dispatchReviewerResume({ jobId: options.job }))(),
     );
 
   dispatch

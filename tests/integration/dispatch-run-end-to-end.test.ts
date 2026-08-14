@@ -182,10 +182,10 @@ const validRoutingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
-    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "implementer", candidates: [{ provider: "codex", model: "gpt-5.6-terra" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -311,6 +311,10 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
         config: { executable: "claude", models: ["opus"], account: "default" },
         process: new ReadyClaudeProcessPort(),
       },
+      codex: {
+        config: { executable: "codex", models: ["gpt-5.6-terra"], account: "default" },
+        process: new ReadyClaudeProcessPort(),
+      },
       quotaAdmission: {
         resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
       },
@@ -335,8 +339,8 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     const dispatchResult = dispatched.result;
     expect(dispatchResult.decision.candidate.role).toBe("implementer");
     expect(dispatchResult.decision.model?.candidate).toEqual({
-      provider: "claude",
-      model: "opus",
+      provider: "codex",
+      model: "gpt-5.6-terra",
     });
 
     const issue = dispatched.candidates.find(

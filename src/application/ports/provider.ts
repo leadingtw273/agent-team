@@ -63,7 +63,15 @@ export type ProviderEvent =
       payload: Readonly<Record<string, unknown>>;
     }>
   | Readonly<{ kind: "checkpoint"; observedAt: Instant; checkpoint: Checkpoint }>
-  | Readonly<{ kind: "quota_boundary"; observedAt: Instant; bucket: "weekly" | "five_hour" }>
+  | Readonly<{
+      kind: "quota_boundary";
+      observedAt: Instant;
+      /** Optional for a confirmed generic wall or an unconfirmed 429 whose bucket is unknown. */
+      bucket?: "weekly" | "five_hour" | "model_weekly";
+      /** Present only when the structured provider field parsed as a valid instant. */
+      resetAt?: Instant;
+      confidence: "confirmed" | "unconfirmed";
+    }>
   | Readonly<{ kind: "completed"; observedAt: Instant }>
   | Readonly<{ kind: "failed"; observedAt: Instant; error: DomainError }>;
 

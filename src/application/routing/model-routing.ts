@@ -36,13 +36,16 @@ export const roleModelRouteSchema = z
         path: ["candidates"],
       });
     }
-    if (
-      route.role !== "visual_reviewer" &&
-      route.candidates.some((candidate) => candidate.provider === "gemini")
-    ) {
+    const requiredProvider =
+      route.role === "code_reviewer"
+        ? "claude"
+        : route.role === "visual_reviewer"
+          ? "gemini"
+          : "codex";
+    if (route.candidates.some((candidate) => candidate.provider !== requiredProvider)) {
       context.addIssue({
         code: "custom",
-        message: "Gemini is visual-review-only in version 1.",
+        message: `${route.role} routes must use ${requiredProvider}.`,
         path: ["candidates"],
       });
     }

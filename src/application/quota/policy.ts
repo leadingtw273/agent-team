@@ -140,6 +140,24 @@ export function evaluateQuotaForNewJob(
 
   const weekly = usageSample(snapshot, identity, "weekly", now, policy);
   const fiveHour = usageSample(snapshot, identity, "five_hour", now, policy);
+  if (identity.provider === "codex") {
+    if (weekly === undefined || !validRemainingPercent(weekly)) {
+      return Object.freeze({ state: "quota_unknown", reason: "usage_unknown_or_stale" });
+    }
+    const weeklyRemainingWall = 100 - policy.weeklyUsageLimitPercent;
+    if (weekly.remainingPercent <= weeklyRemainingWall) {
+      return Object.freeze({ state: "quota_blocked", reason: "weekly_wall_reached" });
+    }
+    if (fiveHour !== undefined) {
+      if (!validRemainingPercent(fiveHour)) {
+        return Object.freeze({ state: "quota_unknown", reason: "usage_unknown_or_stale" });
+      }
+      if (fiveHour.remainingPercent <= 0) {
+        return Object.freeze({ state: "quota_blocked", reason: "five_hour_limit_reached" });
+      }
+    }
+    return Object.freeze({ state: "ready", reason: "weekly_quota_confirmed" });
+  }
   if (
     weekly === undefined ||
     fiveHour === undefined ||
@@ -181,6 +199,23 @@ export function evaluateRunningQuota(
   }
   const weekly = usageSample(snapshot, identity, "weekly", now, policy);
   const fiveHour = usageSample(snapshot, identity, "five_hour", now, policy);
+  if (identity.provider === "codex") {
+    if (weekly === undefined || !validRemainingPercent(weekly)) {
+      return Object.freeze({ action: "checkpoint", reason: "quota_signal_unknown_or_stale" });
+    }
+    if (weekly.remainingPercent <= policy.terminalRemainingPercent) {
+      return Object.freeze({ action: "checkpoint", reason: "terminal_weekly_boundary" });
+    }
+    if (fiveHour !== undefined) {
+      if (!validRemainingPercent(fiveHour)) {
+        return Object.freeze({ action: "checkpoint", reason: "quota_signal_unknown_or_stale" });
+      }
+      if (fiveHour.remainingPercent <= 0) {
+        return Object.freeze({ action: "checkpoint", reason: "five_hour_limit_reached" });
+      }
+    }
+    return Object.freeze({ action: "continue", reason: "quota_safe" });
+  }
   if (
     weekly === undefined ||
     fiveHour === undefined ||

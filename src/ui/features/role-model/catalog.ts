@@ -57,8 +57,7 @@ export const roleModelCandidateCatalog: readonly RoleModelCandidateCatalogEntry[
     capabilities: Object.freeze(["架構與整合", "複雜規劃", "高風險驗收"]),
     roles: Object.freeze([
       "team_lead",
-      "code_reviewer",
-      "visual_reviewer",
+      "implementer",
       "integration_engineer",
     ] satisfies readonly AgentRole[]),
   }),
@@ -67,25 +66,25 @@ export const roleModelCandidateCatalog: readonly RoleModelCandidateCatalogEntry[
     model: "gpt-5.6-terra",
     providerLabel: "Codex",
     capabilities: Object.freeze(["程式實作", "測試", "一般除錯"]),
-    roles: Object.freeze(["implementer"] satisfies readonly AgentRole[]),
+    roles: Object.freeze([
+      "team_lead",
+      "implementer",
+      "integration_engineer",
+    ] satisfies readonly AgentRole[]),
   }),
   Object.freeze({
     provider: "claude",
     model: "opus",
     providerLabel: "Claude",
     capabilities: Object.freeze(["架構與整合", "複雜規劃", "獨立審查"]),
-    roles: Object.freeze([
-      "team_lead",
-      "code_reviewer",
-      "integration_engineer",
-    ] satisfies readonly AgentRole[]),
+    roles: Object.freeze(["code_reviewer"] satisfies readonly AgentRole[]),
   }),
   Object.freeze({
     provider: "claude",
     model: "sonnet",
     providerLabel: "Claude",
     capabilities: Object.freeze(["程式實作", "一般審查", "測試"]),
-    roles: Object.freeze(["implementer"] satisfies readonly AgentRole[]),
+    roles: Object.freeze(["code_reviewer"] satisfies readonly AgentRole[]),
   }),
   Object.freeze({
     provider: "gemini",
@@ -127,7 +126,7 @@ export function defaultRoleModelRoutingConfig(): ModelRoutingConfig {
             role,
             candidates: [
               { provider: "codex", model: "gpt-5.6-sol" },
-              { provider: "claude", model: "opus" },
+              { provider: "codex", model: "gpt-5.6-terra" },
             ],
           };
         case "implementer":
@@ -135,31 +134,25 @@ export function defaultRoleModelRoutingConfig(): ModelRoutingConfig {
             role,
             candidates: [
               { provider: "codex", model: "gpt-5.6-terra" },
-              { provider: "claude", model: "sonnet" },
+              { provider: "codex", model: "gpt-5.6-sol" },
             ],
           };
         case "code_reviewer":
           return {
             role,
-            candidates: [
-              { provider: "codex", model: "gpt-5.6-sol" },
-              { provider: "claude", model: "opus" },
-            ],
+            candidates: [{ provider: "claude", model: "opus" }],
           };
         case "visual_reviewer":
           return {
             role,
-            candidates: [
-              { provider: "gemini", model: "auto" },
-              { provider: "codex", model: "gpt-5.6-sol" },
-            ],
+            candidates: [{ provider: "gemini", model: "auto" }],
           };
         case "integration_engineer":
           return {
             role,
             candidates: [
               { provider: "codex", model: "gpt-5.6-sol" },
-              { provider: "claude", model: "opus" },
+              { provider: "codex", model: "gpt-5.6-terra" },
             ],
           };
       }

@@ -124,7 +124,14 @@ describe("quota probe-status CLI", () => {
           terminalRemainingPercent: 3,
           maxSampleAgeMs: 300_000,
         },
-        codex: { diagnosticEnabled: true, expectedCliVersion: "0.147.0" },
+        codex: {
+          enabled: true,
+          diagnosticEnabled: true,
+          expectedCliVersion: "0.147.0",
+          weeklyUsageLimitPercent: 80,
+          terminalRemainingPercent: 3,
+          maxSampleAgeMs: 300_000,
+        },
       }),
       { mode: 0o600 },
     );
@@ -192,9 +199,6 @@ fi
         },
       },
     );
-    expect(await readFile(rpcLog, "utf8").catch(() => "missing")).toBe(
-      "initialize\ninitialized\naccount/read\naccount/rateLimits/read\naccount/read\n",
-    );
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("{");
     const payload: unknown = JSON.parse(result.stdout);
@@ -204,6 +208,9 @@ fi
         { provider: "codex", state: "partial" },
       ],
     });
+    expect(await readFile(rpcLog, "utf8").catch(() => "missing")).toBe(
+      "initialize\ninitialized\naccount/read\naccount/rateLimits/read\naccount/read\n",
+    );
     expect(result.stdout).not.toMatch(/secret-session-id|secret@example|secret-org|secret-name/u);
     expect(await tree(home)).toEqual(before);
   }, 25_000);

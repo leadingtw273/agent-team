@@ -32,7 +32,7 @@ async function temporaryHome(): Promise<string> {
   return directory;
 }
 
-const claudeConfig = { executable: "claude", models: ["opus"], account: "default" };
+const codexConfig = { executable: "codex", models: ["gpt-5.6-terra"], account: "default" };
 
 describe("buildCiRecoveryPipeline", () => {
   it("blocks with github_authentication_unavailable before constructing any port", async () => {
@@ -43,7 +43,7 @@ describe("buildCiRecoveryPipeline", () => {
     );
     const result = await buildCiRecoveryPipeline({
       agentTeamHome,
-      claudeConfig,
+      codexConfig,
       jobs,
       githubTransport: {
         requestJson: () => Promise.reject(new Error("must never be called")),
@@ -62,7 +62,7 @@ describe("buildCiRecoveryPipeline", () => {
     );
     const result = await buildCiRecoveryPipeline({
       agentTeamHome,
-      claudeConfig,
+      codexConfig,
       jobs,
       githubTransport: {
         requestJson: () => Promise.reject(new Error("unused in this test")),
@@ -79,7 +79,7 @@ describe("buildCiRecoveryPipeline", () => {
     expect(result.value.ports.preflight).toBeInstanceOf(GitPreflight);
     const capabilities = await result.value.ports.provider.inspectCapabilities();
     expect(capabilities.ok).toBe(true);
-    if (capabilities.ok) expect(capabilities.value.provider).toBe("claude");
+    if (capabilities.ok) expect(capabilities.value.provider).toBe("codex");
     expect(result.value.ports.sourceControl).toBeDefined();
     expect(result.value.ports.ciLog).toBeDefined();
     // C017: `sourceControl` and `ciLog` are the same underlying `GitHubAdapter` instance -- one
@@ -118,7 +118,7 @@ describe("buildCiRecoveryPipeline", () => {
     ].join("\n");
     const result = await buildCiRecoveryPipeline({
       agentTeamHome,
-      claudeConfig,
+      codexConfig,
       jobs,
       githubTransport: {
         requestJson: (arguments_, schema) => {

@@ -12,18 +12,18 @@ import {
 const routingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
-    { role: "team_lead", candidates: [{ provider: "claude", model: "lead" }] },
+    { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
     {
       role: "implementer",
       candidates: [
-        { provider: "claude", model: "opus" },
-        { provider: "claude", model: "sonnet" },
+        { provider: "codex", model: "opus" },
+        { provider: "codex", model: "sonnet" },
         { provider: "codex", model: "gpt" },
       ],
     },
     { role: "code_reviewer", candidates: [{ provider: "claude", model: "review" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -43,7 +43,7 @@ describe("dispatch quota route admission", () => {
       resolve(provider) {
         calls.set(provider, (calls.get(provider) ?? 0) + 1);
         return Promise.resolve({
-          state: provider === "claude" ? ("quota_unknown" as const) : ("ready" as const),
+          state: provider === "codex" ? ("ready" as const) : ("quota_unknown" as const),
           reason: "fixture",
         });
       },
@@ -55,15 +55,10 @@ describe("dispatch quota route admission", () => {
       quota,
     });
 
-    expect(calls).toEqual(
-      new Map([
-        ["claude", 1],
-        ["codex", 1],
-      ]),
-    );
+    expect(calls).toEqual(new Map([["codex", 1]]));
     expect(observations).toEqual([
-      { provider: "claude", model: "opus", state: "quota_unknown" },
-      { provider: "claude", model: "sonnet", state: "quota_unknown" },
+      { provider: "codex", model: "opus", state: "ready" },
+      { provider: "codex", model: "sonnet", state: "ready" },
       { provider: "codex", model: "gpt", state: "ready" },
     ]);
   });

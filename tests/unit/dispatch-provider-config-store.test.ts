@@ -33,6 +33,7 @@ async function temporaryHome(): Promise<string> {
 
 const validConfig = {
   schemaVersion: 1,
+  codex: { executable: "codex", models: ["gpt-5.6-terra"], account: "default" },
   claude: { executable: "claude", models: ["opus", "sonnet"], account: "default" },
 };
 
@@ -88,6 +89,19 @@ describe("loadHostDispatchProviderConfig", () => {
     );
     const result = await loadHostDispatchProviderConfig(filePath);
     expect(result).toEqual({ ok: false, reason: "missing_or_invalid" });
+  });
+
+  it("fails closed when required Codex config is absent", async () => {
+    const agentTeamHome = await temporaryHome();
+    const filePath = defaultDispatchProviderConfigPath(agentTeamHome);
+    await mkdir(join(agentTeamHome, "config", "dispatch"), { recursive: true });
+    const { codex: _codex, ...withoutCodex } = validConfig;
+    void _codex;
+    await writeFile(filePath, JSON.stringify(withoutCodex), "utf8");
+    await expect(loadHostDispatchProviderConfig(filePath)).resolves.toEqual({
+      ok: false,
+      reason: "missing_or_invalid",
+    });
   });
 
   it("loads a schema-valid config", async () => {

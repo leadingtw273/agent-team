@@ -39,6 +39,7 @@ function failed(
   extra?: Readonly<{
     reportFailureCategory?: ReportContractFailureCategory;
     rejectedOutput?: string;
+    reviewWait?: NonNullable<Extract<ReviewerPipelineOutcome, { state: "failed" }>["reviewWait"]>;
   }>,
 ): ReviewerPipelineOutcome {
   return Object.freeze({ state: "failed", stage, error, job, ...extra });
@@ -230,6 +231,7 @@ export class ReviewerPipeline {
         ...(firstFailure.rejectedOutput === undefined
           ? {}
           : { rejectedOutput: firstFailure.rejectedOutput }),
+        ...(firstFailure.reviewWait === undefined ? {} : { reviewWait: firstFailure.reviewWait }),
       });
     }
     const firstPause = runs.find((run) => run.kind === "paused");

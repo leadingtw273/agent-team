@@ -143,18 +143,18 @@ const routingConfig: ModelRoutingConfig = {
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
     { role: "implementer", candidates: [{ provider: "codex", model: "build" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "review" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
 const routeObservations = [
   { provider: "codex", model: "lead", state: "ready" },
   { provider: "codex", model: "build", state: "ready" },
-  { provider: "codex", model: "review", state: "ready" },
+  { provider: "claude", model: "review", state: "ready" },
   { provider: "gemini", model: "visual", state: "ready" },
-  { provider: "claude", model: "integrate", state: "ready" },
+  { provider: "codex", model: "integrate", state: "ready" },
 ] as const;
 
 function dispatchInput(holderId: string) {

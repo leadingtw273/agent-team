@@ -4,7 +4,7 @@ import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { GitPreflight, LocalGitAdapter } from "../../adapters/git/index.js";
 import { ReviewerRecoveryPipeline } from "../../application/pipelines/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
-import { buildClaudeRunner } from "./claude-factory.js";
+import { buildCodexRunner } from "./codex-factory.js";
 import { FileJobUpdateAdapter } from "./pipeline-job-adapter.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
 import { ReviewerRecoveryCheckpointAdapter } from "./reviewer-recovery-checkpoint.js";
@@ -12,7 +12,7 @@ import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
 
 export interface BuildReviewerRecoveryPipelineOptions {
   readonly agentTeamHome: string;
-  readonly claudeConfig: DispatchProviderConfig["claude"];
+  readonly codexConfig: DispatchProviderConfig["codex"];
   readonly jobs: Pick<FileJobRepository, "update">;
 }
 
@@ -34,7 +34,7 @@ export function buildReviewerRecoveryPipeline(
   const pipeline = new ReviewerRecoveryPipeline({
     git,
     preflight: new GitPreflight(git),
-    provider: buildClaudeRunner(options.claudeConfig),
+    provider: buildCodexRunner(options.codexConfig),
     jobs: new FileJobUpdateAdapter(options.jobs),
     checkpoint: new ReviewerRecoveryCheckpointAdapter({
       store: new LocalYamlCheckpointStore(join(options.agentTeamHome, "state", "checkpoints")),

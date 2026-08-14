@@ -59,14 +59,6 @@ function record(value: unknown): JsonRecord | undefined {
     : undefined;
 }
 
-function hasExactKeys(value: JsonRecord, expected: readonly string[]): boolean {
-  const actual = Reflect.ownKeys(value);
-  return (
-    actual.length === expected.length &&
-    actual.every((key) => typeof key === "string" && expected.includes(key))
-  );
-}
-
 function normalizeVersion(text: string): string | undefined {
   const match = /^codex-cli (\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$/u.exec(text.trimEnd());
   return match?.[1];
@@ -96,11 +88,7 @@ function parseWindow(
   nowMillis: number,
 ): Readonly<{ remainingPercent: number; resetsAt: Instant }> | undefined {
   const window = record(input);
-  if (
-    window === undefined ||
-    !hasExactKeys(window, ["usedPercent", "windowDurationMins", "resetsAt"]) ||
-    window["windowDurationMins"] !== duration
-  ) {
+  if (window?.["windowDurationMins"] !== duration) {
     return undefined;
   }
   const used = window["usedPercent"];
@@ -119,6 +107,52 @@ function parseWindow(
   return instant.ok && Date.parse(instant.value) > nowMillis
     ? Object.freeze({ remainingPercent: 100 - used, resetsAt: instant.value })
     : undefined;
+}
+
+function rateLimitBuckets(input: unknown): readonly JsonRecord[] | undefined {
+  const root = record(input);
+  if (root === undefined) return undefined;
+  // App Server defines `rateLimits` as the backward-compatible single-bucket view. When it
+  // exists it is the authority for the ordinary Codex allowance: `rateLimitsByLimitId` can also
+  // contain independent model-specific buckets with the same duration, so merging both views
+  // would incorrectly classify separate meters as conflicting observations of one window.
+  if (root["rateLimits"] !== undefined) {
+    const single = record(root["rateLimits"]);
+    if (single === undefined) return undefined;
+    return Object.freeze([single]);
+  }
+  const buckets: JsonRecord[] = [];
+  if (root["rateLimitsByLimitId"] !== undefined) {
+    const byId = record(root["rateLimitsByLimitId"]);
+    if (byId === undefined) return undefined;
+    for (const candidate of Object.values(byId)) {
+      const bucket = record(candidate);
+      if (bucket === undefined) return undefined;
+      buckets.push(bucket);
+    }
+  }
+  return buckets.length === 0 ? undefined : Object.freeze(buckets);
+}
+
+function uniqueWindow(
+  windows: readonly unknown[],
+  duration: 300 | 10_080,
+  nowMillis: number,
+):
+  | Readonly<{ ok: true; value?: Readonly<{ remainingPercent: number; resetsAt: Instant }> }>
+  | Readonly<{ ok: false }> {
+  const parsed = windows
+    .map((window) => parseWindow(window, duration, nowMillis))
+    .filter((window): window is NonNullable<typeof window> => window !== undefined);
+  const identities = new Set(
+    parsed.map((window) => `${String(window.remainingPercent)}:${window.resetsAt}`),
+  );
+  return identities.size > 1
+    ? Object.freeze({ ok: false as const })
+    : Object.freeze({
+        ok: true as const,
+        ...(parsed[0] === undefined ? {} : { value: parsed[0] }),
+      });
 }
 
 class NodeCodexAppServerEpochPort implements CodexAppServerEpochPort {
@@ -284,7 +318,7 @@ export function createCodexQuotaCollector(
       }
       const now = clock.now();
       const nowMillis = Date.parse(now);
-      const limits = record(record(observed.rateLimits)?.["rateLimits"]);
+      const limits = rateLimitBuckets(observed.rateLimits);
       if (limits === undefined) {
         return Object.freeze({
           provider: "codex",
@@ -292,14 +326,16 @@ export function createCodexQuotaCollector(
           reason: "app_server_unavailable",
         });
       }
-      const windows = [limits["primary"], limits["secondary"]];
+      const windows = limits.flatMap((limit) => [limit["primary"], limit["secondary"]]);
       if (
         windows.some((window) => {
           if (window === null || window === undefined) return false;
           const parsed = record(window);
           return (
             parsed === undefined ||
-            !hasExactKeys(parsed, ["usedPercent", "windowDurationMins", "resetsAt"])
+            typeof parsed["usedPercent"] !== "number" ||
+            typeof parsed["windowDurationMins"] !== "number" ||
+            typeof parsed["resetsAt"] !== "number"
           );
         })
       ) {
@@ -309,8 +345,17 @@ export function createCodexQuotaCollector(
           reason: "app_server_unavailable",
         });
       }
-      const weekly = windows.map((window) => parseWindow(window, 10_080, nowMillis)).find(Boolean);
-      const fiveHour = windows.map((window) => parseWindow(window, 300, nowMillis)).find(Boolean);
+      const weeklyResult = uniqueWindow(windows, 10_080, nowMillis);
+      const fiveHourResult = uniqueWindow(windows, 300, nowMillis);
+      if (!weeklyResult.ok || !fiveHourResult.ok) {
+        return Object.freeze({
+          provider: "codex",
+          state: "unknown",
+          reason: "app_server_unavailable",
+        });
+      }
+      const weekly = weeklyResult.value;
+      const fiveHour = fiveHourResult.value;
       if (weekly === undefined && fiveHour === undefined) {
         return Object.freeze({
           provider: "codex",

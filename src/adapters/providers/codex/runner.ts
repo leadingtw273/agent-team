@@ -166,7 +166,12 @@ class CodexRun implements ProviderRunHandle {
     const thread = await this.#rpcRequest("thread/start", {
       model: this.#request.model,
       cwd: this.#request.workingDirectory,
-      approvalPolicy: "untrusted",
+      // Agent Team is an unattended controller: there is no interactive approval UI to resume
+      // an App Server request. `never` does not grant sandbox escapes; Codex fails an operation
+      // that falls outside the policy instead of asking a human to broaden it. Keep the legacy
+      // thread-level sandbox for the installed protocol and repeat the exact, bounded policy on
+      // `turn/start`, where App Server supports explicit writable roots.
+      approvalPolicy: "never",
       sandbox:
         this.#request.role === "code_reviewer" || this.#request.role === "visual_reviewer"
           ? "read-only"
@@ -186,6 +191,16 @@ class CodexRun implements ProviderRunHandle {
     const turn = await this.#rpcRequest("turn/start", {
       threadId: this.#threadId,
       input: [{ type: "text", text: context }],
+      cwd: this.#request.workingDirectory,
+      approvalPolicy: "never",
+      sandboxPolicy:
+        this.#request.role === "code_reviewer" || this.#request.role === "visual_reviewer"
+          ? { type: "readOnly", networkAccess: false }
+          : {
+              type: "workspaceWrite",
+              writableRoots: [this.#request.workingDirectory],
+              networkAccess: false,
+            },
     });
     if (!turn.ok) return turn;
     this.#turnId = nestedString(turn.value, "turn", "id");

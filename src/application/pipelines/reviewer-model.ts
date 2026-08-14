@@ -6,6 +6,7 @@ import type { Job } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type {
   CanonicalVisualManifestInput,
+  HeadSha,
   ReviewIdentity,
   RequirementSnapshot,
 } from "../../domain/review/index.js";
@@ -357,4 +358,13 @@ export type ReviewerPipelineOutcome =
        * solely so the CLI-layer diagnostic sidecar (decision 5) can write it, Redactor-scrubbed,
        * size-capped, 0600, somewhere that is not any of those. */
       rejectedOutput?: string;
+      /** Structured provider evidence for an interrupted required review; never raw provider text. */
+      reviewWait?: Readonly<{
+        confidence: "confirmed" | "unconfirmed";
+        bucket?: "weekly" | "five_hour" | "model_weekly";
+        resetAt?: Instant;
+        requirementsDigest: string;
+        headSha: HeadSha;
+        diffDigest: string;
+      }>;
     }>;

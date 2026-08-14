@@ -32,11 +32,13 @@ import { buildStatusMergePipelines } from "./status-merge-composition.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
+import { ReviewerWaitPublicationCoordinator } from "./reviewer-wait-publication.js";
 
 export type ResumeCompositionBlockedReason = "github_authentication_unavailable";
 
 export interface BuildResumeCompositionOptions {
   readonly agentTeamHome: string;
+  readonly codexConfig: DispatchProviderConfig["codex"];
   readonly claudeConfig: DispatchProviderConfig["claude"];
   /** E102-2: threaded straight through to `buildReviewerPipeline` (reviewer-composition.ts);
    * absent means no real visual-review provider is configured on this host -- see that file's own
@@ -47,7 +49,8 @@ export interface BuildResumeCompositionOptions {
   readonly mutationClient: Pick<
     LinearMutationClient,
     "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
-  >;
+  > &
+    Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
   readonly teamId: string;
   readonly linearProjectId: string;
   readonly progress: FileJobProgressStore;
@@ -75,11 +78,15 @@ export type ResumePipelineComposition = Pick<
   | "reviewStatus"
   | "autoMerge"
   | "workManagement"
+  | "reviewWaitPublication"
   | "lifecycle"
   | "visualReviewModel"
 > &
   Required<
-    Pick<ResumeCycleDependencies, "visualEvidence" | "linearPublication" | "linearPublicationStore">
+    Pick<
+      ResumeCycleDependencies,
+      "visualEvidence" | "linearPublication" | "linearPublicationStore" | "reviewWaitPublication"
+    >
   >;
 
 export type BuildResumeCompositionResult =
@@ -91,7 +98,7 @@ export async function buildResumeComposition(
 ): Promise<BuildResumeCompositionResult> {
   const ciRecovery = await buildCiRecoveryPipeline({
     agentTeamHome: options.agentTeamHome,
-    claudeConfig: options.claudeConfig,
+    codexConfig: options.codexConfig,
     jobs: options.jobs,
   });
   if (ciRecovery.state !== "ready") {
@@ -99,7 +106,7 @@ export async function buildResumeComposition(
   }
   const reviewerRecovery = await buildReviewerRecoveryPipeline({
     agentTeamHome: options.agentTeamHome,
-    claudeConfig: options.claudeConfig,
+    codexConfig: options.codexConfig,
     jobs: options.jobs,
   });
   const reviewer = await buildReviewerPipeline({
@@ -177,6 +184,10 @@ export async function buildResumeComposition(
       reviewStatus: statusMerge.value.reviewStatus,
       autoMerge: statusMerge.value.autoMergeGate,
       workManagement,
+      reviewWaitPublication: new ReviewerWaitPublicationCoordinator(
+        workManagement,
+        statusMerge.value.reviewStatus.ports.sourceControl,
+      ),
       lifecycle,
       visualEvidence,
       linearPublication,

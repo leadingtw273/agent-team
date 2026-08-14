@@ -20,7 +20,7 @@ import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters
 import { GitPreflight, LocalGitAdapter } from "../../adapters/git/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { ImplementerPipeline } from "../../application/pipelines/index.js";
-import { buildClaudeRunner } from "./claude-factory.js";
+import { buildCodexRunner } from "./codex-factory.js";
 import { ScopeOverrunCheckpointAdapter } from "./scope-checkpoint.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
@@ -29,7 +29,7 @@ export type ImplementerCompositionBlockedReason = "github_authentication_unavail
 
 export interface BuildImplementerPipelineOptions {
   readonly agentTeamHome: string;
-  readonly claudeConfig: DispatchProviderConfig["claude"];
+  readonly codexConfig: DispatchProviderConfig["codex"];
   /** Injectable for tests (same convention as `probe-composition.ts`'s `githubTransport`);
    * production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
@@ -54,7 +54,7 @@ export async function buildImplementerPipeline(
   const pipeline = new ImplementerPipeline({
     git,
     preflight: new GitPreflight(git),
-    provider: buildClaudeRunner(options.claudeConfig),
+    provider: buildCodexRunner(options.codexConfig),
     sourceControl: new GitHubAdapter(githubTransport),
     scopeCheckpoint: new ScopeOverrunCheckpointAdapter({
       store: new LocalYamlCheckpointStore(checkpointDirectory),

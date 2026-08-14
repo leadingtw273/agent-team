@@ -1,22 +1,22 @@
 import {
-  createClaudeQuotaCollector,
-  createClaudeQuotaRefresher,
-  type ClaudeQuotaCollector,
-  type ClaudeQuotaDiagnosticResult,
-  type ClaudeQuotaRefresher,
-} from "../../adapters/providers/claude/index.js";
-import type {
-  PlatformIdentity,
-  ProcessPort,
-  QuotaPort,
-  QuotaSnapshot,
-} from "../../application/ports/index.js";
+  createCodexQuotaCollector,
+  type CodexQuotaCollector,
+  type CodexQuotaDiagnosticResult,
+} from "../../adapters/providers/codex/index.js";
+import type { PlatformIdentity, QuotaPort, QuotaSnapshot } from "../../application/ports/index.js";
 import {
   PolicyBackedNewJobQuotaAdmission,
   type NewJobQuotaAdmissionPort,
   type QuotaRuntimeContextPort,
 } from "../../application/quota/index.js";
-import { createClock, domainError, err, ok, type Clock } from "../../domain/foundation/index.js";
+import {
+  createClock,
+  domainError,
+  err,
+  ok,
+  type Clock,
+  type Instant,
+} from "../../domain/foundation/index.js";
 import {
   defaultQuotaHostConfigPath,
   readQuotaHostConfig,
@@ -24,94 +24,68 @@ import {
 } from "../quota/index.js";
 import { createFailClosedNewJobQuotaAdmission } from "./quota-admission.js";
 
-type ClaudeFullResult = Extract<ClaudeQuotaDiagnosticResult, { state: "full" }>;
-const activeRefreshAfterMs = 60_000;
+type CodexPartialResult = Extract<CodexQuotaDiagnosticResult, { state: "partial" }>;
+type CodexUsableResult = CodexPartialResult & {
+  readonly buckets: CodexPartialResult["buckets"] & {
+    readonly weekly: NonNullable<CodexPartialResult["buckets"]["weekly"]>;
+  };
+};
 
-function snapshot(result: ClaudeFullResult): QuotaSnapshot {
+function usable(result: CodexQuotaDiagnosticResult): result is CodexUsableResult {
+  return result.state === "partial" && result.buckets.weekly !== undefined;
+}
+
+function snapshot(result: CodexUsableResult): QuotaSnapshot {
   const identity = Object.freeze({
-    provider: "claude",
+    provider: "codex",
     accountFingerprint: result.accountFingerprint,
   });
+  const sample = (
+    bucket: "weekly" | "five_hour",
+    value: Readonly<{ remainingPercent: number; resetsAt: Instant }>,
+  ) =>
+    Object.freeze({
+      ...identity,
+      cliVersion: result.cliVersion,
+      source: result.provenance,
+      observedAt: result.observedAt,
+      kind: "usage" as const,
+      bucket,
+      state: "confirmed" as const,
+      remainingPercent: value.remainingPercent,
+      resetsAt: value.resetsAt,
+    });
   return Object.freeze({
     ...identity,
     samples: Object.freeze([
-      Object.freeze({
-        ...identity,
-        cliVersion: result.cliVersion,
-        source: result.provenance,
-        observedAt: result.observedAt,
-        kind: "usage" as const,
-        bucket: "weekly" as const,
-        state: "confirmed" as const,
-        remainingPercent: result.buckets.weekly.remainingPercent,
-        resetsAt: result.buckets.weekly.resetsAt,
-      }),
-      Object.freeze({
-        ...identity,
-        cliVersion: result.cliVersion,
-        source: result.provenance,
-        observedAt: result.observedAt,
-        kind: "usage" as const,
-        bucket: "five_hour" as const,
-        state: "confirmed" as const,
-        remainingPercent: result.buckets.fiveHour.remainingPercent,
-        resetsAt: result.buckets.fiveHour.resetsAt,
-      }),
+      sample("weekly", result.buckets.weekly),
+      ...(result.buckets.fiveHour === undefined
+        ? []
+        : [sample("five_hour", result.buckets.fiveHour)]),
     ]),
   });
 }
 
-/** One process-local collection bridge shared by runtime-context and quota reads. It retains only
- * a successful, already-observed epoch long enough for PolicyBackedNewJobQuotaAdmission's
- * immediate readCached call; failures clear it. Concurrent callers share one in-flight epoch. */
-class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
-  readonly #collector: ClaudeQuotaCollector;
-  readonly #refresher: ClaudeQuotaRefresher | undefined;
-  readonly #config: QuotaHostConfig["claude"];
-  readonly #clock: Clock;
-  #inFlight: Promise<ClaudeFullResult | undefined> | undefined;
-  #latest: ClaudeFullResult | undefined;
+/** One process-local authoritative App Server epoch, shared by context and quota reads. */
+class CodexQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
+  readonly #collector: CodexQuotaCollector;
+  readonly #config: QuotaHostConfig["codex"];
+  #inFlight: Promise<CodexUsableResult | undefined> | undefined;
+  #latest: CodexUsableResult | undefined;
 
-  constructor(
-    collector: ClaudeQuotaCollector,
-    config: QuotaHostConfig["claude"],
-    clock: Clock,
-    refresher?: ClaudeQuotaRefresher,
-  ) {
+  constructor(collector: CodexQuotaCollector, config: QuotaHostConfig["codex"]) {
     this.#collector = collector;
     this.#config = config;
-    this.#clock = clock;
-    this.#refresher = refresher;
   }
 
-  #needsActiveRefresh(result: ClaudeQuotaDiagnosticResult): boolean {
-    if (this.#refresher === undefined) return false;
-    if (result.state === "unknown") {
-      return result.reason === "snapshot_stale" || result.reason === "snapshot_unavailable";
-    }
-    const age = Date.parse(this.#clock.now()) - Date.parse(result.observedAt);
-    return Number.isFinite(age) && age > activeRefreshAfterMs;
-  }
-
-  async #collect(): Promise<ClaudeFullResult | undefined> {
+  async #collect(): Promise<CodexUsableResult | undefined> {
     if (this.#inFlight !== undefined) return this.#inFlight;
     const epoch = this.#collector
-      .collect(this.#config)
-      .then(async (initial) => {
-        if (!this.#needsActiveRefresh(initial) || this.#refresher === undefined) return initial;
-        const refreshed = await this.#refresher.refresh(this.#config);
-        return refreshed.state === "refreshed"
-          ? this.#collector.collect(this.#config)
-          : Object.freeze({
-              provider: "claude" as const,
-              state: "unknown" as const,
-              reason: "snapshot_unavailable" as const,
-            });
-      })
+      .collect({ expectedCliVersion: this.#config.expectedCliVersion })
       .then((result) => {
-        const full = result.state === "full" ? result : undefined;
-        this.#latest = full;
-        return full;
+        const accepted = usable(result) ? result : undefined;
+        this.#latest = accepted;
+        return accepted;
       })
       .catch(() => {
         this.#latest = undefined;
@@ -125,14 +99,14 @@ class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
   }
 
   async observe(provider: string) {
-    if (provider !== "claude") return err(domainError("unavailable"));
+    if (provider !== "codex") return err(domainError("unavailable"));
     const result = await this.#collect();
     return result === undefined
       ? err(domainError("unavailable"))
       : ok(
           Object.freeze({
             identity: Object.freeze({
-              provider: "claude",
+              provider: "codex",
               accountFingerprint: result.accountFingerprint,
             }),
             cliVersion: result.cliVersion,
@@ -144,7 +118,7 @@ class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
     const result = this.#latest;
     return Promise.resolve(
       result !== undefined &&
-        identity.provider === "claude" &&
+        identity.provider === "codex" &&
         identity.accountFingerprint === result.accountFingerprint
         ? ok(snapshot(result))
         : err(domainError("not_found")),
@@ -152,7 +126,7 @@ class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
   }
 
   async refresh(provider: string) {
-    if (provider !== "claude") return err(domainError("unavailable"));
+    if (provider !== "codex") return err(domainError("unavailable"));
     this.#latest = undefined;
     const result = await this.#collect();
     return result === undefined ? err(domainError("unavailable")) : ok(snapshot(result));
@@ -161,50 +135,32 @@ class ClaudeQuotaEpochBridge implements QuotaRuntimeContextPort, QuotaPort {
 
 export interface CreateProductionQuotaAdmissionOptions {
   readonly agentTeamHome: string;
-  readonly claudeProcess: ProcessPort;
-  readonly claudeExecutable?: string;
-  readonly workingDirectory: string;
+  readonly codexExecutable?: string;
   readonly clock?: Clock;
-  readonly collector?: ClaudeQuotaCollector;
-  readonly refresher?: ClaudeQuotaRefresher;
+  readonly collector?: CodexQuotaCollector;
 }
 
 export async function createProductionQuotaAdmission(
   options: CreateProductionQuotaAdmissionOptions,
 ): Promise<NewJobQuotaAdmissionPort> {
   const config = await readQuotaHostConfig(defaultQuotaHostConfigPath(options.agentTeamHome));
-  if (!config.ok || !config.value.claude.enabled) return createFailClosedNewJobQuotaAdmission();
+  if (!config.ok || !config.value.codex.enabled) return createFailClosedNewJobQuotaAdmission();
   const clock = options.clock ?? createClock();
   const collector =
     options.collector ??
-    createClaudeQuotaCollector({
-      process: options.claudeProcess,
-      ...(options.claudeExecutable === undefined ? {} : { executable: options.claudeExecutable }),
-      workingDirectory: options.workingDirectory,
+    createCodexQuotaCollector({
+      ...(options.codexExecutable === undefined ? {} : { executable: options.codexExecutable }),
       clock,
     });
-  const activeRefresh = config.value.claude.activeRefresh;
-  const refresher =
-    options.refresher ??
-    (options.collector === undefined && activeRefresh?.enabled === true
-      ? createClaudeQuotaRefresher({
-          process: options.claudeProcess,
-          ...(options.claudeExecutable === undefined
-            ? {}
-            : { claudeExecutable: options.claudeExecutable }),
-          workingDirectory: activeRefresh.workingDirectory,
-          clock,
-        })
-      : undefined);
-  const bridge = new ClaudeQuotaEpochBridge(collector, config.value.claude, clock, refresher);
+  const bridge = new CodexQuotaEpochBridge(collector, config.value.codex);
   return new PolicyBackedNewJobQuotaAdmission(
     bridge,
     bridge,
     Object.freeze({
-      weeklyUsageLimitPercent: config.value.claude.weeklyUsageLimitPercent,
-      terminalRemainingPercent: config.value.claude.terminalRemainingPercent,
-      maxSampleAgeMs: config.value.claude.maxSampleAgeMs,
-      expectedCliVersions: Object.freeze({ claude: config.value.claude.expectedCliVersion }),
+      weeklyUsageLimitPercent: config.value.codex.weeklyUsageLimitPercent,
+      terminalRemainingPercent: config.value.codex.terminalRemainingPercent,
+      maxSampleAgeMs: config.value.codex.maxSampleAgeMs,
+      expectedCliVersions: Object.freeze({ codex: config.value.codex.expectedCliVersion }),
     }),
     clock,
   );

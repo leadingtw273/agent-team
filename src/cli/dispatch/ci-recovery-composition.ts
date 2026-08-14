@@ -20,7 +20,7 @@ import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { CiLogExcerptDiagnosticsSidecar } from "../../adapters/dispatch/ci-log-excerpt-diagnostics-sidecar.js";
 import { CiRecoveryPipeline } from "../../application/pipelines/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
-import { buildClaudeRunner } from "./claude-factory.js";
+import { buildCodexRunner } from "./codex-factory.js";
 import { CiRecoveryCheckpointAdapter } from "./ci-recovery-checkpoint.js";
 import { FileJobUpdateAdapter } from "./pipeline-job-adapter.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
@@ -30,7 +30,7 @@ export type CiRecoveryCompositionBlockedReason = "github_authentication_unavaila
 
 export interface BuildCiRecoveryPipelineOptions {
   readonly agentTeamHome: string;
-  readonly claudeConfig: DispatchProviderConfig["claude"];
+  readonly codexConfig: DispatchProviderConfig["codex"];
   readonly jobs: Pick<FileJobRepository, "update">;
   /**
    * Injectable for tests; production defaults to a real `GhTransport`.
@@ -72,7 +72,7 @@ export async function buildCiRecoveryPipeline(
   const pipeline = new CiRecoveryPipeline({
     git,
     preflight: new GitPreflight(git),
-    provider: buildClaudeRunner(options.claudeConfig),
+    provider: buildCodexRunner(options.codexConfig),
     sourceControl: github,
     ciLog: github,
     jobs: new FileJobUpdateAdapter(options.jobs),

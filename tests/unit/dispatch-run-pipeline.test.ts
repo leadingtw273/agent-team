@@ -222,17 +222,10 @@ const routingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
-    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
-    // `code_reviewer` deliberately routes to claude/opus too (not the more realistic codex) --
-    // the fake Claude capability probe below only ever reports observations for
-    // `claude.config.models` ("opus"), so the `not_applicable_role` test (which overrides the
-    // candidate's role to "code_reviewer" to reach the dispatched-but-not-implementer branch)
-    // needs its route to actually resolve to "ready"; the point of that test is the CLI handler's
-    // role branch, not model routing, so this keeps it decoupled from a real codex observation
-    // this fixture has no way to provide.
+    { role: "implementer", candidates: [{ provider: "codex", model: "gpt-5.6-terra" }] },
     { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -349,6 +342,14 @@ function buildHandlers(
         trustedConfig: trustedConfigFixture(),
         claude: {
           config: { executable: "claude", models: ["opus"], account: "default" },
+          process: claudeProcess,
+        },
+        codex: {
+          config: {
+            executable: "codex",
+            models: ["lead", "gpt-5.6-terra", "integrate"],
+            account: "default",
+          },
           process: claudeProcess,
         },
         quotaAdmission: quotaAdmission ?? {
@@ -686,7 +687,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     ).resolves.toEqual({ ok: true, value: { state: "expired" } });
   });
 
-  it("Q01 consumes before provider start, while dry-run leaves the active canary untouched", async () => {
+  it("Q01 leaves the superseded Claude canary untouched for Codex-primary execution", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const parsedCanaryNow = parseInstant("2026-08-12T12:00:00.000Z");
@@ -796,11 +797,12 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
 
     const run = await handlers.run({ projectId });
     expect(run).toMatchObject({ state: "success" });
-    expect(events).toEqual(["consume.end", "provider.spawn.begin"]);
-    expect(versionedClaude.calls).toBe(1);
+    expect(events).toEqual([]);
+    expect(versionedClaude.calls).toBe(0);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
     await expect(
       canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
-    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
   });
 
   it("maps a ci_waiting pipeline outcome to a success payload with the change request URL", async () => {
@@ -1390,7 +1392,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * per this ticket's own packet) no longer implies "nothing to do here."
    */
   it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role, but persists a resolvable requires_manual record and flags it in the response", async () => {
-    candidateRoleOverride.current = "code_reviewer";
+    candidateRoleOverride.current = "team_lead";
     const buildImplementerPipeline = vi.fn(() =>
       Promise.reject(new Error("must never be called for a non-implementer role")),
     );
@@ -1441,7 +1443,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * resolve` to ever find.
    */
   it("C019: reports a failed outcome (not success) when the role_pipeline_unavailable fallback write itself genuinely fails", async () => {
-    candidateRoleOverride.current = "code_reviewer";
+    candidateRoleOverride.current = "team_lead";
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const progressDirectory = defaultJobProgressDirectory(stateRoot);

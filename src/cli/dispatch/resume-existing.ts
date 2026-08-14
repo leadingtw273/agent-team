@@ -124,6 +124,7 @@ export async function resumeExistingProjectJobs(
     preparePromise ??= (async () => {
       const built = await (options.buildResumeComposition ?? buildResumeComposition)({
         agentTeamHome: options.agentTeamHome,
+        codexConfig: options.ready.codex.config,
         claudeConfig: options.ready.claude.config,
         ...(options.ready.gemini === undefined ? {} : { geminiConfig: options.ready.gemini }),
         jobs: options.ready.jobs,
@@ -183,6 +184,9 @@ export async function resumeExistingProjectJobs(
         },
         workManagement: {
           getIssue: (...args) => prepared().workManagement.getIssue(...args),
+        },
+        reviewWaitPublication: {
+          publish: (...args) => prepared().reviewWaitPublication.publish(...args),
         },
         readModel: options.ready.discovery.readModel,
         teamId: options.ready.discovery.teamId,

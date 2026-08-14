@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { ClaudeQuotaCollector } from "../../src/adapters/providers/claude/index.js";
+import type { CodexQuotaCollector } from "../../src/adapters/providers/codex/index.js";
 import { buildDispatchComposition } from "../../src/cli/dispatch/composition.js";
 import {
   serializeTrustedProjectConfig,
@@ -122,9 +122,9 @@ const validRoutingConfig: ModelRoutingConfig = {
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
     { role: "implementer", candidates: [{ provider: "codex", model: "build" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "review" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -151,6 +151,7 @@ async function writeRoutingConfig(agentTeamHome: string, value: unknown): Promis
 
 const validProviderConfig = {
   schemaVersion: 1,
+  codex: { executable: "codex", models: ["build"], account: "default" },
   claude: { executable: "claude", models: ["opus"], account: "default" },
 };
 
@@ -175,7 +176,14 @@ async function writeQuotaConfig(agentTeamHome: string): Promise<void> {
         terminalRemainingPercent: 3,
         maxSampleAgeMs: 300_000,
       },
-      codex: { diagnosticEnabled: true, expectedCliVersion: "0.147.0" },
+      codex: {
+        enabled: true,
+        diagnosticEnabled: true,
+        expectedCliVersion: "0.147.0",
+        weeklyUsageLimitPercent: 80,
+        terminalRemainingPercent: 3,
+        maxSampleAgeMs: 300_000,
+      },
     }),
     { mode: 0o600 },
   );
@@ -315,7 +323,7 @@ describe("buildDispatchComposition", () => {
     });
   });
 
-  it("wires a trusted Claude full/fresh collector into the production quota boundary", async () => {
+  it("wires a trusted Codex weekly snapshot into the production quota boundary", async () => {
     const agentTeamHome = await temporaryHome();
     await writeDraft(agentTeamHome, project());
     await writeRoutingConfig(agentTeamHome, validRoutingConfig);
@@ -324,20 +332,19 @@ describe("buildDispatchComposition", () => {
     const config = trustedConfig(project());
     const observed = parseInstant("2026-08-13T07:15:00.000Z");
     const weeklyReset = parseInstant("2026-08-20T07:15:00.000Z");
-    const fiveHourReset = parseInstant("2026-08-13T11:15:00.000Z");
-    if (!observed.ok || !weeklyReset.ok || !fiveHourReset.ok) throw new Error("invalid fixture");
-    const collector: ClaudeQuotaCollector = {
+    if (!observed.ok || !weeklyReset.ok) throw new Error("invalid fixture");
+    const collector: CodexQuotaCollector = {
       collect: () =>
         Promise.resolve({
-          provider: "claude",
-          state: "full",
+          provider: "codex",
+          state: "partial",
+          reason: "five_hour_unavailable",
           accountFingerprint: "provider-owned-fingerprint",
-          cliVersion: "2.1.229",
+          cliVersion: "0.147.0",
           observedAt: observed.value,
-          provenance: "claude_status_line_v1",
+          provenance: "codex_app_server_v1",
           buckets: {
             weekly: { remainingPercent: 90, resetsAt: weeklyReset.value },
-            fiveHour: { remainingPercent: 80, resetsAt: fiveHourReset.value },
           },
         }),
     };
@@ -352,11 +359,11 @@ describe("buildDispatchComposition", () => {
     });
     expect(result.state).toBe("ready");
     if (result.state !== "ready") return;
-    await expect(result.value.quotaAdmission.resolve("claude")).resolves.toEqual({
-      state: "ready",
-      reason: "quota_confirmed",
-    });
     await expect(result.value.quotaAdmission.resolve("codex")).resolves.toEqual({
+      state: "ready",
+      reason: "weekly_quota_confirmed",
+    });
+    await expect(result.value.quotaAdmission.resolve("claude")).resolves.toEqual({
       state: "quota_unknown",
       reason: "runtime_context_unavailable",
     });

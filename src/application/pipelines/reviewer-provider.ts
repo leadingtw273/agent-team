@@ -1,10 +1,16 @@
 import { domainError, type DomainError } from "../../domain/foundation/index.js";
 import type { EffectiveTreeChange, ReviewIdentity } from "../../domain/review/index.js";
-import type { CommitChecksSnapshot, ProviderPort, ProviderRunHandle } from "../ports/index.js";
+import type {
+  CommitChecksSnapshot,
+  ProviderEvent,
+  ProviderPort,
+  ProviderRunHandle,
+} from "../ports/index.js";
 import type { ProviderToolDecisionPort } from "./implementer-model.js";
 import type {
   ReportContractFailureCategory,
   ReviewerFailureStage,
+  ReviewerPipelineOutcome,
   ReviewerPipelineRequest,
   ReviewerReport,
 } from "./reviewer-model.js";
@@ -30,12 +36,14 @@ export type ReviewerRunResult =
        * own header on `ReviewerPipelineOutcome`'s "failed" variant (reviewer-model.ts) for the exact
        * handling rule (never persisted here; the CLI/adapter-layer sidecar decides that). */
       rejectedOutput?: string;
+      reviewWait?: NonNullable<Extract<ReviewerPipelineOutcome, { state: "failed" }>["reviewWait"]>;
     }>;
 
 interface EventCollection {
   readonly outputs: readonly string[];
   readonly error?: DomainError;
   readonly pauseSummary?: string;
+  readonly quotaBoundary?: Extract<ProviderEvent, { kind: "quota_boundary" }>;
 }
 
 export interface RunReviewerProviderInput {
@@ -54,9 +62,14 @@ async function collectEvents(
   input: RunReviewerProviderInput,
 ): Promise<EventCollection> {
   const outputs: string[] = [];
+  let quotaBoundary: EventCollection["quotaBoundary"];
   for await (const event of handle.events) {
     if (event.kind === "output" && event.stream === "stdout" && event.text.trim().length > 0) {
       outputs.push(event.text.trim());
+      continue;
+    }
+    if (event.kind === "quota_boundary") {
+      if (quotaBoundary === undefined || event.confidence === "confirmed") quotaBoundary = event;
       continue;
     }
     if (event.kind !== "tool_request") continue;
@@ -68,19 +81,58 @@ async function collectEvents(
     if (!decision.ok) {
       await handle.respondToToolRequest(event.requestId, "decline");
       await handle.interrupt();
-      return Object.freeze({ outputs, error: decision.error });
+      return Object.freeze({
+        outputs,
+        error: decision.error,
+        ...(quotaBoundary === undefined ? {} : { quotaBoundary }),
+      });
     }
     const responded = await handle.respondToToolRequest(event.requestId, decision.value.response);
     if (!responded.ok) {
       await handle.interrupt();
-      return Object.freeze({ outputs, error: responded.error });
+      return Object.freeze({
+        outputs,
+        error: responded.error,
+        ...(quotaBoundary === undefined ? {} : { quotaBoundary }),
+      });
     }
     if (decision.value.pause) {
       await handle.interrupt();
-      return Object.freeze({ outputs, pauseSummary: decision.value.summary });
+      return Object.freeze({
+        outputs,
+        pauseSummary: decision.value.summary,
+        ...(quotaBoundary === undefined ? {} : { quotaBoundary }),
+      });
     }
   }
-  return Object.freeze({ outputs: Object.freeze(outputs) });
+  return Object.freeze({
+    outputs: Object.freeze(outputs),
+    ...(quotaBoundary === undefined ? {} : { quotaBoundary }),
+  });
+}
+
+function reviewWaitSignal(
+  input: RunReviewerProviderInput,
+  collected: EventCollection,
+  error: DomainError,
+): NonNullable<Extract<ReviewerRunResult, { kind: "failed" }>["reviewWait"]> | undefined {
+  const boundary = collected.quotaBoundary;
+  if (
+    input.role !== "code_reviewer" ||
+    boundary === undefined ||
+    (boundary.confidence === "confirmed" && error.code !== "rate_limited") ||
+    (boundary.confidence === "unconfirmed" && error.code !== "quota_unknown")
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    confidence: boundary.confidence,
+    ...(boundary.bucket === undefined ? {} : { bucket: boundary.bucket }),
+    ...(boundary.resetAt === undefined ? {} : { resetAt: boundary.resetAt }),
+    requirementsDigest: input.identity.requirementsDigest,
+    headSha: input.identity.headSha,
+    diffDigest: input.identity.diffDigest,
+  });
 }
 
 /**
@@ -232,10 +284,12 @@ export async function runReviewerProvider(
   }
   if (completion.value.outcome === "interrupted") return Object.freeze({ kind: "interrupted" });
   if (completion.value.outcome !== "completed") {
+    const reviewWait = reviewWaitSignal(input, collected, completion.value.error);
     return Object.freeze({
       kind: "failed",
       stage: "provider_run",
       error: completion.value.error,
+      ...(reviewWait === undefined ? {} : { reviewWait }),
     });
   }
   const output = collected.outputs.at(-1);

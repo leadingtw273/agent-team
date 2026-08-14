@@ -50,7 +50,8 @@ import type { LinearReadModel } from "../../adapters/linear/read.js";
 export type LinearWorkManagementMutationClient = Pick<
   LinearMutationClient,
   "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
->;
+> &
+  Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
 export type LinearWorkManagementReadModel = Pick<LinearReadModel, "readContext" | "readIssue">;
 
 export interface LinearWorkManagementAdapterOptions {
@@ -122,7 +123,7 @@ export class LinearWorkManagementAdapter implements Pick<
     _options: MutationOptions,
   ): Promise<Result<WorkManagementIssueSnapshot, DomainError>> {
     void _options;
-    if (status !== "completed" && status !== "requires_manual") {
+    if (status !== "completed" && status !== "requires_manual" && status !== "in_review") {
       return err(domainError("invariant_violation"));
     }
     const context = await this.#context();
@@ -130,10 +131,18 @@ export class LinearWorkManagementAdapter implements Pick<
     const result =
       status === "completed"
         ? await this.#mutationClient.observeGithubMerge(context.value, reference.externalIssueId)
-        : await this.#mutationClient.requireManualIntervention(
-            context.value,
-            reference.externalIssueId,
-          );
+        : status === "requires_manual"
+          ? await this.#mutationClient.requireManualIntervention(
+              context.value,
+              reference.externalIssueId,
+            )
+          : this.#mutationClient.transitionWorkStatus === undefined
+            ? err(domainError("invariant_violation"))
+            : await this.#mutationClient.transitionWorkStatus(
+                context.value,
+                reference.externalIssueId,
+                { target: "in_review", cause: "review_started" },
+              );
     if (!result.ok) return result;
     return toWorkManagementSnapshot(reference.project.id, result.value);
   }

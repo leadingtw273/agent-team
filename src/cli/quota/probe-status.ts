@@ -28,7 +28,7 @@ export function createQuotaProbeStatusHandler(
           : Object.freeze({
               provider: "claude" as const,
               state: "unknown" as const,
-              reason: "config_unavailable" as const,
+              reason: config.ok ? ("config_unavailable" as const) : config.reason,
             }),
       );
     }
@@ -39,7 +39,7 @@ export function createQuotaProbeStatusHandler(
           : Object.freeze({
               provider: "codex" as const,
               state: "unknown" as const,
-              reason: "config_unavailable" as const,
+              reason: config.ok ? ("config_unavailable" as const) : config.reason,
             }),
       );
     }

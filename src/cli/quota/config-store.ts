@@ -27,19 +27,16 @@ export const quotaHostConfigSchema = z
         weeklyUsageLimitPercent: z.number().positive().max(100),
         terminalRemainingPercent: z.number().min(0).max(100),
         maxSampleAgeMs: z.number().int().positive(),
-        activeRefresh: z
-          .object({
-            enabled: z.boolean(),
-            workingDirectory: canonicalAbsolutePath,
-          })
-          .strict()
-          .optional(),
       })
       .strict(),
     codex: z
       .object({
+        enabled: z.boolean(),
         diagnosticEnabled: z.boolean(),
         expectedCliVersion: exactVersion,
+        weeklyUsageLimitPercent: z.number().positive().max(100),
+        terminalRemainingPercent: z.number().min(0).max(100),
+        maxSampleAgeMs: z.number().int().positive(),
       })
       .strict(),
   })
@@ -49,7 +46,18 @@ export type QuotaHostConfig = z.infer<typeof quotaHostConfigSchema>;
 
 export type QuotaHostConfigReadResult =
   | Readonly<{ ok: true; value: QuotaHostConfig }>
-  | Readonly<{ ok: false; reason: "config_unavailable" }>;
+  | Readonly<{ ok: false; reason: "config_unavailable" | "active_refresh_superseded" }>;
+
+function hasSupersededActiveRefresh(input: unknown): boolean {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false;
+  const claude = (input as Readonly<Record<string, unknown>>)["claude"];
+  return (
+    typeof claude === "object" &&
+    claude !== null &&
+    !Array.isArray(claude) &&
+    Object.prototype.hasOwnProperty.call(claude, "activeRefresh")
+  );
+}
 
 export function defaultQuotaHostConfigPath(agentTeamHome: string): string {
   return join(agentTeamHome, "config", "quota.json");
@@ -97,6 +105,9 @@ export async function readQuotaHostConfig(
       }
       const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       const parsed: unknown = JSON.parse(text);
+      if (hasSupersededActiveRefresh(parsed)) {
+        return Object.freeze({ ok: false, reason: "active_refresh_superseded" });
+      }
       const validated = quotaHostConfigSchema.safeParse(parsed);
       return validated.success
         ? Object.freeze({ ok: true, value: Object.freeze(validated.data) })

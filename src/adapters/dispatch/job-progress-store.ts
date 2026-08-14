@@ -82,6 +82,7 @@ const providerRetryCountSchema = z.number().int().min(0).max(100);
  * enum just to stay in sync with it; resume-composition.ts is what decides whether a code is
  * `retryable` before ever reaching this stage at all. */
 const lastErrorCodeSchema = z.string().trim().min(1).max(64);
+const reviewBindingDigestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 
 /**
  * C016 fix: mirrors `ImplementerPipelineOutcome`'s own `paused` `reason` union
@@ -171,6 +172,8 @@ export const requiresManualReasonCodeSchema = z.enum([
   // `legacy_base_revision_mismatch` -- confirmed absent from every record on disk as of this
   // ticket, safe to drop from the enum outright rather than keep as a dead, unreachable case.
   "legacy_base_revision_unrecoverable",
+  /** Pre-ADR-009 records did not persist which Provider/model owned execution and review. */
+  "legacy_provider_assignment_unavailable",
   // ci_recovery
   "ci_recovery_paused",
   "ci_recovery_failed",
@@ -395,6 +398,24 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("implementing") }).strict(),
   z.object({ kind: z.literal("ci_waiting") }).strict(),
   z.object({ kind: z.literal("awaiting_review") }).strict(),
+  z
+    .object({
+      kind: z.literal("reviewer_waiting"),
+      reason: z.enum(["confirmed_quota_wall", "unconfirmed_throttling"]),
+      confidence: z.enum(["confirmed", "unconfirmed"]),
+      bucket: z.enum(["weekly", "five_hour", "model_weekly"]).optional(),
+      resetAt: instantSchema.optional(),
+      retryNotBefore: instantSchema.optional(),
+      binding: z
+        .object({
+          requirementsDigest: reviewBindingDigestSchema,
+          headSha: headShaSchema,
+          diffDigest: reviewBindingDigestSchema,
+        })
+        .strict(),
+      publication: z.enum(["pending", "confirmed"]),
+    })
+    .strict(),
   z.object({ kind: z.literal("fix_round") }).strict(),
   // C015x decision 3: previously the bare `{kind:"merging"}` below -- the coordinator's own
   // diagnosis (this ticket) named this as having *zero* bound on how long a job may sit being
@@ -543,6 +564,24 @@ export const protectedRegionHandoffSchema = z
   .strict();
 export type ProtectedRegionHandoff = z.infer<typeof protectedRegionHandoffSchema>;
 
+export const jobProviderAssignmentsSchema = z
+  .object({
+    execution: z
+      .object({
+        provider: z.literal("codex"),
+        model: z.string().trim().min(1).max(255),
+      })
+      .strict(),
+    codeReview: z
+      .object({
+        provider: z.literal("claude"),
+        model: z.string().trim().min(1).max(255),
+      })
+      .strict(),
+  })
+  .strict();
+export type JobProviderAssignments = z.infer<typeof jobProviderAssignmentsSchema>;
+
 export const jobProgressRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -560,6 +599,9 @@ export const jobProgressRecordSchema = z
      * function of `Issue`) -- without this, a resumed job could not build a valid
      * `CiRecoveryPipelineRequest`/`ReviewerPipelineRequest`. */
     model: z.string().trim().min(1).max(255),
+    /** Optional only so schema-v1 records written before ADR-009 remain readable. New model Jobs
+     * write this once; resume refuses to infer a missing assignment from current settings. */
+    providerAssignments: jobProviderAssignmentsSchema.optional(),
     stage: jobProgressStageSchema,
     /** Durable component receipts for the protected-region human handoff. Optional for every
      * legacy/non-policy record; when present, the stage reason below must identify this exact
@@ -724,6 +766,13 @@ export class FileJobProgressStore {
     if (
       normalizedCurrent.value?.baseRevision !== undefined &&
       next.baseRevision !== normalizedCurrent.value.baseRevision
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      normalizedCurrent.value?.providerAssignments !== undefined &&
+      JSON.stringify(next.providerAssignments) !==
+        JSON.stringify(normalizedCurrent.value.providerAssignments)
     ) {
       return err(domainError("invariant_violation"));
     }

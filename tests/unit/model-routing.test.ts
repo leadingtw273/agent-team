@@ -13,38 +13,26 @@ function config() {
     routes: [
       {
         role: "team_lead",
-        candidates: [
-          { provider: "codex", model: "gpt-5.6-sol" },
-          { provider: "claude", model: "opus" },
-        ],
+        candidates: [{ provider: "codex", model: "gpt-5.6-sol" }],
       },
       {
         role: "implementer",
         candidates: [
           { provider: "codex", model: "gpt-5.6-terra" },
-          { provider: "claude", model: "sonnet" },
+          { provider: "codex", model: "gpt-5.6-sol" },
         ],
       },
       {
         role: "code_reviewer",
-        candidates: [
-          { provider: "codex", model: "gpt-5.6-sol" },
-          { provider: "claude", model: "opus" },
-        ],
+        candidates: [{ provider: "claude", model: "opus" }],
       },
       {
         role: "visual_reviewer",
-        candidates: [
-          { provider: "gemini", model: "auto" },
-          { provider: "codex", model: "gpt-5.6-sol" },
-        ],
+        candidates: [{ provider: "gemini", model: "auto" }],
       },
       {
         role: "integration_engineer",
-        candidates: [
-          { provider: "codex", model: "gpt-5.6-sol" },
-          { provider: "claude", model: "opus" },
-        ],
+        candidates: [{ provider: "codex", model: "gpt-5.6-sol" }],
       },
     ],
   } as const;
@@ -63,7 +51,7 @@ describe("ordered model routing", () => {
     expect(
       selectModelRoute(config(), "implementer", [
         observation("codex", "gpt-5.6-terra", "ready"),
-        observation("claude", "sonnet", "ready"),
+        observation("codex", "gpt-5.6-sol", "ready"),
       ]),
     ).toEqual({
       kind: "selected",
@@ -84,11 +72,11 @@ describe("ordered model routing", () => {
     expect(
       selectModelRoute(config(), "implementer", [
         observation("codex", "gpt-5.6-terra", state),
-        observation("claude", "sonnet", "ready"),
+        observation("codex", "gpt-5.6-sol", "ready"),
       ]),
     ).toMatchObject({
       kind: "selected",
-      candidate: { provider: "claude", model: "sonnet" },
+      candidate: { provider: "codex", model: "gpt-5.6-sol" },
       candidateIndex: 1,
       fallbackUsed: true,
       skipped: [{ provider: "codex", model: "gpt-5.6-terra", index: 0, state }],
@@ -98,7 +86,7 @@ describe("ordered model routing", () => {
   it("keeps the active fallback assignment after the primary recovers", () => {
     const fallback = selectModelRoute(config(), "implementer", [
       observation("codex", "gpt-5.6-terra", "provider_unavailable"),
-      observation("claude", "sonnet", "ready"),
+      observation("codex", "gpt-5.6-sol", "ready"),
     ]);
     if (fallback.kind !== "selected") throw new Error("expected fallback");
     const active = retainActiveModelAssignment({
@@ -109,10 +97,10 @@ describe("ordered model routing", () => {
     });
     const nextJob = selectModelRoute(config(), "implementer", [
       observation("codex", "gpt-5.6-terra", "ready"),
-      observation("claude", "sonnet", "ready"),
+      observation("codex", "gpt-5.6-sol", "ready"),
     ]);
 
-    expect(active.candidate).toEqual({ provider: "claude", model: "sonnet" });
+    expect(active.candidate).toEqual({ provider: "codex", model: "gpt-5.6-sol" });
     expect(nextJob).toMatchObject({
       kind: "selected",
       candidate: { provider: "codex", model: "gpt-5.6-terra" },
@@ -123,7 +111,7 @@ describe("ordered model routing", () => {
     expect(
       selectModelRoute(config(), "implementer", [
         observation("codex", "gpt-5.6-terra", "provider_slot_full"),
-        observation("claude", "sonnet", "quota_unknown"),
+        observation("codex", "gpt-5.6-sol", "quota_unknown"),
       ]),
     ).toMatchObject({
       kind: "waiting",
@@ -132,7 +120,7 @@ describe("ordered model routing", () => {
     });
   });
 
-  it("requires every role once, unique candidates, and visual-only Gemini", () => {
+  it("requires every role once, unique candidates, and fixed role Providers", () => {
     expect(modelRoutingConfigSchema.safeParse(config()).success).toBe(true);
     const duplicateRole = {
       ...config(),
@@ -147,6 +135,16 @@ describe("ordered model routing", () => {
       ),
     };
     expect(modelRoutingConfigSchema.safeParse(invalidGemini).success).toBe(false);
+
+    const invalidReviewer = {
+      ...config(),
+      routes: config().routes.map((route) =>
+        route.role === "code_reviewer"
+          ? { ...route, candidates: [{ provider: "codex", model: "gpt-5.6-sol" }] }
+          : route,
+      ),
+    };
+    expect(modelRoutingConfigSchema.safeParse(invalidReviewer).success).toBe(false);
 
     const duplicateCandidate = {
       ...config(),

@@ -54,6 +54,7 @@ import {
   type LifecyclePipelineOutcome,
 } from "../../src/application/pipelines/index.js";
 import { NoOpAutoMergePauseAdapter } from "../../src/cli/dispatch/lifecycle-policy-adapter.js";
+import type { ReviewerWaitPublicationPort } from "../../src/cli/dispatch/reviewer-wait-publication.js";
 import {
   createFixedClock,
   domainError,
@@ -484,6 +485,7 @@ async function harness(
       issueId: string,
       headSha: string,
     ) => Promise<Result<LinearPublicationReceiptRecord | undefined, DomainError>>;
+    reviewWaitPublish: ReviewerWaitPublicationPort["publish"];
     workStatus: WorkStatus;
   }> = {},
 ): Promise<Harness> {
@@ -542,6 +544,18 @@ async function harness(
           }),
         ),
     },
+    ...(overrides.reviewWaitPublish === undefined
+      ? {}
+      : {
+          reviewWaitPublication: {
+            publish: (request) => {
+              calls.push("reviewWaitPublication.publish");
+              const publish = overrides.reviewWaitPublish;
+              if (publish === undefined) throw new Error("unreachable");
+              return publish(request);
+            },
+          },
+        }),
     readModel: readModel({
       ...(overrides.reviewRequirement === undefined
         ? {}
@@ -758,7 +772,11 @@ async function seedProgressRecord(
     projectId,
     issueId,
     externalIssueId,
-    model: "claude-opus",
+    model: "gpt-5.6-terra",
+    providerAssignments: {
+      execution: { provider: "codex", model: "gpt-5.6-terra" },
+      codeReview: { provider: "claude", model: "claude-opus" },
+    },
     stage: stage as never,
     branch: "agent-team/job-1",
     worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
@@ -776,6 +794,179 @@ async function seedProgressRecord(
 }
 
 describe("runResumeCycle", () => {
+  it("fails a pre-ADR-009 record closed instead of guessing its execution or review provider", async () => {
+    const { deps, progress, calls } = await harness();
+    await progress.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "claude-opus",
+      stage: { kind: "ci_waiting" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
+      changeRequestId: "42",
+      headSha,
+      baseRevision,
+      // Deliberately omits providerAssignments: the old model string is not authoritative.
+    });
+
+    const result = await runResumeCycle(deps);
+    expect(result).toEqual({
+      ok: true,
+      value: [
+        { jobId, outcome: "requires_manual", reason: "legacy_provider_assignment_unavailable" },
+      ],
+    });
+    expect(calls).toEqual([]);
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "setup", reasonCode: "legacy_provider_assignment_unavailable" },
+        },
+      },
+    });
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.providerAssignments).toBeUndefined();
+  });
+
+  it("persists and publishes a confirmed Claude wall without accepting a partial review", async () => {
+    const resetAt = instant("2026-08-07T13:00:00.000Z");
+    const { deps, progress, calls } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_run",
+        error: domainError("rate_limited"),
+        job: job(),
+        reviewWait: {
+          confidence: "confirmed",
+          bucket: "five_hour",
+          resetAt,
+          requirementsDigest: "a".repeat(64),
+          headSha,
+          diffDigest: "b".repeat(64),
+        },
+      },
+      reviewWaitPublish: () => Promise.resolve(ok(undefined)),
+    });
+    await seedProgressRecord(progress, { kind: "awaiting_review" });
+
+    const result = await runResumeCycle(deps);
+    expect(result).toEqual({
+      ok: true,
+      value: [
+        {
+          jobId,
+          outcome: "reviewer_waiting",
+          reason: "confirmed_quota_wall",
+          retryNotBefore: resetAt,
+        },
+      ],
+    });
+    expect(calls).toContain("reviewWaitPublication.publish");
+    expect(calls).not.toContain("reviewStatus.record");
+    expect(calls).not.toContain("autoMerge.enable");
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "reviewer_waiting",
+          reason: "confirmed_quota_wall",
+          confidence: "confirmed",
+          bucket: "five_hour",
+          resetAt,
+          retryNotBefore: resetAt,
+          publication: "confirmed",
+          binding: { requirementsDigest: "a".repeat(64), headSha, diffDigest: "b".repeat(64) },
+        },
+      },
+    });
+  });
+
+  it("keeps an unconfirmed Claude 429 waiting indefinitely until an operator confirms a retry", async () => {
+    const { deps, progress } = await harness({
+      reviewerOutcome: {
+        state: "failed",
+        stage: "provider_run",
+        error: domainError("quota_unknown"),
+        job: job(),
+        reviewWait: {
+          confidence: "unconfirmed",
+          requirementsDigest: "c".repeat(64),
+          headSha,
+          diffDigest: "d".repeat(64),
+        },
+      },
+      reviewWaitPublish: () => Promise.resolve(ok(undefined)),
+    });
+    await seedProgressRecord(progress, { kind: "awaiting_review" });
+
+    await expect(runResumeCycle(deps)).resolves.toEqual({
+      ok: true,
+      value: [{ jobId, outcome: "reviewer_waiting", reason: "unconfirmed_throttling" }],
+    });
+    const loaded = await progress.load(jobId);
+    expect(loaded.ok && loaded.value?.stage).toMatchObject({
+      kind: "reviewer_waiting",
+      confidence: "unconfirmed",
+      publication: "confirmed",
+    });
+    if (loaded.ok && loaded.value?.stage.kind === "reviewer_waiting") {
+      expect(loaded.value.stage.retryNotBefore).toBeUndefined();
+    }
+  });
+
+  it("does not start Claude before retryNotBefore and only re-arms awaiting_review after it", async () => {
+    const future = instant("2026-08-07T13:00:00.000Z");
+    const first = await harness();
+    await seedProgressRecord(first.progress, {
+      kind: "reviewer_waiting",
+      reason: "confirmed_quota_wall",
+      confidence: "confirmed",
+      bucket: "weekly",
+      resetAt: future,
+      retryNotBefore: future,
+      binding: { requirementsDigest: "e".repeat(64), headSha, diffDigest: "f".repeat(64) },
+      publication: "confirmed",
+    });
+    await expect(runResumeCycle(first.deps)).resolves.toEqual({
+      ok: true,
+      value: [
+        {
+          jobId,
+          outcome: "reviewer_waiting",
+          reason: "confirmed_quota_wall",
+          retryNotBefore: future,
+        },
+      ],
+    });
+    expect(first.calls).not.toContain("reviewer.run");
+
+    const past = instant("2026-08-07T11:00:00.000Z");
+    const second = await harness();
+    await seedProgressRecord(second.progress, {
+      kind: "reviewer_waiting",
+      reason: "confirmed_quota_wall",
+      confidence: "confirmed",
+      bucket: "weekly",
+      resetAt: past,
+      retryNotBefore: past,
+      binding: { requirementsDigest: "e".repeat(64), headSha, diffDigest: "f".repeat(64) },
+      publication: "confirmed",
+    });
+    await expect(runResumeCycle(second.deps)).resolves.toEqual({
+      ok: true,
+      value: [{ jobId, outcome: "awaiting_review" }],
+    });
+    expect(second.calls).not.toContain("reviewer.run");
+    await expect(second.progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { stage: { kind: "awaiting_review" } },
+    });
+  });
+
   it("happy path: ci_waiting -> CI green -> approved -> merged -> Lifecycle completed, in one cycle", async () => {
     const { deps, progress, calls } = await harness({ changeRequestState: { draft: true } });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
@@ -2294,7 +2485,11 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       projectId,
       issueId,
       externalIssueId,
-      model: "claude-opus",
+      model: "gpt-5.6-terra",
+      providerAssignments: {
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      },
       stage: {
         kind: "requires_manual",
         cause: {
@@ -3095,7 +3290,11 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
       projectId,
       issueId,
       externalIssueId,
-      model: "claude-opus",
+      model: "gpt-5.6-terra",
+      providerAssignments: {
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      },
       stage: { kind: "ci_waiting" },
       branch: "agent-team/job-1",
       worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
@@ -3112,7 +3311,11 @@ describe("C015y decision A: persisted baseRevision is authoritative -- resume re
       projectId,
       issueId,
       externalIssueId,
-      model: "claude-opus",
+      model: "gpt-5.6-terra",
+      providerAssignments: {
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      },
       stage: { kind: "ci_waiting" },
       branch: "agent-team/job-1",
       worktreePath: "/tmp/does-not-need-to-exist-for-these-fakes",
