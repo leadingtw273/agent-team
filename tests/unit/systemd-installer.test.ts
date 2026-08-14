@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -221,10 +221,14 @@ describe("systemd installer security boundary", () => {
     expect(preview.timer).toContain("OnBootSec=5min");
     expect(preview.timer).toContain("OnUnitInactiveSec=5min");
     expect(preview.service).not.toContain("\nEnvironment=");
-    expect(preview.service).toContain('ExecStart="/usr/bin/env" "-i" "PATH=/test/$$path"');
+    expect(preview.service).toContain(
+      `ExecStart="/usr/bin/env" "-i" "PATH=/tmp:${join(fixture.root, "home", ".local", "bin")}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"`,
+    );
     expect(preview.service).toContain("agent-$$home");
     expect(preview.service).not.toContain("never-render-or-run-with-this");
-    expect(preview.runtimeCommand).toContain("PATH=/test/$path");
+    expect(preview.runtimeCommand).toContain(
+      `PATH=/tmp:${join(fixture.root, "home", ".local", "bin")}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    );
     expect(preview.runtimeCommand).toContain(
       `AGENT_TEAM_HOME=${join(fixture.root, "agent-$home")}`,
     );
@@ -232,6 +236,49 @@ describe("systemd installer security boundary", () => {
       [...runtimeEnvironmentNames].sort(),
     );
     await expect(readFile(preview.servicePath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    ["Codex temporary entries", "/tmp/codex/bin:/usr/bin"],
+    ["Windows-style entries", "C:\\\\Windows\\\\System32;/mnt/c/Windows/System32"],
+    ["empty PATH", ""],
+    ["control characters", "/tmp/good\u0000/bad"],
+    ["undefined PATH", undefined],
+  ])("renders identical canonical unit bytes with %s in the caller PATH", async (_name, path) => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-systemd-canonical-path-"));
+    roots.push(root);
+    const baseEnvironment: NodeJS.ProcessEnv = {
+      HOME: join(root, "home"),
+      XDG_CONFIG_HOME: join(root, "xdg-config"),
+    };
+    const createPreview = async (ambientPath: string | undefined) =>
+      new SystemdManager({
+        runtimeCommand: {
+          executable: "/opt/node/bin/node",
+          arguments: ["/opt/agent-team/dist/cli/index.js", "cycle", "--all"],
+          environment: {
+            ...baseEnvironment,
+            ...(ambientPath === undefined ? {} : { PATH: ambientPath }),
+          },
+        },
+      }).preview();
+
+    const canonical = await createPreview("/another/ambient/path");
+    const preview = await createPreview(path);
+    const expectedPath = `${dirname("/opt/node/bin/node")}:${join(
+      root,
+      "home",
+      ".local",
+      "bin",
+    )}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`;
+
+    expect(preview.service).toBe(canonical.service);
+    expect(preview.timer).toBe(canonical.timer);
+    expect(preview.runtimeCommand).toEqual(canonical.runtimeCommand);
+    expect(preview.runtimeEnvironment["PATH"]).toBe(expectedPath);
+    expect(preview.service).not.toContain("Codex");
+    expect(preview.service).not.toContain("Windows");
+    expect(preview.service).not.toContain("/another/ambient/path");
   });
 
   it("keeps injected unit names isolated across render, query, enable, and uninstall", async () => {

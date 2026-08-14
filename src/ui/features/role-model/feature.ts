@@ -60,7 +60,7 @@ export function createRoleModelFeature(
           {
             jobId: "job-running-implementer",
             role: "implementer",
-            candidate: { provider: "claude", model: "sonnet" },
+            candidate: { provider: "codex", model: "gpt-5.6-sol" },
             candidateIndex: 1,
           },
         ]),

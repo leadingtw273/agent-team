@@ -49,8 +49,9 @@ import type { LinearReadModel } from "../../adapters/linear/read.js";
  * real `LinearMutationClient`/`LinearReadModel` instance. */
 export type LinearWorkManagementMutationClient = Pick<
   LinearMutationClient,
-  "observeGithubMerge" | "setAgentCondition" | "appendComment"
->;
+  "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
+> &
+  Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
 export type LinearWorkManagementReadModel = Pick<LinearReadModel, "readContext" | "readIssue">;
 
 export interface LinearWorkManagementAdapterOptions {
@@ -122,13 +123,26 @@ export class LinearWorkManagementAdapter implements Pick<
     _options: MutationOptions,
   ): Promise<Result<WorkManagementIssueSnapshot, DomainError>> {
     void _options;
-    if (status !== "completed") return err(domainError("invariant_violation"));
+    if (status !== "completed" && status !== "requires_manual" && status !== "in_review") {
+      return err(domainError("invariant_violation"));
+    }
     const context = await this.#context();
     if (!context.ok) return context;
-    const result = await this.#mutationClient.observeGithubMerge(
-      context.value,
-      reference.externalIssueId,
-    );
+    const result =
+      status === "completed"
+        ? await this.#mutationClient.observeGithubMerge(context.value, reference.externalIssueId)
+        : status === "requires_manual"
+          ? await this.#mutationClient.requireManualIntervention(
+              context.value,
+              reference.externalIssueId,
+            )
+          : this.#mutationClient.transitionWorkStatus === undefined
+            ? err(domainError("invariant_violation"))
+            : await this.#mutationClient.transitionWorkStatus(
+                context.value,
+                reference.externalIssueId,
+                { target: "in_review", cause: "review_started" },
+              );
     if (!result.ok) return result;
     return toWorkManagementSnapshot(reference.project.id, result.value);
   }

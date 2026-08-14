@@ -100,6 +100,7 @@ import type { ReportContractFailureCategory } from "../../application/pipelines/
 import { Redactor } from "../../infrastructure/redaction/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
+import type { ReviewerWaitPublicationPort } from "./reviewer-wait-publication.js";
 
 /** The engine's own `JobRepository` interface only declares `create` -- this module also needs
  * `readAll` (find the job by id) and `update` (C015c item 1's addition to `FileJobRepository`,
@@ -126,6 +127,7 @@ export const resumableStageKinds: ReadonlySet<string> = new Set([
   "fix_round",
   "merging",
   "review_pending_retry",
+  "reviewer_waiting",
   "ci_pending_retry",
   // C015r decision 4: symmetric to the two above, for a `report`-stage contract failure that has
   // not yet exhausted its own, separately-capped retry limit.
@@ -354,6 +356,7 @@ export interface ResumeCycleDependencies {
   readonly sourceControl: Pick<SourceControlPort, "getChangeRequest">;
   /** C035: authoritative Linear state read, separate from the requirement projection. */
   readonly workManagement: Pick<WorkManagementPort, "getIssue">;
+  readonly reviewWaitPublication?: ReviewerWaitPublicationPort;
   readonly readModel: LinearDiscoveryReadModel;
   readonly teamId: string;
   readonly linearProjectId: string;
@@ -459,6 +462,12 @@ export type ResumeJobOutcome =
   // `"ci_waiting"` both fall through the same generic CiRecovery-then-Reviewer sequence), but a
   // distinct, more accurate label for anyone reading `agent-team run`'s own output.
   | Readonly<{ jobId: string; outcome: "awaiting_review" }>
+  | Readonly<{
+      jobId: string;
+      outcome: "reviewer_waiting";
+      reason: "confirmed_quota_wall" | "unconfirmed_throttling";
+      retryNotBefore?: Instant;
+    }>
   | Readonly<{ jobId: string; outcome: "repair_pushed" }>
   | Readonly<{ jobId: string; outcome: "reviewer_fix_pushed" }>
   | Readonly<{
@@ -778,6 +787,14 @@ async function resumeOneJob(
   try {
     const current = await revalidateRecordUnderLease(record, guardedDeps, isPipelineResumable);
     if ("outcome" in current) return current;
+    if (current.record.providerAssignments === undefined) {
+      return await requiresManual(
+        current.record,
+        guardedDeps,
+        "legacy_provider_assignment_unavailable",
+        requiresManualCause("setup", "legacy_provider_assignment_unavailable"),
+      );
+    }
     if (guardedDeps.prepare !== undefined) {
       await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
     }
@@ -1303,6 +1320,15 @@ async function resumeUnderLease(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
 ): Promise<ResumeJobOutcome> {
+  const assignments = record.providerAssignments;
+  if (assignments === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "legacy_provider_assignment_unavailable",
+      requiresManualCause("setup", "legacy_provider_assignment_unavailable"),
+    );
+  }
   if (record.changeRequestId === undefined) {
     return requiresManual(
       record,
@@ -1401,6 +1427,33 @@ async function resumeUnderLease(
       "change_request_closed",
       requiresManualCause("setup", "change_request_unavailable"),
     );
+  }
+
+  if (record.stage.kind === "reviewer_waiting") {
+    const waiting = record as ReviewerWaitingRecord;
+    if (currentChangeRequest.value.headSha !== waiting.stage.binding.headSha) {
+      return requiresManual(
+        record,
+        deps,
+        "reviewer_wait_head_changed",
+        requiresManualCause("setup", "change_request_unavailable"),
+      );
+    }
+    if (waiting.stage.publication === "pending") {
+      return publishReviewerWaiting(waiting, deps);
+    }
+    if (
+      waiting.stage.retryNotBefore === undefined ||
+      Date.parse(deps.clock.now()) < Date.parse(waiting.stage.retryNotBefore)
+    ) {
+      return reviewerWaitingOutcome(waiting);
+    }
+    // The next cycle performs the ordinary full PR/CI/requirements/effective-diff validation and
+    // starts a brand-new Claude process. This transition never resumes a partial provider session.
+    return transitionOrReport(deps, record, { stage: { kind: "awaiting_review" } }, () => ({
+      jobId: record.jobId,
+      outcome: "awaiting_review",
+    }));
   }
 
   if (record.stage.kind === "merging") {
@@ -1522,7 +1575,7 @@ async function resumeUnderLease(
       requirementSnapshot: requirementSnapshot.value,
       worktree,
       changeRequest: currentChangeRequest.value,
-      model: record.model,
+      model: assignments.execution.model,
       remote: "origin",
       commitMessage: `${issue.value.title} (${issue.value.externalId}) CI 修復`,
       controllerDirective: buildDirective(issue.value),
@@ -1744,6 +1797,92 @@ async function handleReportContractFailure(
   );
 }
 
+type ReviewerWaitingRecord = JobProgressRecord & {
+  stage: Extract<JobProgressRecord["stage"], { kind: "reviewer_waiting" }>;
+};
+
+function reviewerWaitingOutcome(record: ReviewerWaitingRecord): ResumeJobOutcome {
+  return Object.freeze({
+    jobId: record.jobId,
+    outcome: "reviewer_waiting" as const,
+    reason: record.stage.reason,
+    ...(record.stage.retryNotBefore === undefined
+      ? {}
+      : { retryNotBefore: record.stage.retryNotBefore }),
+  });
+}
+
+async function publishReviewerWaiting(
+  record: ReviewerWaitingRecord,
+  deps: ResumeCycleDependencies,
+): Promise<ResumeJobOutcome> {
+  if (record.stage.publication === "confirmed") return reviewerWaitingOutcome(record);
+  if (deps.reviewWaitPublication === undefined || record.changeRequestId === undefined) {
+    return reviewerWaitingOutcome(record);
+  }
+  const published = await whileResumeLeaseHeld(
+    deps,
+    () =>
+      deps.reviewWaitPublication?.publish({
+        project: deps.project,
+        externalIssueId: record.externalIssueId,
+        changeRequestId: record.changeRequestId ?? "",
+        headSha: record.stage.binding.headSha,
+        confidence: record.stage.confidence,
+        ...(record.stage.bucket === undefined ? {} : { bucket: record.stage.bucket }),
+        ...(record.stage.resetAt === undefined ? {} : { resetAt: record.stage.resetAt }),
+        idempotencyKeyPrefix: `reviewer-wait:${record.jobId}:${record.stage.binding.headSha}:${record.stage.reason}`,
+      }) ?? Promise.resolve(err(domainError("invariant_violation"))),
+  );
+  if (!published.ok) {
+    return Object.freeze({
+      jobId: record.jobId,
+      outcome: "transient_failure" as const,
+      reason: `reviewer_wait_publication_failed:${published.error.code}`,
+      error: published.error,
+    });
+  }
+  const confirmed = await transition(deps, record, {
+    stage: { ...record.stage, publication: "confirmed" },
+  });
+  return confirmed.ok
+    ? reviewerWaitingOutcome(confirmed.value as ReviewerWaitingRecord)
+    : { jobId: record.jobId, outcome: "progress_write_failed", error: confirmed.error };
+}
+
+async function enterReviewerWaiting(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  wait: NonNullable<Extract<ReviewerPipelineOutcome, { state: "failed" }>["reviewWait"]>,
+): Promise<ResumeJobOutcome> {
+  const retryNotBefore =
+    wait.confidence === "confirmed" &&
+    wait.resetAt !== undefined &&
+    Date.parse(wait.resetAt) > Date.parse(deps.clock.now())
+      ? wait.resetAt
+      : undefined;
+  const written = await transition(deps, record, {
+    stage: {
+      kind: "reviewer_waiting",
+      reason: wait.confidence === "confirmed" ? "confirmed_quota_wall" : "unconfirmed_throttling",
+      confidence: wait.confidence,
+      ...(wait.bucket === undefined ? {} : { bucket: wait.bucket }),
+      ...(wait.resetAt === undefined ? {} : { resetAt: wait.resetAt }),
+      ...(retryNotBefore === undefined ? {} : { retryNotBefore }),
+      binding: {
+        requirementsDigest: wait.requirementsDigest,
+        headSha: wait.headSha,
+        diffDigest: wait.diffDigest,
+      },
+      publication: "pending",
+    },
+  });
+  if (!written.ok) {
+    return { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
+  }
+  return publishReviewerWaiting(written.value as ReviewerWaitingRecord, deps);
+}
+
 async function resumeReview(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
@@ -1760,6 +1899,15 @@ async function resumeReview(
     readonly idempotencyKeyPrefix: string;
   },
 ): Promise<ResumeJobOutcome> {
+  const assignments = record.providerAssignments;
+  if (assignments === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "legacy_provider_assignment_unavailable",
+      requiresManualCause("setup", "legacy_provider_assignment_unavailable"),
+    );
+  }
   const expectedHeadSha = context.changeRequest.headSha;
   const begin = await whileResumeLeaseHeld(deps, () =>
     deps.reviewStatus.begin({
@@ -1952,7 +2100,7 @@ async function resumeReview(
       baseRevision: context.baseRevision,
       expectedHeadSha,
       models: {
-        ...(needsCodeReview ? { code: record.model } : {}),
+        ...(needsCodeReview ? { code: assignments.codeReview.model } : {}),
         // Guarded above: `needsVisualReview` only ever reaches here once `deps.visualReviewModel`
         // has already been confirmed defined (E102-2's real `gemini.models`-sourced value, never
         // this job's own Claude `record.model` -- a Gemini `GeminiRunner` would reject that model
@@ -2000,6 +2148,9 @@ async function resumeReview(
         requiresManualCause("review", "review_paused"),
       );
     case "failed": {
+      if (reviewOutcome.reviewWait !== undefined) {
+        return enterReviewerWaiting(record, deps, reviewOutcome.reviewWait);
+      }
       // C015r decision 4: a `report`-stage failure (the provider ran to completion, but its output
       // failed decision 3's tolerant parse/schema/context checks) is handled entirely separately
       // from the retryable-provider-start/run path below -- its own dedicated, 1-capped retry
@@ -2104,7 +2255,7 @@ async function resumeReview(
           trustedConfig: deps.trustedConfig,
           requirementSnapshot: context.requirementSnapshot,
           worktree: context.worktree,
-          model: record.model,
+          model: assignments.execution.model,
           remote: "origin",
           commitMessage: `${context.issue.title} (${context.issue.externalId}) Review 修復`,
           controllerDirective: buildDirective(context.issue),

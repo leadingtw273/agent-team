@@ -12,14 +12,22 @@
 import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { GeminiRunner } from "../../adapters/providers/gemini/index.js";
 import { Redactor } from "../../infrastructure/redaction/index.js";
+import type { ProviderPort } from "../../application/ports/index.js";
 import type { GeminiProviderConfig } from "./provider-config-store.js";
+import { PolicyBoundProvider } from "./provider-policy.js";
 
-export function buildGeminiRunner(config: GeminiProviderConfig): GeminiRunner {
-  return new GeminiRunner({
+export function buildGeminiRunner(config: GeminiProviderConfig): ProviderPort {
+  const runner = new GeminiRunner({
     process: new ChildProcessRunner(),
     redactor: new Redactor(),
     executable: config.executable,
     models: config.models,
     adminPolicyPath: config.adminPolicyPath,
+  });
+  return new PolicyBoundProvider({
+    delegate: runner,
+    provider: "gemini",
+    models: config.models,
+    roles: ["visual_reviewer"],
   });
 }

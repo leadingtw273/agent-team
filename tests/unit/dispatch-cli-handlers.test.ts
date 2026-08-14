@@ -195,9 +195,9 @@ const routingConfig: ModelRoutingConfig = {
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
     { role: "implementer", candidates: [{ provider: "codex", model: "build" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "review" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -321,6 +321,10 @@ function fakeBuildComposition(stateRoot: string) {
           config: { executable: "claude", models: ["opus"], account: "default" },
           process: new ReadyProcessPort(),
         },
+        codex: {
+          config: { executable: "codex", models: ["gpt-5.6-terra"], account: "default" },
+          process: new ReadyProcessPort(),
+        },
         quotaAdmission: {
           resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
         },
@@ -439,7 +443,11 @@ async function seedResumableProgressRecord(stateRoot: string): Promise<Identifie
     projectId: id("project", projectId),
     issueId: id("issue", issueId),
     externalIssueId: "linear-issue-1",
-    model: "claude-opus",
+    model: "gpt-5.6-terra",
+    providerAssignments: {
+      execution: { provider: "codex", model: "gpt-5.6-terra" },
+      codeReview: { provider: "claude", model: "claude-opus" },
+    },
     stage: { kind: "ci_waiting" },
     branch: `agent-team/${jobId}`,
     worktreePath: "/tmp/does-not-need-to-exist-for-this-fake",
@@ -463,7 +471,11 @@ async function seedRequiresManualProgressRecord(
     projectId: id("project", projectId),
     issueId: id("issue", issueId),
     externalIssueId: "linear-issue-1",
-    model: "claude-opus",
+    model: "gpt-5.6-terra",
+    providerAssignments: {
+      execution: { provider: "codex", model: "gpt-5.6-terra" },
+      codeReview: { provider: "claude", model: "claude-opus" },
+    },
     stage: {
       kind: "requires_manual",
       cause: {

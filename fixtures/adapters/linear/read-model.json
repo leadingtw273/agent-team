@@ -12,6 +12,7 @@
   "states": [
     { "id": "state-backlog", "name": "待辦", "type": "backlog" },
     { "id": "state-ready", "name": "待執行", "type": "unstarted" },
+    { "id": "state-manual", "name": "需人工", "type": "unstarted" },
     { "id": "state-progress", "name": "進行中", "type": "started" },
     { "id": "state-review", "name": "審查中", "type": "started" },
     { "id": "state-completed", "name": "已完成", "type": "completed" },

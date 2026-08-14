@@ -289,6 +289,14 @@ describe("Linear mutation contract", () => {
     expect(falseReadBack.ok ? "ok" : falseReadBack.error.code).toBe("external_failure");
   });
 
+  it("moves a Ready issue into the formal requires-manual workflow state with read-back", async () => {
+    const harness = new MutationHarness();
+    harness.issue = { ...harness.issue, stateId: context.catalog.stateIdByWorkStatus.ready };
+    const result = await harness.client().requireManualIntervention(context, harness.issue.id);
+    expect(result.ok ? result.value.workStatus : result.error.code).toBe("requires_manual");
+    expect(harness.issue.stateId).toBe(context.catalog.stateIdByWorkStatus.requires_manual);
+  });
+
   it("replaces ordinary labels while preserving all controlled Label Group values", async () => {
     const harness = new MutationHarness();
     const client = harness.client();

@@ -143,7 +143,10 @@ class FakeProcessPort implements ProcessPort {
   }
 }
 
-function runRequest(withCheckpoint = false): ProviderRunRequest {
+function runRequest(
+  withCheckpoint = false,
+  role: ProviderRunRequest["role"] = "implementer",
+): ProviderRunRequest {
   const issue = issueSchema.parse({
     schemaVersion: 1,
     id: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab",
@@ -188,7 +191,7 @@ function runRequest(withCheckpoint = false): ProviderRunRequest {
   });
   return {
     job,
-    role: "implementer",
+    role,
     model: "gpt-5.6-sol",
     workingDirectory: "/tmp/provider-worktree",
     requirementSnapshot: snapshot.value,
@@ -207,7 +210,10 @@ function runRequest(withCheckpoint = false): ProviderRunRequest {
   };
 }
 
-async function startedRunner(withCheckpoint = false) {
+async function startedRunner(
+  withCheckpoint = false,
+  role: ProviderRunRequest["role"] = "implementer",
+) {
   const process = new FakeProcessPort();
   const runner = new CodexRunner({
     process,
@@ -215,7 +221,7 @@ async function startedRunner(withCheckpoint = false) {
     clock: createFixedClock(instant("2026-08-04T12:01:00.000Z")),
     models: ["gpt-5.6-sol"],
   });
-  const started = await runner.start(runRequest(withCheckpoint));
+  const started = await runner.start(runRequest(withCheckpoint, role));
   if (!started.ok) throw new Error(started.error.code);
   return { process, runner, handle: started.value };
 }
@@ -244,11 +250,20 @@ describe("Codex app-server runner", () => {
       (message) => message["method"] === "thread/start",
     );
     expect(threadStart?.["params"]).toMatchObject({
-      approvalPolicy: "untrusted",
+      approvalPolicy: "never",
       sandbox: "workspace-write",
       ephemeral: true,
     });
     const turnStart = process.child.writes.find((message) => message["method"] === "turn/start");
+    expect(turnStart?.["params"]).toMatchObject({
+      cwd: "/tmp/provider-worktree",
+      approvalPolicy: "never",
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        writableRoots: ["/tmp/provider-worktree"],
+        networkAccess: false,
+      },
+    });
     const context = (turnStart?.["params"] as { input: { text: string }[] }).input[0]?.text ?? "";
     expect(context).toContain("=== BEGIN EXTERNAL DATA ===");
     expect(context).not.toContain("do-not-leak");
@@ -264,6 +279,29 @@ describe("Codex app-server runner", () => {
     ]);
     expect(events.map((event) => event.kind)).toEqual(["started", "output", "completed"]);
     expect(completion).toMatchObject({ ok: true, value: { outcome: "completed" } });
+  });
+
+  it("keeps reviewer turns read-only while suppressing interactive approvals", async () => {
+    const { process, handle } = await startedRunner(false, "code_reviewer");
+    const threadStart = process.child.writes.find(
+      (message) => message["method"] === "thread/start",
+    );
+    expect(threadStart?.["params"]).toMatchObject({
+      approvalPolicy: "never",
+      sandbox: "read-only",
+    });
+    const turnStart = process.child.writes.find((message) => message["method"] === "turn/start");
+    expect(turnStart?.["params"]).toMatchObject({
+      cwd: "/tmp/provider-worktree",
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    });
+    expect(
+      (turnStart?.["params"] as { sandboxPolicy?: Record<string, unknown> }).sandboxPolicy,
+    ).not.toHaveProperty("writableRoots");
+
+    process.child.emit({ method: "turn/completed", params: { turn: { status: "completed" } } });
+    await handle.completion();
   });
 
   it("surfaces approval requests and sends only the controller decision", async () => {

@@ -42,6 +42,15 @@ const claudeProviderConfigSchema = z
   })
   .strict();
 
+const codexProviderConfigSchema = z
+  .object({
+    executable: z.string().trim().min(1).max(1024),
+    models: z.array(z.string().trim().min(1).max(255)).min(1).max(20),
+    /** Operator label only. Authentication identity still comes from the Codex App Server. */
+    account: z.string().trim().min(1).max(255),
+  })
+  .strict();
+
 /** S003/E102-2: the `gemini` provider config -- feeds `buildGeminiRunner` (gemini-factory.ts),
  * the same additive-schema shape `claudeProviderConfigSchema` already established (`executable`/
  * `models`/`account`), plus the one field Gemini's real adapter requires that Claude's does not:
@@ -68,6 +77,7 @@ const geminiProviderConfigSchema = z
 export const dispatchProviderConfigSchema = z
   .object({
     schemaVersion: z.literal(1),
+    codex: codexProviderConfigSchema,
     claude: claudeProviderConfigSchema,
     /** Optional on purpose -- see this file's own header. Absent means "no visual-review
      * provider is configured on this host," not "use Claude instead." */
@@ -76,6 +86,7 @@ export const dispatchProviderConfigSchema = z
   .strict();
 
 export type DispatchProviderConfig = z.infer<typeof dispatchProviderConfigSchema>;
+export type CodexProviderConfig = DispatchProviderConfig["codex"];
 export type GeminiProviderConfig = NonNullable<DispatchProviderConfig["gemini"]>;
 
 export function defaultDispatchProviderConfigPath(agentTeamHome: string): string {

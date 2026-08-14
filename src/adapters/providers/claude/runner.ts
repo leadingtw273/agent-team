@@ -17,11 +17,13 @@ import {
   createClock,
   domainError,
   err,
+  instantFromDate,
   ok,
   type Clock,
   type DomainError,
   type Result,
 } from "../../../domain/foundation/index.js";
+import { claudeAllowedToolsForRole } from "./write-policy.js";
 
 const pinnedCliVersion = "2.1.221";
 const knownEventTypes = new Set(["system", "assistant", "user", "result", "rate_limit_event"]);
@@ -207,37 +209,12 @@ function toolsForRole(role: ProviderRunRequest["role"]): string {
  * that is expected whitelist maintenance, not a matcher-syntax problem. Never widen this back to
  * `./**`, never add `.github` to it, and never add a bare root `Write(./*)`/`Edit(./*)`.
  */
-const writableDirectories = Object.freeze([
-  "docs",
-  "fixtures",
-  "roles",
-  "schemas",
-  "scripts",
-  "spikes",
-  "src",
-  "systemd",
-  "tests",
-]);
-
-function allowedToolsForRole(role: ProviderRunRequest["role"]): readonly string[] {
-  const scopedRead = Object.freeze(["Read(./*)", "Read(./**)"]);
-  if (role === "implementer" || role === "integration_engineer") {
-    const scopedWriteEdit = writableDirectories.flatMap((directory) => [
-      `Write(./${directory}/*)`,
-      `Write(./${directory}/**)`,
-      `Edit(./${directory}/*)`,
-      `Edit(./${directory}/**)`,
-    ]);
-    return Object.freeze([...scopedRead, ...scopedWriteEdit]);
-  }
-  return scopedRead;
-}
-
 interface ParsedResult {
   readonly isError: boolean;
   readonly text: string;
   readonly sessionId?: string;
   readonly permissionDenials: readonly Readonly<Record<string, unknown>>[];
+  readonly apiErrorStatus?: number;
 }
 
 class ClaudeRun implements ProviderRunHandle {
@@ -252,6 +229,7 @@ class ClaudeRun implements ProviderRunHandle {
   #controllerInterrupted = false;
   #checkpointEmitted = false;
   #finished = false;
+  #confirmedQuotaBoundary = false;
 
   constructor(
     process: ChildProcessHandle,
@@ -328,6 +306,17 @@ class ClaudeRun implements ProviderRunHandle {
       return this.#finish(ok({ outcome: "interrupted" }));
     }
     if (!exit.ok) return this.#fail(exit.error);
+    // Structured quota evidence wins even when the CLI also exits non-zero. Classification is
+    // based on the complete drained stream, not on whether the event appeared before/after result.
+    if (this.#confirmedQuotaBoundary) return this.#fail(domainError("rate_limited"));
+    if (resultEvent?.apiErrorStatus === 429) {
+      this.#eventLog.append({
+        kind: "quota_boundary",
+        observedAt: this.#clock.now(),
+        confidence: "unconfirmed",
+      });
+      return this.#fail(domainError("quota_unknown"));
+    }
     if (exit.value.exitCode !== 0 || exit.value.signal !== null || invalidStream) {
       return this.#fail(domainError("external_failure"));
     }
@@ -392,21 +381,33 @@ class ClaudeRun implements ProviderRunHandle {
   #handleRateLimit(event: Readonly<Record<string, unknown>>): void {
     const info = asRecord(event["rate_limit_info"] ?? event["rateLimitInfo"]);
     const status = info?.["status"];
-    if (status !== "rejected" && status !== "exceeded") return;
-    const bucket = info?.["rate_limit_type"] ?? info?.["rateLimitType"];
-    if (bucket === "seven_day") {
-      this.#eventLog.append({
-        kind: "quota_boundary",
-        observedAt: this.#clock.now(),
-        bucket: "weekly",
-      });
-    } else if (bucket === "five_hour") {
-      this.#eventLog.append({
-        kind: "quota_boundary",
-        observedAt: this.#clock.now(),
-        bucket: "five_hour",
-      });
-    }
+    // The public Agent SDK contract confirms `rejected` as the hard wall. `exceeded` has not
+    // been established as an authoritative status and therefore cannot block a review by itself.
+    if (status !== "rejected") return;
+    const rawBucket = info?.["rate_limit_type"] ?? info?.["rateLimitType"];
+    const bucket =
+      rawBucket === "seven_day"
+        ? "weekly"
+        : rawBucket === "five_hour"
+          ? "five_hour"
+          : typeof rawBucket === "string" && rawBucket.startsWith("seven_day_")
+            ? "model_weekly"
+            : undefined;
+    const rawReset = info?.["resets_at"] ?? info?.["resetsAt"];
+    const parsedReset =
+      typeof rawReset === "number" && Number.isSafeInteger(rawReset)
+        ? instantFromDate(new Date(rawReset * 1_000))
+        : undefined;
+    this.#confirmedQuotaBoundary = true;
+    this.#eventLog.append({
+      kind: "quota_boundary",
+      observedAt: this.#clock.now(),
+      confidence: "confirmed",
+      ...(bucket === undefined ? {} : { bucket }),
+      ...(parsedReset?.ok === true && Date.parse(parsedReset.value) > Date.parse(this.#clock.now())
+        ? { resetAt: parsedReset.value }
+        : {}),
+    });
   }
 
   #parseResult(event: Readonly<Record<string, unknown>>): ParsedResult | undefined {
@@ -419,11 +420,22 @@ class ClaudeRun implements ProviderRunHandle {
           return record === undefined ? [] : [record];
         })
       : [];
+    const apiErrorStatus = event["api_error_status"] ?? event["apiErrorStatus"];
+    if (
+      apiErrorStatus !== undefined &&
+      (typeof apiErrorStatus !== "number" ||
+        !Number.isInteger(apiErrorStatus) ||
+        apiErrorStatus < 100 ||
+        apiErrorStatus > 599)
+    ) {
+      return undefined;
+    }
     return Object.freeze({
       isError: event["is_error"],
       text: this.#redactor.redactText(event["result"]),
       ...(typeof event["session_id"] === "string" ? { sessionId: event["session_id"] } : {}),
       permissionDenials: Object.freeze(denials),
+      ...(typeof apiErrorStatus === "number" ? { apiErrorStatus } : {}),
     });
   }
 
@@ -513,7 +525,7 @@ export class ClaudeRunner implements ProviderPort {
           "--tools",
           toolsForRole(request.role),
           "--allowedTools",
-          ...allowedToolsForRole(request.role),
+          ...claudeAllowedToolsForRole(request.role),
           "--no-session-persistence",
           "--model",
           request.model,

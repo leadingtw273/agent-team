@@ -115,7 +115,7 @@ export function parseClaudeRateLimitEvents(
     const sample = confirmedUsage(
       context,
       bucket,
-      status === "rejected" || status === "exceeded" ? 100 : utilization * 100,
+      status === "rejected" ? 100 : utilization * 100,
       info["resets_at"] ?? info["resetsAt"],
     );
     if (sample !== undefined) parsed.set(bucket, sample);

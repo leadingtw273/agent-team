@@ -168,6 +168,7 @@ class FakeReadModel implements LinearWorkManagementReadModel {
 
 class FakeMutationClient implements LinearWorkManagementMutationClient {
   observeGithubMergeCalls = 0;
+  requireManualInterventionCalls = 0;
   setAgentConditionCalls: unknown[] = [];
   appendCommentCalls: unknown[] = [];
   constructor(private readonly result: LinearIssueSnapshot = snapshot()) {}
@@ -175,6 +176,13 @@ class FakeMutationClient implements LinearWorkManagementMutationClient {
   observeGithubMerge(): ReturnType<LinearWorkManagementMutationClient["observeGithubMerge"]> {
     this.observeGithubMergeCalls += 1;
     return Promise.resolve(ok(this.result));
+  }
+
+  requireManualIntervention(): ReturnType<
+    LinearWorkManagementMutationClient["requireManualIntervention"]
+  > {
+    this.requireManualInterventionCalls += 1;
+    return Promise.resolve(ok({ ...this.result, workStatus: "requires_manual" } as never));
   }
 
   setAgentCondition(
@@ -270,7 +278,24 @@ describe("LinearWorkManagementAdapter", () => {
     expect(mutationClient.observeGithubMergeCalls).toBe(1);
   });
 
-  it("setWorkStatus fails closed on any target other than completed, without calling the mutation client (narrow-scope disclosure)", async () => {
+  it('setWorkStatus("requires_manual") delegates to the policy transition', async () => {
+    const mutationClient = new FakeMutationClient();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.setWorkStatus(reference(), "requires_manual", {
+      idempotencyKey: "k-manual",
+    });
+    expect(result.ok).toBe(true);
+    expect(mutationClient.requireManualInterventionCalls).toBe(1);
+    expect(mutationClient.observeGithubMergeCalls).toBe(0);
+  });
+
+  it("setWorkStatus fails closed on unsupported targets without calling the mutation client", async () => {
     const mutationClient = new FakeMutationClient();
     const adapter = new LinearWorkManagementAdapter({
       readModel: new FakeReadModel(),
@@ -285,6 +310,7 @@ describe("LinearWorkManagementAdapter", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("invariant_violation");
     expect(mutationClient.observeGithubMergeCalls).toBe(0);
+    expect(mutationClient.requireManualInterventionCalls).toBe(0);
   });
 
   it("setAgentCondition maps a single blocking reason through to LinearVisibleAgentCondition", async () => {

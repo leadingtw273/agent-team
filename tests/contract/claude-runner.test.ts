@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { ClaudeRunner } from "../../src/adapters/providers/claude/index.js";
+import {
+  ClaudeRunner,
+  claudeWritableDirectories,
+} from "../../src/adapters/providers/claude/index.js";
 import type {
   ChildProcessHandle,
   ProcessExit,
@@ -367,6 +370,127 @@ describe("Claude stream-json runner", () => {
     });
   });
 
+  describe("ADR-009 Claude review throttling classification", () => {
+    it("treats only rejected as a confirmed five-hour wall and retains a valid reset", async () => {
+      const resetSeconds = 1_786_000_000;
+      const process = new FakeProcessPort(
+        [
+          { type: "assistant", message: { content: [{ type: "text", text: "partial review" }] } },
+          {
+            type: "rate_limit_event",
+            rate_limit_info: {
+              status: "rejected",
+              rate_limit_type: "five_hour",
+              resets_at: resetSeconds,
+            },
+          },
+          {
+            type: "result",
+            is_error: true,
+            result: "rate limited",
+            permission_denials: [],
+          },
+        ],
+        1,
+      );
+      const started = await runner(process).start(runRequest("code_reviewer"));
+      if (!started.ok) throw new Error(started.error.code);
+      const [events, completion] = await Promise.all([
+        collect(started.value.events),
+        started.value.completion(),
+      ]);
+
+      expect(events).toContainEqual({
+        kind: "quota_boundary",
+        observedAt: instant("2026-08-04T12:01:00.000Z"),
+        bucket: "five_hour",
+        resetAt: instant(new Date(resetSeconds * 1_000).toISOString()),
+        confidence: "confirmed",
+      });
+      expect(events.map((event) => event.kind)).not.toContain("completed");
+      expect(completion).toMatchObject({
+        ok: true,
+        value: { outcome: "failed", error: { code: "rate_limited" } },
+      });
+    });
+
+    it("keeps a rejected wall confirmed even when bucket and reset are unavailable", async () => {
+      const process = new FakeProcessPort([
+        { type: "rate_limit_event", rate_limit_info: { status: "rejected" } },
+        { type: "result", is_error: true, result: "stopped", permission_denials: [] },
+      ]);
+      const started = await runner(process).start(runRequest("code_reviewer"));
+      if (!started.ok) throw new Error(started.error.code);
+      const [events, completion] = await Promise.all([
+        collect(started.value.events),
+        started.value.completion(),
+      ]);
+
+      expect(events).toContainEqual({
+        kind: "quota_boundary",
+        observedAt: instant("2026-08-04T12:01:00.000Z"),
+        confidence: "confirmed",
+      });
+      expect(completion).toMatchObject({
+        ok: true,
+        value: { outcome: "failed", error: { code: "rate_limited" } },
+      });
+    });
+
+    it("classifies api_error_status 429 without rejected as unconfirmed throttling", async () => {
+      const process = new FakeProcessPort(
+        [
+          {
+            type: "result",
+            is_error: true,
+            result: "request failed",
+            api_error_status: 429,
+            permission_denials: [],
+          },
+        ],
+        1,
+      );
+      const started = await runner(process).start(runRequest("code_reviewer"));
+      if (!started.ok) throw new Error(started.error.code);
+      const [events, completion] = await Promise.all([
+        collect(started.value.events),
+        started.value.completion(),
+      ]);
+
+      expect(events).toContainEqual({
+        kind: "quota_boundary",
+        observedAt: instant("2026-08-04T12:01:00.000Z"),
+        confidence: "unconfirmed",
+      });
+      expect(completion).toMatchObject({
+        ok: true,
+        value: { outcome: "failed", error: { code: "quota_unknown" } },
+      });
+    });
+
+    it.each(["allowed_warning", "exceeded"])(
+      "does not treat %s alone as a confirmed quota wall",
+      async (status) => {
+        const process = new FakeProcessPort([
+          {
+            type: "rate_limit_event",
+            rate_limit_info: { status, rate_limit_type: "seven_day" },
+          },
+          { type: "result", is_error: false, result: "review complete", permission_denials: [] },
+        ]);
+        const started = await runner(process).start(runRequest("code_reviewer"));
+        if (!started.ok) throw new Error(started.error.code);
+        const [events, completion] = await Promise.all([
+          collect(started.value.events),
+          started.value.completion(),
+        ]);
+
+        expect(events.map((event) => event.kind)).not.toContain("quota_boundary");
+        expect(completion).toMatchObject({ ok: true, value: { outcome: "completed" } });
+      },
+    );
+  });
+
   /**
    * C015f: real Claude Code `stream-json` output carries a `signature` field on every
    * "thinking" content block (a real Anthropic API integrity value, not a secret). This field
@@ -562,6 +686,10 @@ describe("Claude stream-json runner", () => {
         const allowedToolsIndex = arguments_.indexOf("--allowedTools");
         const noSessionIndex = arguments_.indexOf("--no-session-persistence");
         const grants = arguments_.slice(allowedToolsIndex + 1, noSessionIndex);
+        const actualDirectories = grants
+          .filter((grant) => grant.startsWith("Write(./") && grant.endsWith("/*)"))
+          .map((grant) => grant.slice("Write(./".length, -"/*)".length));
+        expect(actualDirectories).toEqual(claudeWritableDirectories);
 
         // The C015h-1 baseline this ticket replaced was exactly `Write(./**)`/`Edit(./**)` --
         // that bare recursive-from-root pattern is what let `.github/workflows/**` be rewritten.

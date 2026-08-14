@@ -17,24 +17,35 @@
 import { randomUUID } from "node:crypto";
 
 import type { CliHandlers } from "../program.js";
+import {
+  classifyClaudeChangeRegions,
+  createClaudeQuotaCollector,
+} from "../../adapters/providers/claude/index.js";
+import { createCodexQuotaCollector } from "../../adapters/providers/codex/index.js";
+import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import type { ModelRoutingConfig } from "../../application/routing/index.js";
 import type {
   FileJobProgressStore,
+  JobProgressRecord,
   JobProgressRecordMutation,
+  JobProviderAssignments,
+  ProtectedRegionHandoff,
   RequiresManualReasonCode,
 } from "../../adapters/dispatch/job-progress-store.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import {
   createClock,
-  ok,
   type Clock,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
+import { createAgentCondition } from "../../domain/workflow/index.js";
+import type { Project } from "../../domain/project/index.js";
 import {
   resolveAuthoritativeBaseRevision,
   type AuthoritativeBaseFailure,
@@ -73,8 +84,11 @@ import { createOperatorCanaryCliHandlers } from "./operator-canary-attestation.j
 import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
+import { createReviewerResumeHandler } from "./reviewer-resume-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { resumeExistingProjectJobs } from "./resume-existing.js";
+import { createQuotaProbeStatusHandler } from "../quota/index.js";
+import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -106,11 +120,149 @@ export interface CreateDispatchCliHandlersOptions {
    * credentials just to get past this step. */
   readonly resolveAuthoritativeBase?: typeof resolveAuthoritativeBaseRevision;
   readonly clock?: Clock;
+  /** Narrow test seam for the protected-region handoff; production always uses the real Linear
+   * adapter built from this dispatch composition's already-shared read/mutation clients. */
+  readonly protectedRegionWorkManagement?: Pick<
+    LinearWorkManagementAdapter,
+    "setWorkStatus" | "setAgentCondition" | "appendComment"
+  >;
 }
 
 const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = Object.freeze({
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
+
+export const protectedRegionHandoffComment =
+  "Agent Team 已停止自動執行：此工單宣告的變更範圍包含 AI 實作者不可寫入的受保護區域（例如 CI 設定或 repository 根層檔案）。為避免模型修改驗證機制，本次未啟動模型、未建立 PR。請由人工處理，或拆成只包含允許目錄的獨立工單；完成後先使用 dispatch resolve 結束舊工作，再重新通過 Ready Gate 並明確移回待執行。";
+
+type ProtectedRegionPrimaryReason =
+  | "job_progress_write_failed"
+  | "protected_region_lease_release_failed"
+  | "protected_region_sync_failed";
+
+interface ProtectedRegionAttempt {
+  readonly handoff: ProtectedRegionHandoff;
+  readonly primaryReason?: Exclude<ProtectedRegionPrimaryReason, "job_progress_write_failed">;
+}
+
+function progressMutation(record: JobProgressRecord): JobProgressRecordMutation {
+  return Object.freeze({
+    jobId: record.jobId,
+    projectId: record.projectId,
+    issueId: record.issueId,
+    externalIssueId: record.externalIssueId,
+    model: record.model,
+    ...(record.providerAssignments === undefined
+      ? {}
+      : { providerAssignments: record.providerAssignments }),
+    stage: record.stage,
+    branch: record.branch,
+    worktreePath: record.worktreePath,
+    ...(record.protectedRegionHandoff === undefined
+      ? {}
+      : { protectedRegionHandoff: record.protectedRegionHandoff }),
+    ...(record.changeRequestId === undefined ? {} : { changeRequestId: record.changeRequestId }),
+    ...(record.headSha === undefined ? {} : { headSha: record.headSha }),
+    ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
+    ...(record.baseRevision === undefined ? {} : { baseRevision: record.baseRevision }),
+  });
+}
+
+function providerAssignmentsForNewJob(
+  execution: Readonly<{ provider: string; model: string }> | undefined,
+  routingConfig: ModelRoutingConfig,
+): JobProviderAssignments | undefined {
+  const codeReview = routingConfig.routes.find((route) => route.role === "code_reviewer")
+    ?.candidates[0];
+  if (execution?.provider !== "codex" || codeReview?.provider !== "claude") return undefined;
+  return Object.freeze({
+    execution: Object.freeze({ provider: "codex", model: execution.model }),
+    codeReview: Object.freeze({ provider: "claude", model: codeReview.model }),
+  });
+}
+
+async function attemptProtectedRegionHandoff(options: {
+  readonly handoff: ProtectedRegionHandoff;
+  readonly project: Project;
+  readonly externalIssueId: string;
+  readonly workManagement: Pick<
+    LinearWorkManagementAdapter,
+    "setWorkStatus" | "setAgentCondition" | "appendComment"
+  >;
+  readonly leases: LeaseCoordinator;
+  readonly idempotencyPrefix: string;
+}): Promise<ProtectedRegionAttempt> {
+  let workflowState = options.handoff.workflowState;
+  let agentCondition = options.handoff.agentCondition;
+  let comment = options.handoff.comment;
+  let leaseRelease = options.handoff.leaseRelease;
+
+  const reference = { project: options.project, externalIssueId: options.externalIssueId };
+  if (workflowState === "pending") {
+    const result = await options.workManagement.setWorkStatus(reference, "requires_manual", {
+      idempotencyKey: `${options.idempotencyPrefix}:workflow`,
+    });
+    if (result.ok) workflowState = "confirmed";
+  }
+  if (agentCondition === "pending") {
+    const result = await options.workManagement.setAgentCondition(
+      reference,
+      createAgentCondition("blocked", ["unknown_error"]),
+      { idempotencyKey: `${options.idempotencyPrefix}:agent-condition` },
+    );
+    if (result.ok) agentCondition = "confirmed";
+  }
+  if (comment === "pending") {
+    const result = await options.workManagement.appendComment(
+      reference,
+      protectedRegionHandoffComment,
+      { idempotencyKey: `${options.idempotencyPrefix}:comment` },
+    );
+    if (result.ok) comment = "confirmed";
+  }
+  if (leaseRelease === "pending") {
+    const result = await options.leases.release({
+      leaseId: options.handoff.leaseId,
+      holderId: options.handoff.holderId,
+    });
+    if (
+      result.ok &&
+      result.value.persistence !== "unknown" &&
+      result.value.lockRelease === "confirmed"
+    ) {
+      leaseRelease = "confirmed";
+    }
+  }
+
+  const handoff = Object.freeze({
+    ...options.handoff,
+    workflowState,
+    agentCondition,
+    comment,
+    leaseRelease,
+  });
+  const syncConfirmed =
+    workflowState === "confirmed" && agentCondition === "confirmed" && comment === "confirmed";
+  return Object.freeze({
+    handoff,
+    ...(leaseRelease !== "confirmed"
+      ? { primaryReason: "protected_region_lease_release_failed" as const }
+      : !syncConfirmed
+        ? { primaryReason: "protected_region_sync_failed" as const }
+        : {}),
+  });
+}
+
+async function persistProtectedRegionAttempt(
+  progress: FileJobProgressStore,
+  record: JobProgressRecord,
+  attempt: ProtectedRegionAttempt,
+): Promise<Result<JobProgressRecord, DomainError>> {
+  return progress.compareAndSwap(record.jobId, record.revision, {
+    ...progressMutation(record),
+    protectedRegionHandoff: attempt.handoff,
+  });
+}
 
 function safeResumeOutcomes(
   outcomes: readonly ResumeJobOutcome[],
@@ -126,7 +278,12 @@ function safeResumeOutcomes(
 
 type DispatchHandlers = Pick<
   CliHandlers,
-  "run" | "dispatchResolve" | "dispatchResolveLegacyClaim" | "dispatchAutoMergeResume" | "quota"
+  | "run"
+  | "dispatchResolve"
+  | "dispatchResolveLegacyClaim"
+  | "dispatchAutoMergeResume"
+  | "dispatchReviewerResume"
+  | "quota"
 >;
 
 const blockedMessages: Readonly<Record<DispatchCompositionBlockedReason, string>> = Object.freeze({
@@ -252,7 +409,7 @@ async function writeDispatchRequiresManual(
   progress: FileJobProgressStore,
   reasonCode: RequiresManualReasonCode,
   fields: Omit<JobProgressRecordMutation, "stage">,
-): Promise<Result<void, DomainError>> {
+): Promise<Result<JobProgressRecord, DomainError>> {
   const written = await progress.compareAndSwap(fields.jobId, null, {
     ...fields,
     stage: {
@@ -260,8 +417,7 @@ async function writeDispatchRequiresManual(
       cause: { stage: "dispatch", reasonCode, attempts: { count: 1 } },
     },
   });
-  if (!written.ok) return written;
-  return ok(undefined);
+  return written;
 }
 
 /**
@@ -288,9 +444,22 @@ export function createDispatchCliHandlers(
   const generateHolderId = options.generateHolderId ?? (() => `cli-dispatch:${randomUUID()}`);
   const clock = options.clock ?? createClock();
   const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
-  const quota = createOperatorCanaryCliHandlers({
+  const operatorCanary = createOperatorCanaryCliHandlers({
     agentTeamHome: options.agentTeamHome,
     clock,
+  });
+  const quota = Object.freeze({
+    ...operatorCanary,
+    probeStatus: createQuotaProbeStatusHandler({
+      agentTeamHome: options.agentTeamHome,
+      clock,
+      claude: createClaudeQuotaCollector({
+        process: new ChildProcessRunner(),
+        workingDirectory: process.cwd(),
+        clock,
+      }),
+      codex: createCodexQuotaCollector({ clock }),
+    }),
   });
 
   // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/
@@ -318,11 +487,16 @@ export function createDispatchCliHandlers(
     store: autoMergePause,
     progress: buildJobProgressStore(options.agentTeamHome),
   });
+  const dispatchReviewerResume = createReviewerResumeHandler({
+    progress: buildJobProgressStore(options.agentTeamHome),
+    clock,
+  });
 
   return Object.freeze({
     dispatchResolve,
     dispatchResolveLegacyClaim,
     dispatchAutoMergeResume,
+    dispatchReviewerResume,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
@@ -434,6 +608,60 @@ export function createDispatchCliHandlers(
             admission: buildIssueAdmissionStore(options.agentTeamHome),
           };
 
+      const workManagement =
+        options.protectedRegionWorkManagement ??
+        new LinearWorkManagementAdapter({
+          readModel: build.value.discovery.readModel,
+          mutationClient: build.value.discovery.mutationClient,
+          teamId: build.value.discovery.teamId,
+          linearProjectId: build.value.discovery.linearProjectId,
+        });
+      const protectedRegionSyncFailures: Readonly<Record<string, string>>[] = [];
+      if (!dryRun) {
+        const records = await progress.listForProject(build.value.project.id);
+        if (!records.ok) {
+          return outcome("failed", {
+            operation: "dispatch_run",
+            state: "blocked",
+            projectId: input.projectId,
+            reason: "job_progress_read_failed",
+            errorCode: records.error.code,
+          });
+        }
+        for (const record of records.value) {
+          if (
+            record.stage.kind !== "requires_manual" ||
+            record.stage.cause?.reasonCode !== "protected_region_requires_human" ||
+            record.protectedRegionHandoff === undefined ||
+            (record.protectedRegionHandoff.workflowState === "confirmed" &&
+              record.protectedRegionHandoff.agentCondition === "confirmed" &&
+              record.protectedRegionHandoff.comment === "confirmed" &&
+              record.protectedRegionHandoff.leaseRelease === "confirmed")
+          ) {
+            continue;
+          }
+          const attempt = await attemptProtectedRegionHandoff({
+            handoff: record.protectedRegionHandoff,
+            project: build.value.project,
+            externalIssueId: record.externalIssueId,
+            workManagement,
+            leases: ports.leases,
+            idempotencyPrefix: `cli-dispatch:${record.jobId}:protected-region`,
+          });
+          const persisted = await persistProtectedRegionAttempt(progress, record, attempt);
+          if (!persisted.ok || attempt.primaryReason !== undefined) {
+            protectedRegionSyncFailures.push(
+              Object.freeze({
+                jobId: record.jobId,
+                reason: !persisted.ok
+                  ? "job_progress_write_failed"
+                  : (attempt.primaryReason ?? "protected_region_sync_failed"),
+              }),
+            );
+          }
+        }
+      }
+
       const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId, {
         allowOperatorCanary: !dryRun,
       });
@@ -460,6 +688,19 @@ export function createDispatchCliHandlers(
       }));
 
       if (dryRun) {
+        const selectedIssue =
+          result.kind === "dispatched"
+            ? candidates.find((candidate) => candidate.issue.id === result.job.issueId)?.issue
+            : undefined;
+        const protectedRegionPrediction =
+          selectedIssue?.agentRole === "implementer" &&
+          selectedIssue.changeRegions !== undefined &&
+          classifyClaudeChangeRegions(selectedIssue.changeRegions).state === "blocked"
+            ? Object.freeze({
+                state: "blocked" as const,
+                reason: "protected_region_requires_human" as const,
+              })
+            : Object.freeze({ state: "allowed" as const });
         return outcome("success", {
           operation: "dispatch_run",
           state: "dry_run",
@@ -468,6 +709,7 @@ export function createDispatchCliHandlers(
           discoverySkipped,
           admissionSkipped,
           candidateSummaries,
+          protectedRegionPrediction,
         });
       }
 
@@ -484,6 +726,7 @@ export function createDispatchCliHandlers(
             skipped: result.skipped,
             discoverySkipped,
             admissionSkipped,
+            protectedRegionSyncFailures,
           };
 
           // C018 fix: deterministic (a pure function of `result.job.id`, never dependent on
@@ -506,6 +749,12 @@ export function createDispatchCliHandlers(
             (candidate) => candidate.issue.id === result.job.issueId,
           )?.issue;
           const model = result.decision.model?.candidate.model;
+          const providerAssignments = providerAssignmentsForNewJob(
+            result.decision.model?.candidate,
+            build.value.routingConfig,
+          );
+          const providerAssignmentFields =
+            providerAssignments === undefined ? {} : { providerAssignments };
 
           // C015b item 5 scope boundary: only implementer-role work drives a pipeline here.
           // Reviewer/integration/etc. pipelines are separate, unbuilt C-series tickets.
@@ -535,6 +784,7 @@ export function createDispatchCliHandlers(
                   result.job.issueId,
                 ),
                 model: model ?? "unresolved",
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -586,6 +836,7 @@ export function createDispatchCliHandlers(
                 // exists purely so this record can still be written at all, and `dispatch resolve`
                 // can still find and release the claim.
                 model: model ?? "unresolved",
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -605,9 +856,61 @@ export function createDispatchCliHandlers(
             });
           }
 
+          const regionClassification = classifyClaudeChangeRegions(issue.changeRegions ?? []);
+          if (regionClassification.state === "blocked") {
+            const pendingHandoff: ProtectedRegionHandoff = Object.freeze({
+              leaseId: result.lease.id,
+              holderId,
+              workflowState: "pending",
+              agentCondition: "pending",
+              comment: "pending",
+              leaseRelease: "pending",
+            });
+            const written = await writeDispatchRequiresManual(
+              progress,
+              "protected_region_requires_human",
+              {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: issue.externalId,
+                model,
+                ...providerAssignmentFields,
+                branch,
+                worktreePath,
+                protectedRegionHandoff: pendingHandoff,
+              },
+            );
+            const attempt = await attemptProtectedRegionHandoff({
+              handoff: pendingHandoff,
+              project: build.value.project,
+              externalIssueId: issue.externalId,
+              workManagement,
+              leases: ports.leases,
+              idempotencyPrefix: `cli-dispatch:${result.job.id}:protected-region`,
+            });
+            const persisted = written.ok
+              ? await persistProtectedRegionAttempt(progress, written.value, attempt)
+              : written;
+            const primaryReason: ProtectedRegionPrimaryReason | undefined = !written.ok
+              ? "job_progress_write_failed"
+              : !persisted.ok
+                ? "job_progress_write_failed"
+                : attempt.primaryReason;
+            return outcome(primaryReason === undefined ? "success" : "failed", {
+              ...dispatchedPayload,
+              state: "requires_manual",
+              pipeline: "not_started",
+              pipelineReason: primaryReason ?? "protected_region_requires_human",
+              protectedRegionCount: regionClassification.protectedRegionCount,
+              handoff: attempt.handoff,
+              requiresManual: true,
+            });
+          }
+
           const pipelineComposition = await buildPipelineComposition({
             agentTeamHome: options.agentTeamHome,
-            claudeConfig: build.value.claude.config,
+            codexConfig: build.value.codex.config,
           });
           if (pipelineComposition.state !== "ready") {
             const requiresManual = await writeDispatchRequiresManual(
@@ -619,6 +922,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -671,6 +975,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -709,6 +1014,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -755,6 +1061,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch,
                 worktreePath,
               },
@@ -817,6 +1124,7 @@ export function createDispatchCliHandlers(
                   issueId: result.job.issueId,
                   externalIssueId: issue.externalId,
                   model,
+                  ...providerAssignmentFields,
                   branch: request.value.branch,
                   worktreePath: request.value.worktreePath,
                   changeRequestId: String(pipelineOutcome.changeRequest.number),
@@ -868,6 +1176,7 @@ export function createDispatchCliHandlers(
                   issueId: result.job.issueId,
                   externalIssueId: issue.externalId,
                   model,
+                  ...providerAssignmentFields,
                   branch: request.value.branch,
                   worktreePath: request.value.worktreePath,
                   changeRequestId: String(pipelineOutcome.changeRequest.number),
@@ -898,6 +1207,7 @@ export function createDispatchCliHandlers(
               issueId: result.job.issueId,
               externalIssueId: issue.externalId,
               model,
+              ...providerAssignmentFields,
               stage: { kind: "ci_waiting" },
               branch: request.value.branch,
               worktreePath: request.value.worktreePath,
@@ -944,6 +1254,7 @@ export function createDispatchCliHandlers(
                     issueId: result.job.issueId,
                     externalIssueId: issue.externalId,
                     model,
+                    ...providerAssignmentFields,
                     branch: request.value.branch,
                     worktreePath: request.value.worktreePath,
                   },
@@ -975,6 +1286,7 @@ export function createDispatchCliHandlers(
               issueId: result.job.issueId,
               externalIssueId: issue.externalId,
               model,
+              ...providerAssignmentFields,
               stage: {
                 kind: "paused",
                 pauseReason: pipelineOutcome.reason,
@@ -1013,6 +1325,7 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: issue.externalId,
                 model,
+                ...providerAssignmentFields,
                 branch: request.value.branch,
                 worktreePath: request.value.worktreePath,
               },
@@ -1040,6 +1353,7 @@ export function createDispatchCliHandlers(
             skipped: result.skipped,
             discoverySkipped,
             admissionSkipped,
+            protectedRegionSyncFailures,
           });
         case "blocked":
           return outcome("failed", {
@@ -1050,6 +1364,7 @@ export function createDispatchCliHandlers(
             skipped: result.skipped,
             discoverySkipped,
             admissionSkipped,
+            protectedRegionSyncFailures,
           });
       }
     },

@@ -332,10 +332,11 @@ describe("O003 Linear provision use case", () => {
     expect(preview.ok).toBe(true);
     if (!preview.ok) return;
     expect(preview.value.actions).toHaveLength(linearProvisionDesiredObjects.length);
-    expect(preview.value.summary).toEqual({ unchanged: 0, create: 27, manual: 6, conflict: 0 });
+    expect(preview.value.summary).toEqual({ unchanged: 0, create: 27, manual: 7, conflict: 0 });
     expect(preview.value.actions.filter((item) => item.kind === "workflow_state")).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "待辦", state: "manual_create" }),
+        expect.objectContaining({ name: "需人工", state: "manual_create" }),
         expect.objectContaining({ name: "已完成", state: "manual_create" }),
       ]),
     );
@@ -393,7 +394,7 @@ describe("O003 Linear provision use case", () => {
     expect(final.ok).toBe(true);
     if (!final.ok) return;
     expect(final.value.state).toBe("ready");
-    expect(final.value.summary).toEqual({ unchanged: 33, create: 0, manual: 0, conflict: 0 });
+    expect(final.value.summary).toEqual({ unchanged: 34, create: 0, manual: 0, conflict: 0 });
   });
 
   it("never adopts by name, renames, or deletes an existing object", async () => {

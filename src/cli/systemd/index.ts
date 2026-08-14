@@ -182,7 +182,14 @@ const defaultTemplateDirectory = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../../systemd",
 );
-const defaultRuntimePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const standardRuntimePathEntries = Object.freeze([
+  "/usr/local/sbin",
+  "/usr/local/bin",
+  "/usr/sbin",
+  "/usr/bin",
+  "/sbin",
+  "/bin",
+] as const);
 const defaultDeadlineMs = 10_000;
 const defaultOutputLimit = 8_192;
 const defaultTerminateGraceMs = 500;
@@ -530,11 +537,29 @@ function assertSafeEnvironmentValue(name: string, value: string): void {
   }
 }
 
-export function buildRuntimeEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function buildCanonicalRuntimePath(nodeExecutable: string | undefined, home: string): string {
+  const entries = [
+    ...(nodeExecutable === undefined ? [] : [dirname(nodeExecutable)]),
+    join(home, ".local", "bin"),
+    ...standardRuntimePathEntries,
+  ];
+  const canonicalEntries = entries.filter(
+    (entry, index) => isAbsolute(entry) && entries.indexOf(entry) === index,
+  );
+  if (canonicalEntries.length === 0) {
+    throw new Error("Systemd Runtime PATH is unavailable.");
+  }
+  return canonicalEntries.join(":");
+}
+
+export function buildRuntimeEnvironment(
+  source: NodeJS.ProcessEnv,
+  nodeExecutable?: string,
+): NodeJS.ProcessEnv {
   const home = source["HOME"] ?? homedir();
   const xdgConfigHome = source["XDG_CONFIG_HOME"] ?? join(home, ".config");
   const environment: NodeJS.ProcessEnv = {
-    PATH: source["PATH"] ?? defaultRuntimePath,
+    PATH: buildCanonicalRuntimePath(nodeExecutable, home),
     HOME: home,
     XDG_CONFIG_HOME: xdgConfigHome,
   };
@@ -1085,7 +1110,10 @@ export class SystemdManager {
     assertExactControllerCommand(options.runtimeCommand, "cycle");
     this.#runtimeAvailable = options.runtimeAvailable ?? false;
     this.#inheritedEnvironment = Object.freeze({ ...options.runtimeCommand.environment });
-    this.#runtimeEnvironment = buildRuntimeEnvironment(options.runtimeCommand.environment);
+    this.#runtimeEnvironment = buildRuntimeEnvironment(
+      options.runtimeCommand.environment,
+      options.runtimeCommand.executable,
+    );
     this.#runtimeCommand = buildRuntimeWrapperCommand(
       options.runtimeCommand,
       this.#runtimeEnvironment,

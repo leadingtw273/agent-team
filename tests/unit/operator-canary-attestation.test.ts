@@ -170,10 +170,10 @@ const routingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
-    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "implementer", candidates: [{ provider: "codex", model: "gpt-5.6-terra" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -327,7 +327,7 @@ describe("operator canary CLI handlers", () => {
 });
 
 describe("exact operator canary candidate gate", () => {
-  it("consumes only the one exact Claude-routable candidate and leaves every other candidate unknown", async () => {
+  it("does not consume a Claude execution canary after implementer routing becomes Codex-only", async () => {
     const root = await home();
     const store = new FileOperatorCanaryAttestationStore(root, { clock });
     const issued = await store.issue({
@@ -352,16 +352,13 @@ describe("exact operator canary candidate gate", () => {
       },
       clock,
     });
-    expect(result).toMatchObject({
-      state: "consumed",
-      candidate: { issue: { externalId: externalIssueId } },
-      routeObservations: [{ provider: "claude", model: "opus", state: "ready" }],
-    });
+    expect(result).toEqual({ state: "unavailable" });
+    expect(process.requests).toHaveLength(0);
     await expect(
       store.inspect({ projectId, linearExternalIssueId: externalIssueId }),
     ).resolves.toMatchObject({
       ok: true,
-      value: { state: "consumed" },
+      value: { state: "issued" },
     });
     await expect(
       store.inspect({ projectId, linearExternalIssueId: otherExternalIssueId }),

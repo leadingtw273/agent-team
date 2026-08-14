@@ -48,7 +48,12 @@ import {
   type Result,
 } from "../../domain/foundation/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
-import { jobIdSchema, projectIdSchema, issueIdSchema } from "../../domain/jobs/index.js";
+import {
+  issueIdSchema,
+  jobIdSchema,
+  leaseIdSchema,
+  projectIdSchema,
+} from "../../domain/jobs/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
 import { reportContractFailureCategorySchema } from "../../application/pipelines/reviewer-model.js";
 import {
@@ -77,6 +82,7 @@ const providerRetryCountSchema = z.number().int().min(0).max(100);
  * enum just to stay in sync with it; resume-composition.ts is what decides whether a code is
  * `retryable` before ever reaching this stage at all. */
 const lastErrorCodeSchema = z.string().trim().min(1).max(64);
+const reviewBindingDigestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 
 /**
  * C016 fix: mirrors `ImplementerPipelineOutcome`'s own `paused` `reason` union
@@ -166,6 +172,8 @@ export const requiresManualReasonCodeSchema = z.enum([
   // `legacy_base_revision_mismatch` -- confirmed absent from every record on disk as of this
   // ticket, safe to drop from the enum outright rather than keep as a dead, unreachable case.
   "legacy_base_revision_unrecoverable",
+  /** Pre-ADR-009 records did not persist which Provider/model owned execution and review. */
+  "legacy_provider_assignment_unavailable",
   // ci_recovery
   "ci_recovery_paused",
   "ci_recovery_failed",
@@ -304,6 +312,7 @@ export const requiresManualReasonCodeSchema = z.enum([
   // an actual failure reasonCode would mislead whoever reads this record later via `dispatch
   // resolve`.
   "role_pipeline_unavailable",
+  "protected_region_requires_human",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 
@@ -389,6 +398,24 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("implementing") }).strict(),
   z.object({ kind: z.literal("ci_waiting") }).strict(),
   z.object({ kind: z.literal("awaiting_review") }).strict(),
+  z
+    .object({
+      kind: z.literal("reviewer_waiting"),
+      reason: z.enum(["confirmed_quota_wall", "unconfirmed_throttling"]),
+      confidence: z.enum(["confirmed", "unconfirmed"]),
+      bucket: z.enum(["weekly", "five_hour", "model_weekly"]).optional(),
+      resetAt: instantSchema.optional(),
+      retryNotBefore: instantSchema.optional(),
+      binding: z
+        .object({
+          requirementsDigest: reviewBindingDigestSchema,
+          headSha: headShaSchema,
+          diffDigest: reviewBindingDigestSchema,
+        })
+        .strict(),
+      publication: z.enum(["pending", "confirmed"]),
+    })
+    .strict(),
   z.object({ kind: z.literal("fix_round") }).strict(),
   // C015x decision 3: previously the bare `{kind:"merging"}` below -- the coordinator's own
   // diagnosis (this ticket) named this as having *zero* bound on how long a job may sit being
@@ -525,6 +552,36 @@ export const jobProgressStageSchema = z.discriminatedUnion("kind", [
 
 export type JobProgressStage = z.infer<typeof jobProgressStageSchema>;
 
+export const protectedRegionHandoffSchema = z
+  .object({
+    leaseId: leaseIdSchema,
+    holderId: z.string().trim().min(1).max(255),
+    workflowState: z.enum(["pending", "confirmed"]),
+    agentCondition: z.enum(["pending", "confirmed"]),
+    comment: z.enum(["pending", "confirmed"]),
+    leaseRelease: z.enum(["pending", "confirmed"]),
+  })
+  .strict();
+export type ProtectedRegionHandoff = z.infer<typeof protectedRegionHandoffSchema>;
+
+export const jobProviderAssignmentsSchema = z
+  .object({
+    execution: z
+      .object({
+        provider: z.literal("codex"),
+        model: z.string().trim().min(1).max(255),
+      })
+      .strict(),
+    codeReview: z
+      .object({
+        provider: z.literal("claude"),
+        model: z.string().trim().min(1).max(255),
+      })
+      .strict(),
+  })
+  .strict();
+export type JobProviderAssignments = z.infer<typeof jobProviderAssignmentsSchema>;
+
 export const jobProgressRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -542,7 +599,14 @@ export const jobProgressRecordSchema = z
      * function of `Issue`) -- without this, a resumed job could not build a valid
      * `CiRecoveryPipelineRequest`/`ReviewerPipelineRequest`. */
     model: z.string().trim().min(1).max(255),
+    /** Optional only so schema-v1 records written before ADR-009 remain readable. New model Jobs
+     * write this once; resume refuses to infer a missing assignment from current settings. */
+    providerAssignments: jobProviderAssignmentsSchema.optional(),
     stage: jobProgressStageSchema,
+    /** Durable component receipts for the protected-region human handoff. Optional for every
+     * legacy/non-policy record; when present, the stage reason below must identify this exact
+     * policy so a later controller cycle can safely replay only the unfinished external writes. */
+    protectedRegionHandoff: protectedRegionHandoffSchema.optional(),
     branch: z.string().trim().min(1).max(255),
     worktreePath: z.string().startsWith("/").min(2).max(1024),
     changeRequestId: changeRequestNumberSchema.optional(),
@@ -590,7 +654,20 @@ export const jobProgressRecordSchema = z
     baseRevision: headShaSchema.optional(),
     updatedAt: instantSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((record, context) => {
+    const protectedReason =
+      record.stage.kind === "requires_manual" &&
+      record.stage.cause?.stage === "dispatch" &&
+      record.stage.cause.reasonCode === "protected_region_requires_human";
+    if ((record.protectedRegionHandoff !== undefined) !== protectedReason) {
+      context.addIssue({
+        code: "custom",
+        path: ["protectedRegionHandoff"],
+        message: "protected-region handoff receipts must match the protected dispatch reason",
+      });
+    }
+  });
 
 export type JobProgressRecord = z.infer<typeof jobProgressRecordSchema>;
 /** The caller never supplies `schemaVersion` (always `1`, stamped by the store itself -- see
@@ -689,6 +766,13 @@ export class FileJobProgressStore {
     if (
       normalizedCurrent.value?.baseRevision !== undefined &&
       next.baseRevision !== normalizedCurrent.value.baseRevision
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      normalizedCurrent.value?.providerAssignments !== undefined &&
+      JSON.stringify(next.providerAssignments) !==
+        JSON.stringify(normalizedCurrent.value.providerAssignments)
     ) {
       return err(domainError("invariant_violation"));
     }

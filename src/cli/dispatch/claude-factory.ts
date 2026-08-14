@@ -8,13 +8,21 @@
 import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { ClaudeRunner } from "../../adapters/providers/claude/index.js";
 import { Redactor } from "../../infrastructure/redaction/index.js";
+import type { ProviderPort } from "../../application/ports/index.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
+import { PolicyBoundProvider } from "./provider-policy.js";
 
-export function buildClaudeRunner(config: DispatchProviderConfig["claude"]): ClaudeRunner {
-  return new ClaudeRunner({
+export function buildClaudeRunner(config: DispatchProviderConfig["claude"]): ProviderPort {
+  const runner = new ClaudeRunner({
     process: new ChildProcessRunner(),
     redactor: new Redactor(),
     executable: config.executable,
     models: config.models,
+  });
+  return new PolicyBoundProvider({
+    delegate: runner,
+    provider: "claude",
+    models: config.models,
+    roles: ["code_reviewer"],
   });
 }

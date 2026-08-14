@@ -8,8 +8,9 @@
  *
  * Scope: this wires discovery -> eligibility -> quota admission -> provider liveness -> issue
  * admission -> lease -> job creation. T03A adds a fail-closed quota boundary before every durable
- * claim. The default production composition has no trusted collector yet, so model work remains
- * waiting with `quota_unknown`; tests and controlled canaries may inject a policy-backed port.
+ * claim. ADR-009 supplies the Codex App Server production collector when the private host config
+ * is trusted; absent/invalid/stale evidence remains `quota_unknown`. Tests may still inject a
+ * controlled policy-backed port.
  *
  * A real invocation against typical Linear-discovered work can still end in `kind:"waiting"` for
  * independent reasons -- do not assume fixing one fixes the others:
@@ -20,11 +21,10 @@
  *    has no such fields at all. `evaluateEligibility` runs *before* routing ever sees a
  *    candidate, so every real candidate fails eligibility (`reason:"no_eligible_candidates"`) and
  *    is filtered out before quota or model routing is consulted.
- * 2. A candidate that clears eligibility still requires a trusted, fresh quota observation. Until
- *    a real collector is wired, the production default intentionally reports `quota_unknown` and
- *    performs no provider process probe or durable write.
- * 3. Quota-ready candidates also require a live execution-provider route. Claude has a liveness
- *    probe; other providers remain unavailable until their runner wiring exists.
+ * 2. A candidate that clears eligibility still requires a trusted, fresh Codex quota observation;
+ *    missing or invalid host config intentionally reports `quota_unknown` before durable writes.
+ * 3. Quota-ready candidates also require a live Codex execution-provider route whose configured
+ *    model allowlist matches the durable assignment policy.
  *
  * Wiring a collector alone is therefore **not sufficient** to make a real `run` dispatch: the
  * Linear projection and provider runner/liveness boundaries must also be complete.
@@ -59,6 +59,7 @@ import {
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
 import { FileOperatorCanaryAttestationStore } from "../../adapters/dispatch/operator-canary-attestation-store.js";
+import type { CodexQuotaCollector } from "../../adapters/providers/codex/index.js";
 import { LinearGraphqlTransport } from "../../adapters/linear/index.js";
 import { LinearReadModel } from "../../adapters/linear/read.js";
 import { LinearMutationClient } from "../../adapters/linear/write.js";
@@ -89,7 +90,7 @@ import {
   type ModelRoutingConfig,
 } from "../../application/routing/index.js";
 import type { JobRepository } from "../../application/dispatch/index.js";
-import type { DomainError } from "../../domain/foundation/index.js";
+import type { Clock, DomainError } from "../../domain/foundation/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import {
@@ -97,16 +98,13 @@ import {
   loadHostRegistrationSetupDraft,
 } from "../registration/draft-store.js";
 import { readLinearApiKeyWithFileFallback } from "../registration/secrets.js";
-import { observeClaudeRouteCandidates } from "./claude-observation.js";
+import { observeCodexRouteCandidates } from "./codex-observation.js";
 import {
   consumeExactOperatorCanaryCandidate,
   hasNormalModelAdmissionCandidate,
 } from "./operator-canary-attestation.js";
-import {
-  applyProviderLiveness,
-  createFailClosedNewJobQuotaAdmission,
-  observeQuotaRouteCandidates,
-} from "./quota-admission.js";
+import { applyProviderLiveness, observeQuotaRouteCandidates } from "./quota-admission.js";
+import { createProductionQuotaAdmission } from "./quota-composition.js";
 import {
   defaultDispatchProviderConfigPath,
   loadHostDispatchProviderConfig,
@@ -151,8 +149,9 @@ export interface DispatchCompositionReady {
      * can fake this with a plain object instead of a real `LinearMutationClient` instance. */
     readonly mutationClient: Pick<
       LinearMutationClient,
-      "observeGithubMerge" | "setAgentCondition" | "appendComment"
-    >;
+      "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
+    > &
+      Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
     /** E102-5: the same transport `readModel`/`mutationClient` above already share -- threaded
      * through `handlers.ts` to `buildResumeComposition` so it can construct a real
      * `LinearUploadClient` (upload.ts) for `LinearVisualPublicationCoordinator`, never a second,
@@ -167,6 +166,10 @@ export interface DispatchCompositionReady {
   readonly claude: {
     readonly config: DispatchProviderConfig["claude"];
     /** Injectable for tests; production defaults to a real `ChildProcessRunner` (R001). */
+    readonly process: ProcessPort;
+  };
+  readonly codex: {
+    readonly config: DispatchProviderConfig["codex"];
     readonly process: ProcessPort;
   };
   /** T03A: required new-Job quota boundary. Production is fail-closed until a trusted collector
@@ -204,8 +207,13 @@ export interface BuildDispatchCompositionOptions {
   readonly activationPort?: TrustedProjectActivationPort;
   /** Injectable for tests; production defaults to a real `ChildProcessRunner`. */
   readonly claudeProcessPort?: ProcessPort;
+  readonly codexProcessPort?: ProcessPort;
   /** Test/canary seam only. Production deliberately defaults to collector_unavailable. */
   readonly quotaAdmissionPort?: NewJobQuotaAdmissionPort;
+  /** QP02 compatibility seam; production uses only the passive Claude collector until Task 4
+   * replaces this bridge with Codex App Server admission. */
+  readonly quotaCollector?: CodexQuotaCollector;
+  readonly quotaClock?: Clock;
   /** Test seam for Q01's independent, project-and-opaque-issue scoped attestation store. */
   readonly operatorCanaryStore?: FileOperatorCanaryAttestationStore;
 }
@@ -323,13 +331,13 @@ export async function dispatchOnce(
     candidates: discovered.value.candidates,
     quota: ready.quotaAdmission,
   });
-  const claudeQuotaReady = quotaObservations.some(
-    (observation) => observation.provider === "claude" && observation.state === "ready",
+  const codexQuotaReady = quotaObservations.some(
+    (observation) => observation.provider === "codex" && observation.state === "ready",
   );
-  const livenessObservations = claudeQuotaReady
-    ? await observeClaudeRouteCandidates({
-        process: ready.claude.process,
-        config: ready.claude.config,
+  const livenessObservations = codexQuotaReady
+    ? await observeCodexRouteCandidates({
+        process: ready.codex.process,
+        config: ready.codex.config,
         workingDirectory: ready.project.localRepositoryPath,
       })
     : Object.freeze([]);
@@ -500,6 +508,16 @@ export async function buildDispatchComposition(
     join(stateRoot, "leases.lock"),
   );
   const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
+  const claudeProcess = options.claudeProcessPort ?? new ChildProcessRunner();
+  const codexProcess = options.codexProcessPort ?? new ChildProcessRunner();
+  const quotaAdmission =
+    options.quotaAdmissionPort ??
+    (await createProductionQuotaAdmission({
+      agentTeamHome,
+      codexExecutable: providerConfig.value.codex.executable,
+      ...(options.quotaCollector === undefined ? {} : { collector: options.quotaCollector }),
+      ...(options.quotaClock === undefined ? {} : { clock: options.quotaClock }),
+    }));
 
   return Object.freeze({
     state: "ready",
@@ -523,9 +541,10 @@ export async function buildDispatchComposition(
       trustedConfig: readyEntry.config,
       claude: Object.freeze({
         config: providerConfig.value.claude,
-        process: options.claudeProcessPort ?? new ChildProcessRunner(),
+        process: claudeProcess,
       }),
-      quotaAdmission: options.quotaAdmissionPort ?? createFailClosedNewJobQuotaAdmission(),
+      codex: Object.freeze({ config: providerConfig.value.codex, process: codexProcess }),
+      quotaAdmission,
       operatorCanary: Object.freeze({
         store: options.operatorCanaryStore ?? new FileOperatorCanaryAttestationStore(agentTeamHome),
       }),

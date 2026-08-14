@@ -24,12 +24,12 @@ const routingConfig = {
       role: "implementer",
       candidates: [
         { provider: "codex", model: "balanced" },
-        { provider: "claude", model: "backup" },
+        { provider: "codex", model: "backup" },
       ],
     },
     {
       role: "code_reviewer",
-      candidates: [{ provider: "codex", model: "review" }],
+      candidates: [{ provider: "claude", model: "review" }],
     },
     {
       role: "visual_reviewer",
@@ -37,7 +37,7 @@ const routingConfig = {
     },
     {
       role: "integration_engineer",
-      candidates: [{ provider: "claude", model: "integration" }],
+      candidates: [{ provider: "codex", model: "integration" }],
     },
   ],
 } as const satisfies ModelRoutingConfig;
@@ -45,10 +45,10 @@ const routingConfig = {
 const readyObservations: readonly CandidateObservation[] = [
   { provider: "codex", model: "lead", state: "ready" },
   { provider: "codex", model: "balanced", state: "ready" },
-  { provider: "claude", model: "backup", state: "ready" },
-  { provider: "codex", model: "review", state: "ready" },
+  { provider: "codex", model: "backup", state: "ready" },
+  { provider: "claude", model: "review", state: "ready" },
   { provider: "gemini", model: "visual", state: "ready" },
-  { provider: "claude", model: "integration", state: "ready" },
+  { provider: "codex", model: "integration", state: "ready" },
 ];
 
 function candidate(id: string, overrides: Partial<DispatchCandidate> = {}): DispatchCandidate {
@@ -175,18 +175,24 @@ describe("dispatch candidate ordering", () => {
 });
 
 describe("model and project slots", () => {
-  it("uses a fallback provider when the primary provider slot is occupied", () => {
+  it("does not cross providers when the Codex execution slot is occupied", () => {
     const decision = decideNextDispatch(
       input([candidate("next")], { active: [active("running")] }),
     );
 
     expect(decision).toMatchObject({
-      kind: "selected",
-      model: {
-        candidate: { provider: "claude", model: "backup" },
-        candidateIndex: 1,
-        fallbackUsed: true,
-      },
+      kind: "waiting",
+      skipped: [
+        {
+          blocker: {
+            code: "provider_route_unavailable",
+            skipped: [
+              { provider: "codex", model: "balanced", state: "provider_slot_full" },
+              { provider: "codex", model: "backup", state: "provider_slot_full" },
+            ],
+          },
+        },
+      ],
     });
   });
 
@@ -237,6 +243,10 @@ describe("model and project slots", () => {
               declaredRegions: undefined,
             }),
           ],
+          slotLimits: limits({
+            globalModelJobs: 3,
+            perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
+          }),
         },
       ),
     );
@@ -301,6 +311,10 @@ describe("repository concurrency", () => {
               declaredRegions: [{ path: "src/running.ts", coverage: "exact" }],
             }),
           ],
+          slotLimits: limits({
+            globalModelJobs: 3,
+            perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
+          }),
         },
       ),
     );
@@ -324,6 +338,10 @@ describe("repository concurrency", () => {
               declaredRegions: [{ path: "src/domain", coverage: "subtree" }],
             }),
           ],
+          slotLimits: limits({
+            globalModelJobs: 3,
+            perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
+          }),
         },
       ),
     );
@@ -351,6 +369,10 @@ describe("repository concurrency", () => {
             declaredRegions: [{ path: "src/known.ts", coverage: "exact" }],
           }),
         ],
+        slotLimits: limits({
+          globalModelJobs: 3,
+          perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
+        }),
       }),
     );
 
@@ -409,7 +431,13 @@ describe("fail-closed input and blocked candidate handling", () => {
             priority: "high",
           }),
         ],
-        { active: [active("running", { repositoryId: "shared" })] },
+        {
+          active: [active("running", { repositoryId: "shared" })],
+          slotLimits: limits({
+            globalModelJobs: 3,
+            perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
+          }),
+        },
       ),
     );
 

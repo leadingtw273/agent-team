@@ -1,6 +1,6 @@
 # Agent Team 路線校正版 Roadmap：走到第一輪 Sandbox 測試
 
-狀態：leadi 已核可執行  
+狀態：第一輪 Sandbox Happy Path 已達成  
 日期：2026-08-11  
 基準：main `2bc269be3387fc72ceddf378997ce7f050ab62e5`
 
@@ -10,7 +10,10 @@
 - T11 四來源去敏 artifact 已由 official collector／validator／atomic writer 產生並合併；replay PASS。
 - T12 fresh-context 唯讀驗收 PASS，blocking finding=0；限制與裁決見 [`evidence/t12-first-sandbox-acceptance.md`](evidence/t12-first-sandbox-acceptance.md)。
 - T13 使用者第一輪測試包已提供，見 [`first-user-test-guide.md`](first-user-test-guide.md)。
-- 「可開始第一輪使用者測試」不代表 v1 全部情境完成；額度自動監測、Webhook Runtime、危險操作 UI 與非 Happy Path 仍依第 7 節邊界延後。
+- 2026-08-14 ADR-009 路由與 Codex App Server production quota admission 已完成；live weekly-only probe PASS，Claude 改為必要 fresh-context code reviewer 且不做事前 quota probe。
+- LEA-37 已真實完成 Codex Implementer → PR #51 → CI → fresh Claude Review → Squash Merge → Linear Done；最終 0 non-terminal Job、0 active／expired Lease，達成第 6 節第一輪 PASS。
+- 首次 LEA-37 run 的互動 approval 暫停已以 unattended sandbox 修正：`approvalPolicy: "never"`、Implementer 精確 worktree write、Reviewer read-only、兩者無網路，非預期 tool request fail closed。
+- 「可開始第一輪使用者測試」不代表 v1 全部情境完成；危險操作 UI、完整限流 live case 與其他非 Happy Path 仍依第 7 節邊界延後。
 
 ## 1. 目標出口
 
@@ -25,7 +28,7 @@ leadi 只透過外層 Codex／Claude 所承載的「團隊管理者」提出並�
 - Linear 管工作；GitHub 管代碼、CI、Review 與 Merge；本機保存 Runtime 狀態。
 - v1 團隊管理者由外層 Codex／Claude 對話承載，不另建聊天 Server。
 - localhost UI 只顯示 Runtime／模型／額度與敏感控制，不承擔需求討論。
-- 第一輪只測安全的 implementer＋內嵌 code review Happy Path。
+- 第一輪只測安全的 Codex implementer＋fresh Claude code review Happy Path。
 - 視覺雙審、危險操作、額度撞牆、依賴、衝突、取消與流程外 Merge留到後續測試輪次。
 
 ## 3. 執行順序
@@ -36,12 +39,12 @@ T00 真相基線
 T01 C035 Merge 安全
   ↓
 ┌─────────────────────────────┐
-│ T02A Quota capability 重驗  │
+│ T02A Codex quota／Claude runtime signal 重驗 │
 │ T02B Active-job inventory   │  可平行
 └──────────────┬──────────────┘
                ↓
 ┌─────────────────────────────┐
-│ T03A Quota production gate  │
+│ T03A Codex quota production gate │
 │ T03B Reconcile resume spine │  可平行；撞同檔則序列
 └──────────────┬──────────────┘
                ↓
@@ -62,9 +65,9 @@ T11 internal canary → T12 fresh acceptance → T13 使用者測試包
 |---|---|---|
 | T00 | 文件與 CLI 說明反映真實成熟度 | 文件 read-back、CLI snapshot、CI |
 | T01 | canceled／unknown 阻止兩條 Merge mutation；post-race 可稽核 | 負向回歸＋Sandbox 專屬取消 case |
-| T02A | 確認 Codex／Claude 現行 quota 能力與 account identity | CLI/version/sample/freshness 去敏紀錄 |
+| T02A | 確認 Codex 主動 quota 能力，以及 Claude Review runtime 限流訊號分類 | CLI/version/sample/freshness 去敏紀錄 |
 | T02B | Reconcile 可從 durable progress 列出 active jobs | restart 後 active／terminal 對照 |
-| T03A | unknown／expired quota 不建立新 Job | 零 Job／零 lease admission probe |
+| T03A | Codex unknown／expired quota 不建立新 Job；Claude Review 不以缺少主動 snapshot 阻擋啟動 | Codex 零 Job／零 lease admission probe；Claude Review runtime failure fixture |
 | T03B | 可恢復 Job 只 resume 一次，不確定時清楚阻塞 | replay 不重複 Job／PR／留言／Merge |
 | T04 | timer 五分鐘內復航專屬 canary 或誠實阻塞 | PID、job、lease、timer、event before/after |
 | T05 | `agent-team project` 顯示 production 真狀態 | CLI read-back，不回顯 Secret |
@@ -88,6 +91,8 @@ T11 internal canary → T12 fresh acceptance → T13 使用者測試包
 
 ## 6. 第一輪 PASS
 
+2026-08-14 LEA-37 已逐項達成下列出口；這不會把第 7 節延後情境自動視為通過。
+
 1. leadi 只與團隊管理者對話，不手動處理 Branch、PR 或 CI。
 2. 一張新 Sandbox 代碼工單完整完成。
 3. 精確 Head 的 CI、Review Status 與 Diff Digest 全綠後才 Merge。
@@ -101,3 +106,5 @@ T11 internal canary → T12 fresh acceptance → T13 使用者測試包
 ## 8. Review 限制
 
 本 Roadmap 依 2026-08-11 fresh-context 全方向審查重排。Codex 起草後，Claude CLI Plan review 在限定窗口內零輸出而中止；因此不能宣稱 Roadmap 原稿曾跨模型複審通過。這是歷史 review 限制，不覆蓋第 0 節的最新執行證據；T12 fresh acceptance 驗的是 T11 產物，也不倒推補作當時的 Plan review。
+
+2026-08-14 的需求規格 ADR-009 已取代 Claude QP02／QP03 主動 admission refresh 方向：Claude 第一版只做必要代碼審查，啟動前不探測訂閱額度；Codex quota production gate 與 Claude 執行期間 `rejected`／單獨 `429` 分級改為兩條獨立驗收線。

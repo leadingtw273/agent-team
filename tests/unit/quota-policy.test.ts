@@ -197,8 +197,16 @@ describe("quota routing policy", () => {
   it("allows fresh confirmed quota and blocks configured weekly or provider five-hour walls", () => {
     expect(evaluateQuotaForNewJob(usageSnapshot(), codexIdentity, now, policy)).toEqual({
       state: "ready",
-      reason: "quota_confirmed",
+      reason: "weekly_quota_confirmed",
     });
+    expect(
+      evaluateQuotaForNewJob(
+        { ...usageSnapshot(), samples: [usage("codex", "weekly", 50)] },
+        codexIdentity,
+        now,
+        policy,
+      ),
+    ).toEqual({ state: "ready", reason: "weekly_quota_confirmed" });
     expect(
       evaluateQuotaForNewJob(usageSnapshot("codex", 20, 50), codexIdentity, now, policy),
     ).toEqual({
@@ -213,9 +221,8 @@ describe("quota routing policy", () => {
     });
   });
 
-  it("treats missing, stale, future, duplicate, and switched-account samples as unknown", () => {
+  it("treats stale, future, duplicate weekly, and switched-account samples as unknown", () => {
     const cases: QuotaSnapshot[] = [
-      { ...usageSnapshot(), samples: [usage("codex", "weekly", 50)] },
       {
         ...usageSnapshot(),
         samples: [
@@ -270,7 +277,7 @@ describe("quota routing policy", () => {
     ).toBe("quota_unknown");
   });
 
-  it("checkpoints running work at 3%, a five-hour limit, or an unknown signal", () => {
+  it("checkpoints running work at 3%, a known five-hour limit, or an unknown weekly signal", () => {
     expect(evaluateRunningQuota(usageSnapshot("codex", 3, 50), codexIdentity, now, policy)).toEqual(
       {
         action: "checkpoint",
@@ -285,7 +292,7 @@ describe("quota routing policy", () => {
     );
     expect(
       evaluateRunningQuota(
-        { ...usageSnapshot(), samples: [usage("codex", "weekly", 50)] },
+        { ...usageSnapshot(), samples: [usage("codex", "five_hour", 50)] },
         codexIdentity,
         now,
         policy,

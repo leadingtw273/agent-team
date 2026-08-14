@@ -12,6 +12,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { CodexQuotaCollector } from "../../src/adapters/providers/codex/index.js";
 import { buildDispatchComposition } from "../../src/cli/dispatch/composition.js";
 import {
   serializeTrustedProjectConfig,
@@ -19,7 +20,7 @@ import {
   type TrustedProjectConfig,
   type TrustedProjectGitPort,
 } from "../../src/application/projects/index.js";
-import { ok } from "../../src/domain/foundation/index.js";
+import { createFixedClock, ok, parseInstant } from "../../src/domain/foundation/index.js";
 import { projectSchema, type Project } from "../../src/domain/project/index.js";
 import { sha256Digest } from "../../src/domain/review/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
@@ -121,9 +122,9 @@ const validRoutingConfig: ModelRoutingConfig = {
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
     { role: "implementer", candidates: [{ provider: "codex", model: "build" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "review" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -150,6 +151,7 @@ async function writeRoutingConfig(agentTeamHome: string, value: unknown): Promis
 
 const validProviderConfig = {
   schemaVersion: 1,
+  codex: { executable: "codex", models: ["build"], account: "default" },
   claude: { executable: "claude", models: ["opus"], account: "default" },
 };
 
@@ -157,6 +159,34 @@ async function writeProviderConfig(agentTeamHome: string, value: unknown): Promi
   const directory = join(agentTeamHome, "config", "dispatch");
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, "providers.json"), JSON.stringify(value), "utf8");
+}
+
+async function writeQuotaConfig(agentTeamHome: string): Promise<void> {
+  const directory = join(agentTeamHome, "config");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(directory, "quota.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      claude: {
+        enabled: true,
+        statusSnapshotPath: "/operator/quota/latest.json",
+        expectedCliVersion: "2.1.229",
+        weeklyUsageLimitPercent: 80,
+        terminalRemainingPercent: 3,
+        maxSampleAgeMs: 300_000,
+      },
+      codex: {
+        enabled: true,
+        diagnosticEnabled: true,
+        expectedCliVersion: "0.147.0",
+        weeklyUsageLimitPercent: 80,
+        terminalRemainingPercent: 3,
+        maxSampleAgeMs: 300_000,
+      },
+    }),
+    { mode: 0o600 },
+  );
 }
 
 describe("buildDispatchComposition", () => {
@@ -290,6 +320,52 @@ describe("buildDispatchComposition", () => {
     await expect(result.value.quotaAdmission.resolve("claude")).resolves.toEqual({
       state: "quota_unknown",
       reason: "collector_unavailable",
+    });
+  });
+
+  it("wires a trusted Codex weekly snapshot into the production quota boundary", async () => {
+    const agentTeamHome = await temporaryHome();
+    await writeDraft(agentTeamHome, project());
+    await writeRoutingConfig(agentTeamHome, validRoutingConfig);
+    await writeProviderConfig(agentTeamHome, validProviderConfig);
+    await writeQuotaConfig(agentTeamHome);
+    const config = trustedConfig(project());
+    const observed = parseInstant("2026-08-13T07:15:00.000Z");
+    const weeklyReset = parseInstant("2026-08-20T07:15:00.000Z");
+    if (!observed.ok || !weeklyReset.ok) throw new Error("invalid fixture");
+    const collector: CodexQuotaCollector = {
+      collect: () =>
+        Promise.resolve({
+          provider: "codex",
+          state: "partial",
+          reason: "five_hour_unavailable",
+          accountFingerprint: "provider-owned-fingerprint",
+          cliVersion: "0.147.0",
+          observedAt: observed.value,
+          provenance: "codex_app_server_v1",
+          buckets: {
+            weekly: { remainingPercent: 90, resetsAt: weeklyReset.value },
+          },
+        }),
+    };
+    const result = await buildDispatchComposition({
+      agentTeamHome,
+      projectId,
+      environment: { LINEAR_API_KEY: "test-key" },
+      gitPort: gitWith(JSON.stringify(config)),
+      activationPort: activationFor(config),
+      quotaCollector: collector,
+      quotaClock: createFixedClock(observed.value),
+    });
+    expect(result.state).toBe("ready");
+    if (result.state !== "ready") return;
+    await expect(result.value.quotaAdmission.resolve("codex")).resolves.toEqual({
+      state: "ready",
+      reason: "weekly_quota_confirmed",
+    });
+    await expect(result.value.quotaAdmission.resolve("claude")).resolves.toEqual({
+      state: "quota_unknown",
+      reason: "runtime_context_unavailable",
     });
   });
 });

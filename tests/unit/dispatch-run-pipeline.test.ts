@@ -10,7 +10,7 @@
  * routing path matters here.
  */
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -66,6 +66,9 @@ const candidateRoleOverride = vi.hoisted(() => ({ current: undefined as string |
 const candidateWorkKindOverride = vi.hoisted(() => ({
   current: undefined as "model" | "mechanical" | undefined,
 }));
+const candidateChangeRegionsOverride = vi.hoisted(() => ({
+  current: undefined as Issue["changeRegions"],
+}));
 
 vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/adapters/dispatch/index.js")>();
@@ -98,6 +101,7 @@ afterEach(async () => {
   discoverSpy.mockClear();
   candidateRoleOverride.current = undefined;
   candidateWorkKindOverride.current = undefined;
+  candidateChangeRegionsOverride.current = undefined;
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -195,7 +199,9 @@ function eligibleIssue(role = "implementer"): Issue {
     agentRole: role,
     reviewRequirement: "code_review",
     estimatedMinutes: 30,
-    changeRegions: [{ path: "src/feature.ts", coverage: "exact" }],
+    changeRegions: candidateChangeRegionsOverride.current ?? [
+      { path: "src/feature.ts", coverage: "exact" },
+    ],
   });
 }
 
@@ -216,17 +222,10 @@ const routingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
-    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
-    // `code_reviewer` deliberately routes to claude/opus too (not the more realistic codex) --
-    // the fake Claude capability probe below only ever reports observations for
-    // `claude.config.models` ("opus"), so the `not_applicable_role` test (which overrides the
-    // candidate's role to "code_reviewer" to reach the dispatched-but-not-implementer branch)
-    // needs its route to actually resolve to "ready"; the point of that test is the CLI handler's
-    // role branch, not model routing, so this keeps it decoupled from a real codex observation
-    // this fixture has no way to provide.
+    { role: "implementer", candidates: [{ provider: "codex", model: "gpt-5.6-terra" }] },
     { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -312,6 +311,9 @@ function buildHandlers(
   quotaAdmission?: NewJobQuotaAdmissionPort,
   operatorCanaryStore?: FileOperatorCanaryAttestationStore,
   claudeProcess: ProcessPort = new ReadyProcessPort(),
+  protectedRegionWorkManagement?: Parameters<
+    typeof createDispatchCliHandlers
+  >[0]["protectedRegionWorkManagement"],
 ) {
   const leases = new FileLeaseRepository(
     join(stateRoot, "leases.json"),
@@ -342,6 +344,14 @@ function buildHandlers(
           config: { executable: "claude", models: ["opus"], account: "default" },
           process: claudeProcess,
         },
+        codex: {
+          config: {
+            executable: "codex",
+            models: ["lead", "gpt-5.6-terra", "integrate"],
+            account: "default",
+          },
+          process: claudeProcess,
+        },
         quotaAdmission: quotaAdmission ?? {
           resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
         },
@@ -356,6 +366,7 @@ function buildHandlers(
     resolveAuthoritativeBase:
       resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
     ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
+    ...(protectedRegionWorkManagement === undefined ? {} : { protectedRegionWorkManagement }),
   });
 }
 
@@ -419,6 +430,167 @@ function fakeResolveAuthoritativeBase(repositoryPath: string) {
 }
 
 describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
+  it("moves a protected implementer issue out of Ready before pipeline/worktree/provider start", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    candidateChangeRegionsOverride.current = [
+      { path: "src/feature.ts", coverage: "exact" },
+      { path: ".github/workflows/ci.yml", coverage: "exact" },
+    ];
+    const calls: string[] = [];
+    const protectedRegionWorkManagement = {
+      setWorkStatus: (_reference: unknown, status: string) => {
+        calls.push(`workflow:${status}`);
+        return Promise.resolve(ok({} as never));
+      },
+      setAgentCondition: (_reference: unknown, condition: { status: string }) => {
+        calls.push(`agent:${condition.status}`);
+        return Promise.resolve(ok({} as never));
+      },
+      appendComment: (_reference: unknown, body: string) => {
+        calls.push(`comment:${body}`);
+        return Promise.resolve(ok({} as never));
+      },
+    } as never;
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("protected work must never build a pipeline")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      undefined,
+      undefined,
+      new ReadyProcessPort(),
+      protectedRegionWorkManagement,
+    );
+
+    const dryRun = await handlers.run({ projectId, dryRun: true });
+    expect(JSON.parse(dryRun.message ?? "{}")).toMatchObject({
+      state: "dry_run",
+      protectedRegionPrediction: {
+        state: "blocked",
+        reason: "protected_region_requires_human",
+      },
+    });
+    expect(calls).toEqual([]);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+
+    const result = await handlers.run({ projectId });
+    const payload = JSON.parse(result.message ?? "{}") as {
+      state: string;
+      jobId: string;
+      leaseId: string;
+      pipelineReason: string;
+      handoff: Readonly<Record<string, string>>;
+    };
+    expect(result.state).toBe("success");
+    expect(payload).toMatchObject({
+      state: "requires_manual",
+      pipelineReason: "protected_region_requires_human",
+      handoff: {
+        workflowState: "confirmed",
+        agentCondition: "confirmed",
+        comment: "confirmed",
+        leaseRelease: "confirmed",
+      },
+    });
+    expect(calls.slice(0, 2)).toEqual(["workflow:requires_manual", "agent:blocked"]);
+    expect(calls[2]).toContain("未啟動模型、未建立 PR");
+    expect(calls[2]).not.toContain(".github/workflows/ci.yml");
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    await expect(readdir(join(stateRoot, "state", "dispatch", "worktrees"))).rejects.toThrow();
+
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    await expect(progress.load(payload.jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: { reasonCode: "protected_region_requires_human" },
+        },
+        protectedRegionHandoff: {
+          workflowState: "confirmed",
+          agentCondition: "confirmed",
+          comment: "confirmed",
+          leaseRelease: "confirmed",
+        },
+      },
+    });
+    const leaseRepository = new FileLeaseRepository(
+      join(stateRoot, "leases.json"),
+      join(stateRoot, "leases.lock"),
+    );
+    const leases = await leaseRepository.readAll();
+    expect(leases.ok).toBe(true);
+    if (!leases.ok) throw new Error(leases.error.code);
+    expect(leases.value[0]?.id).toBe(payload.leaseId);
+    expect(leases.value[0]?.releasedAt).toEqual(expect.any(String));
+    const admission = new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(stateRoot));
+    await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "active", jobId: payload.jobId },
+    });
+  });
+
+  it("replays an incomplete protected-region Linear handoff without re-running the model", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const repositoryPath = await temporaryRepository();
+    candidateChangeRegionsOverride.current = [
+      { path: ".github/workflows/ci.yml", coverage: "exact" },
+    ];
+    let workflowAttempts = 0;
+    const protectedRegionWorkManagement = {
+      setWorkStatus: () => {
+        workflowAttempts += 1;
+        return Promise.resolve(
+          workflowAttempts === 1 ? err(domainError("external_failure")) : ok({} as never),
+        );
+      },
+      setAgentCondition: () => Promise.resolve(ok({} as never)),
+      appendComment: () => Promise.resolve(ok({} as never)),
+    } as never;
+    const buildImplementerPipeline = vi.fn(() =>
+      Promise.reject(new Error("protected work must never build a pipeline")),
+    );
+    const handlers = buildHandlers(
+      stateRoot,
+      repositoryPath,
+      buildImplementerPipeline,
+      undefined,
+      undefined,
+      undefined,
+      new ReadyProcessPort(),
+      protectedRegionWorkManagement,
+    );
+
+    const first = await handlers.run({ projectId });
+    const firstPayload = JSON.parse(first.message ?? "{}") as {
+      jobId: string;
+      pipelineReason: string;
+    };
+    expect(first.state).toBe("failed");
+    expect(firstPayload.pipelineReason).toBe("protected_region_sync_failed");
+
+    const second = await handlers.run({ projectId });
+    expect(second.state).toBe("success");
+    expect(workflowAttempts).toBe(2);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
+    const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
+    await expect(progress.load(firstPayload.jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        protectedRegionHandoff: {
+          workflowState: "confirmed",
+          agentCondition: "confirmed",
+          comment: "confirmed",
+          leaseRelease: "confirmed",
+        },
+      },
+    });
+  });
+
   it("Q01 without a record remains quota_unknown, with no version probe, pipeline, claim, or job", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
@@ -515,7 +687,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
     ).resolves.toEqual({ ok: true, value: { state: "expired" } });
   });
 
-  it("Q01 consumes before provider start, while dry-run leaves the active canary untouched", async () => {
+  it("Q01 leaves the superseded Claude canary untouched for Codex-primary execution", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const parsedCanaryNow = parseInstant("2026-08-12T12:00:00.000Z");
@@ -625,11 +797,12 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
 
     const run = await handlers.run({ projectId });
     expect(run).toMatchObject({ state: "success" });
-    expect(events).toEqual(["consume.end", "provider.spawn.begin"]);
-    expect(versionedClaude.calls).toBe(1);
+    expect(events).toEqual([]);
+    expect(versionedClaude.calls).toBe(0);
+    expect(buildImplementerPipeline).not.toHaveBeenCalled();
     await expect(
       canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-1" }),
-    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
   });
 
   it("maps a ci_waiting pipeline outcome to a success payload with the change request URL", async () => {
@@ -1219,7 +1392,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * per this ticket's own packet) no longer implies "nothing to do here."
    */
   it("never constructs a pipeline for a non-implementer role, reporting dispatched/not_applicable_role, but persists a resolvable requires_manual record and flags it in the response", async () => {
-    candidateRoleOverride.current = "code_reviewer";
+    candidateRoleOverride.current = "team_lead";
     const buildImplementerPipeline = vi.fn(() =>
       Promise.reject(new Error("must never be called for a non-implementer role")),
     );
@@ -1270,7 +1443,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * resolve` to ever find.
    */
   it("C019: reports a failed outcome (not success) when the role_pipeline_unavailable fallback write itself genuinely fails", async () => {
-    candidateRoleOverride.current = "code_reviewer";
+    candidateRoleOverride.current = "team_lead";
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const progressDirectory = defaultJobProgressDirectory(stateRoot);

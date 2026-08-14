@@ -14,8 +14,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildReviewerPipeline } from "../../src/cli/dispatch/reviewer-composition.js";
-import { ClaudeRunner } from "../../src/adapters/providers/claude/index.js";
-import { GeminiRunner } from "../../src/adapters/providers/gemini/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import {
   ok,
@@ -226,8 +224,16 @@ describe("buildReviewerPipeline", () => {
     });
     expect(result.state).toBe("ready");
     if (result.state !== "ready") return;
-    expect(result.value.ports.codeReviewer).toBeInstanceOf(ClaudeRunner);
-    expect(result.value.ports.visualReviewer).toBeInstanceOf(GeminiRunner);
+    expect(result.value.ports.codeReviewer).toBeDefined();
+    if (result.value.ports.codeReviewer === undefined) return;
+    await expect(result.value.ports.codeReviewer.inspectCapabilities()).resolves.toMatchObject({
+      ok: true,
+      value: { provider: "claude" },
+    });
+    await expect(result.value.ports.visualReviewer?.inspectCapabilities()).resolves.toMatchObject({
+      ok: true,
+      value: { provider: "gemini" },
+    });
     // C015c's original composition pointed both roles at the very same Claude instance -- this is
     // the exact regression E102-2 closes: the two providers must now be genuinely distinct.
     expect(result.value.ports.codeReviewer).not.toBe(result.value.ports.visualReviewer);
@@ -253,7 +259,12 @@ describe("buildReviewerPipeline", () => {
     });
     expect(result.state).toBe("ready");
     if (result.state !== "ready") return;
-    expect(result.value.ports.codeReviewer).toBeInstanceOf(ClaudeRunner);
+    expect(result.value.ports.codeReviewer).toBeDefined();
+    if (result.value.ports.codeReviewer === undefined) return;
+    await expect(result.value.ports.codeReviewer.inspectCapabilities()).resolves.toMatchObject({
+      ok: true,
+      value: { provider: "claude" },
+    });
     expect(result.value.ports.visualReviewer).toBeUndefined();
   });
 

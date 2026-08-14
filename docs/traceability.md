@@ -37,7 +37,7 @@
 ### 當前執行優先序
 
 1. 取消工單的 Merge revocation boundary。
-2. Codex／Claude quota capability 重驗與 production admission gate。
+2. Codex quota capability／production admission gate，以及 Claude Review runtime 限流分級。
 3. Durable active-job inventory、Reconcile resume 與 systemd live proof。
 4. `project` production read model 與最小 localhost UI。
 5. Team Manager host contract、Smoke Runbook、live artifact、internal canary。
@@ -45,19 +45,26 @@
 
 完整 Task、依賴與第一輪邊界見 [`roadmap-to-first-sandbox-test.md`](roadmap-to-first-sandbox-test.md)。診斷細化、逐 artifact transcript、root-file broker、review context 診斷、secret scanner corpus 微調與合成 E2E 擴張在第一輪前暫停。
 
+### 2026-08-14 ADR-009 與第一輪 Happy Path 更新
+
+- Production 路由已改為 Codex execution／Claude code review／Gemini visual review；Codex App Server weekly admission probe PASS，缺少 5 小時窗口時維持 unavailable，不捏造數值。
+- LEA-37 已完成 Codex Implementer → Sandbox PR #51 → CI SUCCESS → fresh Claude Review → `agent-team/review` SUCCESS → Squash Merge → Linear Done。
+- 最終 production read-back：46 terminal Jobs、0 non-terminal Job、0 active／expired Lease；systemd 與 webhook read-back 為 `healthy/unattended`。
+- 這只更新 ADR-009 與第一輪 code-review Happy Path 的證據；視覺雙審、危險操作、quota 撞牆與其他 failure E2E 仍維持未完成。
+
 ## 規格章節對應
 
 | 規格 ID | 規格主題 | Plan Task | 主要 Test／Probe | 狀態 |
 |---|---|---|---|---|
 | SPEC-01 | 鎖定前提：使用者、外部服務、產品定位、動機 | B001、B005 | 文件 SHA Read-back、角色／架構 Contract | 已驗證 |
-| SPEC-02 | 第一版目標：需求到 Merge、Done、Checkpoint 的完整鏈 | C004-C009、E101-E109、D003 | Sandbox Happy Path、Failure Injection、親測腳本 | 已規劃 |
+| SPEC-02 | 第一版目標：需求到 Merge、Done、Checkpoint 的完整鏈 | C004-C009、E101-E109、D003 | LEA-37／Sandbox PR #51 Happy Path、Failure Injection、親測腳本 | 已驗證 |
 | SPEC-03 | 第一版不做：Plugin、Linear Agent、SQLite、常駐 Server 等 | B005、F009-F011、D004 | 架構 Review、依賴／資料層 Contract、出口稽核 | 已規劃 |
 | SPEC-04 | 使用者只與團隊管理者互動、Ready Gate、需求變更 | B005、F003、C011、D003 | 角色 Contract、Eligibility 矩陣、Change Control Fixture | 已規劃 |
 | SPEC-05 | Linear 狀態、Label Group、Form Template、留言政策 | S004、F002-F004、A001-A004、O003 | Linear Capability Probe、Adapter Contract、Round-trip | 已規劃 |
 | SPEC-06 | 五個核心角色與 Controller 分工 | B005 | `role-definitions.test.ts`、fresh-context 架構 Review | 已驗證 |
 | SPEC-07 | 每工單獨立 Branch／Worktree／Draft PR | A005-A006、C005、E101 | Temp Repo Integration、Sandbox PR 證據 | 已規劃 |
 | SPEC-08 | CI、Fresh Review、Visual Manifest、Digest、Auto-merge、衝突 | B004、F007-F008、A008、C006-C010、E101-E105、E113 | 真 Actions Run、Review／Digest／Conflict E2E | 已規劃 |
-| SPEC-09 | Provider Runner、模型路由、週額度與三態訊號 | S001-S003、R003-R007、U004-U005、E106-E107 | 真 CLI Probe、Quota Fixture、UI／Fallback E2E | 已規劃 |
+| SPEC-09 | Provider Runner、模型路由、週額度與三態訊號 | S001-S003、R003-R007、U004-U005、E106-E107 | Codex App Server live probe、Quota Fixture、LEA-37 Codex→Claude E2E | 已驗證 |
 | SPEC-10 | 危險操作分類、localhost 核可、固定權限層級 | B005、R008、U002、U006、E108、E118 | Authority Contract、Safety Fixture、注入 E2E | 已規劃 |
 | SPEC-11 | 雙重 Checkpoint、45／60 分鐘、Watchdog、Reconcile Timer | F006、F008、R009、C012-C014、O007-O008、E109-E111 | Crash／Clock／Lease Fixture、五分鐘復航與 Soak | 已規劃 |
 | SPEC-12 | 優先度、Slot、Provider 備援、同 Repo 併行 | F003、F006、C002-C004、E112 | Dispatcher 決策矩陣、租約競爭、Sandbox 併行 | 已規劃 |
@@ -85,7 +92,7 @@
 | EXIT-05 | 危險操作未核可不執行，核可／拒絕留摘要 | R008、U006、E108 | Process 前攔截、UI 決策、Linear 稽核留言 | 已規劃 |
 | EXIT-06 | Merge 前需求快照、CI、Reviewer、Head SHA、Digest 一致 | F007、C007-C008、E105 | Canonical Fixture、Status、有效 Diff 偷換反向測試 | 已規劃 |
 | EXIT-07 | Linear、GitHub、UI、本機狀態可對帳且沒有假綠 | E005、E007-E009、E110、E116-E117 | 四來源 Evidence Validator、Soak、流程外事件報告 | 已規劃 |
-| EXIT-08 | 提供使用者可親測的完整案例與啟用說明 | D002-D003、E101-E102 | 新環境 dry-run、Happy Path 與親測逐步結果 | 已規劃 |
+| EXIT-08 | 提供使用者可親測的完整案例與啟用說明 | D002-D003、E101-E102 | 使用者指南、LEA-37／Sandbox PR #51 Happy Path 與逐步結果 | 已驗證 |
 
 ## ADR 索引
 
@@ -99,6 +106,7 @@
 | ADR-006 | Fresh Reviewer＋Commit Status＋Diff Digest | F007、A008、C007-C008、E101-E105 | Fresh Context、Head SHA Status、Digest E2E |
 | ADR-007 | 危險操作只在 localhost UI 核可 | R008、U001-U006、E108 | CSRF／Session、安全分類與 Linear 注入反向測試 |
 | ADR-008 | 舊 Repo 唯讀，獨立 Sandbox 先行 | B001、E001-E118 | 舊 Repo Clean Gate、Sandbox 全案例報告 |
+| ADR-009 | Codex 主用、Claude 強制跨模型代碼審查；Claude 不做事前 quota probe | R003-R007、C004-C009、E101-E107 | Codex App Server live probe、限流 fixtures、LEA-37／Sandbox PR #51 |
 
 ## Phase 0 已驗證證據
 
@@ -155,6 +163,9 @@ Foundation Gate 在同步 main 上完成 lint、typecheck、unit、contract、in
 | R007 | PR #43，Merge `df1456a` | 帳號／CLI 版本／時間綁定的週與 5h 三態額度；unknown fail-closed、刷新一次、3% Checkpoint |
 | R008 | PR #44，Merge `8b9f8fe` | 七大危險類別、相似命令同類、未知 fail-closed、專案長期允許仍稽核、Process 前攔截 |
 | R009 | PR #45，Merge `9dc10e5` | Preflight→WIP Commit／Push→私有 YAML→Linear 摘要；Push／Crash 失敗仍保留可復航 Checkpoint |
+| QP01 | Quota Probe Spec v2／本分支，保留診斷用途 | Claude Status Line＋stable auth/version bounded epoch；Codex App Server observation；private `quota probe-status` 零 admission／Job／Lease／model turn，不是 Claude Review 前置 |
+| QP02 | **已由 ADR-009 取代，停止作為目標規格** | 不再把 Claude full/fresh snapshot 接到 new-Job admission；待重整為 Codex quota production admission |
+| QP03 | **已由 ADR-009 取代，停止作為目標規格** | 不再以 PTY Haiku micro-turn 主動刷新 Claude 額度；改驗 Claude Review runtime `rejected`／單獨 `429` 分級與等待狀態 |
 
 Track B Gate 在 main `9dc10e5` 上重跑 10 個相關測試檔、97／97 通過；R009 合併後 main CI Run `30957008043` 通過完整品質 Gate。R007-R009 各 PR 均綁定精確 Head SHA、CI 與 `agent-team/review` status；因本 session 的 Claude review 路徑持續回傳空結果，這三張採目前 Agent 的獨立 AC pass，並已在各 PR 證據留言揭露非 fresh-context 限制。
 

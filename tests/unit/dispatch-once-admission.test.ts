@@ -138,10 +138,10 @@ const routingConfig: ModelRoutingConfig = {
   schemaVersion: 1,
   routes: [
     { role: "team_lead", candidates: [{ provider: "codex", model: "lead" }] },
-    { role: "implementer", candidates: [{ provider: "claude", model: "opus" }] },
-    { role: "code_reviewer", candidates: [{ provider: "codex", model: "review" }] },
+    { role: "implementer", candidates: [{ provider: "codex", model: "gpt-5.6-terra" }] },
+    { role: "code_reviewer", candidates: [{ provider: "claude", model: "opus" }] },
     { role: "visual_reviewer", candidates: [{ provider: "gemini", model: "visual" }] },
-    { role: "integration_engineer", candidates: [{ provider: "claude", model: "integrate" }] },
+    { role: "integration_engineer", candidates: [{ provider: "codex", model: "integrate" }] },
   ],
 };
 
@@ -282,6 +282,10 @@ function readyComposition(
       config: { executable: "claude", models: ["opus"], account: "default" },
       process: new ReadyClaudeProcessPort(),
     },
+    codex: {
+      config: { executable: "codex", models: ["gpt-5.6-terra"], account: "default" },
+      process: new ReadyClaudeProcessPort(),
+    },
     quotaAdmission: {
       resolve: () => Promise.resolve({ state: "ready" as const, reason: "test_fixture" }),
     },
@@ -416,7 +420,7 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     });
   });
 
-  it("keeps an execution-unwired primary unavailable and safely selects a quota-ready Claude fallback", async () => {
+  it("never crosses from an unavailable Codex execution route to a Claude fallback", async () => {
     const stateRoot = await temporaryStateRoot();
     const baseReady = readyComposition(stateRoot, "linear-issue-quota-fallback");
     const providerCalls = new Map<string, number>();
@@ -448,13 +452,10 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
 
     expect(outcome.outcome).toBe("ran");
     if (outcome.outcome !== "ran") return;
-    expect(outcome.result.kind).toBe("dispatched");
-    if (outcome.result.kind !== "dispatched") return;
-    expect(outcome.result.decision.model).toMatchObject({
-      candidate: { provider: "claude", model: "opus" },
-      candidateIndex: 1,
-      fallbackUsed: true,
-    });
+    expect(outcome.result.kind).toBe("waiting");
+    expect(outcome.admissionSkipped).toHaveLength(1);
+    // Admission pre-observes both candidates before the routing schema rejects this deliberately
+    // invalid cross-provider route. No job is claimed or dispatched through the Claude fallback.
     expect(providerCalls).toEqual(
       new Map([
         ["codex", 1],
@@ -584,7 +585,7 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     expect(reclaimed.ok).toBe(true);
   });
 
-  it("Q01 consumes the exact Claude candidate before claim, lease, and Job creation", async () => {
+  it("Q01 cannot bypass the fixed Codex execution policy", async () => {
     const stateRoot = await temporaryStateRoot();
     const events: string[] = [];
     const canaryClock = createFixedClock(now);
@@ -653,14 +654,9 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     });
     expect(outcome.outcome).toBe("ran");
     if (outcome.outcome !== "ran") return;
-    expect(outcome.result.kind).toBe("dispatched");
-    expect(events).toEqual([
-      "consume.end",
-      "admission.claim.begin",
-      "lease.acquire.begin",
-      "job.create.begin",
-    ]);
-    expect(process.calls).toBe(1);
+    expect(outcome.result.kind).toBe("waiting");
+    expect(events).toEqual([]);
+    expect(process.calls).toBe(0);
     const exactCandidate = outcome.candidates.find(
       (candidate) => candidate.issue.externalId === "linear-issue-canary-exact",
     );
@@ -670,17 +666,14 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     if (exactCandidate === undefined || otherCandidate === undefined) {
       throw new Error("fixture must discover both candidates");
     }
-    expect(outcome.result).toMatchObject({
-      kind: "dispatched",
-      job: { issueId: exactCandidate.issue.id },
-    });
+    expect(outcome.admissionSkipped).toHaveLength(2);
     await expect(admissionStore.load(projectId, otherCandidate.issue.id)).resolves.toEqual({
       ok: true,
       value: undefined,
     });
     await expect(
       canaryStore.inspect({ projectId, linearExternalIssueId: "linear-issue-canary-exact" }),
-    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
 
     const replay = await dispatchOnce(ready, ports, "holder-canary-replay", {
       allowOperatorCanary: true,
@@ -689,16 +682,11 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
       outcome: "ran",
       result: { kind: "waiting", reason: "no_dispatchable_candidate" },
     });
-    expect(events).toEqual([
-      "consume.end",
-      "admission.claim.begin",
-      "lease.acquire.begin",
-      "job.create.begin",
-    ]);
-    expect(process.calls).toBe(1);
+    expect(events).toEqual([]);
+    expect(process.calls).toBe(0);
     await expect(jobStore.readAll()).resolves.toMatchObject({
       ok: true,
-      value: [expect.anything()],
+      value: [],
     });
   });
 
@@ -775,7 +763,7 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
       allowOperatorCanary: true,
     });
     expect(mismatch).toMatchObject({ outcome: "ran", result: { kind: "waiting" } });
-    expect(process.calls).toBe(1);
+    expect(process.calls).toBe(0);
     await expect(ports.admission.load(projectId, candidateId)).resolves.toEqual({
       ok: true,
       value: undefined,
@@ -828,6 +816,6 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
         projectId,
         linearExternalIssueId: "linear-issue-consumed-after-job-failure",
       }),
-    ).resolves.toMatchObject({ ok: true, value: { state: "consumed" } });
+    ).resolves.toMatchObject({ ok: true, value: { state: "issued" } });
   });
 });

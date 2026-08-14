@@ -32,7 +32,7 @@ describe("buildReviewerRecoveryPipeline", () => {
     );
     const result = await buildReviewerRecoveryPipeline({
       agentTeamHome,
-      claudeConfig: { executable: "claude", models: ["opus"], account: "default" },
+      codexConfig: { executable: "codex", models: ["gpt-5.6-terra"], account: "default" },
       jobs,
     });
 
@@ -44,6 +44,6 @@ describe("buildReviewerRecoveryPipeline", () => {
     expect(result.value.ports.toolDecisions).toBeDefined();
     const capabilities = await result.value.ports.provider.inspectCapabilities();
     expect(capabilities.ok).toBe(true);
-    if (capabilities.ok) expect(capabilities.value.provider).toBe("claude");
+    if (capabilities.ok) expect(capabilities.value.provider).toBe("codex");
   });
 });

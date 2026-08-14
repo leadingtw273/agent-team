@@ -70,7 +70,11 @@ function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProg
     projectId,
     issueId,
     externalIssueId: "linear-issue-1",
-    model: "claude-opus",
+    model: "gpt-5.6-terra",
+    providerAssignments: {
+      execution: { provider: "codex", model: "gpt-5.6-terra" },
+      codeReview: { provider: "claude", model: "claude-opus" },
+    },
     stage: { kind: "ci_waiting" },
     branch: "agent-team/job-018f47d2",
     worktreePath: "/tmp/sandbox-worktree",
@@ -145,7 +149,49 @@ describe("FileJobProgressStore", () => {
     if (loaded.ok) {
       expect(loaded.value?.changeRequestId).toBe("42");
       expect(loaded.value?.headSha).toBe("a".repeat(40));
+      expect(loaded.value?.providerAssignments).toEqual({
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      });
     }
+  });
+
+  it("preserves provider assignments across a fresh store instance and rejects later changes or removal", async () => {
+    const directory = await temporaryDirectory();
+    const writer = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const first = await writer.compareAndSwap(jobId, null, baseRecord());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const reader = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    await expect(reader.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        providerAssignments: {
+          execution: { provider: "codex", model: "gpt-5.6-terra" },
+          codeReview: { provider: "claude", model: "claude-opus" },
+        },
+      },
+    });
+
+    const changed = await reader.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        providerAssignments: {
+          execution: { provider: "codex", model: "gpt-5.6-sol" },
+          codeReview: { provider: "claude", model: "claude-opus" },
+        },
+      }),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("invariant_violation");
+
+    const { providerAssignments, ...withoutAssignments } = baseRecord();
+    void providerAssignments;
+    const removed = await reader.compareAndSwap(jobId, first.value.revision, withoutAssignments);
+    expect(removed.ok).toBe(false);
+    if (!removed.ok) expect(removed.error.code).toBe("invariant_violation");
   });
 
   it("rejects a changeRequestId shaped like a GitHub node id instead of a decimal PR number (O009c)", () => {

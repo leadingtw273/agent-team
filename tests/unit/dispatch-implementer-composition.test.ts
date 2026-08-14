@@ -29,14 +29,14 @@ async function temporaryHome(): Promise<string> {
   return directory;
 }
 
-const claudeConfig = { executable: "claude", models: ["opus"], account: "default" };
+const codexConfig = { executable: "codex", models: ["gpt-5.6-terra"], account: "default" };
 
 describe("buildImplementerPipeline", () => {
   it("blocks with github_authentication_unavailable before constructing any port", async () => {
     const agentTeamHome = await temporaryHome();
     const result = await buildImplementerPipeline({
       agentTeamHome,
-      claudeConfig,
+      codexConfig,
       githubTransport: {
         requestJson: () => Promise.reject(new Error("must never be called")),
         inspectAuthentication: () => Promise.resolve(err(domainError("permission_denied"))),
@@ -49,7 +49,7 @@ describe("buildImplementerPipeline", () => {
     const agentTeamHome = await temporaryHome();
     const result = await buildImplementerPipeline({
       agentTeamHome,
-      claudeConfig,
+      codexConfig,
       githubTransport: {
         requestJson: () => Promise.reject(new Error("unused in this test")),
         inspectAuthentication: () =>
@@ -66,8 +66,8 @@ describe("buildImplementerPipeline", () => {
     const capabilities = await result.value.ports.provider.inspectCapabilities();
     expect(capabilities.ok).toBe(true);
     if (capabilities.ok) {
-      expect(capabilities.value.provider).toBe("claude");
-      expect(capabilities.value.models).toEqual(["opus"]);
+      expect(capabilities.value.provider).toBe("codex");
+      expect(capabilities.value.models).toEqual(["gpt-5.6-terra"]);
     }
     // scopeCheckpoint/toolDecisions/sourceControl are private-adapter instances with no public
     // discriminator beyond their behavior, which scope-checkpoint.test.ts/tool-decision.test.ts

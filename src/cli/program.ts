@@ -47,6 +47,9 @@ export interface RegistrationCliHandlers {
 export interface QuotaCliHandlers {
   readonly canaryConfirm: () => Promise<CliCommandOutcome>;
   readonly canaryStatus: () => Promise<CliCommandOutcome>;
+  readonly probeStatus?: (
+    input: Readonly<{ provider: "claude" | "codex" | "all" }>,
+  ) => Promise<CliCommandOutcome>;
 }
 
 export interface CliHandlers {
@@ -69,6 +72,9 @@ export interface CliHandlers {
    * src/cli/dispatch/auto-merge-pause-handlers.ts's own header for the full rationale. */
   readonly dispatchAutoMergeResume: (
     input: Readonly<{ projectId: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly dispatchReviewerResume: (
+    input: Readonly<{ jobId: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
@@ -128,6 +134,15 @@ const defaultQuotaHandlers: QuotaCliHandlers = Object.freeze({
         reason: "runtime_unavailable",
       }),
     }),
+  probeStatus: () =>
+    Promise.resolve({
+      state: "blocked" as const,
+      message: JSON.stringify({
+        schema: "agent-team-quota-probe-status",
+        version: 1,
+        results: [{ provider: "all", state: "unknown", reason: "runtime_unavailable" }],
+      }),
+    }),
 });
 
 export const defaultCliHandlers: CliHandlers = Object.freeze({
@@ -135,6 +150,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchResolve: () => blocked("dispatch resolve"),
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
+  dispatchReviewerResume: () => blocked("dispatch reviewer-resume"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   cycle: () => blocked("cycle"),
@@ -179,6 +195,28 @@ function operatorCanaryArgvRejection(argv: readonly string[]): CliCommandOutcome
     message: JSON.stringify({
       operation:
         command === "canary-confirm" ? "operator_canary_confirm" : "operator_canary_status",
+      state: "rejected",
+      reason: "invalid_command_input",
+    }),
+  });
+}
+
+/** The diagnostic provider is a closed allowlist. Reject every other argv shape before Commander
+ * can echo an operator-supplied value into stderr. */
+function quotaProbeArgvRejection(argv: readonly string[]): CliCommandOutcome | undefined {
+  if (argv[0] !== "quota" || argv[1] !== "probe-status") return undefined;
+  if (
+    argv.length === 4 &&
+    argv[2] === "--provider" &&
+    (argv[3] === "claude" || argv[3] === "codex" || argv[3] === "all")
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    state: "rejected" as const,
+    message: JSON.stringify({
+      schema: "agent-team-quota-probe-status",
+      version: 1,
       state: "rejected",
       reason: "invalid_command_input",
     }),
@@ -278,6 +316,17 @@ export function createProgram(
     );
 
   dispatch
+    .command("reviewer-resume")
+    .description(
+      "在確認 Claude 可用後，將無可信 reset 的 reviewer_waiting job 受控移回 awaiting_review；" +
+        "不釋放 admission，也不重跑 implementer",
+    )
+    .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
+    .action((options: { readonly job: string }) =>
+      action(state, io, () => handlers.dispatchReviewerResume({ jobId: options.job }))(),
+    );
+
+  dispatch
     .command("resolve-legacy-claim")
     .description(
       "C016：受控復原一個沒有對應 job-progress 記錄的既有 admission claim" +
@@ -327,6 +376,24 @@ export function createProgram(
     .command("canary-status")
     .description("以嚴格 stdin JSON 驗證一次 Claude-only operator canary attestation")
     .action(action(state, io, handlers.quota.canaryStatus));
+  quota
+    .command("probe-status")
+    .description("唯讀觀測官方 Claude／Codex 額度來源，不建立 model turn")
+    .addOption(
+      new Option("--provider <provider>", "額度來源")
+        .choices(["claude", "codex", "all"])
+        .makeOptionMandatory(),
+    )
+    .action((options: Readonly<{ provider: "claude" | "codex" | "all" }>) =>
+      action(
+        state,
+        io,
+        () =>
+          (handlers.quota.probeStatus ?? defaultQuotaHandlers.probeStatus)?.({
+            provider: options.provider,
+          }) ?? blocked("quota probe-status"),
+      )(),
+    );
 
   program
     .command("ingest")
@@ -500,7 +567,10 @@ export async function runCli(
     program.outputHelp();
     return cliExitCodes.success;
   }
-  const argvRejection = controllerCycleArgvRejection(argv) ?? operatorCanaryArgvRejection(argv);
+  const argvRejection =
+    controllerCycleArgvRejection(argv) ??
+    operatorCanaryArgvRejection(argv) ??
+    quotaProbeArgvRejection(argv);
   if (argvRejection !== undefined) {
     state.exitCode = outcomeExitCode(argvRejection);
     renderOutcome(argvRejection, io);

@@ -36,6 +36,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
+    dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     cycle: vi.fn(() => Promise.resolve(outcome)),
@@ -55,6 +56,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     quota: {
       canaryConfirm: vi.fn(() => Promise.resolve(outcome)),
       canaryStatus: vi.fn(() => Promise.resolve(outcome)),
+      probeStatus: vi.fn(() => Promise.resolve(outcome)),
     },
   } satisfies CliHandlers;
 }
@@ -118,6 +120,9 @@ describe("agent-team CLI contract", () => {
     await expect(runCli(metadata, ["quota", "canary-confirm"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["quota", "canary-status"], commands, sink.io)).resolves.toBe(0);
     await expect(
+      runCli(metadata, ["quota", "probe-status", "--provider", "all"], commands, sink.io),
+    ).resolves.toBe(0);
+    await expect(
       runCli(metadata, ["systemd", "install", "--preview"], commands, sink.io),
     ).resolves.toBe(0);
     await expect(
@@ -137,10 +142,11 @@ describe("agent-team CLI contract", () => {
     expect(commands.ui).toHaveBeenCalledOnce();
     expect(commands.quota.canaryConfirm).toHaveBeenCalledOnce();
     expect(commands.quota.canaryStatus).toHaveBeenCalledOnce();
+    expect(commands.quota.probeStatus).toHaveBeenCalledWith({ provider: "all" });
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(12));
+    expect(sink.stdout()).toBe("完成\n".repeat(13));
   });
 
   it.each([

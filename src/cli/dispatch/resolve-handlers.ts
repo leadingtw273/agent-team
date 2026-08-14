@@ -51,16 +51,18 @@ function outcome(
   return { state, message: JSON.stringify(payload) };
 }
 
-function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
+function terminalMutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
   const {
     schemaVersion: _schemaVersion,
     revision: _revision,
     updatedAt: _updatedAt,
+    protectedRegionHandoff: _protectedRegionHandoff,
     ...rest
   } = record;
   void _schemaVersion;
   void _revision;
   void _updatedAt;
+  void _protectedRegionHandoff;
   return rest;
 }
 
@@ -147,7 +149,7 @@ export function createDispatchResolveHandler(
       nextStage = { kind: "cancelled" };
     }
     const written = await options.progress.compareAndSwap(input.jobId, record.value.revision, {
-      ...mutationFrom(record.value),
+      ...terminalMutationFrom(record.value),
       stage: nextStage,
     });
     if (!written.ok) {

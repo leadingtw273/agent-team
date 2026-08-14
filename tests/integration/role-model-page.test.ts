@@ -196,7 +196,7 @@ describe("role model page integration", () => {
         {
           jobId: "job-running-implementer",
           role: "implementer",
-          candidate: { provider: "claude", model: "sonnet" },
+          candidate: { provider: "codex", model: "gpt-5.6-sol" },
           candidateIndex: 1,
         },
       ],

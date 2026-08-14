@@ -266,6 +266,7 @@ function desired(
 const workStatuses = [
   ["backlog", "待辦", "backlog"],
   ["ready", "待執行", "unstarted"],
+  ["requires_manual", "需人工", "unstarted"],
   ["in_progress", "進行中", "started"],
   ["in_review", "審查中", "started"],
   ["completed", "已完成", "completed"],
