@@ -1,6 +1,6 @@
 # Agent Team 本機第一版需求規格
 
-狀態：已核可，實作中；2026-08-11 起依路線校正版 Roadmap 收斂第一輪 Sandbox Smoke Test  
+狀態：已核可，實作中；2026-08-14 補充 Codex 主用／Claude 跨模型代碼審查與額度撞牆邊界  
 日期：2026-08-04  
 規格來源：leadi 與 Codex 的逐題需求釐清  
 
@@ -23,13 +23,21 @@
 
 - 第一階段是長期可維護的本機工具，不包裝成 Plugin。
 - 架構保持單一核心與 Adapter 邊界，未來可低成本包裝成 Codex／Claude Code Plugin。
-- 舊 `agent-gamedev` 正式廢止，只保留為唯讀歷史教材，不移植其 Producer、Supervisor、自建看板或檔案工單系統。
+- 舊 `agent-gamedev` repo 與 runtime state 已永久移除，只保留完整 Git bundle 與共通歷史教訓；不移植其 Producer、Supervisor、自建看板或檔案工單系統。
 
 ### 1.4 真正動機
 
 - 使用者希望以自然語言交代需求，由團隊管理者完成拆單、派工、追蹤、審查、合併與異常說明。
 - 消除舊系統的空轉、無人喚醒、狀態判定分裂、交接文字越權、共用 Worktree 競態與假綠燈。
 - 避免為已有成熟服務的功能重新造輪子。
+
+### 1.5 2026-08-14 元前提覆核
+
+- 目標使用者維持 leadi；隱藏使用者仍包含長期自動執行的 Agent、未來維運者與審計者。
+- 類比仍是 Linear＋GitHub 的一般 IT 團隊流程；本次只調整模型分工與 Reviewer 異常邊界，不改產品形態。
+- Identity 維持「長期可維護的本機工具」，不是為展示多模型或額度探針而存在的實驗場。
+- 真正動機維持「低操作負擔下得到可信工程產出」；因此保留跨模型審查價值，但移除與 Claude 次要角色不相稱的主動額度探測複雜度。
+- 四問覆核結果維持原方向，沒有新增使用者類型、產品定位或商業化動機。
 
 ## 2. 第一版目標
 
@@ -54,6 +62,7 @@
 - SQLite、常駐 Agent Team Server、複雜排程服務或自建看板。
 - Windows 原生環境；Windows 使用者走 WSL2。
 - OpenAI／Anthropic／Google 的直接 API Key 計費模式。
+- 主動探測或輪詢 Claude.ai 訂閱額度；Claude 第一版只處理執行期間實際回傳的限流訊號。
 - Gemini 自訂週額度牆。
 - 專案權重、額度池比例、夜班窗口、活躍使用者額度門檻變化。
 - Agent Team 自我註冊；先用獨立 Sandbox 驗證。
@@ -194,7 +203,8 @@ Supervisor 與 Producer 不再是角色：
 - Reviewer 使用全新 Session／Context，不讀實作者對話。
 - 輸入限核可工單快照、AC、Repo、PR Diff、CI、專案規則，以及和 AC 直接相關的失敗 Log、效能基準、已知 Issue、資產或視覺證據。
 - 不提供實作者中間對話、隱藏推理、臨時筆記、Handoff 建議或與 AC 無關的完整 Log。
-- Reviewer 可用同一模型，但不可沿用同一 Session。
+- 第一版代碼 Reviewer 固定使用 Claude，與預設由 Codex 承擔的實作形成強制跨模型審查；不可用 Codex 代替 Claude 完成同一必要審查。
+- Reviewer 必須使用全新 Session／Context；Claude 審查中斷後的重試也不得沿用不完整審查結果。
 - 實作者不得自我核可。
 - Reviewer 不另開 Linear 審查工單；同一工單進入審查中。
 
@@ -252,18 +262,23 @@ Finding：
 - Claude：本機 Claude Code CLI 登入帳號。
 - Gemini：本機 Gemini CLI，預設供視覺 Reviewer 使用。
 - 第一版不串接直接 API 計費。
-- 每個角色配置有序模型清單；主模型不可用時依序切換。
+- 核心仍保留每個角色配置有序模型清單的能力，但第一版預設 Profile 鎖定：團隊管理者、實作者與整合工程師使用 Codex；代碼審查者使用 Claude；視覺審查者使用 Gemini。
+- 一般執行角色可依已核可模型順序備援；代碼審查者不設 Codex 備援，否則會破壞強制跨模型審查。
 - 執行中工作不因主模型恢復而刻意切回。
 
 ### 9.2 額度政策
 
-- Codex 與 Claude 各自配置週額度上限；超過不啟動新工作。
-- 不配置自訂 5 小時百分比牆；接近／碰到 Provider 5 小時限制時立即記錄並 Checkpoint。
-- 已啟動工作在週額度剩約 3% 時強制進入末端收尾，只允許安全 Checkpoint。
+- Codex 是主要工作 Provider，使用官方 Codex App Server 結構化額度 snapshot 作為主動額度判斷來源；不得以 OpenAI API Key 的 RPM／TPM 推算 ChatGPT Codex 訂閱額度。
+- 第一版只要求 Codex 的有效週額度 snapshot 即可通過 quota admission；目前官方回應沒有 5 小時窗口，不因此標成 `quota_unknown`。若未來目標 CLI 版本開始回傳可驗證的 5 小時窗口，通過版本鎖定與 Fixture 驗證後再一併納入判斷。
+- Codex 未提供 5 小時窗口期間，真實短窗撞牆由 Runner 的結構化 `UsageLimitExceeded` 處理；不得推算或虛構 5 小時剩餘量。
+- Claude 第一版只負責必要的跨模型代碼審查，不做審查前額度探針，也不以缺少 Claude 額度 snapshot 阻擋審查啟動；啟動時預設有足夠額度。
+- 不配置 Claude 自訂 5 小時或週百分比牆；只有審查執行期間出現 Provider 訊號時，才依 9.4 處理。
+- Codex 已啟動工作在已確認週額度剩約 3% 時強制進入末端收尾，只允許安全 Checkpoint。
 - Gemini 第一版只判定可用／不可用與備援。
 
 ### 9.3 額度訊號三態
 
+- 本節的主動 snapshot／admission 規則適用於有可信讀取介面的 Provider；第一版主要適用 Codex，不要求 Claude 實作等價的 subscription-quota pull。
 - 已確認：帳號、來源、時間與剩餘量有效。
 - 已過期：派新工作前刷新一次。
 - 無法確認：不誤判為 0%，不啟動該 Provider 新工作，嘗試下一備援。
@@ -271,6 +286,40 @@ Finding：
 - 監測器失效不立即殺死執行中工作，但優先 Checkpoint。
 - UI 分開提供「刷新額度」與「確認並恢復派工」。
 - 額度 Adapter 必須有 Fixture、反向測試與定期相容性驗證。
+
+### 9.4 Claude 審查撞牆判定與處理
+
+#### 9.4.1 訊號分級
+
+- 收到官方 `rate_limit_event` 且 `status=rejected`：確認為 Claude 額度牆。若同時取得 `rate_limit_type` 與 `resets_at`，可具名記錄五小時、七天或模型別週額度與預計恢復時間。
+- 官方目前列出的狀態為 `allowed`、`allowed_warning`、`rejected`；`exceeded` 不屬於第一版可依賴的官方契約，不得單獨作為確認依據。
+- 只有 `is_error=true` 與 HTTP `429`、但沒有 `rejected`：只能判定 Claude 受到限流，不能宣稱訂閱額度已耗盡；阻塞原因使用「額度資訊無法確認」。
+- 非零退出、逾時或一般外部錯誤，且沒有上述結構化證據：歸類為 Provider 審查失敗或未知錯誤，不得誤報成額度牆。
+- 任何不完整、遭中斷或撞牆前產生的審查內容都不能形成有效 Reviewer 結論或 `agent-team/review=success`。
+
+#### 9.4.2 Team Lead、Linear 與 GitHub 可見性
+
+- Controller 必須把結構化 Runner 結果轉成 Team Lead 可讀的阻塞摘要；Team Lead 必須能知道審查未完成及判定信心，不依賴人工翻 Log。
+- 工單主要狀態維持「審查中」，Agent 狀態設為「等待中」；不得退回實作、標記審查未通過或完成。
+- 確認 `rejected` 時，Linear 留言必須說明「Claude Reviewer 額度牆」、已知的窗口與 reset 時間；未知欄位明確寫未知，不自行推算。
+- 僅有 `429` 時，Linear 留言固定表達為「Claude Reviewer 因限流未完成；目前無法確認是訂閱額度耗盡或服務端暫時節流」。
+- GitHub 的 `agent-team/review` 維持 `pending`，Auto-merge 保持關閉；不得使用 Codex 補審後改成成功。
+
+#### 9.4.3 恢復邊界
+
+- `rejected` 且有可信 `resets_at` 時，可在 reset 後由既有 Reconcile 流程重新排入全新 Claude Review Session；等待期間不主動輪詢 Claude quota。
+- 沒有可信 reset 時間，或只有原因不明的 `429` 時，保持等待並由 Team Lead 告知使用者；第一版不猜測重試時間、不建立額外 Claude quota 探針。
+- 恢復後必須對相同需求快照、Head SHA、Diff Digest 與成功 CI 重新做完整審查；不可續用撞牆前的部分結論。
+
+### 9.5 本次規格驗收條件
+
+1. 預設角色 Profile 明確表達 Codex 主用、Claude 只做代碼 Reviewer、Gemini 保留視覺 Review。
+2. 必要 Claude 代碼審查不可自動降級成 Codex 同模型審查。
+3. `rate_limit_event.status=rejected` 能讓 Team Lead 與 Linear 知道已確認額度牆，且 GitHub Review Gate 不會誤通過。
+4. 僅有 `429` 時不得留言宣稱 Claude 額度用完。
+5. Claude 沒有主動額度 snapshot 不會阻擋審查啟動；撞牆後也不新增主動 quota polling。
+6. 重試審查使用全新 Context，並重新綁定需求快照、Head SHA、Diff Digest 與 CI。
+7. Codex 有效週 snapshot 可通過 admission；缺少尚未提供的 5 小時窗口不會形成永久 `quota_unknown`，未來新增窗口則須先通過版本相容性驗證。
 
 ## 10. 安全模型
 
@@ -549,6 +598,13 @@ Sandbox 必驗：
 被否決：原地重構舊 Repo；直接讓 Agent Team 自我管理；直接拿正式遊戲試跑。  
 影響：需從教訓重新設計，不做代碼搬運；Sandbox 成為第一版出口。
 
+### ADR-009：Codex 主用、Claude 強制跨模型代碼審查
+
+背景：Codex 有官方、可主動讀取的 ChatGPT 訂閱 rate-limit snapshot；Claude 雖可在執行期間送出 RateLimitEvent，但沒有等價的個人訂閱額度主動 pull 介面。為 Claude 額度另建 PTY micro-turn 或 TUI 探針，成本與複雜度高於其目前只負責第二模型復驗的價值。  
+決策：第一版以 Codex 承擔團隊管理、實作與整合，Claude 僅擔任必要的 fresh-context 代碼 Reviewer；不主動探測 Claude 額度，啟動審查時預設可用。Claude 撞牆時保留審查 Gate 並讓 Team Lead／Linear 顯示等待原因，不以 Codex 補審。只有 `rate_limit_event.status=rejected` 可確認為額度牆；單獨 `429` 只標示原因未確認的限流。  
+被否決：為 Claude 建立主動 subscription-quota 探針；Codex／Claude 在所有角色間自由互相備援；Claude 不可用時由 Codex 自審；單憑所有 `429` 宣稱 Claude 額度耗盡。  
+影響：Claude 不再參與一般新工作 admission 的 quota snapshot Gate；必要代碼審查可能因 Claude 不可用而等待，但跨模型品質邊界不會被靜默放寬。Runner／Controller 後續實作須保留結構化判定信心、Linear 留言與 fresh-context 重審證據。
+
 ## 22. 澄清清單
 
 - [x] 看板應自建或使用市場工具？答：Linear，Agent Team 不重做看板。
@@ -579,6 +635,12 @@ Sandbox 必驗：
 - [x] 同帳號 GitHub Reviewer 如何核可？答：Required Commit Status＋PR Comment，不用原生 Approve。
 - [x] 第一次用什麼驗證？答：獨立 `agent-team-sandbox`，核心不先自我註冊。
 - [x] 舊 `agent-gamedev` 如何處理？答：廢止、唯讀留存，只汲取教訓。
+- [x] 第一版各模型如何分工？答：Codex 主用於團隊管理、實作與整合；Claude 僅做 fresh-context 代碼審查；Gemini 保留視覺審查。
+- [x] Claude 審查前是否必須先查訂閱額度？答：否；預設可用，只有執行期間實際遇到限流才處理。
+- [x] Claude 不可用時是否讓 Codex 補做必要代碼審查？答：否；維持審查 Gate，讓工單停在審查中／等待中。
+- [x] Team Lead 能否知道 Claude 撞牆並在單上留言？答：能；Controller 提供結構化阻塞摘要，Linear 留言區分已確認 `rejected` 與原因未確認的 `429`。
+- [x] 哪個訊號可確認 Claude 額度牆？答：官方 `rate_limit_event.status=rejected`；`exceeded` 不列入官方依據，單獨 `429` 也不足以確認。
+- [x] Codex 目前沒有 5 小時窗口時能否接新工作？答：能；有效週 snapshot 即可 admission，實際短窗撞牆由 `UsageLimitExceeded` 處理。未來若官方新增 5 小時窗口，驗證後再納入。
 
 ## 23. 已知風險（不是未決需求）
 
@@ -588,6 +650,7 @@ Sandbox 必驗：
 - Personal Linear API Key 的操作歸屬使用者；多人散布時需改 OAuth。
 - 檔案式 Event／Lease 在單機可行；多機、多租戶服務化時需要重新評估持久層。
 - WSL2 systemd、Tunnel 與 Webhook Runtime 屬外部前置；註冊 Gate 必須誠實顯示未配置狀態。
+- Anthropic 未保證所有版本、執行模式與錯誤路徑都一定送出 `rate_limit_event`；第一版以多訊號分級避免誤報，若實際運作出現漏判或誤判，再以去敏事件樣本更新 Adapter 與 Fixture，不預先擴張探針設計。
 
 ## 24. 參考資料
 

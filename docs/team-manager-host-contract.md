@@ -96,7 +96,11 @@ Host 只能引用下表已有命令，不得捏造一般建單命令：
 | `agent-team run --project <id>` | Mutation／啟動 pipeline | 只在 Ready Gate 完整且需求核可後執行 |
 | `agent-team ui` | 啟動本機前景服務 | 目前是唯讀狀態頁，不是需求聊天或危險核可入口 |
 
-### 6.1 Q01：唯一的 Claude canary host 例外
+### 6.1 Q01：歷史 Claude execution canary（ADR-009 後不再是一般入口）
+
+ADR-009 已把 Implementer／Team Lead／Integration 固定為 Codex，Claude 只做 code review；因此目前
+production routing 沒有可消耗 Q01 的 Claude execution candidate。以下契約只保留舊 record／舊 CLI 的
+fail-closed 邊界，不得用它繞過 Codex admission，也不得把它重新解讀為 Claude Reviewer quota 授權。
 
 `agent-team quota canary-confirm` 與 `agent-team quota canary-status` 不屬於一般 leadi 手動操作
 流程，也不授權一般 `run`。唯一可呼叫者是 Team Manager host，且只能在 **leadi 當前對話**已明確核可
@@ -136,7 +140,11 @@ implementer，也不得放行其他 `requires_manual` 原因。
 `agent-team ui` 固定使用 loopback ephemeral port，stdout fragment bearer 是敏感資料。Host 不複製它到
 Linear、log、artifact 或一般摘要；SIGINT 中斷後預期 exit `130`，而不是可作為需求或危險核可證據。
 
-### 6.2 T11：內部 canary 的狹窄 scheduled-only 例外
+### 6.2 T11：歷史 internal canary 例外（已關閉）
+
+本節只記錄 2026-08-12 T11 live artifact 當時允許的狹窄條件；該一次性例外已隨 T11 完成而關閉，
+不得拿來授權新的 Job。新 run 一律依當下 `health`、Codex quota admission、Ready Gate 與 production
+routing 判定。
 
 T11 的**內部 canary**只可在 `agent-team health` 或 `agent-team project` 的權威 read-back 顯示
 `scheduledReconcile:true`、唯一 wakeup 缺口是 `webhook_runtime_unknown`，且沒有宣稱 webhook 或
@@ -148,8 +156,8 @@ Q01 的 exact private one-time attestation 時才可使用。它不得推論 web
 不得作為其他 project／issue／provider／版本的證據，也不得一般化為 scheduled timer 可繞過任何
 Controller、Ready Gate、quota、lease、pipeline、merge 或 danger-approval 規則。
 
-T13 仍是 blocked；本例外不解除 T13、production approval route 或任何未知／衝突／解析失敗的
-fail-closed 行為。
+T13 後續已交付使用者測試包；這不會追溯擴大 T11，也不解除 production approval route 或任何未知／
+衝突／解析失敗的 fail-closed 行為。
 
 ### 6.3 QP01：被動 quota diagnostic
 
@@ -160,33 +168,25 @@ session id、snapshot path 或 raw stderr輸出。Status Line 只會隨既有真
 `unknown`，host不得為刷新而偷偷建立 model turn。
 
 Codex collector只使用官方 App Server `initialize`、`account/read`、`account/rateLimits/read` 與第二次
-`account/read`；不得建立 thread、turn、prompt或使用 reset credit。目前即使讀到weekly bucket也固定是
-`partial`，不具有 admission authority；未來觀察到five-hour仍不得由本命令自動升為full。
+`account/read`；不得建立 thread、turn、prompt或使用 reset credit。Diagnostic 仍以 `partial` 表示目前只
+觀察到部分窗口；production admission composition 可依 ADR-009 將同一 epoch 的有效 weekly sample 轉成
+domain quota decision。缺少 five-hour 本身不阻擋；未來只有通過目標 CLI schema／fixture 驗證的有效
+five-hour 才加入判定。
 
 設定檔固定為 `${AGENT_TEAM_HOME}/config/quota.json`，必須是canonical absolute path下、effective uid所有、
 regular、single-link、mode `0600` 的strict v1 JSON。`full`／`partial`／`unknown`是diagnostic taxonomy，
-不是既有domain quota decision。QP01不讀、不建立、不延長Q01 canary attestation，也不建立claim、Lease、
-Job或provider work。
+不是 domain quota decision 本身；production admission 必須另經 account/version/epoch/freshness/policy 驗證。
+QP01不讀、不建立、不延長Q01 canary attestation，也不建立claim、Lease、Job或provider work。
 
-QP02 production dispatch只在同次Claude collection得到`full`、CLI version/account一致，且`observedAt`
-未超過private config freshness時，才把樣本交給既有policy-backed admission。weekly used達80%或five-hour
-remaining為0時blocked；partial、stale、config/schema/account/version不可信時都在provider liveness、claim、
-Lease與Job之前回`quota_unknown`。Codex仍只是diagnostic，不接production admission。一般route不可用時，
-既有Q01 exact one-time fallback仍是唯一例外，且normal ready route永不讀或消耗Q01。
+2026-08-14 起，需求規格 ADR-009 取代 QP02／QP03 的 Claude admission 與 active refresh 設計。Claude
+第一版只擔任必要的 fresh-context 代碼 Reviewer；Host 不在 Review 前要求 subscription-quota snapshot，
+也不為刷新額度建立 Haiku model turn。上述 QP01 命令可保留為私有被動診斷，但不是 Review Gate 或 admission
+authority。Codex 的 production quota admission 另依官方 App Server snapshot 收斂，不從 Claude 診斷推論。
 
-QP03只擴充上述**新 Job admission**，不改QP01診斷命令：當owner-only quota config明確啟用
-`claude.activeRefresh`，且strict snapshot缺失／不可信或`observedAt`已超過60秒，Controller會在claim、Lease、
-Job與provider liveness之前，以受控PTY啟動一個Haiku無工具單回合。固定prompt只要求`OK`；模型文字、ANSI／
-TUI與`rate_limit_event`都不是額度證據。只有Status Line寫出晚於本輪開始、且重新通過strict檔案、雙bucket、
-A2/V2 account/version guard的snapshot才可交給既有policy。45秒內未完成、process非零／signal、snapshot未前進、
-單bucket、auth/version漂移一律`quota_unknown`。同一process的並行admission共用singleflight，60秒內的Webhook
-重送不得再花一個model turn。
-
-`activeRefresh.workingDirectory`必須是canonical absolute受控目錄，避免用Linear issue所屬repo或外部內容作
-probe context。互動式Claude可能留下本機resumable session metadata；固定name為
-`agent-team-quota-refresh`，不得把session URL／id或TUI寫入log。Claude CLI仍採exact受信版本：升版後先跑固定
-fake PTY、strict snapshot及一次operator live smoke，通過後才更新private config；不得用未驗證semver range
-自動放行。
+Claude Review 執行期間若收到 `rate_limit_event.status=rejected`，Host 才可向使用者說明已確認額度牆；只有
+HTTP `429` 時必須表達為原因未確認的限流。兩者都讓工單維持審查中、Agent 等待中、GitHub Review Status
+維持 pending，且不得改由 Codex 補審。可信 reset 到期後使用全新 Claude Review Session；沒有 reset 時間時
+保持等待並告知使用者，不主動輪詢 quota。
 
 ## 7. 執行監看與狀態翻譯
 

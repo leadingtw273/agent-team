@@ -1,10 +1,10 @@
 # Agent Team：第一輪使用者測試指南
 
-狀態：**可開始測試**  
-日期：2026-08-12  
+狀態：**第一張 Codex→Claude Happy Path 已完成，可繼續測試**  
+日期：2026-08-14  
 適用範圍：Agent Team Sandbox 的安全、小型、代碼審查型需求。
 
-本狀態只代表可以開始第一輪 Happy Path 使用者測試，不代表 v1 所有情境完成。
+本狀態代表第一輪 Happy Path 已由 LEA-37 真實走通；不代表 v1 所有異常情境完成。
 
 ## 0. 從哪裡開始
 
@@ -27,11 +27,11 @@
 1. 團隊管理者釐清需求，整理 Ready Gate 規格。
 2. 你核可規格與計畫。
 3. 團隊管理者建立 Linear Backlog 工單，設定角色、審查方式、範圍、依賴與預估體量。
-4. 因一般 quota collector 尚未完成，團隊管理者會要求一次性的 Claude-only 15 分鐘確認。
-5. 你在當前對話輸入團隊管理者指定的完整確認句；不要把它預先寫進工單或文件。
-6. 團隊管理者將 exact issue 移到 Ready，完成最後唯讀 launch gate，再啟動唯一一次 production run。
-7. Implementer 在獨立 Worktree／Branch 實作並建立 Draft PR；GitHub CI 自動驗證。
-8. CI 綠後，全新 Reviewer 依功能、代碼品質、型別、測試邊界與不必要複雜度驗收。
+4. 工單移到 Ready 前，團隊管理者完成最後唯讀 launch gate；新 Job admission 只採 Codex App Server 的官方帳戶與額度 snapshot。
+5. 有效週窗口足以 admission；目前官方若未回 5 小時窗口，不捏造數值，也不因此阻擋 Codex。
+6. Codex Implementer 在獨立 Worktree／Branch 實作並建立 Draft PR；GitHub CI 自動驗證。
+7. CI 綠後啟動全新的 Claude Code Reviewer；不在啟動前主動查詢或刷新 Claude 訂閱額度。
+8. Reviewer 依功能、代碼品質、型別、測試邊界與不必要複雜度驗收；若執行期間撞額度牆，工單留在審查中並維持 GitHub pending。
 9. 精確 Head 的 CI、Review Status 與 Diff Digest 一致後才 Squash Merge。
 10. Linear 更新為「已完成」，本機 Job、Lease 與 Admission 全部收斂。
 
@@ -50,16 +50,16 @@
 - Linear：工單從待辦／待執行推進到已完成，重要轉換有時間軸留言。
 - GitHub：只有一個 PR；CI SUCCESS；`agent-team/review` SUCCESS；PR 已 Squash Merge。
 - 本機：exact Job=`completed`；non-terminal／blocked／resumable=0；active／expired lease=0；Admission 已釋放。
-- 管理 UI：能看到 Sandbox 專案、註冊狀態、Job／Lease 與 wakeup 狀態。health 顯示 `scheduled_reconcile_only`／degraded 是本輪已知且預期的狀態，不等於這張單失敗。
+- 管理 UI：能看到 Sandbox 專案、註冊狀態、Job／Lease 與 wakeup 狀態。2026-08-14 read-back 為 `healthy/unattended`；若未來顯示 degraded，須依當下來源診斷，不沿用歷史結論。
 - 若任一權威來源不一致，團隊管理者必須誠實回報 degraded／blocked，不得宣稱完成。
 
 ## 5. 目前已知限制
 
-- **額度**：一般 Codex／Claude production quota collector 尚未完成；第一輪採 exact-issue、Claude-only、15 分鐘、一次性人工確認。已執行中的同一 Job（包含 CI、Reviewer、Merge 與 resume）不因確認過期而被粗暴中斷；只有舊 Job 被取消／取代而必須建立 replacement Job 時，才需要新的當前對話確認。再次被詢問是安全閘門，不是原工作失敗。
-- **喚醒**：canonical systemd timer 在 internal canary 時已 read-back 為 enabled／active，預期每五分鐘對帳；每次新測試的 launch gate 仍必須重新確認。若當下未在跑，團隊管理者須回報 blocked，而非靜默等待。Webhook Runtime 尚未接入，因此外部事件最慢可能等下一個 timer tick。health 會誠實顯示 `scheduled_reconcile_only`／degraded。
+- **額度**：Codex production admission 已接官方 App Server；2026-08-14 live probe 為週額度可用、5 小時窗口缺席。若未來回傳有效 5 小時窗口才納入判定。Claude 不做事前 quota probe；只有執行期間官方 `rejected` 才標示 confirmed wall，單獨 `429` 標示原因未確認，兩者都不會放行 Merge。
+- **喚醒**：canonical systemd timer、Webhook Runtime 與 tunnel 已 read-back 為 enabled／active，`health` 為 `healthy/unattended`。若任一來源後續降級，團隊管理者須據實回報，不得沿用本文件的歷史健康結論。
 - **UI**：第一版是 localhost 唯讀管理介面；一般設定、額度切換與危險操作核可還不是完整 production route。
 - **測試範圍**：這一輪只驗代碼審查 Happy Path。視覺雙審、危險操作、依賴、衝突、取消、quota 撞牆與 Provider 自動備援留到後續輪次。
-- **速度**：因 scheduled-only 喚醒與 fresh Reviewer，完整流程可能需要約 10～25 分鐘；不應以短時間沒有新留言判定空轉。
+- **速度**：即使已有 event-driven ingress 與定時 reconcile，fresh Reviewer 與 CI 仍可能使完整流程需要約 10～25 分鐘；不應以短時間沒有新留言判定空轉。
 
 ## 6. 第一輪請不要做的事
 
@@ -77,6 +77,9 @@
 - Live artifact：`leadingtw273/agent-team` PR #157 已合併，四來源 evidence 可重播 PASS。
 - T12 fresh-context 驗收：PASS，blocking finding=0。
 - Production UI smoke：標題、Sandbox 專案與導覽可見，axe violation=0。
+- 2026-08-14：正式路由已切為 Codex execution／Claude code review／Gemini visual review；Codex weekly-only quota live probe PASS。
+- 2026-08-14：LEA-37 由 Codex 實作，Sandbox PR #51 的 CI 與 fresh Claude Review 通過後 Squash Merge，Linear Done；最終 0 non-terminal Job、0 active／expired Lease。
+- LEA-37 首次執行暴露互動 approval 不適合 unattended controller；修正後 runner 使用 `approvalPolicy: "never"`、精確 worktree sandbox、無網路，非預期 tool request 仍 fail closed。
 
 ## 8. 第一輪完成後怎麼回報
 
