@@ -52,6 +52,7 @@ const projectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const issueId = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const jobA = "job_018f47d2-77a4-7cc1-8ef2-0123456789aa";
 const jobB = "job_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+const leaseId = id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 
 function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProgressRecordMutation {
   return {
@@ -65,6 +66,27 @@ function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProg
     worktreePath: "/tmp/sandbox-worktree",
     ...overrides,
   };
+}
+
+function protectedRegionRecord(): JobProgressRecordMutation {
+  return baseRecord({
+    stage: {
+      kind: "requires_manual",
+      cause: {
+        stage: "dispatch",
+        reasonCode: "protected_region_requires_human",
+        attempts: { count: 1 },
+      },
+    },
+    protectedRegionHandoff: {
+      leaseId,
+      holderId: "cli-dispatch:test-holder",
+      workflowState: "confirmed",
+      agentCondition: "confirmed",
+      comment: "confirmed",
+      leaseRelease: "confirmed",
+    },
+  });
 }
 
 async function* stdinOf(phrase: string): AsyncIterable<string> {
@@ -206,6 +228,31 @@ describe("createDispatchResolveHandler", () => {
     expect(reclaimed.ok).toBe(true);
   });
 
+  it("--as cancelled removes protected-region handoff receipts before writing the terminal record", async () => {
+    const { progress, admission } = await setup();
+    await progress.compareAndSwap(jobA, null, protectedRegionRecord());
+    const claimed = await admission.claim(projectId, issueId);
+    if (!claimed.ok) throw new Error(claimed.error.code);
+    await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
+
+    const handler = createDispatchResolveHandler({
+      progress,
+      admission,
+      stdin: stdinOf(dispatchResolveConfirmationPhrase),
+    });
+    const result = await handler({ jobId: jobA, as: "cancelled" });
+    expect(result.state).toBe("success");
+
+    const record = await progress.load(jobA);
+    expect(record).toMatchObject({ ok: true, value: { stage: { kind: "cancelled" } } });
+    if (!record.ok || record.value === undefined) throw new Error("expected terminal record");
+    expect(record.value).not.toHaveProperty("protectedRegionHandoff");
+    await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "released", releaseReason: "cancelled" },
+    });
+  });
+
   /**
    * C016: the real-world case this whole ticket exists for -- a `paused` job-progress record
    * (written by `handlers.ts`'s new fix, job-progress-store.ts's own `checkpointId`-optional
@@ -287,6 +334,38 @@ describe("createDispatchResolveHandler", () => {
     });
     const claim = await admission.load(projectId, issueId);
     expect(claim).toMatchObject({
+      ok: true,
+      value: {
+        state: "released",
+        releaseReason: "superseded",
+        supersededByJobId: jobB,
+      },
+    });
+  });
+
+  it("--as superseded removes protected-region handoff receipts while preserving the successor", async () => {
+    const { progress, admission } = await setup();
+    await progress.compareAndSwap(jobA, null, protectedRegionRecord());
+    const claimed = await admission.claim(projectId, issueId);
+    if (!claimed.ok) throw new Error(claimed.error.code);
+    await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
+
+    const handler = createDispatchResolveHandler({
+      progress,
+      admission,
+      stdin: stdinOf(dispatchResolveConfirmationPhrase),
+    });
+    const result = await handler({ jobId: jobA, as: "superseded", supersededByJobId: jobB });
+    expect(result.state).toBe("success");
+
+    const record = await progress.load(jobA);
+    expect(record).toMatchObject({
+      ok: true,
+      value: { stage: { kind: "superseded", supersededByJobId: jobB } },
+    });
+    if (!record.ok || record.value === undefined) throw new Error("expected terminal record");
+    expect(record.value).not.toHaveProperty("protectedRegionHandoff");
+    await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
       ok: true,
       value: {
         state: "released",
