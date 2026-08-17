@@ -25,6 +25,10 @@ import type {
   ReviewerReport,
 } from "../../src/application/pipelines/index.js";
 import {
+  currentReviewerReportContractBinding,
+  requiredReviewerRoles,
+} from "../../src/application/pipelines/reviewer-policy.js";
+import {
   buildLinearReadCatalog,
   linearAgentRoleNames,
   linearAgentStatusNames,
@@ -35,7 +39,10 @@ import {
   type LinearProjectContext,
   type LinearWorkflowStateRecord,
 } from "../../src/adapters/linear/model.js";
-import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linear-discovery.js";
+import {
+  projectIssueByExternalId,
+  type LinearDiscoveryReadModel,
+} from "../../src/adapters/dispatch/linear-discovery.js";
 import { readyGateTemplateHeadings } from "../../src/application/registration/linear-provision-model.js";
 import {
   agentRoleSchema,
@@ -55,7 +62,12 @@ import {
   type Instant,
 } from "../../src/domain/foundation/index.js";
 import { emptyAttemptCounters, jobSchema, type Job } from "../../src/domain/jobs/index.js";
-import { headShaSchema, type ReviewIdentity } from "../../src/domain/review/index.js";
+import {
+  createRequirementSnapshot,
+  headShaSchema,
+  sha256Digest,
+  type ReviewIdentity,
+} from "../../src/domain/review/index.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -165,7 +177,9 @@ function linearContext(): LinearProjectContext {
   };
 }
 
-function readModel(): LinearDiscoveryReadModel {
+function readModel(
+  reviewRequirement: "code_review" | "dual_review" = "code_review",
+): LinearDiscoveryReadModel {
   return {
     readContext: () => Promise.resolve(ok(linearContext())),
     listIssueIdsInState: () => Promise.resolve(ok([externalIssueId])),
@@ -181,7 +195,7 @@ function readModel(): LinearDiscoveryReadModel {
           projectId: "linear-project",
           workStatus: "ready" as const,
           agentRole: "implementer" as const,
-          reviewRequirement: "code_review" as const,
+          reviewRequirement,
           otherLabelIds: [],
           relations: [],
           comments: [],
@@ -270,6 +284,7 @@ interface Harness {
   readonly progress: FileJobProgressStore;
   readonly admission: AdmissionFake;
   readonly calls: string[];
+  readonly providerStarts: string[];
   readonly requests: ReviewerPipelineRequest[];
   readonly lifecycleRequests: unknown[];
   readonly leases: InMemoryLeaseRepository;
@@ -303,6 +318,8 @@ async function harness(
     reviewRecordMismatch?: boolean;
     approvedIdentity?: ReviewIdentity;
     autoMergePending?: boolean;
+    seedReplay?: "legacy_exhausted" | "legacy_mixed_exhausted" | "v2_exhausted" | "v2_zero";
+    reviewRequirement?: "code_review" | "dual_review";
   }> = {},
 ): Promise<Harness> {
   const progressRoot = await temporaryDirectory("reviewer-replay-progress-");
@@ -310,7 +327,72 @@ async function harness(
     overrides.failSuccessCheckpoint === true
       ? new FailSuccessCheckpointProgressStore(progressRoot)
       : new FileJobProgressStore(progressRoot);
-  await progress.compareAndSwap(jobId, null, {
+  const workIssue = issueSchema.parse({
+    schemaVersion: 1,
+    id: issueId,
+    projectId,
+    externalId: externalIssueId,
+    title: "Replay review",
+    acceptanceCriteria: ["Review passes"],
+    reviewRequirement: overrides.reviewRequirement ?? "code_review",
+  });
+  const authoritativeIssue = await projectIssueByExternalId(
+    project(),
+    readModel(overrides.reviewRequirement),
+    "team-1",
+    "linear-project",
+    externalIssueId,
+  );
+  if (!authoritativeIssue.ok) throw new Error(authoritativeIssue.error.code);
+  const snapshot = createRequirementSnapshot(authoritativeIssue.value, now);
+  if (!snapshot.ok) throw new Error(snapshot.error.code);
+  const legacyIdentity = {
+    schemaVersion: 1 as const,
+    jobId,
+    projectId,
+    issueId,
+    externalIssueId,
+    changeRequestId: "42",
+    baseRevision,
+    requirementsDigest: snapshot.value.requirementsDigest,
+    headSha,
+    diffDigest,
+  };
+  const legacyDigest = sha256Digest(legacyIdentity);
+  if (!legacyDigest.ok) throw new Error(legacyDigest.error.code);
+  const legacyReplay = {
+    state: "attempting" as const,
+    identity: legacyIdentity,
+    identityDigest: legacyDigest.value,
+    counters: { providerAttempts: 2, formatFailures: 2, transportFailures: 0 },
+    lastFormatCategory: "missing_field" as const,
+  };
+  const mixedLegacyReplay = {
+    ...legacyReplay,
+    counters: { providerAttempts: 2, formatFailures: 1, transportFailures: 0 },
+  };
+  const v2Identity = { ...legacyIdentity, schemaVersion: 2 as const, epochOrdinal: 2 };
+  const v2Digest = sha256Digest(v2Identity);
+  if (!v2Digest.ok) throw new Error(v2Digest.error.code);
+  const v2Replay = {
+    state: "attempting" as const,
+    identity: v2Identity,
+    identityDigest: v2Digest.value,
+    reviewContractBinding: currentReviewerReportContractBinding,
+    counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+  };
+  const v2ExhaustedIdentity = { ...legacyIdentity, schemaVersion: 2 as const, epochOrdinal: 1 };
+  const v2ExhaustedDigest = sha256Digest(v2ExhaustedIdentity);
+  if (!v2ExhaustedDigest.ok) throw new Error(v2ExhaustedDigest.error.code);
+  const v2ExhaustedReplay = {
+    state: "attempting" as const,
+    identity: v2ExhaustedIdentity,
+    identityDigest: v2ExhaustedDigest.value,
+    reviewContractBinding: currentReviewerReportContractBinding,
+    counters: { providerAttempts: 2, formatFailures: 2, transportFailures: 0 },
+    lastFormatCategory: "missing_field" as const,
+  };
+  const baseProgress: JobProgressRecordMutation = {
     jobId,
     projectId,
     issueId,
@@ -333,13 +415,37 @@ async function harness(
     changeRequestId: "42",
     headSha,
     baseRevision,
-  });
+  };
+  const initialProgress =
+    overrides.seedReplay === undefined
+      ? baseProgress
+      : {
+          ...baseProgress,
+          reviewerReplay:
+            overrides.seedReplay === "legacy_mixed_exhausted"
+              ? mixedLegacyReplay
+              : overrides.seedReplay === "v2_exhausted"
+                ? v2ExhaustedReplay
+                : legacyReplay,
+        };
+  const seeded = await progress.compareAndSwap(jobId, null, initialProgress);
+  expect(seeded.ok).toBe(true);
+  if (!seeded.ok) throw new Error("test setup could not seed job progress");
+  if (overrides.seedReplay === "v2_zero") {
+    const archived = await progress.compareAndSwap(jobId, seeded.value.revision, {
+      ...baseProgress,
+      previousReviewerReplay: legacyReplay,
+      reviewerReplay: v2Replay,
+    });
+    expect(archived.ok).toBe(true);
+  }
   const admission = new AdmissionFake();
   if (overrides.claimJobId !== undefined)
     admission.record = { ...admission.record, jobId: overrides.claimJobId };
   const leases = new InMemoryLeaseRepository();
   const leaseCoordinator = new LeaseCoordinator(leases, { clock: createFixedClock(now) });
   const calls: string[] = [];
+  const providerStarts: string[] = [];
   const requests: ReviewerPipelineRequest[] = [];
   const lifecycleRequests: unknown[] = [];
   let reviewerIndex = 0;
@@ -364,6 +470,7 @@ async function harness(
     },
     run: (request: ReviewerPipelineRequest): Promise<ReviewerPipelineOutcome> => {
       calls.push("provider");
+      providerStarts.push(...requiredReviewerRoles(request));
       requests.push(request);
       const scripted = reviewerOutcomes[reviewerIndex] ?? "approved";
       reviewerIndex += 1;
@@ -403,15 +510,6 @@ async function harness(
       });
     },
   };
-  const workIssue = issueSchema.parse({
-    schemaVersion: 1,
-    id: issueId,
-    projectId,
-    externalId: externalIssueId,
-    title: "Replay review",
-    acceptanceCriteria: ["Review passes"],
-    reviewRequirement: "code_review",
-  });
   const policy = { enabled: overrides.enabled ?? true };
   const deps: ResumeCycleDependencies = {
     progress,
@@ -435,7 +533,7 @@ async function harness(
           }),
         ),
     },
-    readModel: readModel(),
+    readModel: readModel(overrides.reviewRequirement),
     teamId: "team-1",
     linearProjectId: "linear-project",
     project: project(),
@@ -451,6 +549,54 @@ async function harness(
       roleInstructions: {},
       commands: { quality: [], visualReview: [] },
     },
+    ...(overrides.reviewRequirement === "dual_review"
+      ? {
+          visualReviewModel: "claude-visual",
+          visualEvidence: {
+            build: () => Promise.reject(new Error("must not build during replay")),
+            verifyExisting: () =>
+              Promise.resolve({
+                ok: true as const,
+                value: {
+                  visualManifest: {
+                    schemaVersion: 1 as const,
+                    issueId,
+                    commitSha: headSha,
+                    generatedAt: now,
+                    environment: { runner: "fixture", operatingSystem: "linux" },
+                    artifacts: [],
+                  },
+                  evidence: [],
+                  evidenceDirectory: "/tmp/reviewer-replay-project/.agent-team/evidence",
+                  reused: true,
+                },
+              } as never),
+          },
+          linearPublicationStore: {
+            load: () =>
+              Promise.resolve(
+                ok({
+                  schemaVersion: 1 as const,
+                  projectId,
+                  issueId,
+                  externalIssueId,
+                  headSha,
+                  manifestDigest: "e".repeat(64),
+                  manifestComment: { id: "manifest-comment", sha256: "f".repeat(64) },
+                  artifacts: [
+                    {
+                      path: "evidence.png",
+                      sha256: "d".repeat(64),
+                      assetUrl: "https://example.test/evidence.png",
+                      commentId: "artifact-comment",
+                    },
+                  ],
+                  createdAt: now,
+                } as never),
+              ),
+          },
+        }
+      : {}),
     ciRecovery: { run: () => Promise.reject(new Error("must not run")) },
     reviewerRecovery: { run: () => Promise.reject(new Error("must not run")) },
     reviewer,
@@ -546,6 +692,7 @@ async function harness(
     progress,
     admission,
     calls,
+    providerStarts,
     requests,
     lifecycleRequests,
     leases,
@@ -555,6 +702,167 @@ async function harness(
 }
 
 describe("ReviewerReplayCoordinator", () => {
+  it("contract epoch dry-run admits the exhausted legacy identity without mutation", async () => {
+    const value = await harness(["approved"], { seedReplay: "legacy_exhausted" });
+    const before = await value.progress.load(jobId);
+    const result = await value.coordinator.run(jobId, true, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    const after = await value.progress.load(jobId);
+    expect(result).toMatchObject({
+      state: "ready",
+      providerAttemptsUsed: 0,
+      providerAttemptsRemaining: 2,
+    });
+    if (result.state !== "ready")
+      throw new Error("contract epoch dry-run was unexpectedly blocked");
+    expect(result.plannedMutations).toContain("archive-reviewer-replay-epoch");
+    expect(result.plannedMutations).toContain("create-reviewer-contract-epoch");
+    expect(value.calls).toEqual(["inspect"]);
+    expect(after).toEqual(before);
+    await expect(value.leases.readAll()).resolves.toEqual({ ok: true, value: [] });
+  });
+
+  it("contract epoch requires the exact expected version and never calls the provider on mismatch", async () => {
+    const value = await harness(["approved"], { seedReplay: "legacy_exhausted" });
+    await expect(
+      value.coordinator.run(jobId, true, {
+        newContractEpoch: true,
+        expectContractVersion: 3,
+      }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "contract_version_mismatch" });
+    expect(value.calls).toEqual([]);
+  });
+
+  it("never replaces an ambiguously reserved legacy epoch as format-only exhaustion", async () => {
+    const value = await harness(["approved"], { seedReplay: "legacy_mixed_exhausted" });
+    const before = await value.progress.load(jobId);
+    const dryRun = await value.coordinator.run(jobId, true, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    const live = await value.coordinator.run(jobId, false, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    const after = await value.progress.load(jobId);
+
+    expect(dryRun).toMatchObject({ state: "blocked", reason: "contract_epoch_not_allowed" });
+    expect(live).toMatchObject({ state: "blocked", reason: "contract_epoch_not_allowed" });
+    expect(value.providerStarts).toHaveLength(0);
+    expect(after).toEqual(before);
+  });
+
+  it("does not report ready when the deployed contract is not newer than the exhausted epoch", async () => {
+    const value = await harness(["approved"], { seedReplay: "v2_exhausted" });
+    const before = await value.progress.load(jobId);
+    const result = await value.coordinator.run(jobId, true, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    const after = await value.progress.load(jobId);
+
+    expect(result).toMatchObject({ state: "blocked", reason: "contract_epoch_not_allowed" });
+    expect(value.providerStarts).toHaveLength(0);
+    expect(after).toEqual(before);
+  });
+
+  it("archives legacy epoch 1, succeeds in ordinal 2, and preserves the old counters", async () => {
+    const value = await harness(["approved"], { seedReplay: "legacy_exhausted" });
+    const result = await value.coordinator.run(jobId, false, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    expect(result).toMatchObject({ state: "continued", providerAttempts: 1 });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.previousReviewerReplay?.counters).toEqual({
+      providerAttempts: 2,
+      formatFailures: 2,
+      transportFailures: 0,
+    });
+    expect(stored.ok && stored.value?.reviewerReplay).toMatchObject({
+      state: "review_succeeded",
+      identity: { schemaVersion: 2, epochOrdinal: 2 },
+      reviewContractBinding: currentReviewerReportContractBinding,
+      counters: { providerAttempts: 1, formatFailures: 0, transportFailures: 0 },
+    });
+  });
+
+  it("plain dedicated replay continues a persisted non-exhausted ordinal-2 epoch after crash", async () => {
+    const value = await harness(["approved"], { seedReplay: "v2_zero" });
+    const result = await value.coordinator.run(jobId, false);
+    expect(result).toMatchObject({ state: "continued", providerAttempts: 1 });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.previousReviewerReplay?.counters.providerAttempts).toBe(2);
+    expect(stored.ok && stored.value?.reviewerReplay?.state).toBe("review_succeeded");
+  });
+
+  it("plain dry-run keeps an exhausted legacy epoch blocked and does not duplicate publication", async () => {
+    const value = await harness(["approved"], { seedReplay: "legacy_exhausted" });
+    const result = await value.coordinator.run(jobId, true);
+    expect(result).toMatchObject({ state: "blocked", reason: "attempts_exhausted" });
+    expect(value.calls).toEqual(["inspect"]);
+    expect(value.calls).not.toContain("pr-summary");
+    expect(value.calls).not.toContain("linear-summary");
+  });
+
+  it("bounds epoch 2 to two format failures and keeps both epoch audits without status or merge", async () => {
+    const value = await harness(["format", "format"], { seedReplay: "legacy_exhausted" });
+    const result = await value.coordinator.run(jobId, false, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    expect(result).toMatchObject({
+      state: "blocked",
+      reason: "attempts_exhausted",
+      providerAttempts: 2,
+      formatFailures: 2,
+      transportFailures: 0,
+    });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(2);
+    expect(value.calls.filter((call) => call === "pr-summary")).toHaveLength(1);
+    expect(value.calls.filter((call) => call === "linear-summary")).toHaveLength(1);
+    expect(value.calls).not.toContain("reviewStatus.record");
+    expect(value.calls).not.toContain("autoMerge.enable");
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.previousReviewerReplay?.counters.providerAttempts).toBe(2);
+    expect(stored.ok && stored.value?.reviewerReplay?.counters).toEqual({
+      providerAttempts: 2,
+      formatFailures: 2,
+      transportFailures: 0,
+    });
+  });
+
+  it("reserves the hard epoch budget per provider invocation for dual review", async () => {
+    const value = await harness(["format", "approved"], {
+      seedReplay: "legacy_exhausted",
+      reviewRequirement: "dual_review",
+    });
+    const result = await value.coordinator.run(jobId, false, {
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+
+    expect(result).toMatchObject({
+      state: "blocked",
+      reason: "attempts_exhausted",
+      providerAttempts: 2,
+      formatFailures: 1,
+      transportFailures: 0,
+    });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.providerStarts).toEqual(["code_reviewer", "visual_reviewer"]);
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.reviewerReplay?.counters).toEqual({
+      providerAttempts: 2,
+      formatFailures: 1,
+      transportFailures: 0,
+    });
+  });
+
   it("AC2/AC11 first attempt succeeds, checkpoints before status, then completes lifecycle and releases claim", async () => {
     const value = await harness(["approved"]);
     const result = await value.coordinator.run(jobId, false);

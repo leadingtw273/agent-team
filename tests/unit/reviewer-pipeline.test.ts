@@ -7,7 +7,15 @@ import {
   type ReviewQualityDimension,
   type ReviewerReport,
 } from "../../src/application/pipelines/index.js";
-import { canonicalVisualManifestInput } from "../../src/application/pipelines/reviewer-model.js";
+import {
+  canonicalVisualManifestInput,
+  reviewFindingSchema,
+} from "../../src/application/pipelines/reviewer-model.js";
+import {
+  computeReviewerReportContractDigest,
+  reviewerReportContractDigest,
+  reviewerReportContractVersion,
+} from "../../src/application/pipelines/reviewer-policy.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type {
   ProviderEvent,
@@ -868,6 +876,66 @@ describe("ReviewerPipeline", () => {
  * through the real, public `ReviewerPipeline.run()`, exactly as production does.
  */
 describe("ReviewerPipeline report contract (C015r decisions 2/3/4/5)", () => {
+  it("pins reviewer report contract v2 to its committed canonical digest", () => {
+    expect(reviewerReportContractVersion).toBe(2);
+    expect(computeReviewerReportContractDigest()).toBe(reviewerReportContractDigest);
+  });
+
+  it("directive omits a copyable line default and requires an exact unquoted positive integer or omission", async () => {
+    const input = request("code_review");
+    const setup = fixture(input);
+    await setup.pipeline.run(input.value);
+
+    const directive = setup.providerRequests[0]?.controllerDirective ?? "";
+    expect(directive).not.toMatch(/\\"line\\"\s*:\s*\\"/u);
+    expect(directive).not.toContain('"line": 1');
+    expect(directive).toContain(
+      'A finding may add a \\"line\\" key only when it also includes \\"path\\" and the exact line is known.',
+    );
+    expect(directive).toContain('A finding without \\"path\\" must omit \\"line\\" entirely.');
+    expect(directive).toContain("unquoted positive-integer JSON number");
+    expect(directive).toContain(
+      '"path" and "line" are the only optional keys inside each findings[] object',
+    );
+    expect(directive).toContain(
+      "Never encode line as a string, null, a range string, an array, or an object.",
+    );
+  });
+
+  it.each([
+    ["string", "42"],
+    ["null", null],
+    ["range", "12-14"],
+    ["zero", 0],
+    ["fraction", 1.5],
+  ])("strict finding schema rejects %s line", (_name, line) => {
+    expect(
+      reviewFindingSchema.safeParse({
+        severity: "advisory",
+        title: "Finding",
+        description: "Evidence",
+        acceptanceCriteria: [acceptanceCriterion],
+        evidenceSources: [],
+        path: "src/file.ts",
+        line,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("strict finding schema accepts a positive integer with path and rejects line without path", () => {
+    const base = {
+      severity: "advisory",
+      title: "Finding",
+      description: "Evidence",
+      acceptanceCriteria: [acceptanceCriterion],
+      evidenceSources: [],
+    };
+    expect(reviewFindingSchema.safeParse({ ...base, path: "src/file.ts", line: 42 }).success).toBe(
+      true,
+    );
+    expect(reviewFindingSchema.safeParse({ ...base, line: 42 }).success).toBe(false);
+  });
+
   it("directive contains a JSON skeleton with the exact identity digests, the approved AC, every quality dimension for the role, and the real evidence source list", async () => {
     const input = request("code_review");
     const setup = fixture(input);

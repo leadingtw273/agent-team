@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { safeReviewReportDiagnostics } from "../../src/application/pipelines/index.js";
+import { currentReviewerReportContractBinding } from "../../src/application/pipelines/reviewer-policy.js";
 import { FileReviewerReplayPolicyStore } from "../../src/adapters/dispatch/reviewer-replay-policy-store.js";
 import { FileReviewerReplayDiagnosticStore } from "../../src/adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
@@ -25,9 +26,13 @@ import {
   createLazyReviewerFacade,
   invokeReviewerReplayInspect,
 } from "../../src/cli/dispatch/reviewer-facade.js";
-import { createReviewerReplaySuccessCheckpoint } from "../../src/cli/dispatch/reviewer-replay-identity.js";
+import {
+  createReviewerReplaySuccessCheckpoint,
+  createReviewerReplaySuccessCheckpointDigest,
+} from "../../src/cli/dispatch/reviewer-replay-identity.js";
 import { buildJobProgressStore } from "../../src/cli/dispatch/resume-composition.js";
 import { resumeExistingProjectJobs } from "../../src/cli/dispatch/resume-existing.js";
+import { sha256Digest } from "../../src/domain/review/index.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -135,6 +140,35 @@ describe("reviewer-replay safe diagnostics", () => {
     );
     expect(loaded.ok && loaded.value.entries).toHaveLength(1);
   });
+
+  it("isolates v2 epoch diagnostics without rewriting the legacy job file", async () => {
+    const directory = await temporaryDirectory("reviewer-replay-diagnostics-epoch-");
+    const store = new FileReviewerReplayDiagnosticStore(directory);
+    const jobId = identifier("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+    const legacyDigest = "a".repeat(64);
+    const epochDigest = "b".repeat(64);
+    const entry = {
+      attempt: 1,
+      kind: "format" as const,
+      category: "schema_invalid" as const,
+      diagnostics: [],
+    };
+    await store.append(jobId, legacyDigest, entry);
+    await store.append(jobId, epochDigest, entry, { epochScoped: true });
+
+    const legacy = await readJsonWithSchema(
+      join(directory, `${jobId}.json`),
+      reviewerReplayDiagnosticRecordSchema,
+    );
+    const epoch = await readJsonWithSchema(
+      join(directory, `${jobId}.${epochDigest}.json`),
+      reviewerReplayDiagnosticRecordSchema,
+    );
+    expect(legacy.ok && legacy.value.identityDigest).toBe(legacyDigest);
+    expect(epoch.ok && epoch.value.identityDigest).toBe(epochDigest);
+    expect(legacy.ok && legacy.value.entries).toHaveLength(1);
+    expect(epoch.ok && epoch.value.entries).toHaveLength(1);
+  });
 });
 
 describe("reviewer-replay CLI outcome", () => {
@@ -169,6 +203,25 @@ describe("reviewer-replay CLI outcome", () => {
       ).state,
     ).toBe("failed");
   });
+
+  it("rejects incomplete contract-epoch options before building runtime composition", async () => {
+    const root = await temporaryDirectory("reviewer-replay-contract-options-");
+    const handlers = createReviewerReplayHandlers({ agentTeamHome: root });
+    const jobId = identifier("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+    const missingVersion = await handlers.reviewerReplay({ jobId, newContractEpoch: true });
+    expect(missingVersion.state).toBe("rejected");
+    expect(missingVersion.message).toContain("contract_epoch_options_invalid");
+    const missingFlag = await handlers.reviewerReplay({ jobId, expectContractVersion: 2 });
+    expect(missingFlag.state).toBe("rejected");
+    expect(missingFlag.message).toContain("contract_epoch_options_invalid");
+    const dryRunMissingVersion = await handlers.reviewerReplay({
+      jobId,
+      dryRun: true,
+      newContractEpoch: true,
+    });
+    expect(dryRunMissingVersion.state).toBe("blocked");
+    expect(dryRunMissingVersion.message).toContain("contract_epoch_options_invalid");
+  });
 });
 
 describe("reviewer-replay production method binding", () => {
@@ -200,6 +253,81 @@ describe("reviewer-replay production method binding", () => {
       error: { code: "invariant_violation" },
       job: { id: "job" },
     });
+  });
+});
+
+describe("reviewer-replay v2 success checkpoint digest", () => {
+  it("round-trips through the shared versioned builder and binds the stored contract pair", () => {
+    const completedAt = parseInstant("2026-08-17T08:00:00.000Z");
+    if (!completedAt.ok) throw new Error(completedAt.error.code);
+    const attempting = {
+      state: "attempting" as const,
+      identity: {
+        schemaVersion: 2 as const,
+        epochOrdinal: 2,
+        jobId: identifier("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab") as never,
+        projectId: identifier("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab") as never,
+        issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as never,
+        externalIssueId: "LEA-46",
+        changeRequestId: "8",
+        baseRevision: "b".repeat(40) as never,
+        requirementsDigest: "c".repeat(64),
+        headSha: "a".repeat(40) as never,
+        diffDigest: "d".repeat(64),
+      },
+      identityDigest: "e".repeat(64),
+      reviewContractBinding: currentReviewerReportContractBinding,
+      counters: { providerAttempts: 1, formatFailures: 0, transportFailures: 0 },
+    };
+    const checkpoint = createReviewerReplaySuccessCheckpoint(
+      attempting,
+      [
+        {
+          schemaVersion: 1,
+          role: "code_reviewer",
+          verdict: "passed",
+          requirementsDigest: attempting.identity.requirementsDigest,
+          headSha: attempting.identity.headSha,
+          diffDigest: attempting.identity.diffDigest,
+          summary: "Approved.",
+          acceptanceCriteria: [
+            { criterion: "Safe", status: "passed", summary: "Safe.", evidenceSources: [] },
+          ],
+          qualityChecks: [
+            {
+              dimension: "correctness",
+              status: "passed",
+              summary: "Correct.",
+              evidenceSources: [],
+            },
+          ],
+          findings: [],
+        },
+      ],
+      completedAt.value,
+    );
+    if (!checkpoint.ok) throw new Error(checkpoint.error.code);
+    const binding = checkpoint.value.reviewContractBinding;
+    if (binding === undefined) throw new Error("missing v2 contract binding");
+    const verified = createReviewerReplaySuccessCheckpointDigest({
+      identity: checkpoint.value.identity,
+      identityDigest: checkpoint.value.identityDigest,
+      reviewContractBinding: binding,
+      counters: checkpoint.value.counters,
+      reportDigests: checkpoint.value.reportDigests,
+    });
+    expect(verified.ok && verified.value).toBe(checkpoint.value.checkpointDigest);
+    const changed = createReviewerReplaySuccessCheckpointDigest({
+      identity: checkpoint.value.identity,
+      identityDigest: checkpoint.value.identityDigest,
+      reviewContractBinding: {
+        ...currentReviewerReportContractBinding,
+        digest: "0".repeat(64),
+      },
+      counters: checkpoint.value.counters,
+      reportDigests: checkpoint.value.reportDigests,
+    });
+    expect(changed.ok && changed.value).not.toBe(checkpoint.value.checkpointDigest);
   });
 });
 
@@ -415,5 +543,203 @@ describe("reviewer-replay progress invariants", () => {
       },
     });
     expect(rolledBack).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+  });
+
+  it("archives one exhausted legacy epoch and atomically installs the committed ordinal-2 epoch", async () => {
+    const directory = await temporaryDirectory("reviewer-replay-epoch-transition-");
+    const store = new FileJobProgressStore(directory);
+    const identityV1 = {
+      schemaVersion: 1 as const,
+      jobId: identifier("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab") as never,
+      projectId: identifier("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab") as never,
+      issueId: "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab" as never,
+      externalIssueId: "LEA-1",
+      changeRequestId: "42",
+      baseRevision: "b".repeat(40) as never,
+      requirementsDigest: "c".repeat(64),
+      headSha: "a".repeat(40) as never,
+      diffDigest: "d".repeat(64),
+    };
+    const legacy = {
+      state: "attempting" as const,
+      identity: identityV1,
+      identityDigest: "e".repeat(64),
+      counters: { providerAttempts: 2, formatFailures: 2, transportFailures: 0 },
+      lastFormatCategory: "missing_field" as const,
+    };
+    const base = {
+      jobId: identityV1.jobId,
+      projectId: identityV1.projectId,
+      issueId: identityV1.issueId,
+      externalIssueId: "LEA-1",
+      model: "claude-opus",
+      providerAssignments: {
+        execution: { provider: "codex" as const, model: "gpt-sol" },
+        codeReview: { provider: "claude" as const, model: "claude-opus" },
+      },
+      stage: {
+        kind: "requires_manual" as const,
+        cause: {
+          stage: "review" as const,
+          reasonCode: "review_report_contract" as const,
+          attempts: { count: 2 },
+        },
+      },
+      branch: "agent-team/replay",
+      worktreePath: "/tmp/replay",
+      changeRequestId: "42",
+      headSha: identityV1.headSha,
+      baseRevision: identityV1.baseRevision,
+      reviewerReplay: legacy,
+    };
+    const seeded = await store.compareAndSwap(identityV1.jobId, null, base);
+    if (!seeded.ok) throw new Error(seeded.error.code);
+    const nextIdentity = { ...identityV1, schemaVersion: 2 as const, epochOrdinal: 2 };
+    const nextIdentityDigest = sha256Digest(nextIdentity);
+    if (!nextIdentityDigest.ok) throw new Error(nextIdentityDigest.error.code);
+    const next = {
+      state: "attempting" as const,
+      identity: nextIdentity,
+      identityDigest: nextIdentityDigest.value,
+      reviewContractBinding: currentReviewerReportContractBinding,
+      counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+    };
+    const transitioned = await store.compareAndSwap(identityV1.jobId, seeded.value.revision, {
+      ...base,
+      previousReviewerReplay: legacy,
+      reviewerReplay: next,
+    });
+    expect(transitioned).toMatchObject({
+      ok: true,
+      value: {
+        previousReviewerReplay: legacy,
+        reviewerReplay: { identity: { schemaVersion: 2, epochOrdinal: 2 } },
+      },
+    });
+    if (!transitioned.ok) throw new Error(transitioned.error.code);
+    await expect(
+      store.compareAndSwap(identityV1.jobId, transitioned.value.revision, {
+        ...base,
+        reviewerReplay: next,
+        previousReviewerReplay: undefined,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+  });
+
+  it("rejects non-format exhaustion and arbitrary contract or identity digests", async () => {
+    const directory = await temporaryDirectory("reviewer-replay-epoch-reject-");
+    const store = new FileJobProgressStore(directory);
+    const identityV1 = {
+      schemaVersion: 1 as const,
+      jobId: identifier("job", "job_018f47d2-77a4-7cc1-8ef2-222222222222") as never,
+      projectId: identifier("project", "project_018f47d2-77a4-7cc1-8ef2-222222222222") as never,
+      issueId: "issue_018f47d2-77a4-7cc1-8ef2-222222222222" as never,
+      externalIssueId: "LEA-2",
+      changeRequestId: "43",
+      baseRevision: "b".repeat(40) as never,
+      requirementsDigest: "c".repeat(64),
+      headSha: "a".repeat(40) as never,
+      diffDigest: "d".repeat(64),
+    };
+    const legacy = {
+      state: "attempting" as const,
+      identity: identityV1,
+      identityDigest: "e".repeat(64),
+      counters: { providerAttempts: 1, formatFailures: 1, transportFailures: 0 },
+    };
+    const base = {
+      jobId: identityV1.jobId,
+      projectId: identityV1.projectId,
+      issueId: identityV1.issueId,
+      externalIssueId: "LEA-2",
+      model: "claude-opus",
+      stage: {
+        kind: "requires_manual" as const,
+        cause: {
+          stage: "review" as const,
+          reasonCode: "review_report_contract" as const,
+          attempts: { count: 2 },
+        },
+      },
+      branch: "agent-team/replay",
+      worktreePath: "/tmp/replay-2",
+      changeRequestId: "43",
+      headSha: identityV1.headSha,
+      baseRevision: identityV1.baseRevision,
+      reviewerReplay: legacy,
+    };
+    const seeded = await store.compareAndSwap(identityV1.jobId, null, base);
+    if (!seeded.ok) throw new Error(seeded.error.code);
+    const candidateIdentity = { ...identityV1, schemaVersion: 2 as const, epochOrdinal: 2 };
+    const candidateIdentityDigest = sha256Digest(candidateIdentity);
+    if (!candidateIdentityDigest.ok) throw new Error(candidateIdentityDigest.error.code);
+    const candidate = {
+      state: "attempting" as const,
+      identity: candidateIdentity,
+      identityDigest: candidateIdentityDigest.value,
+      reviewContractBinding: {
+        ...currentReviewerReportContractBinding,
+        digest: "0".repeat(64),
+      },
+      counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+    };
+    await expect(
+      store.compareAndSwap(identityV1.jobId, seeded.value.revision, {
+        ...base,
+        previousReviewerReplay: legacy,
+        reviewerReplay: {
+          ...candidate,
+          reviewContractBinding: currentReviewerReportContractBinding,
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+    const mixedExhaustion = {
+      ...legacy,
+      counters: { providerAttempts: 2, formatFailures: 1, transportFailures: 0 },
+    };
+    const mixedWrite = await store.compareAndSwap(identityV1.jobId, seeded.value.revision, {
+      ...base,
+      reviewerReplay: mixedExhaustion,
+    });
+    if (!mixedWrite.ok) throw new Error(mixedWrite.error.code);
+    await expect(
+      store.compareAndSwap(identityV1.jobId, mixedWrite.value.revision, {
+        ...base,
+        reviewerReplay: {
+          ...candidate,
+          reviewContractBinding: currentReviewerReportContractBinding,
+        },
+        previousReviewerReplay: mixedExhaustion,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+    const exhausted = {
+      ...legacy,
+      counters: { providerAttempts: 2, formatFailures: 2, transportFailures: 0 },
+    };
+    const exhaustedWrite = await store.compareAndSwap(identityV1.jobId, mixedWrite.value.revision, {
+      ...base,
+      reviewerReplay: exhausted,
+    });
+    if (!exhaustedWrite.ok) throw new Error(exhaustedWrite.error.code);
+    await expect(
+      store.compareAndSwap(identityV1.jobId, exhaustedWrite.value.revision, {
+        ...base,
+        reviewerReplay: candidate,
+        previousReviewerReplay: exhausted,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+    await expect(
+      store.compareAndSwap(identityV1.jobId, exhaustedWrite.value.revision, {
+        ...base,
+        reviewerReplay: {
+          ...candidate,
+          identityDigest: "f".repeat(64),
+          reviewContractBinding: currentReviewerReportContractBinding,
+        },
+        previousReviewerReplay: exhausted,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
   });
 });

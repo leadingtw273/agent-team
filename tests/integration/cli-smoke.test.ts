@@ -137,6 +137,36 @@ describe("compiled CLI smoke", () => {
     expect(reconcileHelp.stdout).toContain("--all");
   });
 
+  it("returns blocked exit 3 without mutation for an incomplete contract-epoch dry-run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "agent-team-reviewer-epoch-cli-"));
+    roots.push(root);
+    const environment = { ...process.env, AGENT_TEAM_HOME: join(root, ".agent-team") };
+    const before = await treeFingerprint(root);
+
+    const result = run(
+      [
+        "dispatch",
+        "reviewer-replay",
+        "--job",
+        "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+        "--dry-run",
+        "--new-contract-epoch",
+      ],
+      environment,
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(3);
+    expect(result.stdout).toBe("");
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      operation: "reviewer-replay",
+      state: "blocked",
+      dryRun: true,
+      reason: "contract_epoch_options_invalid",
+    });
+    await expect(treeFingerprint(root)).resolves.toEqual(before);
+  });
+
   it("E010b: runs the real production composition against an empty, isolated state directory", async () => {
     const root = await mkdtemp(join(tmpdir(), "agent-team-reconcile-cli-"));
     roots.push(root);

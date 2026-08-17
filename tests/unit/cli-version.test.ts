@@ -136,6 +136,29 @@ describe("agent-team CLI contract", () => {
     await expect(
       runCli(
         metadata,
+        [
+          "dispatch",
+          "reviewer-replay",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--dry-run",
+          "--new-contract-epoch",
+          "--expect-contract-version",
+          "2",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchReviewerReplay).toHaveBeenLastCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      dryRun: true,
+      newContractEpoch: true,
+      expectContractVersion: 2,
+    });
+    await expect(
+      runCli(
+        metadata,
         ["dispatch", "reviewer-replay-policy", "--project", "project-a", "--state", "enabled"],
         commands,
         sink.io,
@@ -178,7 +201,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(15));
+    expect(sink.stdout()).toBe("完成\n".repeat(16));
   });
 
   it.each([

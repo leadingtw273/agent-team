@@ -30,6 +30,7 @@
 import { randomUUID } from "node:crypto";
 import { readdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
 
@@ -54,11 +55,12 @@ import {
   leaseIdSchema,
   projectIdSchema,
 } from "../../domain/jobs/index.js";
-import { headShaSchema } from "../../domain/review/index.js";
+import { headShaSchema, sha256Digest } from "../../domain/review/index.js";
 import {
   reportContractFailureCategorySchema,
   reviewerReportSchema,
 } from "../../application/pipelines/reviewer-model.js";
+import { currentReviewerReportContractBinding } from "../../application/pipelines/reviewer-policy.js";
 import {
   AtomicFileStore,
   acquireRecoverableFileLock,
@@ -590,23 +592,38 @@ const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 /** Immutable replay binding. `baseRevision` is the persisted dispatch base, never a live branch
  * tip. Optional evidence/publication digests are present exactly when the underlying review
  * identity contains them. */
-export const reviewerReplayIdentitySchema = z
+const reviewerReplayIdentityBaseSchema = z.object({
+  jobId: jobIdSchema,
+  projectId: projectIdSchema,
+  issueId: issueIdSchema,
+  externalIssueId: z.string().trim().min(1).max(255),
+  changeRequestId: changeRequestNumberSchema,
+  baseRevision: headShaSchema,
+  requirementsDigest: digestSchema,
+  headSha: headShaSchema,
+  diffDigest: digestSchema,
+  evidenceDigest: digestSchema.optional(),
+  publicationDigest: digestSchema.optional(),
+});
+
+export const reviewerReplayIdentitySchema = z.discriminatedUnion("schemaVersion", [
+  reviewerReplayIdentityBaseSchema.extend({ schemaVersion: z.literal(1) }).strict(),
+  reviewerReplayIdentityBaseSchema
+    .extend({
+      schemaVersion: z.literal(2),
+      epochOrdinal: z.number().int().min(1).max(2),
+    })
+    .strict(),
+]);
+export type ReviewerReplayIdentity = z.infer<typeof reviewerReplayIdentitySchema>;
+
+export const reviewerReplayContractBindingSchema = z
   .object({
-    schemaVersion: z.literal(1),
-    jobId: jobIdSchema,
-    projectId: projectIdSchema,
-    issueId: issueIdSchema,
-    externalIssueId: z.string().trim().min(1).max(255),
-    changeRequestId: changeRequestNumberSchema,
-    baseRevision: headShaSchema,
-    requirementsDigest: digestSchema,
-    headSha: headShaSchema,
-    diffDigest: digestSchema,
-    evidenceDigest: digestSchema.optional(),
-    publicationDigest: digestSchema.optional(),
+    version: z.number().int().min(2),
+    digest: digestSchema,
   })
   .strict();
-export type ReviewerReplayIdentity = z.infer<typeof reviewerReplayIdentitySchema>;
+export type ReviewerReplayContractBinding = z.infer<typeof reviewerReplayContractBindingSchema>;
 
 const reviewerReplayCountersSchema = z
   .object({
@@ -625,41 +642,52 @@ const reviewerReplayBaseSchema = z.object({
   identity: reviewerReplayIdentitySchema,
   identityDigest: digestSchema,
   counters: reviewerReplayCountersSchema,
+  reviewContractBinding: reviewerReplayContractBindingSchema.optional(),
 });
 
-export const reviewerReplayCheckpointSchema = z.discriminatedUnion("state", [
-  reviewerReplayBaseSchema
-    .extend({
-      state: z.literal("attempting"),
-      lastFormatCategory: reportContractFailureCategorySchema.optional(),
-      lastTransportErrorCode: z.string().trim().min(1).max(64).optional(),
-      diagnosticCount: z.number().int().min(0).max(100).optional(),
-    })
-    .strict(),
-  reviewerReplayBaseSchema
-    .extend({
-      state: z.literal("review_succeeded"),
-      reports: z.array(reviewerReportSchema).min(1).max(2),
-      reportDigests: z.array(digestSchema).min(1).max(2),
-      checkpointDigest: digestSchema,
-      completedAt: instantSchema,
-    })
-    .strict()
-    .superRefine((value, context) => {
-      if (value.reports.length !== value.reportDigests.length) {
-        context.addIssue({ code: "custom", message: "Every report needs one digest." });
-      }
-      if (value.counters.providerAttempts < 1) {
-        context.addIssue({ code: "custom", message: "A success checkpoint needs an attempt." });
-      }
-      if (
-        value.reports.some((report) => report.verdict !== "passed") ||
-        new Set(value.reports.map((report) => report.role)).size !== value.reports.length
-      ) {
-        context.addIssue({ code: "custom", message: "Success reports must be unique passes." });
-      }
-    }),
-]);
+export const reviewerReplayCheckpointSchema = z
+  .discriminatedUnion("state", [
+    reviewerReplayBaseSchema
+      .extend({
+        state: z.literal("attempting"),
+        lastFormatCategory: reportContractFailureCategorySchema.optional(),
+        lastTransportErrorCode: z.string().trim().min(1).max(64).optional(),
+        diagnosticCount: z.number().int().min(0).max(100).optional(),
+      })
+      .strict(),
+    reviewerReplayBaseSchema
+      .extend({
+        state: z.literal("review_succeeded"),
+        reports: z.array(reviewerReportSchema).min(1).max(2),
+        reportDigests: z.array(digestSchema).min(1).max(2),
+        checkpointDigest: digestSchema,
+        completedAt: instantSchema,
+      })
+      .strict()
+      .superRefine((value, context) => {
+        if (value.reports.length !== value.reportDigests.length) {
+          context.addIssue({ code: "custom", message: "Every report needs one digest." });
+        }
+        if (value.counters.providerAttempts < 1) {
+          context.addIssue({ code: "custom", message: "A success checkpoint needs an attempt." });
+        }
+        if (
+          value.reports.some((report) => report.verdict !== "passed") ||
+          new Set(value.reports.map((report) => report.role)).size !== value.reports.length
+        ) {
+          context.addIssue({ code: "custom", message: "Success reports must be unique passes." });
+        }
+      }),
+  ])
+  .superRefine((value, context) => {
+    if ((value.identity.schemaVersion === 2) !== (value.reviewContractBinding !== undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["reviewContractBinding"],
+        message: "Contract binding is required exactly for reviewer-replay identity v2.",
+      });
+    }
+  });
 export type ReviewerReplayCheckpoint = z.infer<typeof reviewerReplayCheckpointSchema>;
 
 export const jobProgressRecordSchema = z
@@ -735,6 +763,9 @@ export const jobProgressRecordSchema = z
     /** Dedicated, restart-safe recovery state for an exact
      * `requires_manual(review_report_contract)` Job. Optional for all legacy/ordinary records. */
     reviewerReplay: reviewerReplayCheckpointSchema.optional(),
+    /** Immutable audit of the one permitted prior replay epoch. Its singular shape structurally
+     * caps a Job at two epochs. Once present, no writer may remove or modify it. */
+    previousReviewerReplay: reviewerReplayCheckpointSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict()
@@ -759,6 +790,36 @@ export type JobProgressRecordMutation = Omit<
   JobProgressRecord,
   "schemaVersion" | "revision" | "updatedAt"
 >;
+
+function replayBaseIdentity(identity: ReviewerReplayIdentity): Readonly<Record<string, unknown>> {
+  if (identity.schemaVersion === 1) {
+    const { schemaVersion: _schemaVersion, ...base } = identity;
+    void _schemaVersion;
+    return base;
+  }
+  const { schemaVersion: _schemaVersion, epochOrdinal: _epochOrdinal, ...base } = identity;
+  void _schemaVersion;
+  void _epochOrdinal;
+  return base;
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return isDeepStrictEqual(left, right);
+}
+
+function zeroReplayCounters(checkpoint: ReviewerReplayCheckpoint): boolean {
+  return (
+    checkpoint.counters.providerAttempts === 0 &&
+    checkpoint.counters.formatFailures === 0 &&
+    checkpoint.counters.transportFailures === 0
+  );
+}
+
+function canonicalV2ReplayIdentity(checkpoint: ReviewerReplayCheckpoint | undefined): boolean {
+  if (checkpoint?.identity.schemaVersion !== 2) return true;
+  const digest = sha256Digest(checkpoint.identity);
+  return digest.ok && digest.value === checkpoint.identityDigest;
+}
 
 function isNotFound(error: DomainError): boolean {
   return error.code === "not_found";
@@ -860,18 +921,69 @@ export class FileJobProgressStore {
       return err(domainError("invariant_violation"));
     }
     const currentReplay = normalizedCurrent.value?.reviewerReplay;
+    const currentPrevious = normalizedCurrent.value?.previousReviewerReplay;
+    if (
+      !canonicalV2ReplayIdentity(next.reviewerReplay) ||
+      !canonicalV2ReplayIdentity(next.previousReviewerReplay)
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (currentPrevious !== undefined && !sameJson(next.previousReviewerReplay, currentPrevious)) {
+      return err(domainError("invariant_violation"));
+    }
+    if (currentReplay === undefined && next.previousReviewerReplay !== undefined) {
+      return err(domainError("invariant_violation"));
+    }
     if (currentReplay !== undefined) {
       if (next.reviewerReplay === undefined) {
         return err(domainError("invariant_violation"));
       }
+      const sameIdentity =
+        next.reviewerReplay.identityDigest === currentReplay.identityDigest &&
+        sameJson(next.reviewerReplay.identity, currentReplay.identity);
+      if (sameIdentity) {
+        if (
+          !sameJson(
+            next.reviewerReplay.reviewContractBinding,
+            currentReplay.reviewContractBinding,
+          ) ||
+          !sameJson(next.previousReviewerReplay, currentPrevious) ||
+          next.reviewerReplay.counters.providerAttempts < currentReplay.counters.providerAttempts ||
+          next.reviewerReplay.counters.formatFailures < currentReplay.counters.formatFailures ||
+          next.reviewerReplay.counters.transportFailures <
+            currentReplay.counters.transportFailures ||
+          (currentReplay.state === "review_succeeded" &&
+            !sameJson(next.reviewerReplay, currentReplay))
+        ) {
+          return err(domainError("invariant_violation"));
+        }
+      } else {
+        const currentOrdinal =
+          currentReplay.identity.schemaVersion === 1 ? 1 : currentReplay.identity.epochOrdinal;
+        const currentContractVersion = currentReplay.reviewContractBinding?.version ?? 1;
+        const nextIdentity = next.reviewerReplay.identity;
+        const epochTransitionAllowed =
+          currentPrevious === undefined &&
+          currentReplay.state === "attempting" &&
+          currentReplay.counters.providerAttempts === 2 &&
+          currentReplay.counters.formatFailures === currentReplay.counters.providerAttempts &&
+          currentReplay.counters.transportFailures === 0 &&
+          next.reviewerReplay.state === "attempting" &&
+          zeroReplayCounters(next.reviewerReplay) &&
+          sameJson(next.previousReviewerReplay, currentReplay) &&
+          nextIdentity.schemaVersion === 2 &&
+          nextIdentity.epochOrdinal === currentOrdinal + 1 &&
+          nextIdentity.epochOrdinal <= 2 &&
+          sameJson(replayBaseIdentity(nextIdentity), replayBaseIdentity(currentReplay.identity)) &&
+          next.reviewerReplay.reviewContractBinding?.version === currentContractVersion + 1 &&
+          sameJson(next.reviewerReplay.reviewContractBinding, currentReviewerReportContractBinding);
+        if (!epochTransitionAllowed) {
+          return err(domainError("invariant_violation"));
+        }
+      }
       if (
-        next.reviewerReplay.identityDigest !== currentReplay.identityDigest ||
-        JSON.stringify(next.reviewerReplay.identity) !== JSON.stringify(currentReplay.identity) ||
-        next.reviewerReplay.counters.providerAttempts < currentReplay.counters.providerAttempts ||
-        next.reviewerReplay.counters.formatFailures < currentReplay.counters.formatFailures ||
-        next.reviewerReplay.counters.transportFailures < currentReplay.counters.transportFailures ||
-        (currentReplay.state === "review_succeeded" &&
-          JSON.stringify(next.reviewerReplay) !== JSON.stringify(currentReplay))
+        currentReplay.state === "review_succeeded" &&
+        !sameJson(next.reviewerReplay, currentReplay)
       ) {
         return err(domainError("invariant_violation"));
       }

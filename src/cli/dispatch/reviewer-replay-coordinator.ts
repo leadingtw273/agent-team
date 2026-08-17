@@ -3,6 +3,11 @@ import type {
   ReviewerPipelineRequest,
   VisualEvidenceBuildSuccess,
 } from "../../application/pipelines/index.js";
+import {
+  computeReviewerReportContractDigest,
+  currentReviewerReportContractBinding,
+  requiredReviewerRoles,
+} from "../../application/pipelines/reviewer-policy.js";
 import { defaultLeaseDurationMs } from "../../application/leases/index.js";
 import { createRequirementSnapshot, type ReviewIdentity } from "../../domain/review/index.js";
 import { instantFromDate } from "../../domain/foundation/index.js";
@@ -19,6 +24,7 @@ import type { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/
 import type { SourceControlPort, WorkManagementPort } from "../../application/ports/index.js";
 import {
   createReviewerReplayIdentity,
+  createReviewerReplayIdentityForCheckpoint,
   createReviewerReplaySuccessCheckpoint,
   replayIdentityMatches,
   reviewerReportMatchesIdentity,
@@ -46,6 +52,10 @@ export type ReviewerReplayBlockedReason =
   | "work_item_canceled"
   | "authoritative_read_failed"
   | "identity_mismatch"
+  | "provider_budget_insufficient"
+  | "contract_epoch_not_allowed"
+  | "contract_version_mismatch"
+  | "contract_digest_mismatch"
   | "attempts_exhausted"
   | "review_not_approved"
   | "checkpoint_write_failed"
@@ -91,6 +101,11 @@ export interface ReviewerReplayCoordinatorDependencies {
   readonly publication: ReviewerReplayPublicationPorts;
   readonly delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly leaseHeartbeatIntervalMs?: number;
+}
+
+export interface ReviewerReplayRunOptions {
+  readonly newContractEpoch?: boolean;
+  readonly expectContractVersion?: number;
 }
 
 interface ReplayInspection {
@@ -294,7 +309,17 @@ async function inspectReplay(
       ...(inspected.state === "failed" ? { errorCode: inspected.error.code } : {}),
     };
   }
-  const replayIdentity = createReviewerReplayIdentity(record, inspected.identity);
+  const replayIdentity =
+    record.reviewerReplay === undefined
+      ? createReviewerReplayIdentity(record, inspected.identity, {
+          schemaVersion: 2,
+          epochOrdinal: 1,
+        })
+      : createReviewerReplayIdentityForCheckpoint(
+          record,
+          inspected.identity,
+          record.reviewerReplay,
+        );
   if (!replayIdentity.ok) {
     return { state: "blocked", jobId: record.jobId, reason: "identity_mismatch" };
   }
@@ -333,6 +358,79 @@ function initialCheckpoint(
     identity: inspection.replayIdentity.identity,
     identityDigest: inspection.replayIdentity.identityDigest,
     counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+    ...(inspection.replayIdentity.identity.schemaVersion === 1
+      ? {}
+      : { reviewContractBinding: currentReviewerReportContractBinding }),
+  };
+}
+
+function currentContractGoldenIsValid(): boolean {
+  return computeReviewerReportContractDigest() === currentReviewerReportContractBinding.digest;
+}
+
+function canCreateContractEpoch(checkpoint: ReviewerReplayCheckpoint): boolean {
+  return (
+    checkpoint.state === "attempting" &&
+    checkpoint.counters.providerAttempts === maximumReplayAttempts &&
+    checkpoint.counters.formatFailures === checkpoint.counters.providerAttempts &&
+    checkpoint.counters.transportFailures === 0
+  );
+}
+
+type ContractEpochCheckpointResult =
+  | Readonly<{
+      ok: true;
+      checkpoint: Extract<ReviewerReplayCheckpoint, { state: "attempting" }>;
+    }>
+  | Readonly<{
+      ok: false;
+      reason: Extract<
+        ReviewerReplayBlockedReason,
+        "contract_epoch_not_allowed" | "provider_budget_insufficient"
+      >;
+    }>;
+
+function contractEpochCheckpoint(
+  record: JobProgressRecord,
+  inspection: ReplayInspection,
+): ContractEpochCheckpointResult {
+  const requiredProviderInvocations = requiredReviewerRoles(inspection.request).length;
+  if (requiredProviderInvocations === 0 || requiredProviderInvocations > maximumReplayAttempts) {
+    return { ok: false, reason: "provider_budget_insufficient" };
+  }
+  const current = record.reviewerReplay;
+  if (
+    current === undefined ||
+    record.previousReviewerReplay !== undefined ||
+    !canCreateContractEpoch(current)
+  ) {
+    return { ok: false, reason: "contract_epoch_not_allowed" };
+  }
+  const currentOrdinal = current.identity.schemaVersion === 1 ? 1 : current.identity.epochOrdinal;
+  const currentContractVersion = current.reviewContractBinding?.version ?? 1;
+  if (currentReviewerReportContractBinding.version !== currentContractVersion + 1) {
+    return { ok: false, reason: "contract_epoch_not_allowed" };
+  }
+  const created = createReviewerReplayIdentity(record, inspection.identity, {
+    schemaVersion: 2,
+    epochOrdinal: currentOrdinal + 1,
+  });
+  if (
+    !created.ok ||
+    created.value.identity.schemaVersion !== 2 ||
+    created.value.identity.epochOrdinal > 2
+  ) {
+    return { ok: false, reason: "contract_epoch_not_allowed" };
+  }
+  return {
+    ok: true,
+    checkpoint: {
+      state: "attempting",
+      identity: created.value.identity,
+      identityDigest: created.value.identityDigest,
+      reviewContractBinding: currentReviewerReportContractBinding,
+      counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+    },
   };
 }
 
@@ -423,8 +521,22 @@ async function publishFormatExhaustion(
 export class ReviewerReplayCoordinator {
   constructor(readonly dependencies: ReviewerReplayCoordinatorDependencies) {}
 
-  async run(jobId: string, dryRun: boolean): Promise<ReviewerReplayOutcome> {
+  async run(
+    jobId: string,
+    dryRun: boolean,
+    options: ReviewerReplayRunOptions = {},
+  ): Promise<ReviewerReplayOutcome> {
     const deps = this.dependencies.resume;
+    const newContractEpoch = options.newContractEpoch === true;
+    if (
+      newContractEpoch &&
+      options.expectContractVersion !== currentReviewerReportContractBinding.version
+    ) {
+      return { state: "blocked", jobId, reason: "contract_version_mismatch" };
+    }
+    if (newContractEpoch && !currentContractGoldenIsValid()) {
+      return { state: "blocked", jobId, reason: "contract_digest_mismatch" };
+    }
     const loaded = await deps.progress.load(jobId);
     if (!loaded.ok || loaded.value === undefined) {
       return {
@@ -465,7 +577,32 @@ export class ReviewerReplayCoordinator {
       ) {
         return { state: "blocked", jobId, reason: "identity_mismatch" };
       }
+      if (newContractEpoch) {
+        const candidate = contractEpochCheckpoint(record, inspected);
+        if (!candidate.ok) {
+          return { state: "blocked", jobId, reason: candidate.reason };
+        }
+        return {
+          state: "ready",
+          jobId,
+          identityDigest: candidate.checkpoint.identityDigest,
+          providerAttemptsUsed: 0,
+          providerAttemptsRemaining: maximumReplayAttempts,
+          plannedMutations: Object.freeze([
+            "archive-reviewer-replay-epoch",
+            "create-reviewer-contract-epoch",
+            "provider-attempt",
+            "review-success-checkpoint",
+            "review-status",
+            "auto-merge-gate",
+            "lifecycle",
+            "job-completion",
+            "claim-release",
+          ]),
+        };
+      }
       const used = record.reviewerReplay?.counters.providerAttempts ?? 0;
+      const requiredProviderInvocations = requiredReviewerRoles(inspected.request).length;
       if (record.reviewerReplay?.state === "attempting" && used >= maximumReplayAttempts) {
         return {
           state: "blocked",
@@ -474,6 +611,18 @@ export class ReviewerReplayCoordinator {
           providerAttempts: used,
           formatFailures: record.reviewerReplay.counters.formatFailures,
           transportFailures: record.reviewerReplay.counters.transportFailures,
+        };
+      }
+      if (
+        record.reviewerReplay?.state !== "review_succeeded" &&
+        (requiredProviderInvocations === 0 ||
+          used + requiredProviderInvocations > maximumReplayAttempts)
+      ) {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "provider_budget_insufficient",
+          providerAttempts: used,
         };
       }
       return {
@@ -517,6 +666,9 @@ export class ReviewerReplayCoordinator {
         return { state: "blocked", jobId, reason: claimUnderLease };
       }
       const existingCheckpoint = record.reviewerReplay;
+      if (newContractEpoch && existingCheckpoint?.state === "review_succeeded") {
+        return { state: "blocked", jobId, reason: "contract_epoch_not_allowed" };
+      }
       if (
         isReviewerReplayCheckpointReconcilable(record) &&
         existingCheckpoint?.state === "review_succeeded"
@@ -532,9 +684,48 @@ export class ReviewerReplayCoordinator {
         };
       }
 
+      let createContractEpoch = newContractEpoch;
       while (!beat.signal.aborted) {
-        const inspected = await inspectReplay(record, guardedDeps, beat.signal);
+        let inspected = await inspectReplay(record, guardedDeps, beat.signal);
         if (replayBlocked(inspected)) return inspected;
+        if (
+          record.reviewerReplay !== undefined &&
+          !replayIdentityMatches(record.reviewerReplay, inspected.replayIdentity)
+        ) {
+          return { state: "blocked", jobId, reason: "identity_mismatch" };
+        }
+        if (createContractEpoch) {
+          const candidate = contractEpochCheckpoint(record, inspected);
+          if (!candidate.ok || record.reviewerReplay === undefined) {
+            return {
+              state: "blocked",
+              jobId,
+              reason: candidate.ok ? "contract_epoch_not_allowed" : candidate.reason,
+            };
+          }
+          const archived = await guardedDeps.progress.compareAndSwap(
+            jobId,
+            record.revision,
+            {
+              ...mutationFrom(record),
+              previousReviewerReplay: record.reviewerReplay,
+              reviewerReplay: candidate.checkpoint,
+            },
+            { signal: beat.signal },
+          );
+          if (!archived.ok) {
+            return {
+              state: "blocked",
+              jobId,
+              reason: "checkpoint_write_failed",
+              errorCode: archived.error.code,
+            };
+          }
+          record = archived.value;
+          createContractEpoch = false;
+          inspected = await inspectReplay(record, guardedDeps, beat.signal);
+          if (replayBlocked(inspected)) return inspected;
+        }
         let replay = record.reviewerReplay;
         if (replay === undefined) {
           const initialized = await guardedDeps.progress.compareAndSwap(
@@ -589,10 +780,25 @@ export class ReviewerReplayCoordinator {
             transportFailures: replay.counters.transportFailures,
           };
         }
+        const requiredProviderInvocations = requiredReviewerRoles(inspected.request).length;
+        if (
+          requiredProviderInvocations === 0 ||
+          replay.counters.providerAttempts + requiredProviderInvocations > maximumReplayAttempts
+        ) {
+          return {
+            state: "blocked",
+            jobId,
+            reason: "provider_budget_insufficient",
+            providerAttempts: replay.counters.providerAttempts,
+          };
+        }
         const attempt = replay.counters.providerAttempts + 1;
         const attempting: Extract<ReviewerReplayCheckpoint, { state: "attempting" }> = {
           ...replay,
-          counters: { ...replay.counters, providerAttempts: attempt },
+          counters: {
+            ...replay.counters,
+            providerAttempts: replay.counters.providerAttempts + requiredProviderInvocations,
+          },
         };
         const reserved = await guardedDeps.progress.compareAndSwap(
           jobId,
@@ -626,7 +832,11 @@ export class ReviewerReplayCoordinator {
           if (currentReplay?.state !== "attempting") {
             return { state: "blocked", jobId, reason: "checkpoint_write_failed" };
           }
-          const approvedIdentity = createReviewerReplayIdentity(record, reviewOutcome.identity);
+          const approvedIdentity = createReviewerReplayIdentityForCheckpoint(
+            record,
+            reviewOutcome.identity,
+            currentReplay,
+          );
           if (
             !approvedIdentity.ok ||
             !replayIdentityMatches(currentReplay, approvedIdentity.value) ||
@@ -695,6 +905,7 @@ export class ReviewerReplayCoordinator {
               category,
               diagnostics: [...(reviewOutcome.diagnostics ?? [])],
             },
+            { epochScoped: currentReplay.identity.schemaVersion === 2 },
           );
           if (!diagnostic.ok) {
             return {
@@ -726,6 +937,7 @@ export class ReviewerReplayCoordinator {
               errorCode: reviewOutcome.error.code,
               diagnostics: [],
             },
+            { epochScoped: currentReplay.identity.schemaVersion === 2 },
           );
           if (!diagnostic.ok) {
             return {

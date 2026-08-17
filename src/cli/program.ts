@@ -77,7 +77,12 @@ export interface CliHandlers {
     input: Readonly<{ jobId: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplay: (
-    input: Readonly<{ jobId: string; dryRun?: boolean }>,
+    input: Readonly<{
+      jobId: string;
+      dryRun?: boolean;
+      newContractEpoch?: boolean;
+      expectContractVersion?: number;
+    }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplayPolicy: (
     input: Readonly<{ projectId: string; enabled: boolean }>,
@@ -342,13 +347,28 @@ export function createProgram(
     )
     .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
     .option("--dry-run", "只做 admission、權威 read-back、identity 與預計 mutation 檢查")
-    .action((options: { readonly job: string; readonly dryRun?: boolean }) =>
-      action(state, io, () =>
-        handlers.dispatchReviewerReplay({
-          jobId: options.job,
-          ...(options.dryRun === true ? { dryRun: true } : {}),
-        }),
-      )(),
+    .option("--new-contract-epoch", "顯式封存已耗盡 epoch 並建立一次 contract 修正版 epoch")
+    .option(
+      "--expect-contract-version <version>",
+      "建立新 epoch 時操作者預期的 committed reviewer contract version",
+    )
+    .action(
+      (options: {
+        readonly job: string;
+        readonly dryRun?: boolean;
+        readonly newContractEpoch?: boolean;
+        readonly expectContractVersion?: string;
+      }) =>
+        action(state, io, () =>
+          handlers.dispatchReviewerReplay({
+            jobId: options.job,
+            ...(options.dryRun === true ? { dryRun: true } : {}),
+            ...(options.newContractEpoch === true ? { newContractEpoch: true } : {}),
+            ...(options.expectContractVersion === undefined
+              ? {}
+              : { expectContractVersion: Number(options.expectContractVersion) }),
+          }),
+        )(),
     );
 
   dispatch

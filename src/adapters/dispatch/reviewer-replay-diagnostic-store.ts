@@ -71,27 +71,26 @@ export class FileReviewerReplayDiagnosticStore {
     this.#clock = clock;
   }
 
-  #path(jobId: string): string {
-    return join(this.#directory, `${jobId}.json`);
+  #path(jobId: string, identityDigest: string, epochScoped: boolean): string {
+    return join(this.#directory, epochScoped ? `${jobId}.${identityDigest}.json` : `${jobId}.json`);
   }
 
   async append(
     jobId: string,
     identityDigest: string,
     entry: Omit<ReviewerReplayDiagnosticEntry, "recordedAt">,
+    options: Readonly<{ epochScoped?: boolean }> = {},
   ): Promise<Result<void, DomainError>> {
     if (!jobIdSchema.safeParse(jobId).success || !digestSchema.safeParse(identityDigest).success) {
       return err(domainError("invariant_violation"));
     }
+    const path = this.#path(jobId, identityDigest, options.epochScoped === true);
     const lock = await acquireRecoverableFileLock(
-      `${this.#path(jobId)}.lock`,
+      `${path}.lock`,
       `reviewer-replay-diagnostic:${String(process.pid)}:${randomUUID()}`,
     );
     if (!lock.ok) return lock;
-    const current = await readJsonWithSchema(
-      this.#path(jobId),
-      reviewerReplayDiagnosticRecordSchema,
-    );
+    const current = await readJsonWithSchema(path, reviewerReplayDiagnosticRecordSchema);
     const normalized = !current.ok && current.error.code === "not_found" ? ok(undefined) : current;
     let result: Result<void, DomainError>;
     if (!normalized.ok) {
@@ -117,7 +116,7 @@ export class FileReviewerReplayDiagnosticStore {
       } else {
         const written = await writeJsonWithSchema(
           this.#store,
-          this.#path(jobId),
+          path,
           reviewerReplayDiagnosticRecordSchema,
           candidate.data,
           { visibility: "private" },
