@@ -6,5 +6,6 @@ export * from "./operator-canary-attestation.js";
 export * from "./quota-composition.js";
 export * from "./reviewer-replay-handlers.js";
 export * from "./reviewer-replay-coordinator.js";
+export * from "./reviewer-facade.js";
 export * from "./resolve-handlers.js";
 export * from "./routing-config-store.js";

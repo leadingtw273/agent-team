@@ -24,6 +24,7 @@ import { resolveAuthoritativeBaseRevision } from "./authoritative-base.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
 import { join } from "node:path";
+import { createLazyReviewerFacade } from "./reviewer-facade.js";
 
 export type ResumeExistingProjectJobsResult =
   | Readonly<{ state: "none" }>
@@ -222,14 +223,7 @@ export async function resumeExistingProjectJobs(
         trustedConfig: options.ready.trustedConfig,
         ciRecovery: { run: (...args) => prepared().ciRecovery.run(...args) },
         reviewerRecovery: { run: (...args) => prepared().reviewerRecovery.run(...args) },
-        reviewer: {
-          run: (...args) => prepared().reviewer.run(...args),
-          inspect: (...args) => {
-            const inspect = prepared().reviewer.inspect;
-            if (inspect === undefined) throw new Error("reviewer_inspect_not_prepared");
-            return inspect(...args);
-          },
-        },
+        reviewer: createLazyReviewerFacade(() => prepared().reviewer),
         reviewerReplayPolicy,
         reviewStatus: {
           begin: (...args) => prepared().reviewStatus.begin(...args),
