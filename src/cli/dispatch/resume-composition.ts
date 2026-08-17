@@ -61,6 +61,7 @@ import {
 import {
   createRequirementSnapshot,
   headShaSchema,
+  sha256Digest,
   type HeadSha,
 } from "../../domain/review/index.js";
 import { checkpointIdSchema, type VisualManifest } from "../../domain/checkpoint/index.js";
@@ -86,6 +87,7 @@ import {
   type RequiresManualStallTiming,
 } from "../../adapters/dispatch/job-progress-store.js";
 import { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
+import type { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
 import type { AuthoritativeBaseFailure, AuthoritativeBaseRevision } from "./authoritative-base.js";
 import {
   FileIssueAdmissionStore,
@@ -101,6 +103,11 @@ import { Redactor } from "../../infrastructure/redaction/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 import type { ReviewerWaitPublicationPort } from "./reviewer-wait-publication.js";
+import {
+  createReviewerReplayIdentity,
+  replayIdentityMatches,
+  reviewerReportMatchesIdentity,
+} from "./reviewer-replay-identity.js";
 
 /** The engine's own `JobRepository` interface only declares `create` -- this module also needs
  * `readAll` (find the job by id) and `update` (C015c item 1's addition to `FileJobRepository`,
@@ -364,7 +371,10 @@ export interface ResumeCycleDependencies {
   readonly trustedConfig: TrustedProjectConfig;
   readonly ciRecovery: Pick<CiRecoveryPipeline, "run">;
   readonly reviewerRecovery: Pick<ReviewerRecoveryPipeline, "run">;
-  readonly reviewer: Pick<ReviewerPipeline, "run">;
+  readonly reviewer: Pick<ReviewerPipeline, "run"> & Partial<Pick<ReviewerPipeline, "inspect">>;
+  /** Required only for a reviewer-replay success checkpoint. Missing/disabled fails that exact
+   * checkpoint closed without making any external mutation. */
+  readonly reviewerReplayPolicy?: Pick<FileReviewerReplayPolicyStore, "load">;
   /** E102-3: builds the `VisualManifest` + `visual_artifact` evidence a `visual_review`/
    * `dual_review` job's `reviewer.run()` call requires (see `resumeReview`'s own use, below) --
    * see visual-evidence-builder.ts's own header for the full data flow. Optional (unlike every
@@ -572,8 +582,56 @@ function isReviewReuseReconcilable(record: JobProgressRecord): boolean {
   );
 }
 
+/** Scheduler/reconcile bridge for one exact recovery class. The successful checkpoint is the
+ * sole authority to skip provider execution; a bare historical requires_manual record remains
+ * ineligible and can only be started by the dedicated CLI. */
+export function isReviewerReplayCheckpointReconcilable(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "review_report_contract" &&
+    hasReviewerReplaySuccessCheckpoint(record)
+  );
+}
+
+/** Any persisted replay approval remains governed by the project kill switch, even after the
+ * ordinary merge pipeline advances the stage away from the original requires-manual cause. */
+export function hasReviewerReplaySuccessCheckpoint(record: JobProgressRecord): boolean {
+  return record.reviewerReplay?.state === "review_succeeded";
+}
+
+async function reviewerReplayPolicyBlock(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<ResumeJobOutcome | undefined> {
+  if (!hasReviewerReplaySuccessCheckpoint(record)) return undefined;
+  const reviewerReplayPolicy = deps.reviewerReplayPolicy;
+  if (reviewerReplayPolicy === undefined) {
+    return {
+      jobId: record.jobId,
+      outcome: "requires_manual",
+      reason: "reviewer_replay_disabled",
+    };
+  }
+  const policy = await whileResumeLeaseHeld(deps, () =>
+    reviewerReplayPolicy.load(record.projectId),
+  );
+  if (!policy.ok || policy.value?.enabled !== true) {
+    return {
+      jobId: record.jobId,
+      outcome: "requires_manual",
+      reason: !policy.ok ? "reviewer_replay_policy_unavailable" : "reviewer_replay_disabled",
+    };
+  }
+  return undefined;
+}
+
 function isPipelineResumable(record: JobProgressRecord): boolean {
-  return resumableStageKinds.has(record.stage.kind) || isReviewReuseReconcilable(record);
+  return (
+    resumableStageKinds.has(record.stage.kind) ||
+    isReviewReuseReconcilable(record) ||
+    isReviewerReplayCheckpointReconcilable(record)
+  );
 }
 
 /**
@@ -975,6 +1033,8 @@ async function reconcileMergeStateUnderLease(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
 ): Promise<ResumeJobOutcome> {
+  const policyBlock = await reviewerReplayPolicyBlock(record, deps);
+  if (policyBlock !== undefined) return policyBlock;
   const changeRequestId = record.changeRequestId;
   if (changeRequestId === undefined) {
     return {
@@ -1008,12 +1068,26 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
+  const lifecyclePrefix =
+    record.reviewerReplay?.state === "review_succeeded"
+      ? `reviewer-replay:${record.jobId}:${record.reviewerReplay.identityDigest}:lifecycle`
+      : `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`;
   const lifecycleOutcome = await whileResumeLeaseHeld(deps, () =>
     deps.lifecycle.run({
       project: deps.project,
       externalIssueId: record.externalIssueId,
       changeRequestId,
-      idempotencyKeyPrefix: `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`,
+      idempotencyKeyPrefix: lifecyclePrefix,
+      ...(record.reviewerReplay?.state !== "review_succeeded"
+        ? {}
+        : {
+            reviewerReplayAudit: {
+              operation: "reviewer-replay" as const,
+              checkpointDigest: record.reviewerReplay.checkpointDigest,
+              attemptTotal: record.reviewerReplay.counters.providerAttempts,
+              outcome: "review_succeeded" as const,
+            },
+          }),
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
       cancellationRaceAudit: {
         observedAt: deps.clock.now(),
@@ -1316,10 +1390,12 @@ function legacyBaseRevisionEvidence(snapshot: ChangeRequestSnapshot): MergeReadb
   });
 }
 
-async function resumeUnderLease(
+export async function resumeUnderLease(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
 ): Promise<ResumeJobOutcome> {
+  const policyBlock = await reviewerReplayPolicyBlock(record, deps);
+  if (policyBlock !== undefined) return policyBlock;
   const assignments = record.providerAssignments;
   if (assignments === undefined) {
     return requiresManual(
@@ -1526,7 +1602,10 @@ async function resumeUnderLease(
     branch: record.branch,
     headSha: currentChangeRequest.value.headSha,
   };
-  const idempotencyKeyPrefix = `cli-dispatch-resume:${record.jobId}:${String(record.revision)}`;
+  const idempotencyKeyPrefix =
+    record.reviewerReplay?.state === "review_succeeded"
+      ? `reviewer-replay:${record.jobId}:${record.reviewerReplay.identityDigest}`
+      : `cli-dispatch-resume:${record.jobId}:${String(record.revision)}`;
 
   // C031: a non-draft PR has already had `ReviewerPipeline.run()` call
   // `markChangeRequestReady()` (reviewer.ts) at least once. `CiRecoveryPipeline.run()`'s own
@@ -1909,25 +1988,42 @@ async function resumeReview(
     );
   }
   const expectedHeadSha = context.changeRequest.headSha;
-  const begin = await whileResumeLeaseHeld(deps, () =>
-    deps.reviewStatus.begin({
-      project: deps.project,
-      changeRequestId: context.changeRequestId,
-      expectedHeadSha,
-      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
-      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
-    }),
-  );
-  if (begin.state === "failed") {
-    return requiresManualUnlessRetryable(
-      record,
-      deps,
-      "review_begin_failed",
-      begin.error,
-      requiresManualCause("review", "review_begin_failed"),
+  const reviewerReplayCheckpoint =
+    record.reviewerReplay?.state === "review_succeeded" ? record.reviewerReplay : undefined;
+  const beginReview = async (): Promise<ResumeJobOutcome | undefined> => {
+    const begin = await whileResumeLeaseHeld(deps, () =>
+      deps.reviewStatus.begin({
+        project: deps.project,
+        changeRequestId: context.changeRequestId,
+        expectedHeadSha,
+        idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review-begin`,
+        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+      }),
     );
-  }
-  if (begin.state === "not_ready") {
+    if (begin.state === "failed") {
+      if (reviewerReplayCheckpoint !== undefined) {
+        return {
+          jobId: record.jobId,
+          outcome: "requires_manual",
+          reason: `reviewer_replay_review_begin_failed:${begin.error.code}`,
+        };
+      }
+      return requiresManualUnlessRetryable(
+        record,
+        deps,
+        "review_begin_failed",
+        begin.error,
+        requiresManualCause("review", "review_begin_failed"),
+      );
+    }
+    if (begin.state !== "not_ready") return undefined;
+    if (reviewerReplayCheckpoint !== undefined) {
+      return {
+        jobId: record.jobId,
+        outcome: "requires_manual",
+        reason: `reviewer_replay_${begin.reason}`,
+      };
+    }
     // C031: `begin.reason` is `"ci_pending" | "ci_failed"` (BeginReviewOutcome, merge-gate-model.ts)
     // -- a draft PR's CI failure still retreats to `ci_waiting` (a fresh `agent-team run` resume
     // will drive it back through `CiRecoveryPipeline`, exactly as before this ticket). A *non-draft*
@@ -1947,6 +2043,10 @@ async function resumeReview(
       jobId: record.jobId,
       outcome: "still_ci_waiting",
     }));
+  };
+  if (reviewerReplayCheckpoint === undefined) {
+    const halted = await beginReview();
+    if (halted !== undefined) return halted;
   }
   // `already_approved` intentionally falls through to the same fresh Reviewer path as `pending`.
   // Its successful status proves only that this head was reviewed before; it is not a
@@ -1999,8 +2099,9 @@ async function resumeReview(
   if (needsVisualReview) {
     if (
       deps.visualEvidence === undefined ||
-      deps.visualReviewModel === undefined ||
-      deps.trustedConfig.commands.visualReview.length === 0
+      (reviewerReplayCheckpoint === undefined &&
+        (deps.visualReviewModel === undefined ||
+          deps.trustedConfig.commands.visualReview.length === 0))
     ) {
       return requiresManual(
         record,
@@ -2011,15 +2112,22 @@ async function resumeReview(
     }
     const visualEvidencePort = deps.visualEvidence;
     const built = await whileResumeLeaseHeld(deps, () =>
-      visualEvidencePort.build({
-        worktreePath: context.worktree.path,
-        issueId: context.requirementSnapshot.issue.id,
-        headSha: expectedHeadSha,
-        commands: deps.trustedConfig.commands.visualReview,
-        allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
-        deadlineAt: reviewDeadline,
-        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
-      }),
+      reviewerReplayCheckpoint === undefined
+        ? visualEvidencePort.build({
+            worktreePath: context.worktree.path,
+            issueId: context.requirementSnapshot.issue.id,
+            headSha: expectedHeadSha,
+            commands: deps.trustedConfig.commands.visualReview,
+            allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+            deadlineAt: reviewDeadline,
+            ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+          })
+        : visualEvidencePort.verifyExisting({
+            worktreePath: context.worktree.path,
+            issueId: context.requirementSnapshot.issue.id,
+            headSha: expectedHeadSha,
+            allowedAcceptanceCriteria: context.requirementSnapshot.issue.acceptanceCriteria ?? [],
+          }),
     );
     if (!built.ok) {
       return requiresManual(
@@ -2031,91 +2139,179 @@ async function resumeReview(
     }
     visualEvidence = built.value;
 
-    // E102-5: the manifest + PNG evidence `built` just produced must reach Linear -- with a
-    // durable, reusable receipt -- before the reviewer is ever allowed to start. Any failure here
-    // (composition-root gap, a stale/mismatched receipt, or the upload/comment call itself failing)
-    // fails this job closed to `requires_manual`, never letting `reviewer.run()` proceed on
-    // evidence nobody outside this process can see. See linear-publication.ts's own header for why
-    // an "orphan" (a Linear-side asset/comment already created, but no durable receipt for it)
-    // gets a distinct reasonCode from every other publication failure.
-    if (deps.linearPublication === undefined) {
-      return requiresManual(
-        record,
-        deps,
-        "linear_publication_unavailable",
-        requiresManualCause("review", "visual_publication_failed"),
-      );
-    }
-    const linearPublication = deps.linearPublication;
-    const publishedVisualEvidence = visualEvidence;
-    const publicationContext = await whileResumeLeaseHeld(deps, () =>
-      deps.readModel.readContext(
-        deps.teamId,
-        deps.linearProjectId,
-        deps.signal === undefined ? {} : { signal: deps.signal },
-      ),
-    );
-    if (!publicationContext.ok) {
-      return requiresManualUnlessRetryable(
-        record,
-        deps,
-        "linear_publication_context_unavailable",
-        publicationContext.error,
-        requiresManualCause("review", "visual_publication_failed"),
-      );
-    }
-    const published = await whileResumeLeaseHeld(deps, () =>
-      linearPublication.publish({
-        context: publicationContext.value,
-        projectId: deps.project.id,
-        issueId: context.requirementSnapshot.issue.id,
-        externalIssueId: record.externalIssueId,
-        worktreePath: context.worktree.path,
-        visualManifest: publishedVisualEvidence.visualManifest,
-        ...(deps.signal === undefined ? {} : { signal: deps.signal }),
-      }),
-    );
-    if (!published.ok) {
-      return requiresManual(
-        record,
-        deps,
-        `linear_publication_failed:${published.failure.reason}`,
-        requiresManualCause(
-          "review",
-          published.failure.orphan ? "visual_publication_orphan" : "visual_publication_failed",
+    if (reviewerReplayCheckpoint !== undefined) {
+      const linearPublicationStore = deps.linearPublicationStore;
+      if (linearPublicationStore === undefined) {
+        return {
+          jobId: record.jobId,
+          outcome: "requires_manual",
+          reason: "reviewer_replay_publication_unavailable",
+        };
+      }
+      const receipt = await whileResumeLeaseHeld(deps, () =>
+        linearPublicationStore.load(
+          deps.project.id,
+          context.requirementSnapshot.issue.id,
+          expectedHeadSha,
         ),
       );
+      if (!receipt.ok || receipt.value === undefined) {
+        return {
+          jobId: record.jobId,
+          outcome: "requires_manual",
+          reason: "reviewer_replay_publication_unavailable",
+        };
+      }
+      publicationDigest = aggregateLinearPublicationDigest([receipt.value]);
+    } else {
+      // E102-5: the manifest + PNG evidence `built` just produced must reach Linear -- with a
+      // durable, reusable receipt -- before the reviewer is ever allowed to start. Any failure here
+      // (composition-root gap, a stale/mismatched receipt, or the upload/comment call itself failing)
+      // fails this job closed to `requires_manual`, never letting `reviewer.run()` proceed on
+      // evidence nobody outside this process can see. See linear-publication.ts's own header for why
+      // an "orphan" (a Linear-side asset/comment already created, but no durable receipt for it)
+      // gets a distinct reasonCode from every other publication failure.
+      if (deps.linearPublication === undefined) {
+        return requiresManual(
+          record,
+          deps,
+          "linear_publication_unavailable",
+          requiresManualCause("review", "visual_publication_failed"),
+        );
+      }
+      const linearPublication = deps.linearPublication;
+      const publishedVisualEvidence = visualEvidence;
+      const publicationContext = await whileResumeLeaseHeld(deps, () =>
+        deps.readModel.readContext(
+          deps.teamId,
+          deps.linearProjectId,
+          deps.signal === undefined ? {} : { signal: deps.signal },
+        ),
+      );
+      if (!publicationContext.ok) {
+        return requiresManualUnlessRetryable(
+          record,
+          deps,
+          "linear_publication_context_unavailable",
+          publicationContext.error,
+          requiresManualCause("review", "visual_publication_failed"),
+        );
+      }
+      const published = await whileResumeLeaseHeld(deps, () =>
+        linearPublication.publish({
+          context: publicationContext.value,
+          projectId: deps.project.id,
+          issueId: context.requirementSnapshot.issue.id,
+          externalIssueId: record.externalIssueId,
+          worktreePath: context.worktree.path,
+          visualManifest: publishedVisualEvidence.visualManifest,
+          ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+        }),
+      );
+      if (!published.ok) {
+        return requiresManual(
+          record,
+          deps,
+          `linear_publication_failed:${published.failure.reason}`,
+          requiresManualCause(
+            "review",
+            published.failure.orphan ? "visual_publication_orphan" : "visual_publication_failed",
+          ),
+        );
+      }
+      publicationDigest = aggregateLinearPublicationDigest([published.value.receipt]);
     }
-    publicationDigest = aggregateLinearPublicationDigest([published.value.receipt]);
   }
 
-  const reviewOutcome = await whileResumeLeaseHeld(deps, () =>
-    deps.reviewer.run({
-      job: context.job,
-      project: deps.project,
-      trustedConfig: deps.trustedConfig,
-      requirementSnapshot: context.requirementSnapshot,
-      worktree: context.worktree,
-      changeRequestId: context.changeRequestId,
-      baseRevision: context.baseRevision,
-      expectedHeadSha,
-      models: {
-        ...(needsCodeReview ? { code: assignments.codeReview.model } : {}),
-        // Guarded above: `needsVisualReview` only ever reaches here once `deps.visualReviewModel`
-        // has already been confirmed defined (E102-2's real `gemini.models`-sourced value, never
-        // this job's own Claude `record.model` -- a Gemini `GeminiRunner` would reject that model
-        // string outright, see gemini-factory.ts/reviewer-composition.ts's own headers).
-        ...(needsVisualReview ? { visual: deps.visualReviewModel } : {}),
-      },
-      evidence: visualEvidence?.evidence ?? Object.freeze([]),
-      ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
-      ...(publicationDigest === undefined ? {} : { publicationDigest }),
-      deadlineAt: reviewDeadline,
-      idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
-      ...(deps.signal === undefined ? {} : { signal: deps.signal }),
-      ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
-    }),
-  );
+  const reviewerRequest: Parameters<ReviewerPipeline["run"]>[0] = {
+    job: context.job,
+    project: deps.project,
+    trustedConfig: deps.trustedConfig,
+    requirementSnapshot: context.requirementSnapshot,
+    worktree: context.worktree,
+    changeRequestId: context.changeRequestId,
+    baseRevision: context.baseRevision,
+    expectedHeadSha,
+    models: {
+      ...(needsCodeReview ? { code: assignments.codeReview.model } : {}),
+      ...(needsVisualReview && deps.visualReviewModel !== undefined
+        ? { visual: deps.visualReviewModel }
+        : {}),
+    },
+    evidence: visualEvidence?.evidence ?? Object.freeze([]),
+    ...(visualEvidence === undefined ? {} : { visualManifest: visualEvidence.visualManifest }),
+    ...(publicationDigest === undefined ? {} : { publicationDigest }),
+    deadlineAt: reviewDeadline,
+    idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
+    ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+    ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
+  };
+
+  let reviewOutcome: ReviewerPipelineOutcome;
+  if (reviewerReplayCheckpoint === undefined) {
+    reviewOutcome = await whileResumeLeaseHeld(deps, () => deps.reviewer.run(reviewerRequest));
+  } else {
+    const inspect = deps.reviewer.inspect;
+    if (inspect === undefined) {
+      return {
+        jobId: record.jobId,
+        outcome: "requires_manual",
+        reason: "reviewer_replay_inspect_unavailable",
+      };
+    }
+    const inspected = await whileResumeLeaseHeld(deps, () => inspect(reviewerRequest));
+    if (inspected.state !== "ready") {
+      return {
+        jobId: record.jobId,
+        outcome: "requires_manual",
+        reason:
+          inspected.state === "not_ready"
+            ? `reviewer_replay_${inspected.reason}`
+            : `reviewer_replay_identity_read_failed:${inspected.stage}:${inspected.error.code}`,
+      };
+    }
+    const replayIdentity = createReviewerReplayIdentity(record, inspected.identity);
+    const reportDigests = reviewerReplayCheckpoint.reports.map((report) => sha256Digest(report));
+    const expectedCheckpointDigest = sha256Digest({
+      schemaVersion: 1,
+      operation: "reviewer-replay",
+      identityDigest: reviewerReplayCheckpoint.identityDigest,
+      counters: reviewerReplayCheckpoint.counters,
+      reportDigests: reviewerReplayCheckpoint.reportDigests,
+      outcome: "review_succeeded",
+    });
+    if (
+      !replayIdentity.ok ||
+      !replayIdentityMatches(reviewerReplayCheckpoint, replayIdentity.value) ||
+      reportDigests.some((digest) => !digest.ok) ||
+      reportDigests.some(
+        (digest, index) =>
+          digest.ok && digest.value !== reviewerReplayCheckpoint.reportDigests[index],
+      ) ||
+      !expectedCheckpointDigest.ok ||
+      expectedCheckpointDigest.value !== reviewerReplayCheckpoint.checkpointDigest ||
+      reviewerReplayCheckpoint.reports.some(
+        (report) =>
+          report.verdict !== "passed" || !reviewerReportMatchesIdentity(report, inspected.identity),
+      )
+    ) {
+      return {
+        jobId: record.jobId,
+        outcome: "requires_manual",
+        reason: "reviewer_replay_identity_mismatch",
+      };
+    }
+    const halted = await beginReview();
+    if (halted !== undefined) return halted;
+    reviewOutcome = Object.freeze({
+      state: "approved" as const,
+      job: inspected.job,
+      changeRequest: inspected.changeRequest,
+      checks: inspected.checks,
+      identity: inspected.identity,
+      reports: reviewerReplayCheckpoint.reports,
+    });
+  }
 
   switch (reviewOutcome.state) {
     case "not_ready": {
@@ -2632,13 +2828,27 @@ async function finishMerged(
   authorizedHeadSha: string | undefined,
   mergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
+  const lifecyclePrefix =
+    record.reviewerReplay?.state === "review_succeeded"
+      ? `reviewer-replay:${record.jobId}:${record.reviewerReplay.identityDigest}:lifecycle`
+      : `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`;
   const outcome = await whileResumeLeaseHeld(deps, () =>
     deps.lifecycle.run({
       project: deps.project,
       externalIssueId: record.externalIssueId,
       changeRequestId,
       ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
-      idempotencyKeyPrefix: `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`,
+      idempotencyKeyPrefix: lifecyclePrefix,
+      ...(record.reviewerReplay?.state !== "review_succeeded"
+        ? {}
+        : {
+            reviewerReplayAudit: {
+              operation: "reviewer-replay" as const,
+              checkpointDigest: record.reviewerReplay.checkpointDigest,
+              attemptTotal: record.reviewerReplay.counters.providerAttempts,
+              outcome: "review_succeeded" as const,
+            },
+          }),
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
       cancellationRaceAudit: {
         observedAt: deps.clock.now(),

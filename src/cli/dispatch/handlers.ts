@@ -85,6 +85,7 @@ import { createDispatchResolveHandler } from "./resolve-handlers.js";
 import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers.js";
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
 import { createReviewerResumeHandler } from "./reviewer-resume-handlers.js";
+import { createReviewerReplayHandlers } from "./reviewer-replay-handlers.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { resumeExistingProjectJobs } from "./resume-existing.js";
 import { createQuotaProbeStatusHandler } from "../quota/index.js";
@@ -283,6 +284,8 @@ type DispatchHandlers = Pick<
   | "dispatchResolveLegacyClaim"
   | "dispatchAutoMergeResume"
   | "dispatchReviewerResume"
+  | "dispatchReviewerReplay"
+  | "dispatchReviewerReplayPolicy"
   | "quota"
 >;
 
@@ -491,12 +494,20 @@ export function createDispatchCliHandlers(
     progress: buildJobProgressStore(options.agentTeamHome),
     clock,
   });
+  const reviewerReplayHandlers = createReviewerReplayHandlers({
+    agentTeamHome: options.agentTeamHome,
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
+    clock,
+    generateHolderId,
+  });
 
   return Object.freeze({
     dispatchResolve,
     dispatchResolveLegacyClaim,
     dispatchAutoMergeResume,
     dispatchReviewerResume,
+    dispatchReviewerReplay: reviewerReplayHandlers.reviewerReplay,
+    dispatchReviewerReplayPolicy: reviewerReplayHandlers.reviewerReplayPolicy,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {

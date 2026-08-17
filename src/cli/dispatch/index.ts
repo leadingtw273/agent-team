@@ -4,5 +4,7 @@ export * from "./ephemeral-ports.js";
 export * from "./handlers.js";
 export * from "./operator-canary-attestation.js";
 export * from "./quota-composition.js";
+export * from "./reviewer-replay-handlers.js";
+export * from "./reviewer-replay-coordinator.js";
 export * from "./resolve-handlers.js";
 export * from "./routing-config-store.js";

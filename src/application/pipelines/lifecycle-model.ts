@@ -125,6 +125,14 @@ export interface LifecyclePipelineRequest {
     /** Actual GitHub mutation receipt, when this controller can prove one. */
     mergeMutations?: readonly MergeMutationReceipt[];
   }>;
+  /** Durable reviewer-replay provenance appended to the existing lifecycle comment; never emits
+   * a second success comment. */
+  readonly reviewerReplayAudit?: Readonly<{
+    operation: "reviewer-replay";
+    checkpointDigest: string;
+    attemptTotal: number;
+    outcome: "review_succeeded";
+  }>;
   readonly signal?: AbortSignal;
 }
 

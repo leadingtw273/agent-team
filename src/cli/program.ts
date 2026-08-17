@@ -76,6 +76,12 @@ export interface CliHandlers {
   readonly dispatchReviewerResume: (
     input: Readonly<{ jobId: string }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchReviewerReplay: (
+    input: Readonly<{ jobId: string; dryRun?: boolean }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly dispatchReviewerReplayPolicy: (
+    input: Readonly<{ projectId: string; enabled: boolean }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -151,6 +157,8 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
   dispatchReviewerResume: () => blocked("dispatch reviewer-resume"),
+  dispatchReviewerReplay: () => blocked("dispatch reviewer-replay"),
+  dispatchReviewerReplayPolicy: () => blocked("dispatch reviewer-replay-policy"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   cycle: () => blocked("cycle"),
@@ -324,6 +332,41 @@ export function createProgram(
     .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
     .action((options: { readonly job: string }) =>
       action(state, io, () => handlers.dispatchReviewerResume({ jobId: options.job }))(),
+    );
+
+  dispatch
+    .command("reviewer-replay")
+    .description(
+      "只針對既有 requires_manual(review_report_contract) Job 重做有界 Reviewer 審查，" +
+        "成功 checkpoint 後接回既有 merge/lifecycle",
+    )
+    .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
+    .option("--dry-run", "只做 admission、權威 read-back、identity 與預計 mutation 檢查")
+    .action((options: { readonly job: string; readonly dryRun?: boolean }) =>
+      action(state, io, () =>
+        handlers.dispatchReviewerReplay({
+          jobId: options.job,
+          ...(options.dryRun === true ? { dryRun: true } : {}),
+        }),
+      )(),
+    );
+
+  dispatch
+    .command("reviewer-replay-policy")
+    .description("以 stdin 確認字串啟用或停用 project-level reviewer-replay kill switch")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .addOption(
+      new Option("--state <state>", "目標狀態")
+        .choices(["enabled", "disabled"])
+        .makeOptionMandatory(),
+    )
+    .action((options: { readonly project: string; readonly state: "enabled" | "disabled" }) =>
+      action(state, io, () =>
+        handlers.dispatchReviewerReplayPolicy({
+          projectId: options.project,
+          enabled: options.state === "enabled",
+        }),
+      )(),
     );
 
   dispatch

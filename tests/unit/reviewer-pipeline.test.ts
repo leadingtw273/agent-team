@@ -520,6 +520,23 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
 }
 
 describe("ReviewerPipeline", () => {
+  it("reviewer-replay uses its external CAS budget instead of the exhausted historical Job counter", async () => {
+    const input = request(
+      "code_review",
+      { reviewRuns: 3 },
+      { attemptAccounting: "reviewer_replay" },
+    );
+    const setup = fixture(input);
+
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome.state).toBe("approved");
+    expect(setup.calls).toContain("provider:code_reviewer");
+    expect(setup.calls).not.toContain("checkpoint");
+    expect(setup.calls).not.toContain("job:update");
+    expect(outcome.state === "approved" && outcome.job.attempts.reviewRuns).toBe(3);
+  });
+
   it("propagates structured Claude wait evidence while discarding partial reviewer output", async () => {
     const input = request("code_review");
     const setup = fixture(input, {
