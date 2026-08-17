@@ -193,10 +193,7 @@ describe("reviewer-replay production method binding", () => {
   it("represents a missing inspect capability as a fail-closed pipeline result", async () => {
     const request = { job: { id: "job" } } as never;
     await expect(
-      invokeReviewerReplayInspect(
-        { run: () => Promise.reject(new Error("unused")) } as never,
-        request,
-      ),
+      invokeReviewerReplayInspect({ run: () => Promise.reject(new Error("unused")) }, request),
     ).resolves.toMatchObject({
       state: "failed",
       stage: "request",
