@@ -21,6 +21,10 @@ import {
   reviewerReplayCliOutcome,
   reviewerReplayPolicyConfirmationPhrase,
 } from "../../src/cli/dispatch/reviewer-replay-handlers.js";
+import {
+  createLazyReviewerFacade,
+  invokeReviewerReplayInspect,
+} from "../../src/cli/dispatch/reviewer-facade.js";
 import { createReviewerReplaySuccessCheckpoint } from "../../src/cli/dispatch/reviewer-replay-identity.js";
 import { buildJobProgressStore } from "../../src/cli/dispatch/resume-composition.js";
 import { resumeExistingProjectJobs } from "../../src/cli/dispatch/resume-existing.js";
@@ -164,6 +168,38 @@ describe("reviewer-replay CLI outcome", () => {
         false,
       ).state,
     ).toBe("failed");
+  });
+});
+
+describe("reviewer-replay production method binding", () => {
+  it("the shared lazy facade invokes ReviewerPipeline methods through their owning object", async () => {
+    const reviewer = {
+      marker: "bound",
+      run(this: { marker: string }, request: unknown) {
+        if (this.marker !== "bound") throw new Error("run this binding lost");
+        return Promise.resolve(request);
+      },
+      inspect(this: { marker: string }, request: unknown) {
+        if (this.marker !== "bound") throw new Error("inspect this binding lost");
+        return Promise.resolve(request);
+      },
+    };
+    const facade = createLazyReviewerFacade(() => reviewer as never);
+
+    await expect(facade.run("run-request" as never)).resolves.toBe("run-request");
+    await expect(facade.inspect("inspect-request" as never)).resolves.toBe("inspect-request");
+  });
+
+  it("represents a missing inspect capability as a fail-closed pipeline result", async () => {
+    const request = { job: { id: "job" } } as never;
+    await expect(
+      invokeReviewerReplayInspect({ run: () => Promise.reject(new Error("unused")) }, request),
+    ).resolves.toMatchObject({
+      state: "failed",
+      stage: "request",
+      error: { code: "invariant_violation" },
+      job: { id: "job" },
+    });
   });
 });
 

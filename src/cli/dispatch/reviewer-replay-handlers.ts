@@ -29,6 +29,7 @@ import {
   ReviewerReplayCoordinator,
   type ReviewerReplayOutcome,
 } from "./reviewer-replay-coordinator.js";
+import { createLazyReviewerFacade } from "./reviewer-facade.js";
 
 export const reviewerReplayPolicyConfirmationPhrase = "SET REVIEWER REPLAY POLICY" as const;
 
@@ -222,14 +223,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       trustedConfig: built.value.trustedConfig,
       ciRecovery: { run: (...args) => prepared().ciRecovery.run(...args) },
       reviewerRecovery: { run: (...args) => prepared().reviewerRecovery.run(...args) },
-      reviewer: {
-        run: (...args) => prepared().reviewer.run(...args),
-        inspect: (...args) => {
-          const inspect = prepared().reviewer.inspect;
-          if (inspect === undefined) throw new Error("reviewer_inspect_not_prepared");
-          return inspect(...args);
-        },
-      },
+      reviewer: createLazyReviewerFacade(() => prepared().reviewer),
       reviewerReplayPolicy: policy,
       reviewStatus: {
         begin: (...args) => prepared().reviewStatus.begin(...args),
