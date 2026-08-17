@@ -104,7 +104,8 @@ import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 import type { ReviewerWaitPublicationPort } from "./reviewer-wait-publication.js";
 import {
-  createReviewerReplayIdentity,
+  createReviewerReplayIdentityForCheckpoint,
+  createReviewerReplaySuccessCheckpointDigest,
   replayIdentityMatches,
   reviewerReportMatchesIdentity,
 } from "./reviewer-replay-identity.js";
@@ -2270,15 +2271,20 @@ async function resumeReview(
             : `reviewer_replay_identity_read_failed:${inspected.stage}:${inspected.error.code}`,
       };
     }
-    const replayIdentity = createReviewerReplayIdentity(record, inspected.identity);
+    const replayIdentity = createReviewerReplayIdentityForCheckpoint(
+      record,
+      inspected.identity,
+      reviewerReplayCheckpoint,
+    );
     const reportDigests = reviewerReplayCheckpoint.reports.map((report) => sha256Digest(report));
-    const expectedCheckpointDigest = sha256Digest({
-      schemaVersion: 1,
-      operation: "reviewer-replay",
+    const expectedCheckpointDigest = createReviewerReplaySuccessCheckpointDigest({
+      identity: reviewerReplayCheckpoint.identity,
       identityDigest: reviewerReplayCheckpoint.identityDigest,
       counters: reviewerReplayCheckpoint.counters,
+      ...(reviewerReplayCheckpoint.reviewContractBinding === undefined
+        ? {}
+        : { reviewContractBinding: reviewerReplayCheckpoint.reviewContractBinding }),
       reportDigests: reviewerReplayCheckpoint.reportDigests,
-      outcome: "review_succeeded",
     });
     if (
       !replayIdentity.ok ||

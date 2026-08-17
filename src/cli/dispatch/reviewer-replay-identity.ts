@@ -15,6 +15,7 @@ import {
 import type {
   JobProgressRecord,
   ReviewerReplayCheckpoint,
+  ReviewerReplayContractBinding,
   ReviewerReplayIdentity,
 } from "../../adapters/dispatch/job-progress-store.js";
 import { reviewerReplayCheckpointSchema } from "../../adapters/dispatch/job-progress-store.js";
@@ -22,6 +23,9 @@ import { reviewerReplayCheckpointSchema } from "../../adapters/dispatch/job-prog
 export function createReviewerReplayIdentity(
   record: JobProgressRecord,
   review: ReviewIdentity,
+  shape: Readonly<{ schemaVersion: 1 } | { schemaVersion: 2; epochOrdinal: number }> = {
+    schemaVersion: 1,
+  },
 ): Result<
   Readonly<{ identity: ReviewerReplayIdentity; identityDigest: string }>,
   DomainError<"invariant_violation">
@@ -29,8 +33,7 @@ export function createReviewerReplayIdentity(
   if (record.changeRequestId === undefined || record.baseRevision === undefined) {
     return err(domainError("invariant_violation"));
   }
-  const identity: ReviewerReplayIdentity = Object.freeze({
-    schemaVersion: 1,
+  const base = {
     jobId: record.jobId,
     projectId: record.projectId,
     issueId: record.issueId,
@@ -44,9 +47,29 @@ export function createReviewerReplayIdentity(
     ...(review.publicationDigest === undefined
       ? {}
       : { publicationDigest: review.publicationDigest }),
-  });
+  };
+  const identity: ReviewerReplayIdentity = Object.freeze(
+    shape.schemaVersion === 1
+      ? { ...base, schemaVersion: 1 as const }
+      : { ...base, schemaVersion: 2 as const, epochOrdinal: shape.epochOrdinal },
+  );
   const digest = sha256Digest(identity);
   return digest.ok ? ok(Object.freeze({ identity, identityDigest: digest.value })) : digest;
+}
+
+export function createReviewerReplayIdentityForCheckpoint(
+  record: JobProgressRecord,
+  review: ReviewIdentity,
+  checkpoint: ReviewerReplayCheckpoint,
+): ReturnType<typeof createReviewerReplayIdentity> {
+  const identity = checkpoint.identity;
+  return createReviewerReplayIdentity(
+    record,
+    review,
+    identity.schemaVersion === 1
+      ? { schemaVersion: 1 }
+      : { schemaVersion: 2, epochOrdinal: identity.epochOrdinal },
+  );
 }
 
 export function replayIdentityMatches(
@@ -72,6 +95,40 @@ export function reviewerReportMatchesIdentity(
   );
 }
 
+export function createReviewerReplaySuccessCheckpointDigest(
+  input: Readonly<{
+    identity: ReviewerReplayIdentity;
+    identityDigest: string;
+    counters: ReviewerReplayCheckpoint["counters"];
+    reviewContractBinding?: ReviewerReplayContractBinding;
+    reportDigests: readonly string[];
+  }>,
+): Result<string, DomainError<"invariant_violation">> {
+  if ((input.identity.schemaVersion === 2) !== (input.reviewContractBinding !== undefined)) {
+    return err(domainError("invariant_violation"));
+  }
+  return sha256Digest(
+    input.identity.schemaVersion === 1
+      ? {
+          schemaVersion: 1,
+          operation: "reviewer-replay",
+          identityDigest: input.identityDigest,
+          counters: input.counters,
+          reportDigests: input.reportDigests,
+          outcome: "review_succeeded",
+        }
+      : {
+          schemaVersion: 2,
+          operation: "reviewer-replay",
+          identityDigest: input.identityDigest,
+          reviewContractBinding: input.reviewContractBinding,
+          counters: input.counters,
+          reportDigests: input.reportDigests,
+          outcome: "review_succeeded",
+        },
+  );
+}
+
 export function createReviewerReplaySuccessCheckpoint(
   current: Extract<ReviewerReplayCheckpoint, { state: "attempting" }>,
   reports: readonly ReviewerReport[],
@@ -87,13 +144,14 @@ export function createReviewerReplaySuccessCheckpoint(
     if (!digest.ok) return digest;
     reportDigests.push(digest.value);
   }
-  const checkpointDigest = sha256Digest({
-    schemaVersion: 1,
-    operation: "reviewer-replay",
+  const checkpointDigest = createReviewerReplaySuccessCheckpointDigest({
+    identity: current.identity,
     identityDigest: current.identityDigest,
     counters: current.counters,
+    ...(current.reviewContractBinding === undefined
+      ? {}
+      : { reviewContractBinding: current.reviewContractBinding }),
     reportDigests,
-    outcome: "review_succeeded",
   });
   if (!checkpointDigest.ok) return checkpointDigest;
   const parsed = reviewerReplayCheckpointSchema.safeParse({
@@ -101,6 +159,9 @@ export function createReviewerReplaySuccessCheckpoint(
     identity: current.identity,
     identityDigest: current.identityDigest,
     counters: current.counters,
+    ...(current.reviewContractBinding === undefined
+      ? {}
+      : { reviewContractBinding: current.reviewContractBinding }),
     reports: orderedReports,
     reportDigests,
     checkpointDigest: checkpointDigest.value,

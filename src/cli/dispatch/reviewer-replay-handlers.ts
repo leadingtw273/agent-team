@@ -36,6 +36,8 @@ export const reviewerReplayPolicyConfirmationPhrase = "SET REVIEWER REPLAY POLIC
 export interface ReviewerReplayHandlerInput {
   readonly jobId: string;
   readonly dryRun?: boolean;
+  readonly newContractEpoch?: boolean;
+  readonly expectContractVersion?: number;
 }
 
 export interface ReviewerReplayPolicyHandlerInput {
@@ -273,10 +275,31 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
           reason: "job_id_invalid",
         });
       }
+      const hasNewEpoch = input.newContractEpoch === true;
+      const hasExpectedVersion = input.expectContractVersion !== undefined;
+      if (
+        hasNewEpoch !== hasExpectedVersion ||
+        (hasExpectedVersion &&
+          (!Number.isSafeInteger(input.expectContractVersion) ||
+            (input.expectContractVersion ?? 0) < 2))
+      ) {
+        return outcome(input.dryRun === true ? "blocked" : "rejected", {
+          operation: "reviewer-replay",
+          state: input.dryRun === true ? "blocked" : "rejected",
+          dryRun: input.dryRun === true,
+          reason: "contract_epoch_options_invalid",
+        });
+      }
       const coordinator = await buildCoordinator(input.jobId);
       if (!(coordinator instanceof ReviewerReplayCoordinator)) return coordinator;
       const dryRun = input.dryRun === true;
-      return reviewerReplayCliOutcome(await coordinator.run(input.jobId, dryRun), dryRun);
+      return reviewerReplayCliOutcome(
+        await coordinator.run(input.jobId, dryRun, {
+          ...(hasNewEpoch ? { newContractEpoch: true } : {}),
+          ...(hasExpectedVersion ? { expectContractVersion: input.expectContractVersion } : {}),
+        }),
+        dryRun,
+      );
     },
     async reviewerReplayPolicy(input) {
       if (input.projectId.trim().length === 0) {
