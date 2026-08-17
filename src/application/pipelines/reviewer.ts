@@ -9,8 +9,10 @@ import type {
   ReviewEvidenceBlock,
   ReviewerFailureStage,
   ReviewerPipelineOutcome,
+  ReviewerInspectionOutcome,
   ReviewerPipelinePorts,
   ReviewerPipelineRequest,
+  SafeReviewReportDiagnostic,
 } from "./reviewer-model.js";
 import { canonicalVisualManifestInput } from "./reviewer-model.js";
 import {
@@ -38,6 +40,7 @@ function failed(
    * file omits this, so those outcomes are unchanged from before this ticket. */
   extra?: Readonly<{
     reportFailureCategory?: ReportContractFailureCategory;
+    diagnostics?: readonly SafeReviewReportDiagnostic[];
     rejectedOutput?: string;
     reviewWait?: NonNullable<Extract<ReviewerPipelineOutcome, { state: "failed" }>["reviewWait"]>;
   }>,
@@ -45,8 +48,118 @@ function failed(
   return Object.freeze({ state: "failed", stage, error, job, ...extra });
 }
 
+function inspectionFailed(
+  stage: ReviewerFailureStage,
+  error: DomainError,
+  job: Job,
+): Extract<ReviewerInspectionOutcome, { state: "failed" }> {
+  return Object.freeze({ state: "failed", stage, error, job });
+}
+
 export class ReviewerPipeline {
   constructor(readonly ports: ReviewerPipelinePorts) {}
+
+  /** Read-only authoritative inspection used by reviewer-replay dry-run and checkpoint resume.
+   * It intentionally stops before markChangeRequestReady, provider invocation, Job attempt
+   * persistence, review status, or any merge/lifecycle mutation. */
+  async inspect(request: ReviewerPipelineRequest): Promise<ReviewerInspectionOutcome> {
+    if (!validReviewerRequest(request)) {
+      return inspectionFailed("request", domainError("invariant_violation"), request.job);
+    }
+    const reference = { project: request.project, changeRequestId: request.changeRequestId };
+    const changeRequest = await this.ports.sourceControl.getChangeRequest(
+      reference,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (!changeRequest.ok) {
+      return inspectionFailed("change_request", changeRequest.error, request.job);
+    }
+    if (
+      changeRequest.value.state !== "open" ||
+      changeRequest.value.baseBranch !== request.project.defaultBranch ||
+      changeRequest.value.headBranch !== request.worktree.branch ||
+      !sameReviewSha(changeRequest.value.headSha, request.expectedHeadSha)
+    ) {
+      return inspectionFailed("change_request", domainError("conflict"), request.job);
+    }
+    const checks = await this.ports.sourceControl.getCommitChecks(
+      { project: request.project },
+      request.expectedHeadSha,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (!checks.ok) return inspectionFailed("checks", checks.error, request.job);
+    if (!sameReviewSha(checks.value.headSha, request.expectedHeadSha)) {
+      return inspectionFailed("checks", domainError("conflict"), request.job);
+    }
+    if (checks.value.aggregate !== "success") {
+      return Object.freeze({
+        state: "not_ready" as const,
+        reason:
+          checks.value.aggregate === "pending" ? ("ci_pending" as const) : ("ci_failed" as const),
+        job: request.job,
+        changeRequest: changeRequest.value,
+        checks: checks.value,
+      });
+    }
+    const before = await this.ports.git.inspectWorktree(
+      request.worktree,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    const beforeChanges = await this.ports.git.inspectWorkingTree(
+      request.worktree,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (
+      !before.ok ||
+      !beforeChanges.ok ||
+      !before.value.clean ||
+      before.value.branch !== request.worktree.branch ||
+      !sameReviewSha(before.value.headSha, request.expectedHeadSha) ||
+      !sameReviewSha(beforeChanges.value.headSha, request.expectedHeadSha) ||
+      beforeChanges.value.changes.length !== 0
+    ) {
+      return inspectionFailed(
+        "worktree",
+        !before.ok
+          ? before.error
+          : !beforeChanges.ok
+            ? beforeChanges.error
+            : domainError("conflict"),
+        request.job,
+      );
+    }
+    const diff = await this.ports.git.getEffectiveTreeDiff(
+      { rootPath: request.project.localRepositoryPath },
+      request.baseRevision,
+      request.expectedHeadSha,
+      request.signal === undefined ? {} : { signal: request.signal },
+    );
+    if (!diff.ok) return inspectionFailed("diff", diff.error, request.job);
+    const identity = createReviewIdentity(
+      request.requirementSnapshot,
+      request.expectedHeadSha,
+      diff.value,
+      {
+        ...(request.visualManifest === undefined
+          ? {}
+          : { visualManifest: canonicalVisualManifestInput(request.visualManifest) }),
+        ...(request.publicationDigest === undefined
+          ? {}
+          : { publicationDigest: request.publicationDigest }),
+      },
+    );
+    if (!identity.ok) return inspectionFailed("diff", identity.error, request.job);
+    const evidence = await this.#verifyEvidence(request);
+    if (!evidence.ok) return inspectionFailed("evidence", evidence.error, request.job);
+    return Object.freeze({
+      state: "ready" as const,
+      job: request.job,
+      changeRequest: changeRequest.value,
+      checks: checks.value,
+      identity: identity.value,
+      diff: diff.value,
+    });
+  }
 
   async run(request: ReviewerPipelineRequest): Promise<ReviewerPipelineOutcome> {
     if (!validReviewerRequest(request)) {
@@ -91,7 +204,10 @@ export class ReviewerPipeline {
         checks: checks.value,
       });
     }
-    if (anyReviewerAttemptLimitReached(request.job)) {
+    if (
+      request.attemptAccounting !== "reviewer_replay" &&
+      anyReviewerAttemptLimitReached(request.job)
+    ) {
       return this.#checkpoint(request, checks.value);
     }
 
@@ -228,6 +344,9 @@ export class ReviewerPipeline {
         ...(firstFailure.reportFailureCategory === undefined
           ? {}
           : { reportFailureCategory: firstFailure.reportFailureCategory }),
+        ...(firstFailure.diagnostics === undefined
+          ? {}
+          : { diagnostics: firstFailure.diagnostics }),
         ...(firstFailure.rejectedOutput === undefined
           ? {}
           : { rejectedOutput: firstFailure.rejectedOutput }),
@@ -253,23 +372,27 @@ export class ReviewerPipeline {
     if (reports.length !== roles.length) {
       return failed("report", domainError("external_failure"), request.job);
     }
-    const consumed = consumeAttempt(request.job.attempts, "reviewRuns");
-    if (!consumed.ok) return this.#checkpoint(request, checks.value);
-    const reviewedJob = jobSchema.safeParse({ ...request.job, attempts: consumed.value });
-    if (!reviewedJob.success) {
-      return failed("request", domainError("invariant_violation"), request.job);
-    }
-    const persisted = await this.ports.jobs.update(
-      reviewedJob.data,
-      mutation(request, `review-run-${String(reviewedJob.data.attempts.reviewRuns)}`),
-    );
-    if (!persisted.ok) return failed("attempt_persistence", persisted.error, request.job);
-    if (persisted.value.durability !== "confirmed") {
-      return failed("attempt_persistence", domainError("external_failure"), request.job);
+    let reviewedJob = request.job;
+    if (request.attemptAccounting !== "reviewer_replay") {
+      const consumed = consumeAttempt(request.job.attempts, "reviewRuns");
+      if (!consumed.ok) return this.#checkpoint(request, checks.value);
+      const parsedJob = jobSchema.safeParse({ ...request.job, attempts: consumed.value });
+      if (!parsedJob.success) {
+        return failed("request", domainError("invariant_violation"), request.job);
+      }
+      const persisted = await this.ports.jobs.update(
+        parsedJob.data,
+        mutation(request, `review-run-${String(parsedJob.data.attempts.reviewRuns)}`),
+      );
+      if (!persisted.ok) return failed("attempt_persistence", persisted.error, request.job);
+      if (persisted.value.durability !== "confirmed") {
+        return failed("attempt_persistence", domainError("external_failure"), request.job);
+      }
+      reviewedJob = parsedJob.data;
     }
 
     const common = Object.freeze({
-      job: reviewedJob.data,
+      job: reviewedJob,
       changeRequest: ready.value,
       checks: checks.value,
       identity: identity.value,

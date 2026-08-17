@@ -55,7 +55,10 @@ import {
   projectIdSchema,
 } from "../../domain/jobs/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
-import { reportContractFailureCategorySchema } from "../../application/pipelines/reviewer-model.js";
+import {
+  reportContractFailureCategorySchema,
+  reviewerReportSchema,
+} from "../../application/pipelines/reviewer-model.js";
 import {
   AtomicFileStore,
   acquireRecoverableFileLock,
@@ -582,6 +585,83 @@ export const jobProviderAssignmentsSchema = z
   .strict();
 export type JobProviderAssignments = z.infer<typeof jobProviderAssignmentsSchema>;
 
+const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+
+/** Immutable replay binding. `baseRevision` is the persisted dispatch base, never a live branch
+ * tip. Optional evidence/publication digests are present exactly when the underlying review
+ * identity contains them. */
+export const reviewerReplayIdentitySchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    jobId: jobIdSchema,
+    projectId: projectIdSchema,
+    issueId: issueIdSchema,
+    externalIssueId: z.string().trim().min(1).max(255),
+    changeRequestId: changeRequestNumberSchema,
+    baseRevision: headShaSchema,
+    requirementsDigest: digestSchema,
+    headSha: headShaSchema,
+    diffDigest: digestSchema,
+    evidenceDigest: digestSchema.optional(),
+    publicationDigest: digestSchema.optional(),
+  })
+  .strict();
+export type ReviewerReplayIdentity = z.infer<typeof reviewerReplayIdentitySchema>;
+
+const reviewerReplayCountersSchema = z
+  .object({
+    providerAttempts: z.number().int().min(0).max(2),
+    formatFailures: z.number().int().min(0).max(2),
+    transportFailures: z.number().int().min(0).max(2),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.formatFailures + value.transportFailures > value.providerAttempts) {
+      context.addIssue({ code: "custom", message: "Failure counters cannot exceed attempts." });
+    }
+  });
+
+const reviewerReplayBaseSchema = z.object({
+  identity: reviewerReplayIdentitySchema,
+  identityDigest: digestSchema,
+  counters: reviewerReplayCountersSchema,
+});
+
+export const reviewerReplayCheckpointSchema = z.discriminatedUnion("state", [
+  reviewerReplayBaseSchema
+    .extend({
+      state: z.literal("attempting"),
+      lastFormatCategory: reportContractFailureCategorySchema.optional(),
+      lastTransportErrorCode: z.string().trim().min(1).max(64).optional(),
+      diagnosticCount: z.number().int().min(0).max(100).optional(),
+    })
+    .strict(),
+  reviewerReplayBaseSchema
+    .extend({
+      state: z.literal("review_succeeded"),
+      reports: z.array(reviewerReportSchema).min(1).max(2),
+      reportDigests: z.array(digestSchema).min(1).max(2),
+      checkpointDigest: digestSchema,
+      completedAt: instantSchema,
+    })
+    .strict()
+    .superRefine((value, context) => {
+      if (value.reports.length !== value.reportDigests.length) {
+        context.addIssue({ code: "custom", message: "Every report needs one digest." });
+      }
+      if (value.counters.providerAttempts < 1) {
+        context.addIssue({ code: "custom", message: "A success checkpoint needs an attempt." });
+      }
+      if (
+        value.reports.some((report) => report.verdict !== "passed") ||
+        new Set(value.reports.map((report) => report.role)).size !== value.reports.length
+      ) {
+        context.addIssue({ code: "custom", message: "Success reports must be unique passes." });
+      }
+    }),
+]);
+export type ReviewerReplayCheckpoint = z.infer<typeof reviewerReplayCheckpointSchema>;
+
 export const jobProgressRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -652,6 +732,9 @@ export const jobProgressRecordSchema = z
      * `requires_manual(legacy_base_revision_unrecoverable)` instead (see that reasonCode's own
      * header, and `resolveLegacyBaseRevision`'s). */
     baseRevision: headShaSchema.optional(),
+    /** Dedicated, restart-safe recovery state for an exact
+     * `requires_manual(review_report_contract)` Job. Optional for all legacy/ordinary records. */
+    reviewerReplay: reviewerReplayCheckpointSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict()
@@ -775,6 +858,23 @@ export class FileJobProgressStore {
         JSON.stringify(normalizedCurrent.value.providerAssignments)
     ) {
       return err(domainError("invariant_violation"));
+    }
+    const currentReplay = normalizedCurrent.value?.reviewerReplay;
+    if (currentReplay !== undefined) {
+      if (next.reviewerReplay === undefined) {
+        return err(domainError("invariant_violation"));
+      }
+      if (
+        next.reviewerReplay.identityDigest !== currentReplay.identityDigest ||
+        JSON.stringify(next.reviewerReplay.identity) !== JSON.stringify(currentReplay.identity) ||
+        next.reviewerReplay.counters.providerAttempts < currentReplay.counters.providerAttempts ||
+        next.reviewerReplay.counters.formatFailures < currentReplay.counters.formatFailures ||
+        next.reviewerReplay.counters.transportFailures < currentReplay.counters.transportFailures ||
+        (currentReplay.state === "review_succeeded" &&
+          JSON.stringify(next.reviewerReplay) !== JSON.stringify(currentReplay))
+      ) {
+        return err(domainError("invariant_violation"));
+      }
     }
 
     const candidate = {

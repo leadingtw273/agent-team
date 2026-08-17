@@ -6,6 +6,7 @@ import type { Job } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type {
   CanonicalVisualManifestInput,
+  EffectiveTreeChange,
   HeadSha,
   ReviewIdentity,
   RequirementSnapshot,
@@ -226,6 +227,30 @@ export const reportContractFailureCategorySchema = z.enum([
 ]);
 export type ReportContractFailureCategory = z.infer<typeof reportContractFailureCategorySchema>;
 
+export const safeReviewReportIssueCodeSchema = z.enum([
+  "invalid_type",
+  "invalid_value",
+  "too_small",
+  "too_big",
+  "invalid_format",
+  "unrecognized_keys",
+  "invalid_union",
+  "custom",
+  "other",
+]);
+export type SafeReviewReportIssueCode = z.infer<typeof safeReviewReportIssueCodeSchema>;
+
+export const safeReviewReportDiagnosticSchema = z
+  .object({
+    code: safeReviewReportIssueCodeSchema,
+    path: z
+      .string()
+      .regex(/^(?:[A-Za-z][A-Za-z0-9]*|\[\*\])(?:\.\[\*\]|\.[A-Za-z][A-Za-z0-9]*)*$/u),
+    message: z.string().trim().min(1).max(160),
+  })
+  .strict();
+export type SafeReviewReportDiagnostic = z.infer<typeof safeReviewReportDiagnosticSchema>;
+
 export interface ReviewerEvidenceIntegrityPort {
   verify(
     evidence: Extract<ReviewEvidenceBlock, { kind: "file" }>,
@@ -289,6 +314,9 @@ export interface ReviewerPipelineRequest {
    * `category`, never the previous attempt's raw invalid text (coordinator's explicit requirement:
    * "不得回灌模型原始無效輸出"). Absent on a first attempt. */
   readonly reportRetryFeedback?: Readonly<{ category: ReportContractFailureCategory }>;
+  /** Dedicated reviewer-replay owns its attempt budget in the Job-progress CAS checkpoint. It
+   * must not consume or be blocked by the historical Job.reviewRuns counter. */
+  readonly attemptAccounting?: "job" | "reviewer_replay";
 }
 
 export type ReviewerFailureStage =
@@ -349,6 +377,9 @@ export type ReviewerPipelineOutcome =
       /** C015r decision 4: only ever populated when `stage === "report"` -- see
        * `ReportContractFailureCategory`'s own header for what this is and why it exists. */
       reportFailureCategory?: ReportContractFailureCategory;
+      /** Safe closed diagnostics only. Never includes Zod issue.message, unknown keys, received
+       * values, or raw reviewer output. */
+      diagnostics?: readonly SafeReviewReportDiagnostic[];
       /** C015r decision 5 (observability sidecar, pure data propagation -- the CLI/adapter layer,
        * never this application layer, decides whether/where to persist it): the exact text that
        * failed decision 3's tolerant parse/schema/context checks, only ever populated when
@@ -368,3 +399,14 @@ export type ReviewerPipelineOutcome =
         diffDigest: string;
       }>;
     }>;
+
+export type ReviewerInspectionOutcome =
+  | Readonly<{
+      state: "ready";
+      job: Job;
+      changeRequest: ChangeRequestSnapshot;
+      checks: CommitChecksSnapshot;
+      identity: ReviewIdentity;
+      diff: readonly EffectiveTreeChange[];
+    }>
+  | Extract<ReviewerPipelineOutcome, { state: "not_ready" | "failed" }>;

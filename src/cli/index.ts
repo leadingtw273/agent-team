@@ -12,6 +12,7 @@ import {
   createRegisteredProjectsControllerCycleStage,
 } from "./cycle/projects.js";
 import { createDispatchCliHandlers } from "./dispatch/index.js";
+import { buildJobProgressStore } from "./dispatch/resume-composition.js";
 import { createWakeupHealthHandler } from "./health/index.js";
 import { createWebhookAttestationRuntime } from "./health/webhook-attestation.js";
 import { createLocalWebhookIngestHandler } from "./ingest/index.js";
@@ -20,6 +21,7 @@ import { createProjectHandler, createProjectReadModel } from "./project/index.js
 import { defaultCliHandlers, runCli, type PackageMetadata } from "./program.js";
 import { buildManualReconcileUseCase } from "./reconcile/composition.js";
 import { createManualReconcileHandler } from "./reconcile/index.js";
+import { createReviewerReplayReconcileHandler } from "./reconcile/reviewer-replay-reconcile.js";
 import { createRegistrationCliHandlers } from "./registration/index.js";
 import { createSystemdHandler, createSystemdManager } from "./systemd/index.js";
 import { createUiCliHandler } from "./ui/index.js";
@@ -42,6 +44,11 @@ const projectReadModel = createProjectReadModel({
 const manualReconcile = createManualReconcileHandler({
   reconcile: buildManualReconcileUseCase({ agentTeamHome }),
 });
+const reconcile = createReviewerReplayReconcileHandler({
+  base: manualReconcile,
+  progress: buildJobProgressStore(agentTeamHome),
+  replay: ({ jobId }) => dispatchHandlers.dispatchReviewerReplay({ jobId }),
+});
 
 process.exitCode = await runCli(metadata, process.argv.slice(2), {
   ...defaultCliHandlers,
@@ -58,7 +65,7 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
   // header for exactly which of `ReconcilePorts`' six ports are genuinely real today (leases reap
   // and job updates) versus disclosed, honest-fail-closed gaps (providers/events/processes/blocks,
   // structurally unreachable while `jobs.listActive` always returns `[]`).
-  reconcile: manualReconcile,
+  reconcile,
   cycle: createControllerCycleHandler({
     agentTeamHome,
     stages: Object.freeze({
@@ -66,7 +73,7 @@ process.exitCode = await runCli(metadata, process.argv.slice(2), {
       webhookHealth: webhookAttestation.stage,
       inbox: createProductionInboxControllerCycleStage({ agentTeamHome }),
       reconcile: createManualReconcileControllerCycleStage({
-        reconcile: (input) => manualReconcile(input),
+        reconcile: (input) => reconcile(input),
       }),
       projects: createRegisteredProjectsControllerCycleStage({
         projectReadModel,

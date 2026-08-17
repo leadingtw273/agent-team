@@ -8,6 +8,7 @@ import {
   buildIssueAdmissionStore,
   buildJobProgressStore,
   buildReviewReportDiagnosticsSidecar,
+  hasReviewerReplaySuccessCheckpoint,
   isResumeCandidate,
   runResumeCycle,
   type ResumeCycleSelection,
@@ -21,6 +22,8 @@ import {
 } from "./resume-full-composition.js";
 import { resolveAuthoritativeBaseRevision } from "./authoritative-base.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
+import { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
+import { join } from "node:path";
 
 export type ResumeExistingProjectJobsResult =
   | Readonly<{ state: "none" }>
@@ -40,11 +43,13 @@ export interface ResumeExistingProjectJobsOptions {
   readonly holderId: string;
   readonly clock: Clock;
   readonly autoMergePause?: ReturnType<typeof buildAutoMergePauseStore>;
+  readonly reviewerReplayPolicy?: FileReviewerReplayPolicyStore;
   /** When supplied, only jobs captured by the caller's one-pass durable inventory may run. */
   readonly selections?: ResumeCycleSelection["selections"];
   readonly buildResumeComposition?: (
     options: Parameters<typeof buildResumeComposition>[0],
   ) => Promise<BuildResumeCompositionResult>;
+  readonly runResumeCycle?: typeof runResumeCycle;
   readonly resolveAuthoritativeBase?: typeof resolveAuthoritativeBaseRevision;
 }
 
@@ -82,37 +87,59 @@ export async function resumeExistingProjectJobs(
       error: existing.error,
     });
   }
+  const reviewerReplayPolicy =
+    options.reviewerReplayPolicy ??
+    new FileReviewerReplayPolicyStore(
+      join(options.agentTeamHome, "state", "dispatch", "reviewer-replay-policy"),
+    );
+  let reviewerReplayEnabled = false;
+  if (existing.value.some(hasReviewerReplaySuccessCheckpoint)) {
+    const policy = await reviewerReplayPolicy.load(options.ready.project.id);
+    if (!policy.ok) {
+      return Object.freeze({
+        state: "blocked" as const,
+        reason: "resume_cycle_failed" as const,
+        error: policy.error,
+      });
+    }
+    reviewerReplayEnabled = policy.value?.enabled === true;
+  }
   const selected = existing.value.filter(
     (record) =>
       isResumeCandidate(record) &&
+      (!hasReviewerReplaySuccessCheckpoint(record) || reviewerReplayEnabled) &&
       (options.selections === undefined ||
         options.selections.some(
           (selection) =>
             selection.jobId === record.jobId && selection.expectedRevision === record.revision,
         )),
   );
+  const selectedByJobId = new Map(selected.map((record) => [record.jobId, record]));
+  const preflightOutcomes: ResumeJobOutcome[] = [];
+  if (options.selections !== undefined) {
+    const byJobId = new Map(existing.value.map((record) => [record.jobId, record]));
+    for (const selection of options.selections) {
+      if (selectedByJobId.has(selection.jobId)) continue;
+      const record = byJobId.get(selection.jobId);
+      preflightOutcomes.push({
+        jobId: selection.jobId,
+        outcome: "candidate_changed",
+        reason:
+          record === undefined
+            ? "missing"
+            : record.revision !== selection.expectedRevision
+              ? "revision_changed"
+              : "no_longer_resumable",
+      });
+    }
+  }
   if (selected.length === 0 && options.selections === undefined) {
     return Object.freeze({ state: "none" as const });
   }
   if (options.selections !== undefined && selected.length === 0) {
-    const byJobId = new Map(existing.value.map((record) => [record.jobId, record]));
     return Object.freeze({
       state: "resumed" as const,
-      outcomes: Object.freeze(
-        options.selections.map((selection): ResumeJobOutcome => {
-          const record = byJobId.get(selection.jobId);
-          return Object.freeze({
-            jobId: selection.jobId,
-            outcome: "candidate_changed" as const,
-            reason:
-              record === undefined
-                ? ("missing" as const)
-                : record.revision !== selection.expectedRevision
-                  ? ("revision_changed" as const)
-                  : ("no_longer_resumable" as const),
-          });
-        }),
-      ),
+      outcomes: Object.freeze(preflightOutcomes),
     });
   }
 
@@ -173,7 +200,7 @@ export async function resumeExistingProjectJobs(
   };
 
   try {
-    const cycle = await runResumeCycle(
+    const cycle = await (options.runResumeCycle ?? runResumeCycle)(
       {
         progress,
         jobRepository: options.ready.jobs,
@@ -195,7 +222,15 @@ export async function resumeExistingProjectJobs(
         trustedConfig: options.ready.trustedConfig,
         ciRecovery: { run: (...args) => prepared().ciRecovery.run(...args) },
         reviewerRecovery: { run: (...args) => prepared().reviewerRecovery.run(...args) },
-        reviewer: { run: (...args) => prepared().reviewer.run(...args) },
+        reviewer: {
+          run: (...args) => prepared().reviewer.run(...args),
+          inspect: (...args) => {
+            const inspect = prepared().reviewer.inspect;
+            if (inspect === undefined) throw new Error("reviewer_inspect_not_prepared");
+            return inspect(...args);
+          },
+        },
+        reviewerReplayPolicy,
         reviewStatus: {
           begin: (...args) => prepared().reviewStatus.begin(...args),
           record: (...args) => prepared().reviewStatus.record(...args),
@@ -230,7 +265,14 @@ export async function resumeExistingProjectJobs(
             resolveOptions,
           ),
       },
-      options.selections === undefined ? undefined : { selections: options.selections },
+      {
+        selections: Object.freeze(
+          selected.map((record) => ({
+            jobId: record.jobId,
+            expectedRevision: record.revision,
+          })),
+        ),
+      },
     );
     if (!cycle.ok) {
       return Object.freeze({
@@ -239,7 +281,10 @@ export async function resumeExistingProjectJobs(
         error: cycle.error,
       });
     }
-    return Object.freeze({ state: "resumed" as const, outcomes: cycle.value });
+    return Object.freeze({
+      state: "resumed" as const,
+      outcomes: Object.freeze([...preflightOutcomes, ...cycle.value]),
+    });
   } catch (error) {
     if (error instanceof ResumePreparationBlockedError) return error.result;
     throw error;

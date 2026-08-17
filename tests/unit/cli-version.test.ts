@@ -37,6 +37,8 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
+    dispatchReviewerReplay: vi.fn(() => Promise.resolve(outcome)),
+    dispatchReviewerReplayPolicy: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     cycle: vi.fn(() => Promise.resolve(outcome)),
@@ -113,6 +115,36 @@ describe("agent-team CLI contract", () => {
       ),
     ).resolves.toBe(0);
     await expect(runCli(metadata, ["reconcile", "--all"], commands, sink.io)).resolves.toBe(0);
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
+          "reviewer-replay",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchReviewerReplay).toHaveBeenCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      dryRun: true,
+    });
+    await expect(
+      runCli(
+        metadata,
+        ["dispatch", "reviewer-replay-policy", "--project", "project-a", "--state", "enabled"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchReviewerReplayPolicy).toHaveBeenCalledWith({
+      projectId: "project-a",
+      enabled: true,
+    });
     await expect(runCli(metadata, ["cycle", "--all"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["health"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
@@ -146,7 +178,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(13));
+    expect(sink.stdout()).toBe("完成\n".repeat(15));
   });
 
   it.each([

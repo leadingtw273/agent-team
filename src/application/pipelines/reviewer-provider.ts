@@ -13,8 +13,10 @@ import type {
   ReviewerPipelineOutcome,
   ReviewerPipelineRequest,
   ReviewerReport,
+  SafeReviewReportDiagnostic,
 } from "./reviewer-model.js";
 import { reviewerReportSchema } from "./reviewer-model.js";
+import { safeReviewReportDiagnostics } from "./reviewer-report-diagnostics.js";
 import {
   evidenceForReviewerRole,
   reviewerDirective,
@@ -32,6 +34,7 @@ export type ReviewerRunResult =
       error: DomainError;
       /** C015r decision 4: only populated when `stage === "report"`. See `ReportContractFailureCategory`'s own header (reviewer-model.ts). */
       reportFailureCategory?: ReportContractFailureCategory;
+      diagnostics?: readonly SafeReviewReportDiagnostic[];
       /** C015r decision 5: only populated when `stage === "report"`, pure data -- see this field's
        * own header on `ReviewerPipelineOutcome`'s "failed" variant (reviewer-model.ts) for the exact
        * handling rule (never persisted here; the CLI/adapter-layer sidecar decides that). */
@@ -217,12 +220,14 @@ function classifyReportFailure(
 function reportFailure(
   category: ReportContractFailureCategory,
   rejectedOutput: string | undefined,
+  diagnostics: readonly SafeReviewReportDiagnostic[] = Object.freeze([]),
 ): ReviewerRunResult {
   return Object.freeze({
     kind: "failed" as const,
     stage: "report" as const,
     error: domainError("external_failure"),
     reportFailureCategory: category,
+    ...(diagnostics.length === 0 ? {} : { diagnostics }),
     ...(rejectedOutput === undefined ? {} : { rejectedOutput }),
   });
 }
@@ -318,7 +323,11 @@ export async function runReviewerProvider(
       )
     : undefined;
   if (!report.success || contextMatched === false) {
-    return reportFailure(classifyReportFailure(tolerant, parsed, report, contextMatched), output);
+    return reportFailure(
+      classifyReportFailure(tolerant, parsed, report, contextMatched),
+      output,
+      report.success ? Object.freeze([]) : safeReviewReportDiagnostics(report.error.issues),
+    );
   }
   return Object.freeze({ kind: "completed", report: report.data });
 }

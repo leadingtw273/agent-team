@@ -60,7 +60,12 @@ function validRequest(request: LifecyclePipelineRequest): boolean {
     request.changeRequestId.trim().length > 0 &&
     idempotencyPattern.test(request.idempotencyKeyPrefix) &&
     (request.mergeAuthorizationHeadSha === undefined ||
-      shaPattern.test(request.mergeAuthorizationHeadSha))
+      shaPattern.test(request.mergeAuthorizationHeadSha)) &&
+    (request.reviewerReplayAudit === undefined ||
+      (/^[0-9a-f]{64}$/u.test(request.reviewerReplayAudit.checkpointDigest) &&
+        Number.isInteger(request.reviewerReplayAudit.attemptTotal) &&
+        request.reviewerReplayAudit.attemptTotal >= 1 &&
+        request.reviewerReplayAudit.attemptTotal <= 2))
   );
 }
 
@@ -92,6 +97,13 @@ function mergeComment(
     `- 狀態：GitHub PR 已合併，工單更新為已完成`,
     `- PR：${request.changeRequestId}`,
     `- Head SHA：${headSha}`,
+    ...(request.reviewerReplayAudit === undefined
+      ? []
+      : [
+          "- operation：reviewer-replay",
+          `- Review checkpoint：${request.reviewerReplayAudit.checkpointDigest}`,
+          `- Reviewer attempts：${String(request.reviewerReplayAudit.attemptTotal)}｜outcome=${request.reviewerReplayAudit.outcome}`,
+        ]),
   ];
   if (disposition === "not_required") {
     return [...common, "- 稽核：精確 Head 合併授權相符", "- 後續：等待下游生命週期對帳"].join("\n");
