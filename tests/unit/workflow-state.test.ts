@@ -31,6 +31,8 @@ describe("workflow state", () => {
     ["backlog", "ready", "ready_gate_passed"],
     ["ready", "in_progress", "work_started"],
     ["ready", "requires_manual", "policy_requires_manual"],
+    ["in_progress", "requires_manual", "policy_requires_manual"],
+    ["in_review", "requires_manual", "policy_requires_manual"],
     ["requires_manual", "ready", "ready_gate_passed"],
     ["in_progress", "in_review", "review_started"],
     ["in_review", "in_progress", "changes_requested"],
@@ -116,6 +118,8 @@ describe("workflow state", () => {
       ["in_progress", "ready", "automation_reconcile"],
       ["requires_manual", "in_progress", "work_started"],
       ["in_review", "backlog", "changes_requested"],
+      ["in_progress", "requires_manual", "requirements_changed"],
+      ["in_review", "requires_manual", "automation_reconcile"],
     ];
 
     for (const [current, target, cause] of cases) {
@@ -129,6 +133,7 @@ describe("workflow state", () => {
   it("validates Agent status transitions separately from work status", () => {
     expect(canTransitionAgentStatus("queued", "executing")).toBe(true);
     expect(canTransitionAgentStatus("executing", "blocked")).toBe(true);
+    expect(canTransitionAgentStatus("waiting", "executing")).toBe(true);
     expect(canTransitionAgentStatus("blocked", "queued")).toBe(true);
     expect(canTransitionAgentStatus("blocked", "executing")).toBe(false);
     expect(canTransitionAgentStatus("paused", "executing")).toBe(false);

@@ -37,6 +37,7 @@
  * `superseded`/`cancelled` themselves -- never automatic.
  */
 import { randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
 import { z } from "zod";
@@ -99,6 +100,8 @@ export const issueAdmissionRecordSchema = z
     revision: z.number().int().nonnegative(),
     projectId: projectIdSchema,
     issueId: issueIdSchema,
+    /** Raw Linear Issue id captured at claim time for crash-safe jobless bootstrap diagnosis. */
+    externalIssueId: z.string().trim().min(1).max(255).optional(),
     /** Absent until the real `Job` this claim is reserving space for is confirmed created --
      * `Dispatcher.dispatch()` generates the job id itself, internally, only once it has already
      * selected this exact candidate, so the claim is necessarily written *before* that id exists
@@ -185,7 +188,11 @@ export interface IssueAdmissionPort {
     projectId: string,
     issueId: string,
   ): Promise<Result<IssueAdmissionRecord | undefined, DomainError>>;
-  claim(projectId: string, issueId: string): Promise<Result<IssueAdmissionRecord, DomainError>>;
+  claim(
+    projectId: string,
+    issueId: string,
+    externalIssueId?: string,
+  ): Promise<Result<IssueAdmissionRecord, DomainError>>;
   attachJob(
     projectId: string,
     issueId: string,
@@ -202,6 +209,10 @@ export interface IssueAdmissionPort {
      * `releaseNoteSchema`'s own comment. */
     note?: string,
   ): Promise<Result<IssueAdmissionRecord, DomainError>>;
+}
+
+export interface IssueAdmissionInventoryPort extends IssueAdmissionPort {
+  listForProject(projectId: string): Promise<Result<readonly IssueAdmissionRecord[], DomainError>>;
 }
 
 /** Mirrors `FileJobProgressStore` line for line in shape and locking discipline -- see this file's
@@ -246,6 +257,36 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
     return ok(loaded.value);
   }
 
+  async listForProject(
+    projectId: string,
+    options: ReadOptions = {},
+  ): Promise<Result<readonly IssueAdmissionRecord[], DomainError>> {
+    if (!parseIdentifier("project", projectId).ok || options.signal?.aborted === true) {
+      return err(domainError("invariant_violation"));
+    }
+    let names: readonly string[];
+    try {
+      names = (await readdir(this.#directory))
+        .filter((name) => name.endsWith(".json"))
+        .sort((left, right) => left.localeCompare(right));
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT"
+        ? ok(Object.freeze([]))
+        : err(domainError("external_failure"));
+    }
+    if (names.length > 100_000) return err(domainError("external_failure"));
+    const records: IssueAdmissionRecord[] = [];
+    for (const name of names) {
+      const loaded = await readJsonWithSchema(
+        join(this.#directory, name),
+        issueAdmissionRecordSchema,
+      );
+      if (!loaded.ok) return loaded;
+      if (loaded.value.projectId === projectId) records.push(loaded.value);
+    }
+    return ok(Object.freeze(records));
+  }
+
   /**
    * Claims `issueId` for a not-yet-created `Job`. Fails closed with `conflict` if a record already
    * exists and is `state:"active"` -- this is the single atomic write every concurrent dispatcher
@@ -258,9 +299,15 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
   async claim(
     projectId: string,
     issueId: string,
+    externalIssueId?: string,
     options: ReadOptions = {},
   ): Promise<Result<IssueAdmissionRecord, DomainError>> {
-    if (!isValidCompositeKey(projectId, issueId) || options.signal?.aborted === true) {
+    if (
+      !isValidCompositeKey(projectId, issueId) ||
+      (externalIssueId !== undefined &&
+        (externalIssueId.trim().length === 0 || externalIssueId.length > 255)) ||
+      options.signal?.aborted === true
+    ) {
       return err(domainError("invariant_violation"));
     }
     const acquired = await acquireRecoverableFileLock(
@@ -268,7 +315,7 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
       `issue-admission:${String(process.pid)}:${randomUUID()}`,
     );
     if (!acquired.ok) return acquired;
-    const result = await this.#claimLocked(projectId, issueId);
+    const result = await this.#claimLocked(projectId, issueId, externalIssueId);
     const released = await acquired.value.release();
     return !released.ok && result.ok ? released : result;
   }
@@ -276,6 +323,7 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
   async #claimLocked(
     projectId: string,
     issueId: string,
+    externalIssueId?: string,
   ): Promise<Result<IssueAdmissionRecord, DomainError>> {
     const current = await readJsonWithSchema(
       this.#path(projectId, issueId),
@@ -291,6 +339,7 @@ export class FileIssueAdmissionStore implements IssueAdmissionPort {
       revision: (normalizedCurrent.value?.revision ?? -1) + 1,
       projectId,
       issueId,
+      ...(externalIssueId === undefined ? {} : { externalIssueId }),
       state: "active" as const,
       claimedAt: now,
       updatedAt: now,

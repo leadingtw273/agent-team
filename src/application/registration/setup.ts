@@ -190,16 +190,25 @@ export function createRegistrationSetupPreview(
   if (!validPreviewInput(input)) {
     return Object.freeze({ ok: false, error: domainError("invariant_violation") });
   }
-  const requirements = requirementsDigest(input);
+  // Registration always creates a new trusted config. Make the safe rollout default explicit in
+  // those new bytes while leaving the project loader's legacy `undefined -> off` compatibility
+  // untouched for repositories registered before this feature existed.
+  const normalizedInput: RegistrationSetupPreviewInput = Object.freeze({
+    ...input,
+    config: trustedProjectConfigSchema.parse({
+      ...input.config,
+      workStatusLifecycleMode: input.config.workStatusLifecycleMode ?? "off",
+    }),
+  });
+  const requirements = requirementsDigest(normalizedInput);
   if (!requirements.ok) return requirements;
-  const preview = sha256Digest({ ...input, requirementsDigest: requirements.value });
+  const preview = sha256Digest({ ...normalizedInput, requirementsDigest: requirements.value });
   if (!preview.ok) return preview;
   return Object.freeze({
     ok: true,
     value: Object.freeze({
-      ...input,
-      project: projectSchema.parse(input.project),
-      config: trustedProjectConfigSchema.parse(input.config),
+      ...normalizedInput,
+      project: projectSchema.parse(normalizedInput.project),
       previewDigest: preview.value,
       requirementsDigest: requirements.value,
     }),

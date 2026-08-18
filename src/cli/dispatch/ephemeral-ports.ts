@@ -101,7 +101,11 @@ export class InMemoryIssueAdmissionStore {
     return Promise.resolve(ok(this.#records.get(this.#key(projectId, issueId))));
   }
 
-  claim(projectId: string, issueId: string): Promise<Result<IssueAdmissionRecord, DomainError>> {
+  claim(
+    projectId: string,
+    issueId: string,
+    externalIssueId?: string,
+  ): Promise<Result<IssueAdmissionRecord, DomainError>> {
     const key = this.#key(projectId, issueId);
     const existing = this.#records.get(key);
     if (existing?.state === "active") return Promise.resolve(err(domainError("conflict")));
@@ -111,6 +115,7 @@ export class InMemoryIssueAdmissionStore {
       revision: (existing?.revision ?? -1) + 1,
       projectId,
       issueId,
+      ...(externalIssueId === undefined ? {} : { externalIssueId }),
       state: "active" as const,
       claimedAt: now,
       updatedAt: now,

@@ -156,4 +156,22 @@ describe("ReviewerWaitPublicationCoordinator", () => {
     expect(fixture.comments[0]).toContain("受控 reviewer resume 命令");
     expect(fixture.setCommitStatus).not.toHaveBeenCalled();
   });
+
+  it("observe mode leaves Linear unchanged while preserving GitHub pending publication", async () => {
+    const fixture = harness("success");
+    await fixture.coordinator.publish(request({ lifecycleMode: "observe" }));
+    expect(fixture.setWorkStatus).not.toHaveBeenCalled();
+    expect(fixture.setAgentCondition).not.toHaveBeenCalled();
+    expect(fixture.appendComment).not.toHaveBeenCalled();
+    expect(fixture.setCommitStatus).toHaveBeenCalledOnce();
+  });
+
+  it("enforce mode leaves the main status to lifecycle ownership and publishes only wait details", async () => {
+    const fixture = harness("success");
+    await fixture.coordinator.publish(request({ lifecycleMode: "enforce" }));
+    expect(fixture.setWorkStatus).not.toHaveBeenCalled();
+    expect(fixture.setAgentCondition).toHaveBeenCalledOnce();
+    expect(fixture.appendComment).toHaveBeenCalledOnce();
+    expect(fixture.setCommitStatus).toHaveBeenCalledOnce();
+  });
 });

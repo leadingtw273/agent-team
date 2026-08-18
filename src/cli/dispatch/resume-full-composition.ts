@@ -48,7 +48,11 @@ export interface BuildResumeCompositionOptions {
   readonly readModel: LinearReadModel;
   readonly mutationClient: Pick<
     LinearMutationClient,
-    "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
+    | "observeGithubMerge"
+    | "requireManualIntervention"
+    | "setAgentCondition"
+    | "clearAgentCondition"
+    | "appendComment"
   > &
     Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
   readonly teamId: string;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ProjectRegistry,
+  resolveWorkStatusLifecycleMode,
   TrustedProjectConfigLoader,
   serializeTrustedProjectConfig,
   trustedProjectConfigPath,
@@ -99,6 +100,18 @@ function activationFor(value: TrustedProjectConfig = config()): TrustedProjectAc
 }
 
 describe("trusted project config loader", () => {
+  it("keeps legacy configs byte-compatible and resolves an omitted lifecycle mode to off", () => {
+    const legacy = config();
+    const serialized = serializeTrustedProjectConfig(legacy);
+    expect(serialized.ok).toBe(true);
+    if (!serialized.ok) return;
+    expect(serialized.value.content).not.toContain("workStatusLifecycleMode");
+    expect(resolveWorkStatusLifecycleMode(legacy)).toBe("off");
+    expect(resolveWorkStatusLifecycleMode({ ...legacy, workStatusLifecycleMode: "observe" })).toBe(
+      "observe",
+    );
+  });
+
   it("loads only the configured default-branch path and binds the exact revision", async () => {
     const requests: unknown[] = [];
     const git: TrustedProjectGitPort = {

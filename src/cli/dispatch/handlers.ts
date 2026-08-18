@@ -15,6 +15,7 @@
  * `pipeline: "not_applicable_role"`, exactly like before this ticket existed.
  */
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 
 import type { CliHandlers } from "../program.js";
 import {
@@ -26,7 +27,11 @@ import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
-import type { ImplementerPipelineOutcome } from "../../application/pipelines/index.js";
+import {
+  WorkStatusLifecycleCoordinator,
+  createWorkStatusLifecycleTransitionInstance,
+  type ImplementerPipelineOutcome,
+} from "../../application/pipelines/index.js";
 import type { ModelRoutingConfig } from "../../application/routing/index.js";
 import type {
   FileJobProgressStore,
@@ -36,14 +41,19 @@ import type {
   ProtectedRegionHandoff,
   RequiresManualReasonCode,
 } from "../../adapters/dispatch/job-progress-store.js";
+import {
+  FileIssueScopeLock,
+  JobProgressWorkStatusLifecycleLedger,
+} from "../../adapters/dispatch/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import {
   createClock,
+  ok,
   type Clock,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import { headShaSchema } from "../../domain/review/index.js";
+import { headShaSchema, sha256Digest } from "../../domain/review/index.js";
 import { createAgentCondition } from "../../domain/workflow/index.js";
 import type { Project } from "../../domain/project/index.js";
 import {
@@ -54,6 +64,7 @@ import {
   buildDispatchComposition,
   dispatchOnce,
   type BuildDispatchCompositionResult,
+  type DispatchBootstrapInput,
   type DispatchCompositionBlockedReason,
 } from "./composition.js";
 import {
@@ -86,10 +97,16 @@ import { createDispatchResolveLegacyClaimHandler } from "./legacy-claim-handlers
 import { createDispatchAutoMergeResumeHandler } from "./auto-merge-pause-handlers.js";
 import { createReviewerResumeHandler } from "./reviewer-resume-handlers.js";
 import { createReviewerReplayHandlers } from "./reviewer-replay-handlers.js";
+import { createWorkStatusRecoveryHandler } from "./work-status-recovery-handlers.js";
+import {
+  reconcileBootstrapClaims,
+  type BootstrapReconciliationOutcome,
+} from "./bootstrap-reconciliation.js";
 import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { resumeExistingProjectJobs } from "./resume-existing.js";
 import { createQuotaProbeStatusHandler } from "../quota/index.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
+import { PrePrImplementationCoordinator } from "./pre-pr-implementation-coordinator.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -127,6 +144,11 @@ export interface CreateDispatchCliHandlersOptions {
     LinearWorkManagementAdapter,
     "setWorkStatus" | "setAgentCondition" | "appendComment"
   >;
+  readonly workStatusLifecycleWorkManagement?: Pick<
+    LinearWorkManagementAdapter,
+    "getIssue" | "setWorkStatus" | "setAgentCondition" | "clearAgentCondition"
+  > &
+    Partial<Pick<LinearWorkManagementAdapter, "getIssueHistory">>;
 }
 
 const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = Object.freeze({
@@ -166,6 +188,29 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
     ...(record.headSha === undefined ? {} : { headSha: record.headSha }),
     ...(record.mergeMutations === undefined ? {} : { mergeMutations: record.mergeMutations }),
     ...(record.baseRevision === undefined ? {} : { baseRevision: record.baseRevision }),
+    ...(record.reviewerReplay === undefined ? {} : { reviewerReplay: record.reviewerReplay }),
+    ...(record.previousReviewerReplay === undefined
+      ? {}
+      : { previousReviewerReplay: record.previousReviewerReplay }),
+    ...(record.workStatusLifecycle === undefined
+      ? {}
+      : { workStatusLifecycle: record.workStatusLifecycle }),
+  });
+}
+
+async function persistDispatchProgress(
+  progress: FileJobProgressStore,
+  next: JobProgressRecordMutation,
+): Promise<Result<JobProgressRecord, DomainError>> {
+  const current = await progress.load(next.jobId);
+  if (!current.ok) return current;
+  if (current.value === undefined) return progress.compareAndSwap(next.jobId, null, next);
+  return progress.compareAndSwap(next.jobId, current.value.revision, {
+    ...progressMutation(current.value),
+    ...next,
+    ...(next.workStatusLifecycle === undefined && current.value.workStatusLifecycle !== undefined
+      ? { workStatusLifecycle: current.value.workStatusLifecycle }
+      : {}),
   });
 }
 
@@ -286,6 +331,7 @@ type DispatchHandlers = Pick<
   | "dispatchReviewerResume"
   | "dispatchReviewerReplay"
   | "dispatchReviewerReplayPolicy"
+  | "dispatchWorkStatusRecover"
   | "quota"
 >;
 
@@ -413,7 +459,7 @@ async function writeDispatchRequiresManual(
   reasonCode: RequiresManualReasonCode,
   fields: Omit<JobProgressRecordMutation, "stage">,
 ): Promise<Result<JobProgressRecord, DomainError>> {
-  const written = await progress.compareAndSwap(fields.jobId, null, {
+  const written = await persistDispatchProgress(progress, {
     ...fields,
     stage: {
       kind: "requires_manual",
@@ -500,6 +546,12 @@ export function createDispatchCliHandlers(
     clock,
     generateHolderId,
   });
+  const dispatchWorkStatusRecover = createWorkStatusRecoveryHandler({
+    agentTeamHome: options.agentTeamHome,
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
+    clock,
+    generateHolderId,
+  });
 
   return Object.freeze({
     dispatchResolve,
@@ -508,6 +560,7 @@ export function createDispatchCliHandlers(
     dispatchReviewerResume,
     dispatchReviewerReplay: reviewerReplayHandlers.reviewerReplay,
     dispatchReviewerReplayPolicy: reviewerReplayHandlers.reviewerReplayPolicy,
+    dispatchWorkStatusRecover,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
@@ -537,6 +590,28 @@ export function createDispatchCliHandlers(
       // Constructing this is cheap (no I/O) and safe in `--dry-run` too; only *using* it (the
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
+      const durableAdmission = buildIssueAdmissionStore(options.agentTeamHome);
+      let bootstrapReconciliation: readonly BootstrapReconciliationOutcome[] = Object.freeze([]);
+
+      if (!dryRun) {
+        const reconciled = await reconcileBootstrapClaims({
+          agentTeamHome: options.agentTeamHome,
+          project: build.value.project,
+          admission: durableAdmission,
+          progress,
+          jobs: build.value.jobs,
+        });
+        if (!reconciled.ok) {
+          return outcome("failed", {
+            operation: "dispatch_run",
+            state: "blocked",
+            projectId: input.projectId,
+            reason: "bootstrap_reconciliation_failed",
+            errorCode: reconciled.error.code,
+          });
+        }
+        bootstrapReconciliation = reconciled.value;
+      }
 
       // Resume-only bridge shared with `reconcile --all`. It can converge to `none`, but never
       // falls through internally to discovery/new-Job admission.
@@ -550,6 +625,7 @@ export function createDispatchCliHandlers(
           ...(options.buildResumeComposition === undefined
             ? {}
             : { buildResumeComposition: options.buildResumeComposition }),
+          buildImplementerPipeline: buildPipelineComposition,
           ...(options.resolveAuthoritativeBase === undefined
             ? {}
             : { resolveAuthoritativeBase: options.resolveAuthoritativeBase }),
@@ -616,17 +692,49 @@ export function createDispatchCliHandlers(
         : {
             leases: new LeaseCoordinator(build.value.leases),
             jobs: build.value.jobs,
-            admission: buildIssueAdmissionStore(options.agentTeamHome),
+            admission: durableAdmission,
+            locks: new FileIssueScopeLock(
+              join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+            ),
+            bootstrap: async (input: DispatchBootstrapInput) => {
+              const { result, candidate, lifecycle } = input;
+              const model = result.decision.model?.candidate.model ?? "unresolved";
+              const providerAssignments = providerAssignmentsForNewJob(
+                result.decision.model?.candidate,
+                build.value.routingConfig,
+              );
+              const written = await progress.compareAndSwap(result.job.id, null, {
+                jobId: result.job.id,
+                projectId: build.value.project.id,
+                issueId: result.job.issueId,
+                externalIssueId: candidate.issue.externalId,
+                model,
+                ...(providerAssignments === undefined ? {} : { providerAssignments }),
+                stage: { kind: "work_start_pending" },
+                branch: implementerBranch(result.job.id),
+                worktreePath: implementerWorktreePath(options.agentTeamHome, result.job.id),
+                workStatusLifecycle: {
+                  admissionMode: lifecycle.mode,
+                  ...(lifecycle.capabilityDigest === undefined
+                    ? {}
+                    : { capabilityDigest: lifecycle.capabilityDigest }),
+                  phase: "work_start",
+                  transitions: [],
+                },
+              });
+              return written.ok ? ok(undefined) : written;
+            },
           };
 
-      const workManagement =
-        options.protectedRegionWorkManagement ??
-        new LinearWorkManagementAdapter({
-          readModel: build.value.discovery.readModel,
-          mutationClient: build.value.discovery.mutationClient,
-          teamId: build.value.discovery.teamId,
-          linearProjectId: build.value.discovery.linearProjectId,
-        });
+      const linearWorkManagement = new LinearWorkManagementAdapter({
+        readModel: build.value.discovery.readModel,
+        mutationClient: build.value.discovery.mutationClient,
+        teamId: build.value.discovery.teamId,
+        linearProjectId: build.value.discovery.linearProjectId,
+      });
+      const workManagement = options.protectedRegionWorkManagement ?? linearWorkManagement;
+      const lifecycleWorkManagement =
+        options.workStatusLifecycleWorkManagement ?? linearWorkManagement;
       const protectedRegionSyncFailures: Readonly<Record<string, string>>[] = [];
       if (!dryRun) {
         const records = await progress.listForProject(build.value.project.id);
@@ -676,6 +784,15 @@ export function createDispatchCliHandlers(
       const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId, {
         allowOperatorCanary: !dryRun,
       });
+      if (dispatchOnceOutcome.outcome === "capability_failed") {
+        return outcome("blocked", {
+          operation: "dispatch_run",
+          state: "blocked",
+          projectId: input.projectId,
+          reason: "work_status_capability_unavailable",
+          errorCode: dispatchOnceOutcome.error.code,
+        });
+      }
       if (dispatchOnceOutcome.outcome === "discovery_failed") {
         return outcome("failed", {
           operation: "dispatch_run",
@@ -686,7 +803,8 @@ export function createDispatchCliHandlers(
           errorCode: dispatchOnceOutcome.error.code,
         });
       }
-      const { result, candidates, discoverySkipped, admissionSkipped } = dispatchOnceOutcome;
+      const { result, candidates, discoverySkipped, admissionSkipped, bootstrap } =
+        dispatchOnceOutcome;
       const candidateSummaries = candidates.map((candidate) => ({
         issueId: candidate.issue.id,
         externalId: candidate.issue.externalId,
@@ -724,6 +842,20 @@ export function createDispatchCliHandlers(
         });
       }
 
+      if (result.kind === "dispatched" && bootstrap.state === "blocked") {
+        return outcome("failed", {
+          operation: "dispatch_run",
+          state: "blocked",
+          projectId: input.projectId,
+          jobId: result.job.id,
+          issueId: result.job.issueId,
+          reason: bootstrap.reason,
+          pipelineReason: bootstrap.reason,
+          errorCode: bootstrap.error.code,
+          pipeline: "not_started",
+        });
+      }
+
       switch (result.kind) {
         case "dispatched": {
           const dispatchedPayload = {
@@ -738,6 +870,7 @@ export function createDispatchCliHandlers(
             discoverySkipped,
             admissionSkipped,
             protectedRegionSyncFailures,
+            bootstrapReconciliation,
           };
 
           // C018 fix: deterministic (a pure function of `result.job.id`, never dependent on
@@ -919,6 +1052,103 @@ export function createDispatchCliHandlers(
             });
           }
 
+          // LWS03: every newly-bootstrapped Job now uses the same pre-PR coordinator as crash
+          // recovery. The legacy block below remains only as a defensive fallback for an old or
+          // injected progress record that predates the work_start checkpoint contract.
+          const prePrRecord = await progress.load(result.job.id);
+          if (
+            prePrRecord.ok &&
+            prePrRecord.value?.stage.kind === "work_start_pending" &&
+            prePrRecord.value.workStatusLifecycle !== undefined
+          ) {
+            let observedPipelineOutcome: ImplementerPipelineOutcome | undefined;
+            const lifecycleHistory = lifecycleWorkManagement.getIssueHistory;
+            const prePr = new PrePrImplementationCoordinator({
+              agentTeamHome: options.agentTeamHome,
+              project: build.value.project,
+              trustedConfig: build.value.trustedConfig,
+              progress,
+              jobs: build.value.jobs,
+              admission: durableAdmission,
+              workManagement: lifecycleWorkManagement,
+              workStatus: new WorkStatusLifecycleCoordinator({
+                workManagement: lifecycleWorkManagement,
+                ...(lifecycleHistory !== undefined
+                  ? {
+                      history: {
+                        getIssueHistory: (...args) => lifecycleHistory(...args),
+                      },
+                    }
+                  : {}),
+                ledger: new JobProgressWorkStatusLifecycleLedger(progress),
+                locks: new FileIssueScopeLock(
+                  join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+                ),
+                clock,
+              }),
+              clock,
+              ensureWorktreeDirectory: () =>
+                ensureDispatchWorktreesDirectory(options.agentTeamHome),
+              buildPipeline: () =>
+                buildPipelineComposition({
+                  agentTeamHome: options.agentTeamHome,
+                  codexConfig: build.value.codex.config,
+                }),
+              resolveAuthoritativeBase: (project, resolveOptions) =>
+                (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
+                  project,
+                  { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
+                  resolveOptions,
+                ),
+            });
+            const coordinated = await prePr.run(prePrRecord.value, {
+              holderId: `work-status:${holderId}`,
+              issue,
+              onPipelineOutcome: (pipelineOutcome) => {
+                observedPipelineOutcome = pipelineOutcome;
+              },
+            });
+            const pipelineResultMatches =
+              observedPipelineOutcome?.state === "ci_waiting"
+                ? coordinated.outcome === "still_ci_waiting"
+                : observedPipelineOutcome?.state === "paused"
+                  ? coordinated.outcome === "checkpointed" ||
+                    (coordinated.outcome === "requires_manual" &&
+                      coordinated.reason === observedPipelineOutcome.reason)
+                  : observedPipelineOutcome?.state === "failed";
+            if (observedPipelineOutcome !== undefined && pipelineResultMatches) {
+              return outcome(observedPipelineOutcome.state === "failed" ? "failed" : "success", {
+                ...dispatchedPayload,
+                ...pipelineOutcomePayload(observedPipelineOutcome),
+              });
+            }
+            const coordinatedError = "error" in coordinated ? coordinated.error : undefined;
+            const coordinatedReason =
+              "reason" in coordinated ? coordinated.reason : coordinated.outcome;
+            const authoritativeBaseFailure = new Set([
+              "default_branch_metadata_unavailable",
+              "authoritative_branch_unavailable",
+              "default_branch_mismatch",
+            ]).has(coordinatedReason);
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline:
+                coordinatedReason === "github_authentication_unavailable" ? "blocked" : "failed",
+              pipelineReason: authoritativeBaseFailure
+                ? "authoritative_base_unavailable"
+                : coordinatedReason,
+              ...(authoritativeBaseFailure ? { reason: coordinatedReason } : {}),
+              ...(coordinatedError === undefined
+                ? ["invalid_head_sha", "invalid_checkpoint_id", "invalid_base_revision"].includes(
+                    coordinatedReason,
+                  )
+                  ? { errorCode: "invariant_violation" }
+                  : {}
+                : { errorCode: coordinatedError.code }),
+              requiresManual: coordinated.outcome === "requires_manual",
+            });
+          }
+
           const pipelineComposition = await buildPipelineComposition({
             agentTeamHome: options.agentTeamHome,
             codexConfig: build.value.codex.config,
@@ -1093,7 +1323,154 @@ export function createDispatchCliHandlers(
             });
           }
 
+          const bootstrapRecord = await progress.load(result.job.id);
+          if (!bootstrapRecord.ok || bootstrapRecord.value?.workStatusLifecycle === undefined) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: "job_progress_read_failed",
+              errorCode: bootstrapRecord.ok ? "not_found" : bootstrapRecord.error.code,
+            });
+          }
+          const authorityDigest = sha256Digest({
+            schemaVersion: 1,
+            jobId: result.job.id,
+            executionEpoch: 1,
+          });
+          const transitionInstance = authorityDigest.ok
+            ? createWorkStatusLifecycleTransitionInstance({
+                jobId: result.job.id,
+                step: "work_start",
+                mainTarget: "in_progress",
+                allowedMainSources: ["ready", "in_progress"],
+                agentTarget: { kind: "set", status: "executing" },
+                authorityDigest: authorityDigest.value,
+              })
+            : authorityDigest;
+          const invocationDigest = sha256Digest({
+            schemaVersion: 1,
+            operation: "dispatch-work-start",
+            jobId: result.job.id,
+            holderId,
+          });
+          if (!transitionInstance.ok || !invocationDigest.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: "work_status_identity_invalid",
+              errorCode: "invariant_violation",
+            });
+          }
+          const lifecycleHistory = lifecycleWorkManagement.getIssueHistory;
+          const workStart = await new WorkStatusLifecycleCoordinator({
+            workManagement: lifecycleWorkManagement,
+            ...(lifecycleHistory !== undefined
+              ? {
+                  history: {
+                    getIssueHistory: (...args) => lifecycleHistory(...args),
+                  },
+                }
+              : {}),
+            ledger: new JobProgressWorkStatusLifecycleLedger(progress),
+            locks: new FileIssueScopeLock(
+              join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+            ),
+            clock,
+          }).transition({
+            jobId: result.job.id,
+            reference: { project: build.value.project, externalIssueId: issue.externalId },
+            holderId: `work-status:${holderId}`,
+            mode: bootstrapRecord.value.workStatusLifecycle.admissionMode,
+            ...(bootstrapRecord.value.workStatusLifecycle.capabilityDigest === undefined
+              ? {}
+              : {
+                  capabilityDigest: bootstrapRecord.value.workStatusLifecycle.capabilityDigest,
+                }),
+            phase: "work_start",
+            step: "work_start",
+            transitionInstance: transitionInstance.value,
+            invocationDigest: invocationDigest.value,
+            mainTarget: "in_progress",
+            allowedMainSources: ["ready"],
+            agentTarget: { kind: "set", status: "executing" },
+          });
+          if (workStart.state !== "permitted") {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: `work_status_${workStart.reason}`,
+              ...(workStart.error === undefined ? {} : { errorCode: workStart.error.code }),
+            });
+          }
+          const beforeProvider = await progress.load(result.job.id);
+          if (!beforeProvider.ok || beforeProvider.value?.workStatusLifecycle === undefined) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: "job_progress_read_failed",
+              errorCode: beforeProvider.ok ? "not_found" : beforeProvider.error.code,
+            });
+          }
+          const implementing = await progress.compareAndSwap(
+            result.job.id,
+            beforeProvider.value.revision,
+            {
+              ...progressMutation(beforeProvider.value),
+              stage: {
+                kind: "implementing",
+                executionEpoch: { ordinal: 1, providerOutput: "none", startedAt: clock.now() },
+              },
+              workStatusLifecycle: {
+                ...beforeProvider.value.workStatusLifecycle,
+                phase: "implementing",
+              },
+            },
+          );
+          if (!implementing.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: "job_progress_write_failed",
+              errorCode: implementing.error.code,
+            });
+          }
+
           const pipelineOutcome = await pipelineComposition.value.run(request.value);
+          const afterProvider = await progress.load(result.job.id);
+          if (!afterProvider.ok || afterProvider.value === undefined) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "job_progress_read_failed",
+              errorCode: afterProvider.ok ? "not_found" : afterProvider.error.code,
+            });
+          }
+          const providerOutputConfirmed = await progress.compareAndSwap(
+            result.job.id,
+            afterProvider.value.revision,
+            {
+              ...progressMutation(afterProvider.value),
+              stage: {
+                kind: "implementing",
+                executionEpoch: {
+                  ordinal: 1,
+                  providerOutput: "confirmed",
+                  ...(afterProvider.value.stage.kind === "implementing" &&
+                  afterProvider.value.stage.executionEpoch?.startedAt !== undefined
+                    ? { startedAt: afterProvider.value.stage.executionEpoch.startedAt }
+                    : {}),
+                },
+              },
+            },
+          );
+          if (!providerOutputConfirmed.ok) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "failed",
+              pipelineReason: "job_progress_write_failed",
+              errorCode: providerOutputConfirmed.error.code,
+            });
+          }
           // C015c item 2's own backport (small, disclosed addition to C015b's scope): the instant
           // a real Draft PR exists, record it in the job-progress index -- this is the *only*
           // place a job's `changeRequestId`/`headSha` are ever first learned, and a later
@@ -1212,7 +1589,7 @@ export function createDispatchCliHandlers(
                 errorCode: "invariant_violation",
               });
             }
-            const recorded = await progress.compareAndSwap(result.job.id, null, {
+            const recorded = await persistDispatchProgress(progress, {
               jobId: result.job.id,
               projectId: build.value.project.id,
               issueId: result.job.issueId,
@@ -1291,7 +1668,7 @@ export function createDispatchCliHandlers(
               }
               parsedCheckpointId = checkpointId.data;
             }
-            const recorded = await progress.compareAndSwap(result.job.id, null, {
+            const recorded = await persistDispatchProgress(progress, {
               jobId: result.job.id,
               projectId: build.value.project.id,
               issueId: result.job.issueId,
@@ -1365,6 +1742,7 @@ export function createDispatchCliHandlers(
             discoverySkipped,
             admissionSkipped,
             protectedRegionSyncFailures,
+            bootstrapReconciliation,
           });
         case "blocked":
           return outcome("failed", {
@@ -1376,6 +1754,7 @@ export function createDispatchCliHandlers(
             discoverySkipped,
             admissionSkipped,
             protectedRegionSyncFailures,
+            bootstrapReconciliation,
           });
       }
     },

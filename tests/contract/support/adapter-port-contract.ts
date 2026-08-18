@@ -29,6 +29,7 @@ const workManagement = {
   listComments: unavailable,
   setWorkStatus: unavailable,
   setAgentCondition: unavailable,
+  clearAgentCondition: unavailable,
   appendComment: unavailable,
   uploadArtifact: unavailable,
 } satisfies WorkManagementPort;
@@ -87,6 +88,7 @@ const requiredMethods = {
     "listComments",
     "setWorkStatus",
     "setAgentCondition",
+    "clearAgentCondition",
     "appendComment",
     "uploadArtifact",
   ],

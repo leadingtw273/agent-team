@@ -181,6 +181,26 @@ const runtimeStatuses: readonly RuntimeStatusItem[] = Object.freeze([
       2,
       "由 Reconcile 檢查一次安全復航；再次異常則維持阻塞。",
     ),
+    workStatusLifecycle: Object.freeze({
+      mode: "enforce",
+      phase: "requires_manual",
+      expectedLinearStateId: "linear-state-review",
+      observedLinearStateId: null,
+      transitionInstance: "a".repeat(64),
+      pendingMutation: null,
+      authority: null,
+      incident: Object.freeze({
+        kind: "main",
+        reasonCode: "retry_exhausted",
+        attemptCount: 2,
+      }),
+      capability: Object.freeze({
+        checkedAt: instant("2026-08-05T05:13:00.000Z"),
+        workflowStatesReady: true,
+        agentLabelsReady: true,
+        reasonCodesReady: true,
+      }),
+    }),
     block: Object.freeze({
       kind: "crash",
       reconcileReason: "recovery_limit_reached",

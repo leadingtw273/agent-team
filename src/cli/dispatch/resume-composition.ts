@@ -42,6 +42,10 @@ import type {
   VisualEvidenceBuilder,
   VisualEvidenceBuildSuccess,
 } from "../../application/pipelines/index.js";
+import {
+  createWorkStatusLifecycleTransitionInstance,
+  type WorkStatusLifecycleCoordinator,
+} from "../../application/pipelines/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type {
   ChangeRequestSnapshot,
@@ -130,6 +134,7 @@ export type ResumeJobRepository = JobRepository & Pick<FileJobRepository, "readA
  * instead of ever retrying the stuck job -- the direct mechanical cause of the duplicate-job bug
  * this ticket closes (see decision 3's admission-claim fix for the other half of that story). */
 export const resumableStageKinds: ReadonlySet<string> = new Set([
+  "work_start_pending",
   "ci_waiting",
   "awaiting_review",
   "fix_round",
@@ -141,6 +146,20 @@ export const resumableStageKinds: ReadonlySet<string> = new Set([
   // not yet exhausted its own, separately-capped retry limit.
   "review_report_pending_retry",
 ]);
+
+function isRecoverableImplementing(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "implementing" &&
+    record.stage.executionEpoch?.ordinal === 1 &&
+    record.stage.executionEpoch.providerOutput === "none" &&
+    record.workStatusLifecycle !== undefined &&
+    record.baseRevision !== undefined
+  );
+}
+
+function isPrePrResumeCandidate(record: JobProgressRecord): boolean {
+  return record.stage.kind === "work_start_pending" || isRecoverableImplementing(record);
+}
 
 /**
  * C015o decision 1: the previous code set `deadlineAt: deps.clock.now()` for both the
@@ -454,6 +473,256 @@ export interface ResumeCycleDependencies {
    * ordinary resumable-stage path (`resumeUnderLease`/`resumeReview`) never touches admission at
    * all, exactly as before this ticket. */
   readonly admission: IssueAdmissionPort;
+  readonly workStatusLifecycle?: Pick<WorkStatusLifecycleCoordinator, "transition">;
+  /** LWS03: the only path allowed to resume a Job before a PR identity exists. It runs under the
+   * same per-Job lease/heartbeat as every other resume path and must never create a Job or claim. */
+  readonly prePrImplementation?: Readonly<{
+    run(
+      record: JobProgressRecord,
+      options: Readonly<{ signal?: AbortSignal }>,
+    ): Promise<ResumeJobOutcome>;
+  }>;
+}
+
+async function gateWorkStatusLifecycle(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  input: Readonly<{
+    step: "review_start" | "fix_start" | "merge_start" | "complete";
+    phase: "reviewing" | "fixing" | "merging" | "terminal";
+    mainTarget: "in_review" | "in_progress" | "completed";
+    allowedMainSources: readonly ("in_progress" | "in_review" | "completed")[];
+    agentTarget:
+      | { readonly kind: "clear" }
+      | { readonly kind: "set"; readonly status: "waiting" | "executing" };
+    causeStage: "review" | "merge";
+    authority: Readonly<Record<string, unknown>>;
+  }>,
+): Promise<ResumeJobOutcome | JobProgressRecord> {
+  const checkpoint = record.workStatusLifecycle;
+  if (checkpoint === undefined || checkpoint.admissionMode === "off") return record;
+  const coordinator = deps.workStatusLifecycle;
+  if (coordinator === undefined) {
+    return requiresManual(
+      record,
+      deps,
+      "work_status_lifecycle_unavailable",
+      requiresManualCause(input.causeStage, "work_status_lifecycle_failed"),
+    );
+  }
+  const authorityDigest = sha256Digest({
+    schemaVersion: 1,
+    jobId: record.jobId,
+    step: input.step,
+    ...input.authority,
+  });
+  const transitionInstance = authorityDigest.ok
+    ? createWorkStatusLifecycleTransitionInstance({
+        jobId: record.jobId,
+        step: input.step,
+        mainTarget: input.mainTarget,
+        allowedMainSources: input.allowedMainSources,
+        agentTarget: input.agentTarget,
+        authorityDigest: authorityDigest.value,
+      })
+    : authorityDigest;
+  const invocationDigest = sha256Digest({
+    schemaVersion: 1,
+    operation: `resume-${input.step}`,
+    jobId: record.jobId,
+    checkpointRevision: record.revision,
+    ...(authorityDigest.ok ? { authorityDigest: authorityDigest.value } : {}),
+  });
+  if (!transitionInstance.ok || !invocationDigest.ok) {
+    return requiresManual(
+      record,
+      deps,
+      "work_status_identity_invalid",
+      requiresManualCause(input.causeStage, "work_status_lifecycle_failed"),
+    );
+  }
+  const transitioned = await whileResumeLeaseHeld(deps, () =>
+    coordinator.transition({
+      jobId: record.jobId,
+      reference: { project: deps.project, externalIssueId: record.externalIssueId },
+      holderId: `work-status:${deps.holderId}`,
+      mode: checkpoint.admissionMode,
+      ...(checkpoint.capabilityDigest === undefined
+        ? {}
+        : { capabilityDigest: checkpoint.capabilityDigest }),
+      phase: input.phase,
+      step: input.step,
+      transitionInstance: transitionInstance.value,
+      invocationDigest: invocationDigest.value,
+      mainTarget: input.mainTarget,
+      allowedMainSources: input.allowedMainSources,
+      agentTarget: input.agentTarget,
+    }),
+  );
+  if (transitioned.state === "permitted") {
+    const current = await whileResumeLeaseHeld(deps, () => deps.progress.load(record.jobId));
+    if (current.ok && current.value !== undefined) return current.value;
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "work_status_progress_read_failed",
+      error: current.ok ? domainError("not_found") : current.error,
+    };
+  }
+  const current = await whileResumeLeaseHeld(deps, () => deps.progress.load(record.jobId));
+  if (!current.ok || current.value === undefined) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "work_status_progress_read_failed",
+      error: current.ok ? domainError("not_found") : current.error,
+    };
+  }
+  const incident = current.value.workStatusLifecycle?.incident?.reasonCode;
+  const retryable =
+    (transitioned.reason === "provider_outage" || transitioned.reason === "main_unconfirmed") &&
+    transitioned.error?.retryable === true &&
+    incident !== "mutation_unconfirmed" &&
+    incident !== "retry_exhausted";
+  if (retryable) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: `work_status_${input.step}_${transitioned.reason}`,
+      error: transitioned.error ?? domainError("unavailable"),
+    };
+  }
+  return requiresManual(
+    current.value,
+    deps,
+    `work_status_${input.step}_${transitioned.reason}`,
+    requiresManualCause(input.causeStage, "work_status_lifecycle_failed"),
+  );
+}
+
+/** Final, read-only authority fence immediately before a Reviewer or reviewer-fix Provider call.
+ * Earlier admission/CI/lifecycle checks remain necessary, but are not durable authority across
+ * visual evidence generation, publication, or review-status mutations. This fence deliberately
+ * re-reads every identity that can revoke execution and makes a drift a zero-Provider outcome. */
+async function verifyProviderAuthority(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  input: Readonly<{
+    expectedWorkStatus: "in_review" | "in_progress";
+    expectedHeadSha: string;
+    changeRequestId: string;
+    requirementsDigest: string;
+  }>,
+): Promise<ResumeJobOutcome | undefined> {
+  const readOptions = deps.signal === undefined ? undefined : { signal: deps.signal };
+  const [progress, workItem, claim, jobs, changeRequest, projectedIssue] =
+    await whileResumeLeaseHeld(deps, () =>
+      Promise.all([
+        deps.progress.load(record.jobId),
+        deps.workManagement.getIssue(
+          { project: deps.project, externalIssueId: record.externalIssueId },
+          readOptions,
+        ),
+        deps.admission.load(record.projectId, record.issueId),
+        deps.jobRepository.readAll(),
+        deps.sourceControl.getChangeRequest(
+          { project: deps.project, changeRequestId: input.changeRequestId },
+          readOptions,
+        ),
+        projectIssueByExternalId(
+          deps.project,
+          deps.readModel,
+          deps.teamId,
+          deps.linearProjectId,
+          record.externalIssueId,
+          readOptions,
+        ),
+      ]),
+    );
+  const readError = !progress.ok
+    ? progress.error
+    : !workItem.ok
+      ? workItem.error
+      : !claim.ok
+        ? claim.error
+        : !jobs.ok
+          ? jobs.error
+          : !changeRequest.ok
+            ? changeRequest.error
+            : !projectedIssue.ok
+              ? projectedIssue.error
+              : undefined;
+  if (readError !== undefined) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "provider_authority_read_failed",
+      error: readError,
+    };
+  }
+  if (
+    !progress.ok ||
+    progress.value === undefined ||
+    !workItem.ok ||
+    !claim.ok ||
+    claim.value === undefined ||
+    !jobs.ok ||
+    !changeRequest.ok ||
+    !projectedIssue.ok
+  ) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "provider_authority_read_failed",
+      error: domainError("not_found"),
+    };
+  }
+  if (progress.value.revision !== record.revision) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "provider_authority_checkpoint_changed",
+      error: domainError("conflict"),
+    };
+  }
+  const matchingJobs = jobs.value.filter(
+    (job) =>
+      job.id === record.jobId &&
+      job.projectId === record.projectId &&
+      job.issueId === record.issueId,
+  );
+  const requirementSnapshot = createRequirementSnapshot(projectedIssue.value, deps.clock.now());
+  const lifecycleEnforced = record.workStatusLifecycle?.admissionMode === "enforce";
+  const invalidAuthority =
+    progress.value.projectId !== record.projectId ||
+    progress.value.issueId !== record.issueId ||
+    progress.value.externalIssueId !== record.externalIssueId ||
+    workItem.value.issue.id !== record.issueId ||
+    workItem.value.issue.projectId !== record.projectId ||
+    workItem.value.issue.externalId !== record.externalIssueId ||
+    workItem.value.archivedAt !== undefined ||
+    workItem.value.trashed === true ||
+    workItem.value.workStatus === "canceled" ||
+    (lifecycleEnforced && workItem.value.workStatus !== input.expectedWorkStatus) ||
+    claim.value.state !== "active" ||
+    claim.value.projectId !== record.projectId ||
+    claim.value.issueId !== record.issueId ||
+    claim.value.externalIssueId !== record.externalIssueId ||
+    claim.value.jobId !== record.jobId ||
+    matchingJobs.length !== 1 ||
+    changeRequest.value.state !== "open" ||
+    changeRequest.value.headBranch !== record.branch ||
+    changeRequest.value.headSha !== input.expectedHeadSha ||
+    !requirementSnapshot.ok ||
+    requirementSnapshot.value.requirementsDigest !== input.requirementsDigest;
+  return invalidAuthority
+    ? requiresManual(
+        progress.value,
+        deps,
+        "provider_authority_mismatch",
+        requiresManualCause("review", "work_status_lifecycle_failed"),
+      )
+    : undefined;
 }
 
 export type ResumeJobOutcome =
@@ -541,6 +810,29 @@ export type ResumeJobOutcome =
 type CancellationRaceMergeMutations = NonNullable<
   NonNullable<LifecyclePipelineRequest["cancellationRaceAudit"]>["mergeMutations"]
 >;
+
+function lifecycleAudit(
+  record: JobProgressRecord,
+  operation: "dispatch-resume" | "reconcile" | "reviewer-replay",
+): NonNullable<LifecyclePipelineRequest["workStatusLifecycleAudit"]> {
+  const transitionDigest = (step: "work_start" | "review_start"): string | undefined => {
+    const transition = [...(record.workStatusLifecycle?.transitions ?? [])]
+      .reverse()
+      .find((candidate) => candidate.step === step);
+    if (transition === undefined) return undefined;
+    const digest = sha256Digest({ schemaVersion: 1, jobId: record.jobId, transition });
+    return digest.ok ? digest.value : undefined;
+  };
+  const workReceiptDigest = transitionDigest("work_start");
+  const reviewReceiptDigest = transitionDigest("review_start");
+  return Object.freeze({
+    operation,
+    jobId: record.jobId,
+    ...(workReceiptDigest === undefined ? {} : { workReceiptDigest }),
+    ...(reviewReceiptDigest === undefined ? {} : { reviewReceiptDigest }),
+    outcome: "completed" as const,
+  });
+}
 
 function persistedMergeMutations(
   record: JobProgressRecord,
@@ -630,6 +922,7 @@ async function reviewerReplayPolicyBlock(
 function isPipelineResumable(record: JobProgressRecord): boolean {
   return (
     resumableStageKinds.has(record.stage.kind) ||
+    isRecoverableImplementing(record) ||
     isReviewReuseReconcilable(record) ||
     isReviewerReplayCheckpointReconcilable(record)
   );
@@ -854,6 +1147,23 @@ async function resumeOneJob(
         requiresManualCause("setup", "legacy_provider_assignment_unavailable"),
       );
     }
+    if (isPrePrResumeCandidate(current.record)) {
+      if (guardedDeps.prePrImplementation === undefined) {
+        return await requiresManual(
+          current.record,
+          guardedDeps,
+          "pre_pr_resume_unavailable",
+          requiresManualCause("setup", "bootstrap_incomplete"),
+        );
+      }
+      const resumed = await guardedDeps.prePrImplementation.run(current.record, {
+        signal: heartbeat.signal,
+      });
+      await heartbeat.stop();
+      return heartbeat.signal.aborted
+        ? { jobId: record.jobId, outcome: "lease_conflict" }
+        : resumed;
+    }
     if (guardedDeps.prepare !== undefined) {
       await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
     }
@@ -1069,16 +1379,36 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
+  const terminalLifecycle = await gateWorkStatusLifecycle(record, deps, {
+    step: "complete",
+    phase: "terminal",
+    mainTarget: "completed",
+    allowedMainSources: ["in_progress", "in_review", "completed"],
+    agentTarget: { kind: "clear" },
+    causeStage: "merge",
+    authority: {
+      changeRequestId,
+      authorizedHeadSha: "external",
+      lifecycleHeadSha: current.value.headSha,
+    },
+  });
+  if ("outcome" in terminalLifecycle) return terminalLifecycle;
+  record = terminalLifecycle;
+
   const lifecyclePrefix =
     record.reviewerReplay?.state === "review_succeeded"
       ? `reviewer-replay:${record.jobId}:${record.reviewerReplay.identityDigest}:lifecycle`
-      : `cli-dispatch-reconcile:${record.jobId}:${String(record.revision)}:lifecycle`;
+      : `cli-dispatch-lifecycle:${record.jobId}:${changeRequestId}`;
   const lifecycleOutcome = await whileResumeLeaseHeld(deps, () =>
     deps.lifecycle.run({
       project: deps.project,
       externalIssueId: record.externalIssueId,
       changeRequestId,
       idempotencyKeyPrefix: lifecyclePrefix,
+      workStatusLifecycleAudit: lifecycleAudit(
+        record,
+        record.reviewerReplay?.state === "review_succeeded" ? "reviewer-replay" : "reconcile",
+      ),
       ...(record.reviewerReplay?.state !== "review_succeeded"
         ? {}
         : {
@@ -1912,6 +2242,7 @@ async function publishReviewerWaiting(
         ...(record.stage.bucket === undefined ? {} : { bucket: record.stage.bucket }),
         ...(record.stage.resetAt === undefined ? {} : { resetAt: record.stage.resetAt }),
         idempotencyKeyPrefix: `reviewer-wait:${record.jobId}:${record.stage.binding.headSha}:${record.stage.reason}`,
+        lifecycleMode: record.workStatusLifecycle?.admissionMode ?? "off",
       }) ?? Promise.resolve(err(domainError("invariant_violation"))),
   );
   if (!published.ok) {
@@ -2048,6 +2379,21 @@ async function resumeReview(
   if (reviewerReplayCheckpoint === undefined) {
     const halted = await beginReview();
     if (halted !== undefined) return halted;
+    const lifecycleGate = await gateWorkStatusLifecycle(record, deps, {
+      step: "review_start",
+      phase: "reviewing",
+      mainTarget: "in_review",
+      allowedMainSources: ["in_progress", "in_review"],
+      agentTarget: { kind: "set", status: "waiting" },
+      causeStage: "review",
+      authority: {
+        requirementsDigest: context.requirementSnapshot.requirementsDigest,
+        headSha: expectedHeadSha,
+        baseRevision: context.baseRevision,
+      },
+    });
+    if ("outcome" in lifecycleGate) return lifecycleGate;
+    record = lifecycleGate;
   }
   // `already_approved` intentionally falls through to the same fresh Reviewer path as `pending`.
   // Its successful status proves only that this head was reviewed before; it is not a
@@ -2250,6 +2596,13 @@ async function resumeReview(
 
   let reviewOutcome: ReviewerPipelineOutcome;
   if (reviewerReplayCheckpoint === undefined) {
+    const authority = await verifyProviderAuthority(record, deps, {
+      expectedWorkStatus: "in_review",
+      expectedHeadSha,
+      changeRequestId: context.changeRequestId,
+      requirementsDigest: context.requirementSnapshot.requirementsDigest,
+    });
+    if (authority !== undefined) return authority;
     reviewOutcome = await whileResumeLeaseHeld(deps, () => deps.reviewer.run(reviewerRequest));
   } else {
     const inspect = deps.reviewer.inspect;
@@ -2309,6 +2662,21 @@ async function resumeReview(
     }
     const halted = await beginReview();
     if (halted !== undefined) return halted;
+    const lifecycleGate = await gateWorkStatusLifecycle(record, deps, {
+      step: "review_start",
+      phase: "reviewing",
+      mainTarget: "in_review",
+      allowedMainSources: ["in_progress", "in_review"],
+      agentTarget: { kind: "set", status: "waiting" },
+      causeStage: "review",
+      authority: {
+        requirementsDigest: context.requirementSnapshot.requirementsDigest,
+        headSha: expectedHeadSha,
+        baseRevision: context.baseRevision,
+      },
+    });
+    if ("outcome" in lifecycleGate) return lifecycleGate;
+    record = lifecycleGate;
     reviewOutcome = Object.freeze({
       state: "approved" as const,
       job: inspected.job,
@@ -2441,6 +2809,22 @@ async function resumeReview(
           requiresManualCause("review", "review_record_failed"),
         );
       }
+      const fixLifecycleGate = await gateWorkStatusLifecycle(record, deps, {
+        step: "fix_start",
+        phase: "fixing",
+        mainTarget: "in_progress",
+        allowedMainSources: ["in_review", "in_progress"],
+        agentTarget: { kind: "set", status: "executing" },
+        causeStage: "review",
+        authority: {
+          requirementsDigest: context.requirementSnapshot.requirementsDigest,
+          headSha: expectedHeadSha,
+          baseRevision: context.baseRevision,
+          fixRound: context.job.attempts.reviewerFixRounds + 1,
+        },
+      });
+      if ("outcome" in fixLifecycleGate) return fixLifecycleGate;
+      record = fixLifecycleGate;
       const recoveryDeadline = computeProviderDeadline(deps.clock);
       if (recoveryDeadline === undefined) {
         return requiresManual(
@@ -2450,6 +2834,13 @@ async function resumeReview(
           requiresManualCause("review", "review_paused"),
         );
       }
+      const fixAuthority = await verifyProviderAuthority(record, deps, {
+        expectedWorkStatus: "in_progress",
+        expectedHeadSha,
+        changeRequestId: context.changeRequestId,
+        requirementsDigest: context.requirementSnapshot.requirementsDigest,
+      });
+      if (fixAuthority !== undefined) return fixAuthority;
       const recoveryOutcome = await whileResumeLeaseHeld(deps, () =>
         deps.reviewerRecovery.run({
           job: context.job,
@@ -2626,6 +3017,23 @@ async function resumeReview(
     currentPublicationDigest = aggregateLinearPublicationDigest([receipt.value]);
   }
 
+  const mergeLifecycleGate = await gateWorkStatusLifecycle(record, deps, {
+    step: "merge_start",
+    phase: "merging",
+    mainTarget: "in_review",
+    allowedMainSources: ["in_review"],
+    agentTarget: { kind: "set", status: "executing" },
+    causeStage: "merge",
+    authority: {
+      requirementsDigest: context.requirementSnapshot.requirementsDigest,
+      headSha: expectedHeadSha,
+      baseRevision: context.baseRevision,
+      approvalIdentity: recorded.approval.identity,
+    },
+  });
+  if ("outcome" in mergeLifecycleGate) return mergeLifecycleGate;
+  record = mergeLifecycleGate;
+
   const enabled = await whileResumeLeaseHeld(deps, () =>
     deps.autoMerge.enable({
       project: deps.project,
@@ -2635,6 +3043,9 @@ async function resumeReview(
       requirementSnapshot: context.requirementSnapshot,
       baseRevision: context.baseRevision,
       approval: recorded.approval,
+      ...(record.workStatusLifecycle?.admissionMode === "enforce"
+        ? { expectedWorkStatus: "in_review" as const }
+        : {}),
       ...(currentVisualManifest === undefined ? {} : { currentVisualManifest }),
       ...(currentPublicationDigest === undefined ? {} : { currentPublicationDigest }),
       ...(deps.signal === undefined ? {} : { signal: deps.signal }),
@@ -2834,10 +3245,26 @@ async function finishMerged(
   authorizedHeadSha: string | undefined,
   mergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
+  const terminalLifecycle = await gateWorkStatusLifecycle(record, deps, {
+    step: "complete",
+    phase: "terminal",
+    mainTarget: "completed",
+    allowedMainSources: ["in_progress", "in_review", "completed"],
+    agentTarget: { kind: "clear" },
+    causeStage: "merge",
+    authority: {
+      changeRequestId,
+      authorizedHeadSha: authorizedHeadSha ?? "external",
+      lifecycleHeadSha: authorizedHeadSha ?? record.headSha ?? "external",
+    },
+  });
+  if ("outcome" in terminalLifecycle) return terminalLifecycle;
+  record = terminalLifecycle;
+
   const lifecyclePrefix =
     record.reviewerReplay?.state === "review_succeeded"
       ? `reviewer-replay:${record.jobId}:${record.reviewerReplay.identityDigest}:lifecycle`
-      : `cli-dispatch-resume:${record.jobId}:${String(record.revision)}:lifecycle`;
+      : `cli-dispatch-lifecycle:${record.jobId}:${changeRequestId}`;
   const outcome = await whileResumeLeaseHeld(deps, () =>
     deps.lifecycle.run({
       project: deps.project,
@@ -2845,6 +3272,10 @@ async function finishMerged(
       changeRequestId,
       ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
       idempotencyKeyPrefix: lifecyclePrefix,
+      workStatusLifecycleAudit: lifecycleAudit(
+        record,
+        record.reviewerReplay?.state === "review_succeeded" ? "reviewer-replay" : "dispatch-resume",
+      ),
       ...(record.reviewerReplay?.state !== "review_succeeded"
         ? {}
         : {

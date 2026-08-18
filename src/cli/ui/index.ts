@@ -74,6 +74,50 @@ function snapshotFromPayload(payload: ProjectListPayload): UiSnapshot {
         registrationReason: project.registration.reason,
         nonTerminalCount: project.nonTerminalProgressCount,
         activeLeaseCount: project.activeLeaseCount,
+        workStatusLifecycleMode: project.workStatusLifecycleMode,
+        workStatusPendingCount: project.workStatusPendingCount,
+        workStatusInFlightModeCounts: project.workStatusInFlightModeCounts,
+        workStatusCapability: project.workStatusCapability,
+        workStatusJobs: project.workStatusJobs.map((job) =>
+          Object.freeze({
+            jobId: job.jobId,
+            workStatusLifecycleMode: job.workStatusLifecycleMode,
+            workStatusPhase: job.workStatusPhase,
+            expectedLinearStateId: job.expectedLinearStateId,
+            observedLinearStateId: job.observedLinearStateId,
+            transitionInstance: job.transitionInstance,
+            pendingMutation:
+              job.pendingMutation === null
+                ? null
+                : Object.freeze({
+                    jobId: job.pendingMutation.jobId,
+                    step: job.pendingMutation.step,
+                    transitionInstance: job.pendingMutation.transitionInstance,
+                    targetKind: job.pendingMutation.targetKind,
+                    targetId: job.pendingMutation.targetId,
+                    consecutiveFailureCount: job.pendingMutation.consecutiveFailureCount,
+                    lastClosedReason: job.pendingMutation.lastClosedReason,
+                    lastAttemptAt: job.pendingMutation.lastAttemptAt,
+                  }),
+            authority:
+              job.authority === null
+                ? null
+                : Object.freeze({
+                    jobId: job.authority.jobId,
+                    claimId: job.authority.claimId,
+                    leaseExpiresAt: job.authority.leaseExpiresAt,
+                  }),
+            incident:
+              job.incident === null
+                ? null
+                : Object.freeze({
+                    kind: job.incident.kind,
+                    reasonCode: job.incident.reasonCode,
+                    state: job.incident.state,
+                    attemptCount: job.incident.attemptCount,
+                  }),
+          }),
+        ),
       }),
     ),
   );

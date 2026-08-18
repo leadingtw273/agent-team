@@ -19,6 +19,8 @@ const platformKey = z
   .regex(/^[a-z][a-z0-9_-]{0,63}$/u)
   .max(64);
 const externalId = z.string().trim().min(1).max(255);
+export const workStatusLifecycleModeSchema = z.enum(["off", "observe", "enforce"]);
+export type WorkStatusLifecycleMode = z.infer<typeof workStatusLifecycleModeSchema>;
 const commandArgument = z
   .string()
   .max(10_000)
@@ -75,6 +77,7 @@ export const trustedProjectConfigSchema = z
       })
       .strict(),
     projectRules: z.array(boundedText).max(1_000),
+    workStatusLifecycleMode: workStatusLifecycleModeSchema.optional(),
     roleInstructions: roleInstructionsSchema,
     commands: z
       .object({
@@ -87,6 +90,13 @@ export const trustedProjectConfigSchema = z
 
 export type ProjectCommand = z.infer<typeof projectCommandSchema>;
 export type TrustedProjectConfig = z.infer<typeof trustedProjectConfigSchema>;
+
+/** Legacy trusted configs intentionally omit this field; omission is the immutable off default. */
+export function resolveWorkStatusLifecycleMode(
+  config: Pick<TrustedProjectConfig, "workStatusLifecycleMode">,
+): WorkStatusLifecycleMode {
+  return config.workStatusLifecycleMode ?? "off";
+}
 
 export interface SerializedTrustedProjectConfig {
   readonly content: string;

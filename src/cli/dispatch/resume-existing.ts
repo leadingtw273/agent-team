@@ -25,6 +25,17 @@ import { ensureDispatchWorktreesDirectory } from "./worktree-directories.js";
 import { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
 import { join } from "node:path";
 import { createLazyReviewerFacade } from "./reviewer-facade.js";
+import {
+  FileIssueScopeLock,
+  JobProgressWorkStatusLifecycleLedger,
+} from "../../adapters/dispatch/index.js";
+import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
+import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
+import {
+  buildImplementerPipeline,
+  type BuildImplementerPipelineResult,
+} from "./implementer-composition.js";
+import { PrePrImplementationCoordinator } from "./pre-pr-implementation-coordinator.js";
 
 export type ResumeExistingProjectJobsResult =
   | Readonly<{ state: "none" }>
@@ -50,6 +61,9 @@ export interface ResumeExistingProjectJobsOptions {
   readonly buildResumeComposition?: (
     options: Parameters<typeof buildResumeComposition>[0],
   ) => Promise<BuildResumeCompositionResult>;
+  readonly buildImplementerPipeline?: (
+    options: Parameters<typeof buildImplementerPipeline>[0],
+  ) => Promise<BuildImplementerPipelineResult>;
   readonly runResumeCycle?: typeof runResumeCycle;
   readonly resolveAuthoritativeBase?: typeof resolveAuthoritativeBaseRevision;
 }
@@ -146,6 +160,49 @@ export async function resumeExistingProjectJobs(
 
   const autoMergePause = options.autoMergePause ?? buildAutoMergePauseStore(options.agentTeamHome);
   const leases = new LeaseCoordinator(options.ready.leases);
+  const lifecycleWorkManagement = new LinearWorkManagementAdapter({
+    readModel: options.ready.discovery.readModel,
+    mutationClient: options.ready.discovery.mutationClient,
+    teamId: options.ready.discovery.teamId,
+    linearProjectId: options.ready.discovery.linearProjectId,
+  });
+  const workStatusLifecycle = new WorkStatusLifecycleCoordinator({
+    workManagement: lifecycleWorkManagement,
+    history: lifecycleWorkManagement,
+    ledger: new JobProgressWorkStatusLifecycleLedger(progress),
+    locks: new FileIssueScopeLock(
+      join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+    ),
+    clock: options.clock,
+  });
+  let implementerComposition: BuildImplementerPipelineResult | undefined;
+  const prePrImplementation = new PrePrImplementationCoordinator({
+    agentTeamHome: options.agentTeamHome,
+    project: options.ready.project,
+    trustedConfig: options.ready.trustedConfig,
+    progress,
+    jobs: options.ready.jobs,
+    admission: buildIssueAdmissionStore(options.agentTeamHome),
+    workManagement: lifecycleWorkManagement,
+    workStatus: workStatusLifecycle,
+    clock: options.clock,
+    ensureWorktreeDirectory: () => ensureDispatchWorktreesDirectory(options.agentTeamHome),
+    buildPipeline: async () => {
+      implementerComposition ??= await (
+        options.buildImplementerPipeline ?? buildImplementerPipeline
+      )({
+        agentTeamHome: options.agentTeamHome,
+        codexConfig: options.ready.codex.config,
+      });
+      return implementerComposition;
+    },
+    resolveAuthoritativeBase: (project, resolveOptions) =>
+      (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
+        project,
+        { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
+        resolveOptions,
+      ),
+  });
   let resumeComposition: ResumePipelineComposition | undefined;
   let preparePromise: Promise<void> | undefined;
   const prepare = (): Promise<void> => {
@@ -252,6 +309,14 @@ export async function resumeExistingProjectJobs(
         holderId: options.holderId,
         reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
         admission: buildIssueAdmissionStore(options.agentTeamHome),
+        workStatusLifecycle,
+        prePrImplementation: {
+          run: (record, runOptions) =>
+            prePrImplementation.run(record, {
+              holderId: `pre-pr:${options.holderId}`,
+              ...(runOptions.signal === undefined ? {} : { signal: runOptions.signal }),
+            }),
+        },
         resolveAuthoritativeBase: (project, resolveOptions) =>
           (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
             project,

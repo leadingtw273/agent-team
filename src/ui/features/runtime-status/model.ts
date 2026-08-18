@@ -82,6 +82,45 @@ export interface RuntimeCheckpointSummary {
   readonly nextStep: string;
 }
 
+/** LWS07: closed, local-only lifecycle projection; never contains adapter or provider payloads. */
+export interface RuntimeWorkStatusLifecycleSummary {
+  readonly mode: "off" | "observe" | "enforce";
+  readonly phase:
+    | "idle"
+    | "work_start_pending"
+    | "working"
+    | "review_start_pending"
+    | "reviewing"
+    | "fix_pending"
+    | "blocked_pending_mutation"
+    | "requires_manual"
+    | "completed"
+    | "canceled";
+  readonly expectedLinearStateId: string | null;
+  readonly observedLinearStateId: string | null;
+  readonly transitionInstance: string | null;
+  readonly pendingMutation: Readonly<{
+    step: string;
+    consecutiveFailureCount: number;
+    lastAttemptAt: Instant;
+  }> | null;
+  readonly authority: Readonly<{
+    jobId: string;
+    leaseExpiresAt: Instant;
+  }> | null;
+  readonly incident: Readonly<{
+    kind: "main" | "agent" | "bootstrap";
+    reasonCode: string;
+    attemptCount: number;
+  }> | null;
+  readonly capability: Readonly<{
+    checkedAt: Instant | null;
+    workflowStatesReady: boolean;
+    agentLabelsReady: boolean;
+    reasonCodesReady: boolean;
+  }>;
+}
+
 interface RuntimeBlockBase {
   readonly summary: string;
   readonly nextStep: string;
@@ -126,6 +165,7 @@ export interface RuntimeStatusItem {
   readonly lastEffectiveProgress?: RuntimeEffectiveProgress;
   readonly watchdog: RuntimeWatchdogSummary;
   readonly checkpoint?: RuntimeCheckpointSummary;
+  readonly workStatusLifecycle?: RuntimeWorkStatusLifecycleSummary;
   readonly block?: RuntimeBlock;
   readonly nextStep: string;
 }

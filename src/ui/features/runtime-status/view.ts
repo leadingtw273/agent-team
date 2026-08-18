@@ -284,6 +284,26 @@ function renderBlock(block: RuntimeBlock | undefined): string {
   </section>`;
 }
 
+function renderWorkStatusLifecycle(lifecycle: RuntimeStatusItem["workStatusLifecycle"]): string {
+  if (lifecycle === undefined) return "";
+  const pending = lifecycle.pendingMutation;
+  const authority = lifecycle.authority;
+  const incident = lifecycle.incident;
+  const capability = lifecycle.capability;
+  return `<section class="ui-runtime-section" aria-label="Linear 工作狀態生命週期">
+    <h3>Linear 工作狀態生命週期</h3>
+    <dl class="ui-runtime-facts ui-runtime-facts--compact ui-runtime-facts--mobile-rows">
+      <div><dt>模式／階段</dt><dd>${label(lifecycle.mode)}／${label(lifecycle.phase)}</dd></div>
+      <div><dt>預期／已觀測狀態</dt><dd>${runtimeIdentifier(lifecycle.expectedLinearStateId ?? "unavailable")}／${runtimeIdentifier(lifecycle.observedLinearStateId ?? "unconfirmed")}</dd></div>
+      <div><dt>Transition</dt><dd>${runtimeIdentifier(lifecycle.transitionInstance ?? "none")}</dd></div>
+      <div><dt>Pending mutation</dt><dd>${pending === null ? "無" : `${label(pending.step)}｜失敗 ${String(pending.consecutiveFailureCount)} 次｜${timestamp(pending.lastAttemptAt)}`}</dd></div>
+      <div><dt>Authority</dt><dd>${authority === null ? "無" : `${runtimeIdentifier(authority.jobId)}｜Lease ${timestamp(authority.leaseExpiresAt)}`}</dd></div>
+      <div><dt>Incident</dt><dd>${incident === null ? "無" : `${label(incident.kind)}／${label(incident.reasonCode)}｜${String(incident.attemptCount)} 次`}</dd></div>
+      <div><dt>Capability</dt><dd>${capability.workflowStatesReady && capability.agentLabelsReady && capability.reasonCodesReady ? "完整" : "未完整"}｜${capability.checkedAt === null ? "尚未檢查" : timestamp(capability.checkedAt)}</dd></div>
+    </dl>
+  </section>`;
+}
+
 function renderRuntimeStatus(item: RuntimeStatusItem, index: number): string {
   const headingId = `runtime-status-${String(index + 1)}`;
   return `<article class="card ui-runtime-card ui-runtime-card--${statusClass(item.state)}" aria-labelledby="${headingId}">
@@ -314,6 +334,7 @@ function renderRuntimeStatus(item: RuntimeStatusItem, index: number): string {
       ${renderProgress(item.lastEffectiveProgress)}
       ${renderWatchdog(item.watchdog)}
       ${renderCheckpoint(item.checkpoint)}
+      ${renderWorkStatusLifecycle(item.workStatusLifecycle)}
       ${renderBlock(item.block)}
       <section class="ui-runtime-section ui-runtime-next-step" aria-label="下一步">
         <h3>下一步</h3><p>${text(item.nextStep)}</p>

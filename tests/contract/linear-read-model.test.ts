@@ -131,6 +131,8 @@ function createFixtureFetch(overrides: Readonly<Record<string, unknown>> = {}): 
               description: fixture.issue.description,
               priority: fixture.issue.priority,
               updatedAt: fixture.issue.updatedAt,
+              archivedAt: null,
+              trashed: false,
               team: { id: fixture.issue.teamId },
               project: fixture.issue.projectId === null ? null : { id: fixture.issue.projectId },
               state: { id: fixture.issue.stateId },

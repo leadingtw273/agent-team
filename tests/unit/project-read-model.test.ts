@@ -9,6 +9,7 @@ import {
   jobProgressRecordSchema,
   type JobProgressRecord,
 } from "../../src/adapters/dispatch/job-progress-store.js";
+import { issueAdmissionRecordSchema } from "../../src/adapters/dispatch/issue-admission-store.js";
 import type {
   ProjectRegistrySnapshot,
   TrustedProjectConfig,
@@ -369,6 +370,187 @@ describe("T05 project read model", () => {
     });
     expect(JSON.stringify(progressView)).not.toContain("EXTERNAL-ISSUE-SECRET");
     expect(JSON.stringify(progressView)).not.toContain("provider-secret-model");
+  });
+
+  it("projects a persisted enforce lifecycle safely after the project is downgraded", async () => {
+    const record = jobProgressRecordSchema.parse({
+      ...progress(jobOne, projectOne, issueOne, {
+        kind: "requires_manual",
+        cause: {
+          stage: "dispatch",
+          reasonCode: "work_status_lifecycle_failed",
+          attempts: { count: 1 },
+        },
+      }),
+      workStatusLifecycle: {
+        admissionMode: "enforce",
+        capabilityDigest: "c".repeat(64),
+        phase: "reviewing",
+        transitions: [
+          {
+            step: "review_start",
+            instance: "d".repeat(64),
+            mainTarget: "in_review",
+            allowedMainSources: ["in_progress"],
+            main: { state: "intent", idempotencyKey: "work-status:test:review" },
+            agent: { state: "not_required" },
+            mainFailures: { count: 1, lastErrorCode: "external_failure" },
+            agentFailures: { count: 0 },
+            historyEvidence: {
+              preStateId: "state-in-progress",
+              targetStateId: "state-in-review",
+              observedRevision: observedAt,
+              historyPrefixDigest: "e".repeat(64),
+              historyEntryCount: 2,
+              historyTailId: "history-safe-id",
+              preStateSpanId: "span-safe-id",
+            },
+          },
+        ],
+        incident: { reasonCode: "mutation_unconfirmed", channel: "main" },
+      },
+    });
+    const claim = issueAdmissionRecordSchema.parse({
+      schemaVersion: 1,
+      revision: 3,
+      projectId: projectOne.id,
+      issueId: issueOne,
+      externalIssueId: "LINEAR-SAFE-ID",
+      jobId: jobOne,
+      state: "active",
+      claimedAt: "2026-08-11T11:00:00.000Z",
+      updatedAt: observedAt,
+    });
+    const activeLease = lease(
+      "lease_018f47d2-77a4-7cc1-8ef2-012345678901",
+      jobOne,
+      issueOne,
+      "2026-08-11T13:00:00.000Z",
+    );
+    const result = await model({
+      progress: { listAll: vi.fn(() => Promise.resolve(ok(Object.freeze([record])))) },
+      jobs: {
+        readAll: vi.fn(() =>
+          Promise.resolve(ok(Object.freeze([job(jobOne, projectOne, issueOne)]))),
+        ),
+      },
+      leases: { readAll: vi.fn(() => Promise.resolve(ok(Object.freeze([activeLease])))) },
+      admission: { listForProject: vi.fn(() => Promise.resolve(ok(Object.freeze([claim])))) },
+    }).read({ projectId: projectOne.id });
+    const rendered = payload(result);
+    const lifecycle = (rendered["project"] as Record<string, Record<string, unknown>>)[
+      "workStatusLifecycle"
+    ];
+
+    expect(lifecycle).toMatchObject({
+      workStatusLifecycleMode: "off",
+      inFlightModeCounts: { off: 0, observe: 0, enforce: 1 },
+      pendingMutationCount: 1,
+      capability: {
+        checkedAt: null,
+        workflowStatesReady: false,
+        agentLabelsReady: false,
+        reasonCodesReady: false,
+      },
+      jobs: [
+        {
+          jobId: jobOne,
+          workStatusLifecycleMode: "enforce",
+          workStatusPhase: "blocked_pending_mutation",
+          expectedLinearStateId: "state-in-review",
+          observedLinearStateId: null,
+          transitionInstance: "d".repeat(64),
+          pendingMutation: {
+            step: "review_start",
+            consecutiveFailureCount: 1,
+            lastClosedReason: "external_failure",
+          },
+          authority: {
+            jobId: jobOne,
+            claimId: `${projectOne.id}:${issueOne}:3`,
+            leaseExpiresAt: "2026-08-11T13:00:00.000Z",
+          },
+          incident: {
+            kind: "main",
+            reasonCode: "mutation_unconfirmed",
+            state: "active",
+            attemptCount: 1,
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(lifecycle)).not.toContain("provider-secret-model");
+    expect(JSON.stringify(lifecycle)).not.toContain("/tmp/worktree-secret");
+    expect(JSON.stringify(lifecycle)).not.toContain("token=");
+  });
+
+  it("distinguishes review-start intent from an observed no-mutation state", async () => {
+    const lifecycleRecord = (
+      id: string,
+      issueId: string,
+      main: Readonly<Record<string, unknown>>,
+    ) =>
+      jobProgressRecordSchema.parse({
+        ...progress(id, projectOne, issueId, { kind: "awaiting_review" }),
+        workStatusLifecycle: {
+          admissionMode: "observe",
+          phase: "reviewing",
+          transitions: [
+            {
+              step: "review_start",
+              instance: id === jobOne ? "1".repeat(64) : "2".repeat(64),
+              mainTarget: "in_review",
+              allowedMainSources: ["in_progress", "in_review"],
+              main,
+              agent: { state: "not_required" },
+              mainFailures: { count: 0 },
+              agentFailures: { count: 0 },
+              historyEvidence: {
+                preStateId: "state-in-progress",
+                targetStateId: "state-in-review",
+                observedRevision: observedAt,
+                historyPrefixDigest: "3".repeat(64),
+                historyEntryCount: 0,
+                preStateSpanId: "span-in-progress",
+              },
+            },
+          ],
+        },
+      });
+    const records = [
+      lifecycleRecord(jobOne, issueOne, {
+        state: "observed",
+        observedAt,
+        observedRevision: observedAt,
+      }),
+      lifecycleRecord(jobTwo, issueTwo, {
+        state: "intent",
+        idempotencyKey: "safe-review-intent",
+      }),
+    ];
+    const result = await model({
+      progress: { listAll: vi.fn(() => Promise.resolve(ok(records))) },
+    }).read({ projectId: projectOne.id });
+    const rendered = payload(result);
+    const lifecycle = (rendered["project"] as Record<string, Record<string, unknown>>)[
+      "workStatusLifecycle"
+    ];
+    if (lifecycle === undefined) throw new Error("missing lifecycle projection");
+
+    expect(lifecycle["jobs"]).toMatchObject([
+      {
+        jobId: jobOne,
+        workStatusPhase: "reviewing",
+        expectedLinearStateId: "state-in-review",
+        observedLinearStateId: "state-in-progress",
+      },
+      {
+        jobId: jobTwo,
+        workStatusPhase: "review_start_pending",
+        expectedLinearStateId: "state-in-review",
+        observedLinearStateId: null,
+      },
+    ]);
   });
 
   it("marks all progress unavailable instead of omitting a corrupt durable record", async () => {

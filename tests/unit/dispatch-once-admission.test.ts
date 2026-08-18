@@ -28,6 +28,7 @@ import {
   type IssueAdmissionPort,
 } from "../../src/adapters/dispatch/issue-admission-store.js";
 import { FileOperatorCanaryAttestationStore } from "../../src/adapters/dispatch/operator-canary-attestation-store.js";
+import { FileWorkStatusCapabilityStore } from "../../src/adapters/dispatch/work-status-capability-store.js";
 import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linear-discovery.js";
 import {
   buildLinearReadCatalog,
@@ -497,6 +498,29 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     if (allJobs.ok) expect(allJobs.value).toHaveLength(0);
   });
 
+  it("serializes admission on the shared Issue lock and creates zero claim or Job on contention", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-admission-lock");
+    const base = buildPorts(stateRoot);
+
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...base,
+        locks: { acquire: () => Promise.resolve(err(domainError("conflict"))) },
+      },
+      "holder-lock-contention",
+    );
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.result.kind).toBe("waiting");
+    expect(outcome.admissionSkipped).toEqual([
+      { issueId: outcome.candidates[0]?.issue.id, reason: "issue_scope_lock_unavailable" },
+    ]);
+    expect(await base.jobs.readAll()).toEqual({ ok: true, value: [] });
+  });
+
   it("a successful dispatch attaches the real job id to its admission claim", async () => {
     const stateRoot = await temporaryStateRoot();
     const ready = readyComposition(stateRoot, "linear-issue-admission-2");
@@ -513,6 +537,163 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
     if (claim.ok) {
       expect(claim.value).toMatchObject({ state: "active", jobId: outcome.result.job.id });
     }
+  });
+
+  it("LWS02 confirms durable bootstrap before attaching the selected claim", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-bootstrap-order");
+    const base = buildPorts(stateRoot);
+    const events: string[] = [];
+    const admission: IssueAdmissionPort = {
+      load: (...args) => base.admission.load(...args),
+      claim: (...args) => base.admission.claim(...args),
+      attachJob: (...args) => {
+        events.push("attach");
+        return base.admission.attachJob(...args);
+      },
+      release: (...args) => base.admission.release(...args),
+    };
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...base,
+        admission,
+        bootstrap: () => {
+          events.push("bootstrap");
+          return Promise.resolve(ok(undefined));
+        },
+      },
+      "holder-bootstrap-order",
+    );
+    expect(outcome).toMatchObject({ outcome: "ran", bootstrap: { state: "confirmed" } });
+    expect(events).toEqual(["bootstrap", "attach"]);
+  });
+
+  it("LWS02 leaves a safe active jobless claim when bootstrap fails and never attempts attach", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-bootstrap-fail");
+    const base = buildPorts(stateRoot);
+    let attachCalls = 0;
+    const admission: IssueAdmissionPort = {
+      load: (...args) => base.admission.load(...args),
+      claim: (...args) => base.admission.claim(...args),
+      attachJob: (...args) => {
+        attachCalls += 1;
+        return base.admission.attachJob(...args);
+      },
+      release: (...args) => base.admission.release(...args),
+    };
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...base,
+        admission,
+        bootstrap: () => Promise.resolve(err(domainError("permission_denied"))),
+      },
+      "holder-bootstrap-fail",
+    );
+    expect(outcome).toMatchObject({
+      outcome: "ran",
+      result: { kind: "dispatched" },
+      bootstrap: { state: "blocked", reason: "job_progress_write_failed" },
+    });
+    expect(attachCalls).toBe(0);
+    if (outcome.outcome !== "ran" || outcome.result.kind !== "dispatched") return;
+    const claim = await base.admission.load(ready.project.id, outcome.result.job.issueId);
+    expect(claim).toMatchObject({ ok: true, value: { state: "active" } });
+    if (claim.ok) expect(claim.value).not.toHaveProperty("jobId");
+  });
+
+  it("LWS02 preserves confirmed progress and a jobless claim when selected-claim attach loses CAS", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-attach-fail");
+    const base = buildPorts(stateRoot);
+    let bootstrapCalls = 0;
+    const admission: IssueAdmissionPort = {
+      load: (...args) => base.admission.load(...args),
+      claim: (...args) => base.admission.claim(...args),
+      attachJob: () => Promise.resolve(err(domainError("conflict"))),
+      release: (...args) => base.admission.release(...args),
+    };
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...base,
+        admission,
+        bootstrap: () => {
+          bootstrapCalls += 1;
+          return Promise.resolve(ok(undefined));
+        },
+      },
+      "holder-attach-fail",
+    );
+    expect(outcome).toMatchObject({
+      outcome: "ran",
+      bootstrap: { state: "blocked", reason: "claim_attach_failed" },
+    });
+    expect(bootstrapCalls).toBe(1);
+  });
+
+  it("LWS00/LWS02 enforce capability failure creates zero claim, Lease, or Job", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const base = readyComposition(stateRoot, "linear-issue-capability-fail");
+    const ready: DispatchCompositionReady = {
+      ...base,
+      trustedConfig: trustedProjectConfigSchema.parse({
+        ...base.trustedConfig,
+        workStatusLifecycleMode: "enforce",
+      }),
+      // Deliberately no capability store: enforce must fail before discovery admission.
+    };
+    const ports = buildPorts(stateRoot);
+    const outcome = await dispatchOnce(ready, ports, "holder-capability-fail");
+    expect(outcome).toMatchObject({
+      outcome: "capability_failed",
+      error: { code: "unavailable" },
+    });
+    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
+    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
+  });
+
+  it("LWS01 observe capability failure stays fail-open and still admits the Job", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const base = readyComposition(stateRoot, "linear-issue-capability-observe");
+    const ready: DispatchCompositionReady = {
+      ...base,
+      trustedConfig: trustedProjectConfigSchema.parse({
+        ...base.trustedConfig,
+        workStatusLifecycleMode: "observe",
+      }),
+      // Missing capability storage is telemetry loss only in observe mode.
+    };
+    const ports = buildPorts(stateRoot);
+
+    const outcome = await dispatchOnce(ready, ports, "holder-capability-observe");
+
+    expect(outcome).toMatchObject({ outcome: "ran", result: { kind: "dispatched" } });
+    const jobs = await ports.jobs.readAll();
+    expect(jobs.ok).toBe(true);
+    if (jobs.ok) expect(jobs.value).toHaveLength(1);
+  });
+
+  it("LWS00 stores an enforce capability digest before allowing admission", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const base = readyComposition(stateRoot, "linear-issue-capability-ok");
+    const store = new FileWorkStatusCapabilityStore(join(stateRoot, "capability"));
+    const ready: DispatchCompositionReady = {
+      ...base,
+      trustedConfig: trustedProjectConfigSchema.parse({
+        ...base.trustedConfig,
+        workStatusLifecycleMode: "enforce",
+      }),
+      workStatusCapability: { store },
+    };
+    const outcome = await dispatchOnce(ready, buildPorts(stateRoot), "holder-capability-ok");
+    expect(outcome).toMatchObject({ outcome: "ran", result: { kind: "dispatched" } });
+    const evidence = await store.load(projectId);
+    expect(evidence.ok ? evidence.value?.capability.digest : evidence.error.code).toMatch(
+      /^[0-9a-f]{64}$/u,
+    );
   });
 
   it("exactly one of two genuinely concurrent dispatchOnce calls for the same candidate dispatches", async () => {

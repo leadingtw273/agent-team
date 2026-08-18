@@ -2,10 +2,22 @@ import type {
   FileJobProgressStore,
   JobProgressRecord,
 } from "../../adapters/dispatch/job-progress-store.js";
+import type {
+  FileIssueAdmissionStore,
+  IssueAdmissionRecord,
+} from "../../adapters/dispatch/issue-admission-store.js";
+import type {
+  FileWorkStatusCapabilityStore,
+  WorkStatusCapabilityRecord,
+} from "../../adapters/dispatch/work-status-capability-store.js";
 import {
   type ProjectRegistry,
   type ProjectRegistrySnapshot,
   type TrustedProjectLoadResult,
+} from "../../application/projects/index.js";
+import {
+  resolveWorkStatusLifecycleMode,
+  type WorkStatusLifecycleMode,
 } from "../../application/projects/index.js";
 import {
   evaluateRegistrationWakeupHealth,
@@ -36,6 +48,8 @@ export interface ProjectReadModelOptions {
   readonly progress: Pick<FileJobProgressStore, "listAll">;
   readonly jobs: Pick<FileJobRepository, "readAll">;
   readonly leases: Pick<FileLeaseRepository, "readAll">;
+  readonly admission?: Pick<FileIssueAdmissionStore, "listForProject">;
+  readonly workStatusCapability?: Pick<FileWorkStatusCapabilityStore, "load">;
   readonly clock: Clock;
   readonly systemdReader?: RegistrationWakeupStateReader;
   readonly webhookReader?: GlobalWebhookWakeupStateReader & ProjectWebhookWakeupStateReader;
@@ -80,6 +94,143 @@ type LeaseProjection =
       state: "unknown";
       reason: "lease_unassigned";
     }>;
+
+function phaseFor(record: JobProgressRecord): string {
+  if (record.stage.kind === "completed") return "completed";
+  if (record.stage.kind === "cancelled") return "canceled";
+  if (record.stage.kind === "requires_manual") {
+    return record.workStatusLifecycle?.incident?.reasonCode === "mutation_unconfirmed"
+      ? "blocked_pending_mutation"
+      : "requires_manual";
+  }
+  const checkpoint = record.workStatusLifecycle;
+  if (checkpoint === undefined) return "idle";
+  if (checkpoint.incident?.reasonCode === "mutation_unconfirmed") return "blocked_pending_mutation";
+  const latest = checkpoint.transitions.at(-1);
+  switch (checkpoint.phase) {
+    case "work_start":
+      return "work_start_pending";
+    case "implementing":
+      return "working";
+    case "reviewing":
+      return latest?.step === "review_start" &&
+        latest.main.state !== "confirmed" &&
+        latest.main.state !== "observed"
+        ? "review_start_pending"
+        : "reviewing";
+    case "fixing":
+      return "fix_pending";
+    case "merging":
+      return "reviewing";
+    case "terminal":
+      return latest?.main.state === "confirmed" || latest?.main.state === "observed"
+        ? "completed"
+        : "blocked_pending_mutation";
+  }
+}
+
+function lifecycleProjection(
+  input: Readonly<{
+    projectId: string;
+    configuredMode: WorkStatusLifecycleMode;
+    records: readonly JobProgressRecord[] | undefined;
+    claims: readonly IssueAdmissionRecord[] | undefined;
+    leases: readonly Lease[] | undefined;
+    capability: WorkStatusCapabilityRecord | undefined;
+    observedAt: ReturnType<Clock["now"]>;
+  }>,
+) {
+  const records = (input.records ?? []).filter(
+    (record) => record.projectId === input.projectId && record.workStatusLifecycle !== undefined,
+  );
+  const inFlight = records.filter((record) => classifyJobProgressRecord(record) !== "terminal");
+  const inFlightModeCounts = { off: 0, observe: 0, enforce: 0 };
+  for (const record of inFlight) {
+    const checkpoint = record.workStatusLifecycle;
+    if (checkpoint !== undefined) inFlightModeCounts[checkpoint.admissionMode] += 1;
+  }
+  const jobs = records
+    .sort((left, right) => left.jobId.localeCompare(right.jobId))
+    .flatMap((record) => {
+      const checkpoint = record.workStatusLifecycle;
+      if (checkpoint === undefined) return [];
+      const transition = checkpoint.transitions.at(-1);
+      const pending =
+        transition?.main.state === "intent" || transition?.main.state === "sent_unknown"
+          ? transition
+          : undefined;
+      const claim = input.claims?.find(
+        (candidate) => candidate.state === "active" && candidate.jobId === record.jobId,
+      );
+      const lease = input.leases?.find(
+        (candidate) =>
+          candidate.jobId === record.jobId && leaseState(candidate, input.observedAt) === "active",
+      );
+      const failureCount =
+        transition === undefined
+          ? 0
+          : Math.max(transition.mainFailures.count, transition.agentFailures.count);
+      return [
+        Object.freeze({
+          jobId: record.jobId,
+          workStatusLifecycleMode: checkpoint.admissionMode,
+          workStatusPhase: phaseFor(record),
+          expectedLinearStateId: transition?.historyEvidence?.targetStateId ?? null,
+          observedLinearStateId:
+            transition?.historyEvidence === undefined
+              ? null
+              : transition.main.state === "confirmed"
+                ? transition.historyEvidence.targetStateId
+                : transition.main.state === "observed"
+                  ? transition.historyEvidence.preStateId
+                  : null,
+          transitionInstance: transition?.instance ?? null,
+          pendingMutation:
+            pending?.historyEvidence === undefined
+              ? null
+              : Object.freeze({
+                  jobId: record.jobId,
+                  step: pending.step,
+                  transitionInstance: pending.instance,
+                  targetKind: "work_status" as const,
+                  targetId: pending.historyEvidence.targetStateId,
+                  consecutiveFailureCount: pending.mainFailures.count,
+                  lastClosedReason: pending.mainFailures.lastErrorCode ?? null,
+                  lastAttemptAt: record.updatedAt,
+                }),
+          authority:
+            claim === undefined || lease === undefined
+              ? null
+              : Object.freeze({
+                  jobId: record.jobId,
+                  claimId: `${claim.projectId}:${claim.issueId}:${String(claim.revision)}`,
+                  leaseExpiresAt: lease.expiresAt,
+                }),
+          incident:
+            checkpoint.incident === undefined
+              ? null
+              : Object.freeze({
+                  kind: checkpoint.incident.channel,
+                  reasonCode: checkpoint.incident.reasonCode,
+                  state: "active" as const,
+                  attemptCount: failureCount,
+                }),
+        }),
+      ];
+    });
+  return Object.freeze({
+    workStatusLifecycleMode: input.configuredMode,
+    inFlightModeCounts: Object.freeze(inFlightModeCounts),
+    pendingMutationCount: jobs.filter((job) => job.pendingMutation !== null).length,
+    capability: Object.freeze({
+      checkedAt: input.capability?.checkedAt ?? null,
+      workflowStatesReady: input.capability !== undefined,
+      agentLabelsReady: input.capability !== undefined,
+      reasonCodesReady: input.capability !== undefined,
+    }),
+    jobs: Object.freeze(jobs),
+  });
+}
 
 const secretLikeDisplayNameAssignment =
   /\b(?:api[\s_-]*key|token|cookie|signature)\b[\s_-]*[:=]\s*\S/iu;
@@ -170,6 +321,14 @@ function registrationFor(
     return registrationForRejection(rejectedEntry.reason);
   }
   return Object.freeze({ state: "unknown", reason: "trusted_config_unavailable" });
+}
+
+function configuredLifecycleMode(
+  projectId: string,
+  snapshot: ProjectRegistrySnapshot | undefined,
+): WorkStatusLifecycleMode {
+  const ready = snapshot?.ready.find((entry) => entry.project.id === projectId);
+  return ready === undefined ? "off" : resolveWorkStatusLifecycleMode(ready.config);
 }
 
 function dispositionCounts(records: readonly JobProgressRecord[]): Readonly<{
@@ -352,11 +511,37 @@ export class ProjectReadModel {
       }
 
       const registry = await this.#readRegistry(discovery.drafts);
-      const [records, jobs, leases] = await Promise.all([
+      const admission = this.options.admission;
+      const workStatusCapability = this.options.workStatusCapability;
+      const [records, jobs, leases, claimEntries, capabilityEntries] = await Promise.all([
         safelyRead(() => this.options.progress.listAll()),
         safelyRead(() => this.options.jobs.readAll()),
         safelyRead(() => this.options.leases.readAll()),
+        Promise.all(
+          groups.map(
+            async (group) =>
+              [
+                group.id,
+                admission === undefined
+                  ? undefined
+                  : await safelyRead(() => admission.listForProject(group.id)),
+              ] as const,
+          ),
+        ),
+        Promise.all(
+          groups.map(
+            async (group) =>
+              [
+                group.id,
+                workStatusCapability === undefined
+                  ? undefined
+                  : await safelyRead(() => workStatusCapability.load(group.id)),
+              ] as const,
+          ),
+        ),
       ]);
+      const claimsByProject = new Map(claimEntries);
+      const capabilityByProject = new Map(capabilityEntries);
       const observedAt = this.options.clock.now();
       const wakeup = await this.#wakeupProjection(input.projectId);
 
@@ -365,6 +550,15 @@ export class ProjectReadModel {
         const projects = groups.map((group, index) => {
           const progress = projectProgress(group.id, records);
           const lease = projectLeases(group.id, jobs, leases, observedAt);
+          const lifecycle = lifecycleProjection({
+            projectId: group.id,
+            configuredMode: configuredLifecycleMode(group.id, registry),
+            records,
+            claims: claimsByProject.get(group.id),
+            leases,
+            capability: capabilityByProject.get(group.id),
+            observedAt,
+          });
           return Object.freeze({
             id: group.id,
             displayName: safeDisplayName(group),
@@ -372,6 +566,11 @@ export class ProjectReadModel {
             nonTerminalProgressCount:
               progress.state === "available" ? progress.nonTerminal.length : null,
             activeLeaseCount: lease.state === "available" ? lease.counts.active : null,
+            workStatusLifecycleMode: lifecycle.workStatusLifecycleMode,
+            workStatusPendingCount: lifecycle.pendingMutationCount,
+            workStatusInFlightModeCounts: lifecycle.inFlightModeCounts,
+            workStatusCapability: lifecycle.capability,
+            workStatusJobs: lifecycle.jobs,
           });
         });
         const listLeases = leaseAvailability(jobs, leases, observedAt);
@@ -401,6 +600,15 @@ export class ProjectReadModel {
       const registration = registrationFor(requested, registry);
       const progress = projectProgress(requested.id, records);
       const lease = projectLeases(requested.id, jobs, leases, observedAt);
+      const lifecycle = lifecycleProjection({
+        projectId: requested.id,
+        configuredMode: configuredLifecycleMode(requested.id, registry),
+        records,
+        claims: claimsByProject.get(requested.id),
+        leases,
+        capability: capabilityByProject.get(requested.id),
+        observedAt,
+      });
       return Object.freeze({
         state: "success",
         payload: Object.freeze({
@@ -423,6 +631,7 @@ export class ProjectReadModel {
             leases: lease,
             quota: quotaProjection(),
             wakeup,
+            workStatusLifecycle: lifecycle,
           }),
         }),
       });

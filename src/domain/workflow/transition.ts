@@ -21,6 +21,8 @@ const standardWorkTransitions = new Set([
   "backlog>ready:ready_gate_passed",
   "ready>in_progress:work_started",
   "ready>requires_manual:policy_requires_manual",
+  "in_progress>requires_manual:policy_requires_manual",
+  "in_review>requires_manual:policy_requires_manual",
   "requires_manual>ready:ready_gate_passed",
   "in_progress>in_review:review_started",
   "in_review>in_progress:changes_requested",
@@ -54,7 +56,7 @@ export function transitionWorkStatus(
 const agentTransitions: Readonly<Record<AgentStatus, ReadonlySet<AgentStatus>>> = {
   queued: new Set(["executing", "waiting", "paused", "blocked"]),
   executing: new Set(["queued", "waiting", "paused", "blocked"]),
-  waiting: new Set(["queued", "paused", "blocked"]),
+  waiting: new Set(["queued", "executing", "paused", "blocked"]),
   paused: new Set(["queued"]),
   blocked: new Set(["queued"]),
 };

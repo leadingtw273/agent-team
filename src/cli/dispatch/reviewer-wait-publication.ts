@@ -10,6 +10,7 @@ import {
 } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import { createAgentCondition, type BlockingReason } from "../../domain/workflow/index.js";
+import type { WorkStatusLifecycleMode } from "../../application/projects/index.js";
 
 export interface ReviewerWaitPublicationRequest {
   readonly project: Project;
@@ -20,6 +21,7 @@ export interface ReviewerWaitPublicationRequest {
   readonly bucket?: "weekly" | "five_hour" | "model_weekly";
   readonly resetAt?: Instant;
   readonly idempotencyKeyPrefix: string;
+  readonly lifecycleMode?: WorkStatusLifecycleMode;
 }
 
 export interface ReviewerWaitPublicationPort {
@@ -84,29 +86,34 @@ export class ReviewerWaitPublicationCoordinator implements ReviewerWaitPublicati
       return current.ok ? err(domainError("conflict")) : current;
     }
 
-    const workStatus = await this.workManagement.setWorkStatus(reference, "in_review", {
-      idempotencyKey: `${request.idempotencyKeyPrefix}:linear-work-status`,
-    });
-    if (!workStatus.ok || workStatus.value.workStatus !== "in_review") {
-      return workStatus.ok ? err(domainError("conflict")) : workStatus;
+    const lifecycleMode = request.lifecycleMode ?? "off";
+    if (lifecycleMode === "off") {
+      const workStatus = await this.workManagement.setWorkStatus(reference, "in_review", {
+        idempotencyKey: `${request.idempotencyKeyPrefix}:linear-work-status`,
+      });
+      if (!workStatus.ok || workStatus.value.workStatus !== "in_review") {
+        return workStatus.ok ? err(domainError("conflict")) : workStatus;
+      }
     }
-    const reason = blockingReason(request);
-    const condition = await this.workManagement.setAgentCondition(
-      reference,
-      createAgentCondition("waiting", [reason]),
-      { idempotencyKey: `${request.idempotencyKeyPrefix}:linear-agent-condition` },
-    );
-    if (
-      !condition.ok ||
-      condition.value.agentCondition?.status !== "waiting" ||
-      condition.value.agentCondition.blockingReasons[0] !== reason
-    ) {
-      return condition.ok ? err(domainError("conflict")) : condition;
+    if (lifecycleMode !== "observe") {
+      const reason = blockingReason(request);
+      const condition = await this.workManagement.setAgentCondition(
+        reference,
+        createAgentCondition("waiting", [reason]),
+        { idempotencyKey: `${request.idempotencyKeyPrefix}:linear-agent-condition` },
+      );
+      if (
+        !condition.ok ||
+        condition.value.agentCondition?.status !== "waiting" ||
+        condition.value.agentCondition.blockingReasons[0] !== reason
+      ) {
+        return condition.ok ? err(domainError("conflict")) : condition;
+      }
+      const comment = await this.workManagement.appendComment(reference, waitComment(request), {
+        idempotencyKey: `${request.idempotencyKeyPrefix}:linear-comment`,
+      });
+      if (!comment.ok) return comment;
     }
-    const comment = await this.workManagement.appendComment(reference, waitComment(request), {
-      idempotencyKey: `${request.idempotencyKeyPrefix}:linear-comment`,
-    });
-    if (!comment.ok) return comment;
 
     const statuses = await this.sourceControl.getCommitStatuses(
       { project: request.project },

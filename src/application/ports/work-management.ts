@@ -11,7 +11,11 @@ export interface WorkManagementIssueRef {
 export interface WorkManagementIssueSnapshot {
   readonly issue: Issue;
   readonly workStatus: WorkStatus;
+  /** Provider workflow-state id used only for exact lifecycle/recovery identity. */
+  readonly workStatusStateId?: string;
   readonly agentCondition?: AgentCondition;
+  readonly archivedAt?: Instant;
+  readonly trashed?: boolean;
   readonly updatedAt: Instant;
   readonly revision: string;
 }
@@ -71,6 +75,10 @@ export interface WorkManagementPort {
   setAgentCondition(
     reference: WorkManagementIssueRef,
     condition: AgentCondition,
+    options: MutationOptions,
+  ): AsyncPortResult<WorkManagementIssueSnapshot>;
+  clearAgentCondition(
+    reference: WorkManagementIssueRef,
     options: MutationOptions,
   ): AsyncPortResult<WorkManagementIssueSnapshot>;
   appendComment(

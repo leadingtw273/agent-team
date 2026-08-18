@@ -133,6 +133,14 @@ export interface LifecyclePipelineRequest {
     attemptTotal: number;
     outcome: "review_succeeded";
   }>;
+  /** Safe, controller-derived lifecycle provenance appended to the one existing success comment. */
+  readonly workStatusLifecycleAudit?: Readonly<{
+    operation: "dispatch-resume" | "reconcile" | "reviewer-replay";
+    jobId: string;
+    workReceiptDigest?: string;
+    reviewReceiptDigest?: string;
+    outcome: "completed";
+  }>;
   readonly signal?: AbortSignal;
 }
 

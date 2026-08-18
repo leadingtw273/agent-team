@@ -8,6 +8,7 @@ import type {
 import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { JobProgressRecord } from "../../adapters/dispatch/job-progress-store.js";
 import type { ResumeJobOutcome } from "../dispatch/resume-composition.js";
+import type { WorkStatusOrphanScanOutcome } from "../dispatch/work-status-orphan-coordinator.js";
 import type { CliCommandOutcome } from "../program.js";
 import { countJobProgressInventory, type JobProgressInventory } from "./active-job-inventory.js";
 
@@ -60,6 +61,7 @@ export interface ManualReconcileUseCase {
   readonly resumeJobProgress: (
     records: readonly JobProgressRecord[],
   ) => Promise<JobProgressResumeBatch>;
+  readonly quarantineWorkStatusOrphans?: () => Promise<readonly WorkStatusOrphanScanOutcome[]>;
   /** E010c: which `ReconcilePorts` capabilities this use case's composition actually backed. */
   readonly disclosedScope: ReconcileDisclosedScope;
 }
@@ -157,6 +159,7 @@ function renderReconcileOutcome(
   disclosedScope: ReconcileDisclosedScope,
   inventory: JobProgressInventory,
   resumed: JobProgressResumeBatch,
+  orphanScans: readonly WorkStatusOrphanScanOutcome[] = [],
 ): CliCommandOutcome {
   if (result.state === "failed") {
     return outcome("failed", {
@@ -183,7 +186,10 @@ function renderReconcileOutcome(
         candidate.outcome !== "merge_reconciled",
     );
   const effectiveState =
-    result.state === "degraded" || hasUnresolvedProgress || resumeDidNotConverge
+    result.state === "degraded" ||
+    hasUnresolvedProgress ||
+    resumeDidNotConverge ||
+    orphanScans.some((scan) => scan.blocked > 0)
       ? ("degraded" as const)
       : ("completed" as const);
   const payload = {
@@ -197,6 +203,7 @@ function renderReconcileOutcome(
     targetCounts: countTargets(result.targets),
     jobProgressCounts,
     jobProgressResume: safeResumeBatch(resumed),
+    workStatusOrphanScans: orphanScans,
     jobProgressBlocked: inventory.blocked.map((record) => ({
       projectId: record.projectId,
       jobId: record.jobId,
@@ -242,6 +249,11 @@ export function createManualReconcileHandler(
           },
         );
       }
+      const orphanScans =
+        reconciled.state === "completed" &&
+        options.reconcile.quarantineWorkStatusOrphans !== undefined
+          ? await options.reconcile.quarantineWorkStatusOrphans()
+          : [];
       const resumed =
         reconciled.state === "completed"
           ? await options.reconcile.resumeJobProgress(inventory.value.resumable)
@@ -259,6 +271,7 @@ export function createManualReconcileHandler(
         options.reconcile.disclosedScope,
         finalInventory.value,
         resumed,
+        orphanScans,
       );
     } catch {
       return outcome("failed", {

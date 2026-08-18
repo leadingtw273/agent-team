@@ -1,6 +1,8 @@
 import { join } from "node:path";
 
 import { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
+import { FileIssueAdmissionStore } from "../../adapters/dispatch/issue-admission-store.js";
+import { FileWorkStatusCapabilityStore } from "../../adapters/dispatch/work-status-capability-store.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { FileRegistrationSetupActivationRegistry } from "../../adapters/registration/index.js";
 import { ProjectRegistry, TrustedProjectConfigLoader } from "../../application/projects/index.js";
@@ -68,6 +70,10 @@ export function createProjectReadModel(options: CreateProjectCliHandlersOptions)
     progress: new FileJobProgressStore(join(stateRoot, "dispatch", "progress")),
     jobs: new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock")),
     leases: new FileLeaseRepository(join(stateRoot, "leases.json"), join(stateRoot, "leases.lock")),
+    admission: new FileIssueAdmissionStore(join(stateRoot, "dispatch", "admission")),
+    workStatusCapability: new FileWorkStatusCapabilityStore(
+      join(stateRoot, "dispatch", "work-status-capability"),
+    ),
     clock: createClock(),
     ...(options.systemdReader === undefined ? {} : { systemdReader: options.systemdReader }),
     ...(options.webhookReader === undefined ? {} : { webhookReader: options.webhookReader }),

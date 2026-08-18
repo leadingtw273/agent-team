@@ -137,7 +137,7 @@ test.describe("O003 Linear provision UI", () => {
     const section = page.getByRole("region", { name: "Linear 設定預覽" });
     await expect(section.getByText("設定未完成", { exact: true })).toBeVisible();
     await expect(section.getByText("可自動建立").locator("..").getByText("27")).toBeVisible();
-    await expect(section.getByText("人工步驟").locator("..").getByText("6")).toBeVisible();
+    await expect(section.getByText("人工步驟").locator("..").getByText("7")).toBeVisible();
     await expect(section).toContainText("不刪除、不改名");
     await expect(section).toContainText("不從 Linear 留言取得核可");
     await expectNoAxeViolations(page);

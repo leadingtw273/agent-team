@@ -62,6 +62,11 @@ import {
 } from "../../application/pipelines/reviewer-model.js";
 import { currentReviewerReportContractBinding } from "../../application/pipelines/reviewer-policy.js";
 import {
+  workStatusLifecycleCheckpointSchema,
+  type WorkStatusLifecycleCheckpoint,
+  type WorkStatusLifecycleTransition,
+} from "../../application/pipelines/work-status-lifecycle-model.js";
+import {
   AtomicFileStore,
   acquireRecoverableFileLock,
   readJsonWithSchema,
@@ -318,6 +323,11 @@ export const requiresManualReasonCodeSchema = z.enum([
   // resolve`.
   "role_pipeline_unavailable",
   "protected_region_requires_human",
+  // LWS02: Job creation/progress bootstrap and selected-claim attachment did not converge.
+  "bootstrap_incomplete",
+  "pre_pr_identity_unrecoverable",
+  "process_recovery_exhausted",
+  "work_status_lifecycle_failed",
 ]);
 export type RequiresManualReasonCode = z.infer<typeof requiresManualReasonCodeSchema>;
 
@@ -399,8 +409,19 @@ export const requiresManualCauseSchema = z
   .strict();
 export type RequiresManualCause = z.infer<typeof requiresManualCauseSchema>;
 
+const executionEpochSchema = z
+  .object({
+    ordinal: z.number().int().min(1).max(2),
+    providerOutput: z.enum(["none", "confirmed"]),
+    startedAt: instantSchema.optional(),
+  })
+  .strict();
+
 export const jobProgressStageSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("implementing") }).strict(),
+  z.object({ kind: z.literal("work_start_pending") }).strict(),
+  z
+    .object({ kind: z.literal("implementing"), executionEpoch: executionEpochSchema.optional() })
+    .strict(),
   z.object({ kind: z.literal("ci_waiting") }).strict(),
   z.object({ kind: z.literal("awaiting_review") }).strict(),
   z
@@ -766,6 +787,8 @@ export const jobProgressRecordSchema = z
     /** Immutable audit of the one permitted prior replay epoch. Its singular shape structurally
      * caps a Job at two epochs. Once present, no writer may remove or modify it. */
     previousReviewerReplay: reviewerReplayCheckpointSchema.optional(),
+    /** Optional for every legacy record. New work-status-aware Jobs persist it before Provider. */
+    workStatusLifecycle: workStatusLifecycleCheckpointSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict()
@@ -819,6 +842,91 @@ function canonicalV2ReplayIdentity(checkpoint: ReviewerReplayCheckpoint | undefi
   if (checkpoint?.identity.schemaVersion !== 2) return true;
   const digest = sha256Digest(checkpoint.identity);
   return digest.ok && digest.value === checkpoint.identityDigest;
+}
+
+function lifecycleChannelCanAdvance(
+  current: WorkStatusLifecycleTransition["main"],
+  next: WorkStatusLifecycleTransition["main"],
+): boolean {
+  if (
+    current.state === "confirmed" ||
+    current.state === "not_required" ||
+    current.state === "observed"
+  ) {
+    return sameJson(current, next);
+  }
+  if (current.state === "sent_unknown") {
+    return sameJson(current, next);
+  }
+  return next.state === "intent" || next.state === "sent_unknown" || next.state === "confirmed";
+}
+
+function lifecycleCounterCanAdvance(
+  current: WorkStatusLifecycleTransition["mainFailures"],
+  next: WorkStatusLifecycleTransition["mainFailures"],
+  receipt: WorkStatusLifecycleTransition["main"],
+): boolean {
+  return next.count >= current.count || (receipt.state === "confirmed" && next.count === 0);
+}
+
+function lifecycleCheckpointCanAdvance(
+  current: WorkStatusLifecycleCheckpoint | undefined,
+  next: WorkStatusLifecycleCheckpoint | undefined,
+): boolean {
+  if (current === undefined) return true;
+  if (next === undefined) return false;
+  if (
+    current.admissionMode !== next.admissionMode ||
+    current.capabilityDigest !== next.capabilityDigest ||
+    next.transitions.length < current.transitions.length
+  ) {
+    return false;
+  }
+  if (current.recovery !== undefined) {
+    if (
+      next.recovery === undefined ||
+      next.recovery.epoch < current.recovery.epoch ||
+      (next.recovery.epoch === current.recovery.epoch && !sameJson(next.recovery, current.recovery))
+    ) {
+      return false;
+    }
+  }
+  const currentRecoveries = current.recoveries ?? [];
+  const nextRecoveries = next.recoveries ?? [];
+  if (
+    nextRecoveries.length < currentRecoveries.length ||
+    !currentRecoveries.every((receipt, index) => sameJson(receipt, nextRecoveries[index])) ||
+    nextRecoveries.some((receipt, index) => receipt.epoch !== index + 1)
+  ) {
+    return false;
+  }
+  return current.transitions.every((transition, index) => {
+    const candidate = next.transitions[index];
+    if (candidate === undefined) return false;
+    if (
+      candidate.step !== transition.step ||
+      candidate.instance !== transition.instance ||
+      !sameJson(candidate.mainTarget, transition.mainTarget) ||
+      !sameJson(candidate.allowedMainSources, transition.allowedMainSources) ||
+      !sameJson(candidate.agentTarget, transition.agentTarget) ||
+      !sameJson(candidate.historyEvidence, transition.historyEvidence) ||
+      !lifecycleChannelCanAdvance(transition.main, candidate.main) ||
+      !lifecycleChannelCanAdvance(transition.agent, candidate.agent) ||
+      !lifecycleCounterCanAdvance(
+        transition.mainFailures,
+        candidate.mainFailures,
+        candidate.main,
+      ) ||
+      !lifecycleCounterCanAdvance(
+        transition.agentFailures,
+        candidate.agentFailures,
+        candidate.agent,
+      )
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 function isNotFound(error: DomainError): boolean {
@@ -917,6 +1025,14 @@ export class FileJobProgressStore {
       normalizedCurrent.value?.providerAssignments !== undefined &&
       JSON.stringify(next.providerAssignments) !==
         JSON.stringify(normalizedCurrent.value.providerAssignments)
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      !lifecycleCheckpointCanAdvance(
+        normalizedCurrent.value?.workStatusLifecycle,
+        next.workStatusLifecycle,
+      )
     ) {
       return err(domainError("invariant_violation"));
     }

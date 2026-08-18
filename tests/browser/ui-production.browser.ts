@@ -407,8 +407,14 @@ test.describe("T06 production localhost UI", () => {
     await expect(projectsRegion).toHaveAccessibleName("專案");
     await expect(projectsRegion).toHaveAttribute("tabindex", "0");
     const mobileLabels = page.locator(".ui-table--production-projects .ui-mobile-cell-label");
-    await expect(mobileLabels).toHaveCount(4);
-    await expect(mobileLabels).toHaveText(["名稱", "註冊狀態／原因", "非終態工作", "活躍租約"]);
+    await expect(mobileLabels).toHaveCount(5);
+    await expect(mobileLabels).toHaveText([
+      "名稱",
+      "註冊狀態／原因",
+      "非終態工作",
+      "活躍租約",
+      "Linear lifecycle",
+    ]);
     await expect(mobileLabels.first()).toBeVisible();
     await expect(mobileLabels.last()).toBeVisible();
     await expectProductionProjectsTableFitsViewport(page);

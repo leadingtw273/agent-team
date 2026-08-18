@@ -254,7 +254,7 @@ function mergePorts(
      * (never-paused) path, unaffected by the new gate check. */
     paused?: boolean;
     isPausedResult?: Awaited<ReturnType<MergeGatePorts["autoMergePause"]["isPaused"]>>;
-    workStatus?: "in_review" | "canceled" | "completed";
+    workStatus?: "in_progress" | "in_review" | "canceled" | "completed";
     authorizationResult?: Awaited<ReturnType<MergeGatePorts["workManagement"]["getIssue"]>>;
   } = {},
 ): MergeGatePorts {
@@ -559,6 +559,7 @@ describe("auto-merge gate", () => {
       headSha,
       expect.anything(),
       issue.externalId,
+      undefined,
     );
   });
 
@@ -792,6 +793,18 @@ describe("auto-merge gate", () => {
 
     expect(outcome).toEqual({ state: "work_canceled", mutations: [] });
     expect(ports.workManagement.getIssue).toHaveBeenCalledTimes(1);
+    expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
+  });
+
+  it("enforce expected status drift fails before the GitHub mutation boundary", async () => {
+    const ports = mergePorts({ workStatus: "in_progress" });
+
+    const outcome = await new AutoMergeGate(ports).enable({
+      ...mergeRequest(),
+      expectedWorkStatus: "in_review",
+    });
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "authorization" });
     expect(ports.sourceControl.enableAutoMerge).not.toHaveBeenCalled();
   });
 

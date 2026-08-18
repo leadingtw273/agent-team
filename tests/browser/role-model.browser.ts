@@ -159,7 +159,7 @@ test.describe("U004 role model configuration", () => {
   }) => {
     await visit(page);
     const active = page.locator('[data-active-job-id="job-running-implementer"]');
-    await expect(active).toHaveAttribute("data-active-candidate", "claude:sonnet");
+    await expect(active).toHaveAttribute("data-active-candidate", "codex:gpt-5.6-sol");
     await expect(active).toContainText("啟動時順位 2");
 
     const teamLeadList = page.locator('[data-role-model-list="team_lead"]');
@@ -178,12 +178,12 @@ test.describe("U004 role model configuration", () => {
     await implementers.nth(1).dragTo(implementers.nth(0));
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["claude:sonnet", "codex:gpt-5.6-terra"]);
+      .toEqual(["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"]);
 
     await implementers.nth(0).dragTo(implementers.nth(1));
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["codex:gpt-5.6-terra", "claude:sonnet"]);
+      .toEqual(["codex:gpt-5.6-terra", "codex:gpt-5.6-sol"]);
     const afterDownwardDrag = await candidateKeys(page, "implementer");
     expect(afterDownwardDrag).toHaveLength(2);
     expect(new Set(afterDownwardDrag).size).toBe(2);
@@ -191,7 +191,7 @@ test.describe("U004 role model configuration", () => {
     await implementers.nth(0).dragTo(implementers.nth(0));
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["codex:gpt-5.6-terra", "claude:sonnet"]);
+      .toEqual(["codex:gpt-5.6-terra", "codex:gpt-5.6-sol"]);
 
     const implementerList = page.locator('[data-role-model-list="implementer"]');
     const firstBox = await implementers.nth(0).boundingBox();
@@ -201,24 +201,24 @@ test.describe("U004 role model configuration", () => {
     });
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["codex:gpt-5.6-terra", "claude:sonnet"]);
+      .toEqual(["codex:gpt-5.6-terra", "codex:gpt-5.6-sol"]);
 
     await implementers.nth(1).dragTo(implementers.nth(0));
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["claude:sonnet", "codex:gpt-5.6-terra"]);
+      .toEqual(["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"]);
 
-    const teamLeadClaude = page.locator('[data-candidate-key="claude:opus"]').first();
-    const moveUp = teamLeadClaude.getByRole("button", { name: /上移/u });
+    const teamLeadTerra = page.locator('[data-candidate-key="codex:gpt-5.6-terra"]').first();
+    const moveUp = teamLeadTerra.getByRole("button", { name: /上移/u });
     await moveUp.focus();
     await page.keyboard.press("Enter");
     await expect
       .poll(() => candidateKeys(page, "team_lead"))
-      .toEqual(["claude:opus", "codex:gpt-5.6-sol"]);
+      .toEqual(["codex:gpt-5.6-terra", "codex:gpt-5.6-sol"]);
 
     await page.locator("[data-role-model-save]").click();
     await expect(page.locator("[data-role-model-status]")).toHaveText("已儲存並讀回目前設定。");
-    await expect(active).toHaveAttribute("data-active-candidate", "claude:sonnet");
+    await expect(active).toHaveAttribute("data-active-candidate", "codex:gpt-5.6-sol");
     await expect(active).toContainText("啟動時順位 2");
 
     const apiSnapshot = await page.evaluate(async () => {
@@ -230,7 +230,7 @@ test.describe("U004 role model configuration", () => {
       activeAssignments: [
         {
           jobId: "job-running-implementer",
-          candidate: { provider: "claude", model: "sonnet" },
+          candidate: { provider: "codex", model: "gpt-5.6-sol" },
           candidateIndex: 1,
         },
       ],
@@ -239,10 +239,10 @@ test.describe("U004 role model configuration", () => {
     await page.reload({ waitUntil: "domcontentloaded" });
     await expect
       .poll(() => candidateKeys(page, "implementer"))
-      .toEqual(["claude:sonnet", "codex:gpt-5.6-terra"]);
+      .toEqual(["codex:gpt-5.6-sol", "codex:gpt-5.6-terra"]);
     await expect
       .poll(() => candidateKeys(page, "team_lead"))
-      .toEqual(["claude:opus", "codex:gpt-5.6-sol"]);
+      .toEqual(["codex:gpt-5.6-terra", "codex:gpt-5.6-sol"]);
     await expectNoAxeViolations(page);
     await copyReviewScreenshot(page, "u004-role-model-desktop.png");
   });

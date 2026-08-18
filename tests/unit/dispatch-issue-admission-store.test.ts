@@ -46,10 +46,27 @@ const jobB = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 describe("FileIssueAdmissionStore", () => {
   it("claims a fresh issue and reports the claim back via load", async () => {
     const store = new FileIssueAdmissionStore(await temporaryDirectory());
-    const claimed = await store.claim(projectId, issueId);
-    expect(claimed).toMatchObject({ ok: true, value: { state: "active", revision: 0 } });
+    const claimed = await store.claim(projectId, issueId, "linear-issue-1");
+    expect(claimed).toMatchObject({
+      ok: true,
+      value: { state: "active", revision: 0, externalIssueId: "linear-issue-1" },
+    });
     const loaded = await store.load(projectId, issueId);
     expect(loaded).toEqual(claimed);
+  });
+
+  it("lists only the requested project's durable claims", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileIssueAdmissionStore(directory);
+    const otherProject = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ac");
+    const otherIssue = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ac");
+    await store.claim(projectId, issueId, "linear-issue-1");
+    await store.claim(otherProject, otherIssue, "linear-issue-2");
+
+    await expect(store.listForProject(projectId)).resolves.toMatchObject({
+      ok: true,
+      value: [{ projectId, issueId, externalIssueId: "linear-issue-1" }],
+    });
   });
 
   it("fails closed with conflict when claiming an already-active issue", async () => {

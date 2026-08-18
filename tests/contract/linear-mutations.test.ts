@@ -314,6 +314,28 @@ describe("Linear mutation contract", () => {
     expect(controlled.ok ? "ok" : controlled.error.code).toBe("external_failure");
   });
 
+  it("clears only Controller-owned Agent condition labels and confirms the authoritative read-back", async () => {
+    const harness = new MutationHarness();
+    const cleared = await harness.client().clearAgentCondition(context, harness.issue.id);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    expect(cleared.value.agentCondition).toBeUndefined();
+    expect(cleared.value.agentRole).toBe("implementer");
+    expect(cleared.value.reviewRequirement).toBe("code_review");
+    expect(cleared.value.otherLabelIds).toEqual(["label-extra"]);
+    expect(harness.issue.labelIds).toEqual(
+      expect.arrayContaining(["role-implementer", "review-code", "label-extra"]),
+    );
+    expect(harness.issue.labelIds).not.toEqual(
+      expect.arrayContaining(["status-blocked", "reason-merge-conflict"]),
+    );
+
+    harness.issue = { ...harness.issue, labelIds: [...fixture.issue.labelIds] };
+    harness.ignoreIssueUpdates = true;
+    const unconfirmed = await harness.client().clearAgentCondition(context, harness.issue.id);
+    expect(unconfirmed.ok ? "ok" : unconfirmed.error.code).toBe("external_failure");
+  });
+
   it("deduplicates sequential and concurrent comment retries by hashed idempotency marker", async () => {
     const harness = new MutationHarness();
     const client = harness.client();

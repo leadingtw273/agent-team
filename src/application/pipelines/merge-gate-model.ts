@@ -80,7 +80,7 @@ export type MergeGateAutoMergeAttempt =
       outcome: "mutation_failed";
       stage: "authorization" | "auto_merge";
       error: DomainError;
-      mutations: readonly [MergeMutationReceipt, ...MergeMutationReceipt[]];
+      mutations: readonly MergeMutationReceipt[];
     }>;
 
 export interface MergeGatePorts {
@@ -117,6 +117,7 @@ export interface MergeGatePorts {
       expectedHeadSha: string,
       options: Parameters<SourceControlPort["enableAutoMerge"]>[2],
       externalIssueId: string,
+      expectedWorkStatus?: "in_review",
     ) => Promise<Result<MergeGateAutoMergeAttempt, DomainError>>;
   };
 }
@@ -148,6 +149,8 @@ export interface EnableAutoMergeRequest extends ReviewRequestBase {
   readonly approval: RecordedReviewApproval;
   readonly currentVisualManifest?: VisualManifest;
   readonly currentPublicationDigest?: string;
+  /** Present only for enforce-mode Jobs; checked again immediately at each GitHub mutation edge. */
+  readonly expectedWorkStatus?: "in_review";
 }
 
 export type ReviewStatusFailureStage =

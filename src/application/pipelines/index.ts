@@ -15,3 +15,5 @@ export * from "./reviewer-report-diagnostics.js";
 export * from "./reviewer-recovery-model.js";
 export * from "./reviewer-recovery.js";
 export * from "./visual-evidence-builder.js";
+export * from "./work-status-lifecycle-model.js";
+export * from "./work-status-lifecycle-coordinator.js";

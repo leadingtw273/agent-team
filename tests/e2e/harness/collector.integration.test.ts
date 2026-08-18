@@ -228,6 +228,8 @@ function buildLinearFixture(
                     description: null,
                     priority: 2,
                     updatedAt: "2026-08-06T10:00:00.000Z",
+                    archivedAt: null,
+                    trashed: false,
                     team: { id: teamId },
                     project: { id: projectId },
                     state: { id: stateId },
