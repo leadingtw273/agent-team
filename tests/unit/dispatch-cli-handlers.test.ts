@@ -81,7 +81,33 @@ vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
 // (vi.mock's hoisting makes this safe regardless of import order in source, but writing it below
 // keeps the intent visible -- same convention as
 // tests/unit/registration-cli-probe-composition-poll.test.ts).
-const { createDispatchCliHandlers } = await import("../../src/cli/dispatch/handlers.js");
+const { bindWorkStatusIssueHistory, createDispatchCliHandlers } =
+  await import("../../src/cli/dispatch/handlers.js");
+
+describe("bindWorkStatusIssueHistory", () => {
+  it("preserves the adapter receiver for methods that access private instance state", async () => {
+    class ReceiverBoundHistory {
+      #calls = 0;
+
+      get calls(): number {
+        return this.#calls;
+      }
+
+      getIssueHistory(): Promise<Result<never, DomainError>> {
+        this.#calls += 1;
+        return Promise.resolve(ok(undefined as never));
+      }
+    }
+
+    const adapter = new ReceiverBoundHistory();
+    const history = bindWorkStatusIssueHistory(adapter);
+    if (history === undefined) throw new Error("expected bound issue history method");
+
+    await history({ project: project(), externalIssueId: "LEA-73" });
+
+    expect(adapter.calls).toBe(1);
+  });
+});
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {

@@ -151,6 +151,18 @@ export interface CreateDispatchCliHandlersOptions {
     Partial<Pick<LinearWorkManagementAdapter, "getIssueHistory">>;
 }
 
+/** Preserve the adapter receiver when exposing its optional history method through the
+ * lifecycle port. `LinearWorkManagementAdapter#getIssueHistory` reads private instance fields,
+ * so extracting the method and invoking it as a bare function throws before the pipeline starts. */
+export function bindWorkStatusIssueHistory(
+  workManagement: Partial<Pick<LinearWorkManagementAdapter, "getIssueHistory">>,
+): LinearWorkManagementAdapter["getIssueHistory"] | undefined {
+  const getIssueHistory = workManagement.getIssueHistory;
+  return getIssueHistory === undefined
+    ? undefined
+    : (...args) => getIssueHistory.apply(workManagement, args);
+}
+
 const implementerCompositionBlockedMessages: Readonly<Record<string, string>> = Object.freeze({
   github_authentication_unavailable: "GitHub CLI（gh）未通過身分驗證，無法建立 Draft PR。",
 });
@@ -1062,7 +1074,7 @@ export function createDispatchCliHandlers(
             prePrRecord.value.workStatusLifecycle !== undefined
           ) {
             let observedPipelineOutcome: ImplementerPipelineOutcome | undefined;
-            const lifecycleHistory = lifecycleWorkManagement.getIssueHistory;
+            const lifecycleHistory = bindWorkStatusIssueHistory(lifecycleWorkManagement);
             const prePr = new PrePrImplementationCoordinator({
               agentTeamHome: options.agentTeamHome,
               project: build.value.project,
@@ -1361,7 +1373,7 @@ export function createDispatchCliHandlers(
               errorCode: "invariant_violation",
             });
           }
-          const lifecycleHistory = lifecycleWorkManagement.getIssueHistory;
+          const lifecycleHistory = bindWorkStatusIssueHistory(lifecycleWorkManagement);
           const workStart = await new WorkStatusLifecycleCoordinator({
             workManagement: lifecycleWorkManagement,
             ...(lifecycleHistory !== undefined
