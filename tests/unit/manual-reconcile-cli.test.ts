@@ -84,6 +84,7 @@ describe("O008 manual reconcile CLI adapter", () => {
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       jobProgressResume: { outcomes: [], blocked: [] },
       jobProgressBlocked: [],
+      workStatusOrphanScans: [],
       modelResumeAttempts: 1,
       scopeDisclosure: fixtureDisclosedScope,
     });
@@ -170,6 +171,7 @@ describe("O008 manual reconcile CLI adapter", () => {
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       jobProgressResume: { outcomes: [], blocked: [] },
       jobProgressBlocked: [],
+      workStatusOrphanScans: [],
       modelResumeAttempts: 0,
       scopeDisclosure: fixtureDisclosedScope,
     });

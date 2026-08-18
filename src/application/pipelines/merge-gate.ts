@@ -665,11 +665,18 @@ export class AutoMergeGate {
     if (authorization.value.workStatus === "completed") {
       return mergeFailure("authorization", domainError("conflict"));
     }
+    if (
+      request.expectedWorkStatus !== undefined &&
+      authorization.value.workStatus !== request.expectedWorkStatus
+    ) {
+      return mergeFailure("authorization", domainError("conflict"));
+    }
     const enabled = await this.ports.sourceControl.enableAutoMerge(
       reference,
       request.expectedHeadSha,
       mutation(request, "enable-auto-merge"),
       request.requirementSnapshot.issue.externalId,
+      request.expectedWorkStatus,
     );
     if (!enabled.ok) return mergeFailure("auto_merge", enabled.error);
     const attempt = enabled.value;

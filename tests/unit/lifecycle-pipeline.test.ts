@@ -182,7 +182,16 @@ describe("merged lifecycle", () => {
     const calls: string[] = [];
     const fixture = ports({ changeRequest: changeRequest("merged"), calls });
     const outcome = await new LifecyclePipeline(fixture).run(
-      request({ mergeAuthorizationHeadSha: headSha.toUpperCase() }),
+      request({
+        mergeAuthorizationHeadSha: headSha.toUpperCase(),
+        workStatusLifecycleAudit: {
+          operation: "dispatch-resume",
+          jobId: "job_11111111-1111-4111-8111-111111111111",
+          workReceiptDigest: "a".repeat(64),
+          reviewReceiptDigest: "b".repeat(64),
+          outcome: "completed",
+        },
+      }),
     );
 
     expect(outcome).toEqual({
@@ -193,6 +202,12 @@ describe("merged lifecycle", () => {
     });
     expect(calls[0]).toBe("work_status:completed");
     expect(comments(calls)[0]).toContain("精確 Head 合併授權相符");
+    expect(comments(calls)[0]).toContain("operation：dispatch-resume");
+    expect(comments(calls)[0]).toContain("Job：job_11111111-1111-4111-8111-111111111111");
+    expect(comments(calls)[0]).toContain(`Work receipt：${"a".repeat(64)}`);
+    expect(comments(calls)[0]).toContain(`Review receipt：${"b".repeat(64)}`);
+    expect(comments(calls)[0]).toContain("Merge provenance：controller_authorized");
+    expect(comments(calls)[0]).toContain("outcome：completed");
     expect(calls).not.toContain("pause_auto_merge");
     expect(calls).not.toContain("close_change_request");
   });

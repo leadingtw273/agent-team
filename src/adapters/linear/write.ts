@@ -299,6 +299,30 @@ export class LinearMutationClient {
     );
   }
 
+  async clearAgentCondition(
+    context: LinearProjectContext,
+    issueId: string,
+  ): Promise<Result<LinearIssueSnapshot, DomainError>> {
+    const current = await this.reader.readIssue(context, issueId);
+    if (!current.ok) return current;
+    if (current.value.agentCondition === undefined) return current;
+    const labelIds = [
+      ...controlledLabelIds(context, {
+        ...(current.value.agentRole === undefined ? {} : { agentRole: current.value.agentRole }),
+        ...(current.value.reviewRequirement === undefined
+          ? {}
+          : { reviewRequirement: current.value.reviewRequirement }),
+      }),
+      ...current.value.otherLabelIds,
+    ];
+    return this.updateAndReadBack(
+      context,
+      issueId,
+      { labelIds },
+      (snapshot) => snapshot.agentCondition === undefined,
+    );
+  }
+
   async setOtherLabels(
     context: LinearProjectContext,
     issueId: string,

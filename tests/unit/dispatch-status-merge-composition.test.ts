@@ -55,7 +55,7 @@ const reference = Object.freeze({
 const mutation = Object.freeze({ idempotencyKey: "merge-1" });
 const externalIssueId = "LEA-1";
 
-function workManagement(workStatus: "in_review" | "canceled" = "in_review") {
+function workManagement(workStatus: "in_progress" | "in_review" | "canceled" = "in_review") {
   return {
     getIssue: () =>
       Promise.resolve(
@@ -156,6 +156,29 @@ describe("buildStatusMergePipelines", () => {
 });
 
 describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
+  it("enforce mode re-reads exact Linear status before the first GitHub mutation", async () => {
+    const transport = new ScriptedTransport([]);
+    const sourceControl = buildMergeGateSourceControl(
+      new GitHubAdapter(transport),
+      workManagement("in_progress"),
+      fixedClock,
+    );
+
+    const result = await sourceControl.enableAutoMerge(
+      reference,
+      sha,
+      mutation,
+      externalIssueId,
+      "in_review",
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { outcome: "mutation_failed", stage: "authorization", mutations: [] },
+    });
+    transport.expectDone();
+  });
+
   it("does not invent a mutation receipt when auto-merge was already enabled", async () => {
     const transport = new ScriptedTransport([{ value: pull({ autoMergeEnabled: true }) }]);
     const sourceControl = buildMergeGateSourceControl(

@@ -165,6 +165,8 @@ describe("buildLifecyclePipeline production-composition seam (E116cap: now FileA
     const calls: string[] = [];
     const readModel: LinearWorkManagementReadModel = {
       readContext: () => Promise.resolve(ok({} as never)),
+      listIssueIdsInState: () =>
+        Promise.reject(new Error("must never be called: lifecycle merge path only")),
       readIssue: () => {
         calls.push("readIssue");
         return Promise.resolve(
@@ -205,6 +207,7 @@ describe("buildLifecyclePipeline production-composition seam (E116cap: now FileA
       requireManualIntervention: () =>
         Promise.reject(new Error("must never be called: merge path only")),
       setAgentCondition: () => Promise.reject(new Error("must never be called: merge path only")),
+      clearAgentCondition: () => Promise.reject(new Error("must never be called: merge path only")),
       appendComment: (_context, _issueId, body) => {
         calls.push("appendComment");
         commentBody = body;

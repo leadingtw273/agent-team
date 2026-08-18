@@ -135,7 +135,8 @@ async function temporaryRepository(): Promise<string> {
 }
 
 const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
-const issueId = "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab";
+// Matches the production `generateDeterministicIdentifier("issue", LinearIssue.id)` projection.
+const issueId = "issue_47ea6049-f444-5ed8-8b00-326b431f97e0";
 
 function project(repositoryPath: string) {
   return projectSchema.parse({
@@ -293,9 +294,27 @@ class VersionedProcessPort implements ProcessPort {
   }
 }
 
-const unusedReadModel = {
-  readContext: () => Promise.reject(new Error("must never be called: discovery is mocked")),
-  readIssue: () => Promise.reject(new Error("must never be called: discovery is mocked")),
+const authoritativeReadModel = {
+  // Discovery itself is mocked, but LWS03 deliberately performs an independent exact read-back
+  // immediately before Provider. This fixture represents that authoritative Linear read.
+  readContext: () => Promise.resolve(ok({} as never)),
+  readIssue: () =>
+    Promise.resolve(
+      ok({
+        id: "linear-issue-1",
+        identifier: "LEA-TEST-1",
+        title: "Ship the thing",
+        updatedAt: "2026-08-07T00:00:00.000Z" as never,
+        teamId: "team-1",
+        projectId: "linear-proj-1",
+        workStatus: "ready" as const,
+        agentRole: "implementer" as const,
+        reviewRequirement: "code_review" as const,
+        otherLabelIds: [],
+        relations: [],
+        comments: [],
+      }),
+    ),
   listIssueIdsInState: () => Promise.reject(new Error("must never be called: discovery is mocked")),
 } as unknown as LinearReadModel;
 
@@ -331,9 +350,9 @@ function buildHandlers(
         discovery: {
           teamId: "team-1",
           linearProjectId: "linear-proj-1",
-          readModel: unusedReadModel,
-          // Never exercised here: these tests stop at pipeline-outcome mapping, well before
-          // `LifecyclePipeline` (C015c item 5) would ever consult a mutation client.
+          readModel: authoritativeReadModel,
+          // Work-status lifecycle is off in these fixtures, so exact read-back is read-only and
+          // the mutation client remains intentionally unreachable.
           mutationClient: {} as never,
           // E102-5: never exercised for the identical reason -- see `mutationClient` above.
           linearTransport: {} as never,
@@ -924,7 +943,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         changeRequestId: "2",
       });
       expect(records.value[0]?.headSha).toBeUndefined();
-      expect(records.value[0]?.baseRevision).toBeUndefined();
+      expect(records.value[0]?.baseRevision).toMatch(/^[0-9a-f]{40}$/u);
     }
   });
 
@@ -939,7 +958,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * Confirms `job_progress_write_failed` is still reported *only* in this genuine-failure case,
    * and that nothing partial was ever persisted.
    */
-  it("C019: reports job_progress_write_failed (not invalid_head_sha) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+  it("LWS02: stops before Provider when the earliest durable bootstrap write fails on the invalid-head scenario", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const progressDirectory = defaultJobProgressDirectory(stateRoot);
@@ -985,7 +1004,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         pipelineReason: string;
         errorCode: string;
       };
-      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipeline).toBe("not_started");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
       expect(payload.errorCode).toBe("permission_denied");
     } finally {
@@ -1192,7 +1211,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * denied on the real progress directory), and confirms `job_progress_write_failed` is still
    * reported only in that genuine-failure case, with nothing partial persisted.
    */
-  it("C019: reports job_progress_write_failed (not invalid_checkpoint_id) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+  it("LWS02: stops before Provider when the earliest durable bootstrap write fails on the invalid-checkpoint scenario", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const progressDirectory = defaultJobProgressDirectory(stateRoot);
@@ -1225,7 +1244,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         pipelineReason: string;
         errorCode: string;
       };
-      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipeline).toBe("not_started");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
       expect(payload.errorCode).toBe("permission_denied");
     } finally {
@@ -1442,7 +1461,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * `success`), since the claim is left durably active with nothing recorded for `dispatch
    * resolve` to ever find.
    */
-  it("C019: reports a failed outcome (not success) when the role_pipeline_unavailable fallback write itself genuinely fails", async () => {
+  it("LWS02: stops before role routing when the earliest durable bootstrap write fails", async () => {
     candidateRoleOverride.current = "team_lead";
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
@@ -1461,7 +1480,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         pipelineReason: string;
         errorCode: string;
       };
-      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipeline).toBe("not_started");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
       expect(payload.errorCode).toBe("permission_denied");
       expect(buildImplementerPipeline).not.toHaveBeenCalled();
@@ -1780,7 +1799,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * the real `headSha`/`changeRequestId` -- a human resolving this later can still find the actual
    * PR even though this dispatch's own `baseRevision` bookkeeping failed.
    */
-  it("C018: fails closed to job_progress_write_failed in this invocation's own response, but persists a resolvable requires_manual record (keeping the real changeRequestId/headSha) when the authoritative base SHA fails headShaSchema's guard", async () => {
+  it("LWS03: rejects a malformed authoritative base before Provider and persists a resolvable requires_manual record", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const handlers = buildHandlers(
@@ -1844,9 +1863,9 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
           kind: "requires_manual",
           cause: { stage: "dispatch", reasonCode: "invalid_base_revision" },
         },
-        changeRequestId: "4",
-        headSha: "b".repeat(40),
       });
+      expect(records.value[0]?.changeRequestId).toBeUndefined();
+      expect(records.value[0]?.headSha).toBeUndefined();
       expect(records.value[0]?.baseRevision).toBeUndefined();
     }
   });
@@ -1858,7 +1877,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
    * `job_progress_write_failed` is still reported only in that genuine-failure case, with nothing
    * partial persisted.
    */
-  it("C019: reports job_progress_write_failed (not invalid_base_revision) when the requires_manual fallback write itself genuinely fails, and persists nothing", async () => {
+  it("LWS02: stops before Provider when the earliest durable bootstrap write fails on the invalid-base scenario", async () => {
     const stateRoot = await temporaryStateRoot();
     const repositoryPath = await temporaryRepository();
     const progressDirectory = defaultJobProgressDirectory(stateRoot);
@@ -1909,7 +1928,7 @@ describe("createDispatchCliHandlers pipeline hand-off (C015b item 5)", () => {
         pipelineReason: string;
         errorCode: string;
       };
-      expect(payload.pipeline).toBe("failed");
+      expect(payload.pipeline).toBe("not_started");
       expect(payload.pipelineReason).toBe("job_progress_write_failed");
       expect(payload.errorCode).toBe("permission_denied");
     } finally {

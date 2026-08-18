@@ -21,6 +21,32 @@ function runtimePayload() {
         registration: { state: "configuration_incomplete", reason: "activation_missing" },
         nonTerminalProgressCount: null,
         activeLeaseCount: null,
+        workStatusLifecycleMode: "off",
+        workStatusPendingCount: 0,
+        workStatusInFlightModeCounts: { off: 0, observe: 0, enforce: 0 },
+        workStatusCapability: {
+          checkedAt: "2026-08-18T00:00:00.000Z",
+          workflowStatesReady: true,
+          agentLabelsReady: true,
+          reasonCodesReady: true,
+        },
+        workStatusJobs: [
+          {
+            jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+            workStatusLifecycleMode: "enforce",
+            workStatusPhase: "working",
+            expectedLinearStateId: "state-progress",
+            observedLinearStateId: "state-progress",
+            transitionInstance: "c".repeat(64),
+            pendingMutation: null,
+            authority: {
+              jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+              claimId: "claim-safe",
+              leaseExpiresAt: "2026-08-18T02:00:00.000Z",
+            },
+            incident: null,
+          },
+        ],
       },
     ],
   });
@@ -86,6 +112,7 @@ describe("T06 production localhost UI integration", () => {
     expect(rootBody).toContain("本機 Production 專案");
     expect(rootBody).toContain("降級（degraded）");
     expect(rootBody).toContain("未取得／—");
+    expect(rootBody).toContain("Linear lifecycle off（待確認 0）");
     expect(rootBody).not.toContain("UI Shell 示範資料");
     expect(rootBody).not.toContain("註冊精靈");
     expect(rootBody).not.toContain(handle.sessionToken);
@@ -98,6 +125,21 @@ describe("T06 production localhost UI integration", () => {
     expect(read).toHaveBeenCalledExactlyOnceWith({});
     expect(application.routeContracts.map((route) => route.path)).not.toContain("/runtime-status");
     expect(application.routeContracts.map((route) => route.path)).not.toContain("/settings");
+
+    const projectsResponse = await fetch(`${handle.baseUrl}/projects`, {
+      headers: { cookie: session },
+    });
+    const projectsBody = await projectsResponse.text();
+    expect(projectsBody).toContain("job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+    expect(projectsBody).toContain("enforce／working");
+    expect(projectsBody).toContain("預期 state-progress");
+    expect(projectsBody).toContain("觀測 state-progress");
+    expect(projectsBody).toContain(
+      "job_018f47d2-77a4-7cc1-8ef2-0123456789ab／claim-safe；lease 到期 2026-08-18T02:00:00.000Z",
+    );
+    expect(projectsBody).toContain(
+      "capability 2026-08-18T00:00:00.000Z · workflow true · labels true · reasons true",
+    );
   });
 
   it("refreshes once per authenticated HTML page and calls no mutation or event source", async () => {

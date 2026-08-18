@@ -658,6 +658,8 @@ function buildLinearAuditFixture(teamId: string, projectId: string, auditIssueId
               description: issue.description,
               priority: issue.priority,
               updatedAt: issue.updatedAt,
+              archivedAt: null,
+              trashed: false,
               team: { id: issue.teamId },
               project: { id: issue.projectId },
               state: { id: issue.stateId },

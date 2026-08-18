@@ -50,6 +50,8 @@ export interface LinearIssueRecord {
   readonly description: string | null;
   readonly priority: number;
   readonly updatedAt: string;
+  readonly archivedAt?: string | null;
+  readonly trashed?: boolean;
   readonly teamId: string;
   readonly projectId: string | null;
   readonly stateId: string;
@@ -98,9 +100,12 @@ export interface LinearIssueSnapshot {
   readonly description?: string;
   readonly priority?: Priority;
   readonly updatedAt: Instant;
+  readonly archivedAt?: Instant;
+  readonly trashed?: boolean;
   readonly teamId: string;
   readonly projectId: string;
   readonly workStatus: WorkStatus;
+  readonly stateId?: string;
   readonly agentRole?: AgentRole;
   readonly reviewRequirement?: ReviewRequirement;
   readonly agentCondition?: AgentCondition;
@@ -299,6 +304,11 @@ export function createLinearIssueSnapshot(
   if (!priority.ok) return priority;
   const updatedAt = parseInstant(issue.updatedAt);
   if (!updatedAt.ok) return fail();
+  const archivedAt =
+    issue.archivedAt === null || issue.archivedAt === undefined
+      ? undefined
+      : parseInstant(issue.archivedAt);
+  if (archivedAt !== undefined && !archivedAt.ok) return fail();
   const agentRole = selectedValue(issue.labelIds, context.catalog.agentRole);
   if (!agentRole.ok) return agentRole;
   const reviewRequirement = selectedValue(issue.labelIds, context.catalog.reviewRequirement);
@@ -341,9 +351,12 @@ export function createLinearIssueSnapshot(
       ...(issue.description === null ? {} : { description: issue.description }),
       ...(priority.value === undefined ? {} : { priority: priority.value }),
       updatedAt: updatedAt.value,
+      ...(archivedAt === undefined ? {} : { archivedAt: archivedAt.value }),
+      ...(issue.trashed === undefined ? {} : { trashed: issue.trashed }),
       teamId: issue.teamId,
       projectId: issue.projectId,
       workStatus,
+      stateId: issue.stateId,
       ...(agentRole.value === undefined ? {} : { agentRole: agentRole.value }),
       ...(reviewRequirement.value === undefined
         ? {}

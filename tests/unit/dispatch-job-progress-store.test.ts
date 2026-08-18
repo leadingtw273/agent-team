@@ -209,6 +209,11 @@ describe("FileJobProgressStore", () => {
     const otherJobId = "job_018f47d2-77a4-7cc1-8ef2-1123456789ab";
     const stages = [
       { kind: "implementing" as const },
+      {
+        kind: "implementing" as const,
+        executionEpoch: { ordinal: 1, providerOutput: "none" as const, startedAt: now },
+      },
+      { kind: "work_start_pending" as const },
       { kind: "ci_waiting" as const },
       { kind: "awaiting_review" as const },
       { kind: "fix_round" as const },
@@ -485,6 +490,156 @@ describe("FileJobProgressStore", () => {
       );
       expect(written.ok).toBe(true);
       if (written.ok) expect(written.value.baseRevision).toBe("c".repeat(40));
+    });
+  });
+
+  describe("LWS01 work-status lifecycle checkpoint invariants", () => {
+    const transition = {
+      step: "work_start" as const,
+      instance: "b".repeat(64),
+      mainTarget: "in_progress" as const,
+      agentTarget: { kind: "set" as const, status: "executing" as const },
+      main: { state: "intent" as const, idempotencyKey: "work-status:main" },
+      agent: { state: "intent" as const, idempotencyKey: "work-status:agent" },
+      mainFailures: { count: 0 },
+      agentFailures: { count: 0 },
+    };
+    const lifecycle = {
+      admissionMode: "enforce" as const,
+      capabilityDigest: "a".repeat(64),
+      phase: "work_start" as const,
+      transitions: [transition],
+    };
+
+    it("keeps legacy records readable while new work_start_pending records carry a strict checkpoint", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const legacy = await store.compareAndSwap(jobId, null, baseRecord());
+      expect(legacy.ok && legacy.value.workStatusLifecycle === undefined).toBe(true);
+
+      const otherJobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-1123456789ab");
+      const created = await store.compareAndSwap(
+        otherJobId,
+        null,
+        baseRecord({
+          jobId: otherJobId,
+          stage: { kind: "work_start_pending" },
+          workStatusLifecycle: lifecycle,
+        }),
+      );
+      expect(created.ok ? created.value.workStatusLifecycle : created.error.code).toEqual(
+        lifecycle,
+      );
+    });
+
+    it("makes admission identity and confirmed receipts immutable", async () => {
+      const store = new FileJobProgressStore(
+        await temporaryDirectory(),
+        undefined,
+        createFixedClock(now),
+      );
+      const created = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ stage: { kind: "work_start_pending" }, workStatusLifecycle: lifecycle }),
+      );
+      if (!created.ok) throw new Error(created.error.code);
+      const confirmedTransition = {
+        ...transition,
+        main: {
+          state: "confirmed" as const,
+          idempotencyKey: "work-status:main",
+          confirmedAt: now,
+          observedRevision: "linear-revision-1",
+        },
+        mainFailures: { count: 0 },
+      };
+      const confirmed = await store.compareAndSwap(
+        jobId,
+        created.value.revision,
+        baseRecord({
+          stage: { kind: "work_start_pending" },
+          workStatusLifecycle: { ...lifecycle, transitions: [confirmedTransition] },
+        }),
+      );
+      expect(confirmed.ok).toBe(true);
+      if (!confirmed.ok) return;
+
+      for (const changedLifecycle of [
+        { ...lifecycle, admissionMode: "observe" as const, transitions: [confirmedTransition] },
+        { ...lifecycle, capabilityDigest: "c".repeat(64), transitions: [confirmedTransition] },
+        {
+          ...lifecycle,
+          transitions: [
+            {
+              ...confirmedTransition,
+              main: { ...confirmedTransition.main, observedRevision: "forged" },
+            },
+          ],
+        },
+        { ...lifecycle, transitions: [] },
+      ]) {
+        const rejected = await store.compareAndSwap(
+          jobId,
+          confirmed.value.revision,
+          baseRecord({
+            stage: { kind: "implementing" },
+            workStatusLifecycle: changedLifecycle,
+          }),
+        );
+        expect(rejected.ok ? "ok" : rejected.error.code).toBe("invariant_violation");
+      }
+    });
+
+    it("keeps sent_unknown immutable even when a caller claims authoritative confirmation", async () => {
+      const store = new FileJobProgressStore(
+        await temporaryDirectory(),
+        undefined,
+        createFixedClock(now),
+      );
+      const unknown = {
+        ...transition,
+        main: {
+          state: "sent_unknown" as const,
+          idempotencyKey: "work-status:main",
+          errorCode: "timeout",
+        },
+        mainFailures: { count: 1, lastErrorCode: "timeout" },
+      };
+      const created = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({
+          stage: { kind: "work_start_pending" },
+          workStatusLifecycle: { ...lifecycle, transitions: [unknown] },
+        }),
+      );
+      if (!created.ok) throw new Error(created.error.code);
+      const settled = await store.compareAndSwap(
+        jobId,
+        created.value.revision,
+        baseRecord({
+          stage: { kind: "implementing", executionEpoch: { ordinal: 1, providerOutput: "none" } },
+          workStatusLifecycle: {
+            ...lifecycle,
+            phase: "implementing",
+            transitions: [
+              {
+                ...unknown,
+                main: {
+                  state: "confirmed",
+                  idempotencyKey: "work-status:main",
+                  confirmedAt: now,
+                  observedRevision: "linear-revision-2",
+                },
+                mainFailures: { count: 0 },
+              },
+            ],
+          },
+        }),
+      );
+      expect(settled.ok).toBe(false);
+      expect(settled.ok ? "ok" : settled.error.code).toBe("invariant_violation");
     });
   });
 });

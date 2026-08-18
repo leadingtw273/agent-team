@@ -370,6 +370,7 @@ class InMemoryAdmissionFake implements IssueAdmissionPort {
       revision: 0,
       projectId: projectId as never,
       issueId: issueId as never,
+      externalIssueId,
       state: "active",
       claimedAt: now,
       updatedAt: now,
@@ -487,6 +488,9 @@ async function harness(
     ) => Promise<Result<LinearPublicationReceiptRecord | undefined, DomainError>>;
     reviewWaitPublish: ReviewerWaitPublicationPort["publish"];
     workStatus: WorkStatus;
+    workStatusReadSequence: readonly WorkStatus[];
+    prePrRun: NonNullable<ResumeCycleDependencies["prePrImplementation"]>["run"];
+    workStatusTransition: NonNullable<ResumeCycleDependencies["workStatusLifecycle"]>["transition"];
   }> = {},
 ): Promise<Harness> {
   const repositoryPath = await seededRepositoryPath();
@@ -517,6 +521,8 @@ async function harness(
   admission.seedActive(projectId, issueId, jobId);
   const visualEvidenceBuild = overrides.visualEvidenceBuild;
   const linearPublish = overrides.linearPublish;
+  let currentWorkStatus = overrides.workStatus ?? "in_review";
+  const workStatusReadSequence = [...(overrides.workStatusReadSequence ?? [])];
   const deps: ResumeCycleDependencies = {
     progress,
     jobRepository,
@@ -538,7 +544,7 @@ async function harness(
               externalId: externalIssueId,
               title: "Ship the thing",
             }),
-            workStatus: overrides.workStatus ?? "in_review",
+            workStatus: workStatusReadSequence.shift() ?? currentWorkStatus,
             updatedAt: now,
             revision: now,
           }),
@@ -746,6 +752,39 @@ async function harness(
       },
     },
     admission,
+    ...(overrides.workStatusTransition === undefined
+      ? {}
+      : {
+          workStatusLifecycle: {
+            transition: (request) => {
+              calls.push(`workStatusLifecycle.transition:${request.step}`);
+              const transition = overrides.workStatusTransition;
+              if (transition === undefined) throw new Error("unreachable");
+              return transition(request).then((outcome) => {
+                if (
+                  outcome.state === "permitted" &&
+                  outcome.mode === "enforce" &&
+                  request.mainTarget !== undefined
+                ) {
+                  currentWorkStatus = request.mainTarget;
+                }
+                return outcome;
+              });
+            },
+          },
+        }),
+    ...(overrides.prePrRun === undefined
+      ? {}
+      : {
+          prePrImplementation: {
+            run: (record, options) => {
+              calls.push("prePrImplementation.run");
+              const run = overrides.prePrRun;
+              if (run === undefined) throw new Error("unreachable");
+              return run(record, options);
+            },
+          },
+        }),
   };
   return {
     deps,
@@ -794,6 +833,290 @@ async function seedProgressRecord(
 }
 
 describe("runResumeCycle", () => {
+  it("confirms In Review before invoking the reviewer for an enforce Job", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    await runResumeCycle(deps);
+
+    expect(calls.indexOf("reviewStatus.begin")).toBeLessThan(
+      calls.indexOf("workStatusLifecycle.transition:review_start"),
+    );
+    expect(calls.indexOf("workStatusLifecycle.transition:review_start")).toBeLessThan(
+      calls.indexOf("reviewer.run"),
+    );
+  });
+
+  it("persists the terminal lifecycle transition before Lifecycle publishes its audit comment", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toMatchObject({
+      ok: true,
+      value: [{ outcome: "completed" }],
+    });
+    expect(calls.indexOf("workStatusLifecycle.transition:complete")).toBeGreaterThan(-1);
+    expect(calls.indexOf("workStatusLifecycle.transition:complete")).toBeLessThan(
+      calls.indexOf("lifecycle.run"),
+    );
+  });
+
+  it("does not invoke the reviewer when the enforce In Review gate is unconfirmed", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusTransition: () =>
+        Promise.resolve({ state: "blocked", reason: "human_status_drift" }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [
+        { outcome: "requires_manual", reason: "work_status_review_start_human_status_drift" },
+      ],
+    });
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("keeps a retryable lifecycle provider outage resumable before the bounded budget is exhausted", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "blocked",
+          reason: "provider_outage",
+          error: domainError("unavailable"),
+        }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toMatchObject({
+      ok: true,
+      value: [{ outcome: "transient_failure", reason: "work_status_review_start_provider_outage" }],
+    });
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("moves a lifecycle transition to requires_manual when its bounded retry budget is exhausted", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "blocked",
+          reason: "retry_exhausted",
+          error: domainError("unavailable"),
+        }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+          incident: { reasonCode: "retry_exhausted", channel: "main" },
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toMatchObject({
+      ok: true,
+      value: [{ outcome: "requires_manual", reason: "work_status_review_start_retry_exhausted" }],
+    });
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("confirms the fix transition before invoking ReviewerRecovery", async () => {
+    const { deps, progress, calls } = await harness({
+      reviewerOutcome: {
+        state: "changes_requested",
+        job: job(),
+        changeRequest: changeRequest(),
+        checks: {} as never,
+        identity: {} as never,
+        reports: [],
+        findings: [],
+      },
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    await runResumeCycle(deps);
+
+    expect(calls.indexOf("workStatusLifecycle.transition:fix_start")).toBeGreaterThan(
+      calls.indexOf("reviewStatus.record"),
+    );
+    expect(calls.indexOf("workStatusLifecycle.transition:fix_start")).toBeLessThan(
+      calls.indexOf("reviewerRecovery.run"),
+    );
+  });
+
+  it("re-reads cancellation immediately before Reviewer and invokes Reviewer zero times", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusReadSequence: ["in_review", "canceled"],
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    await expect(runResumeCycle(deps)).resolves.toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "provider_authority_mismatch" }]),
+    );
+    expect(calls).not.toContain("reviewer.run");
+  });
+
+  it("re-reads cancellation immediately before ReviewerRecovery and invokes it zero times", async () => {
+    const { deps, progress, calls } = await harness({
+      workStatusReadSequence: ["in_review", "in_review", "canceled"],
+      reviewerOutcome: {
+        state: "changes_requested",
+        job: job(),
+        changeRequest: changeRequest(),
+        checks: {} as never,
+        identity: {} as never,
+        reports: [],
+        findings: [],
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    await expect(runResumeCycle(deps)).resolves.toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "provider_authority_mismatch" }]),
+    );
+    expect(calls).toContain("reviewer.run");
+    expect(calls).not.toContain("reviewerRecovery.run");
+  });
+
+  it("routes work_start_pending through the leased pre-PR path before any PR read", async () => {
+    const { deps, progress, calls } = await harness({
+      prePrRun: (record) => Promise.resolve({ jobId: record.jobId, outcome: "still_ci_waiting" }),
+    });
+    await progress.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "gpt-5.6-terra",
+      providerAssignments: {
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      },
+      stage: { kind: "work_start_pending" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/pre-pr-fixture",
+      workStatusLifecycle: {
+        admissionMode: "off",
+        phase: "work_start",
+        transitions: [],
+      },
+    });
+
+    await expect(runResumeCycle(deps)).resolves.toEqual({
+      ok: true,
+      value: [{ jobId, outcome: "still_ci_waiting" }],
+    });
+    expect(calls).toEqual(["prePrImplementation.run"]);
+  });
+
+  it("does not auto-resume a legacy bare implementing record", async () => {
+    const { deps, progress, calls } = await harness({
+      prePrRun: (record) => Promise.resolve({ jobId: record.jobId, outcome: "still_ci_waiting" }),
+    });
+    await progress.compareAndSwap(jobId, null, {
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      model: "gpt-5.6-terra",
+      providerAssignments: {
+        execution: { provider: "codex", model: "gpt-5.6-terra" },
+        codeReview: { provider: "claude", model: "claude-opus" },
+      },
+      stage: { kind: "implementing" },
+      branch: "agent-team/job-1",
+      worktreePath: "/tmp/pre-pr-fixture",
+    });
+
+    await expect(runResumeCycle(deps)).resolves.toEqual({ ok: true, value: [] });
+    expect(calls).toEqual([]);
+  });
+
   it("fails a pre-ADR-009 record closed instead of guessing its execution or review provider", async () => {
     const { deps, progress, calls } = await harness();
     await progress.compareAndSwap(jobId, null, {
@@ -982,6 +1305,7 @@ describe("runResumeCycle", () => {
       // only by the dedicated "C015y decision A" describe block below.
       "ciRecovery.run",
       "reviewStatus.begin",
+      "getChangeRequest",
       "reviewer.run",
       "reviewStatus.record",
       "autoMerge.enable",
@@ -1016,6 +1340,7 @@ describe("runResumeCycle", () => {
     expect(calls).toEqual([
       "getChangeRequest",
       "reviewStatus.begin",
+      "getChangeRequest",
       "reviewer.run",
       "reviewStatus.record",
       "autoMerge.enable",
@@ -1090,7 +1415,7 @@ describe("runResumeCycle", () => {
     });
     const { deps, progress } = await harness({
       changeRequestState: { draft: true },
-      leaseDurationMs: 200,
+      leaseDurationMs: 2_000,
       leaseHeartbeatIntervalMs: 20,
       ciRecoveryRun: (request) => {
         observedSignal = request.signal;
@@ -1102,10 +1427,12 @@ describe("runResumeCycle", () => {
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
 
-    const renew = vi.spyOn(deps.leases, "renew");
+    const renew = vi
+      .spyOn(deps.leases, "renew")
+      .mockResolvedValue(ok({ value: {}, changed: true }) as never);
     const running = runResumeCycle(deps);
     await ciStarted;
-    await new Promise((resolve) => setTimeout(resolve, 350));
+    await new Promise((resolve) => setTimeout(resolve, 100));
     expect(renew).toHaveBeenCalled();
     const competing = await deps.leases.acquire({ jobId, issueId, holderId: "second-process" });
     expect(competing).toMatchObject({ ok: false, error: { code: "conflict" } });
@@ -1118,10 +1445,12 @@ describe("runResumeCycle", () => {
 
   it("aborts the provider request and reports lease_conflict when renewal is lost", async () => {
     let observedSignal: AbortSignal | undefined;
+    let providerStarted = false;
     const { deps, progress, calls } = await harness({
       changeRequestState: { draft: true },
       leaseHeartbeatIntervalMs: 5,
       ciRecoveryRun: (request) => {
+        providerStarted = true;
         observedSignal = request.signal;
         return new Promise((resolve) => {
           request.signal?.addEventListener(
@@ -1140,7 +1469,10 @@ describe("runResumeCycle", () => {
       },
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
-    vi.spyOn(deps.leases, "renew").mockResolvedValue(err(domainError("external_failure")));
+    const renew = deps.leases.renew.bind(deps.leases);
+    vi.spyOn(deps.leases, "renew").mockImplementation((request) =>
+      providerStarted ? Promise.resolve(err(domainError("external_failure"))) : renew(request),
+    );
 
     const result = await runResumeCycle(deps);
 
@@ -1151,10 +1483,12 @@ describe("runResumeCycle", () => {
   });
 
   it("stops after a provider ignores abort and returns success after lease renewal is lost", async () => {
+    let providerStarted = false;
     const { deps, progress, calls } = await harness({
       changeRequestState: { draft: true },
       leaseHeartbeatIntervalMs: 5,
       ciRecoveryRun: async () => {
+        providerStarted = true;
         await new Promise((resolve) => setTimeout(resolve, 30));
         return {
           state: "ready_for_review",
@@ -1165,7 +1499,10 @@ describe("runResumeCycle", () => {
       },
     });
     await seedProgressRecord(progress, { kind: "ci_waiting" });
-    vi.spyOn(deps.leases, "renew").mockResolvedValue(err(domainError("external_failure")));
+    const renew = deps.leases.renew.bind(deps.leases);
+    vi.spyOn(deps.leases, "renew").mockImplementation((request) =>
+      providerStarted ? Promise.resolve(err(domainError("external_failure"))) : renew(request),
+    );
 
     const result = await runResumeCycle(deps);
 
@@ -2579,7 +2916,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(lifecycleRequests).toHaveLength(1);
     expect(lifecycleRequests[0]).not.toHaveProperty("mergeAuthorizationHeadSha");
     expect(lifecycleRequests[0]).toMatchObject({
-      idempotencyKeyPrefix: `cli-dispatch-reconcile:${jobId}:0:lifecycle`,
+      idempotencyKeyPrefix: `cli-dispatch-lifecycle:${jobId}:42`,
     });
 
     const reloaded = await progress.load(jobId);

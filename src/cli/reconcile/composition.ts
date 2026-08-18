@@ -48,8 +48,13 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
-import { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
+import {
+  FileJobProgressStore,
+  JobProgressWorkStatusLifecycleLedger,
+} from "../../adapters/dispatch/index.js";
+import { FileIssueScopeLock } from "../../adapters/dispatch/issue-scope-lock.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
+import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
 import {
   ReconcileCoordinator,
   type ReconcileBlockPort,
@@ -80,9 +85,14 @@ import {
   type ResumeExistingProjectJobsResult,
 } from "../dispatch/resume-existing.js";
 import {
+  buildIssueAdmissionStore,
   defaultJobProgressDirectory,
   type ResumeJobOutcome,
 } from "../dispatch/resume-composition.js";
+import { WorkStatusOrphanCoordinator } from "../dispatch/work-status-orphan-coordinator.js";
+import { LinearWorkManagementAdapter } from "../dispatch/work-management-adapter.js";
+import { resolveWorkStatusLifecycleMode } from "../../application/projects/index.js";
+import { listHostRegistrationSetupDrafts } from "../registration/draft-store.js";
 import { readJobProgressInventory } from "./active-job-inventory.js";
 import type {
   ManualReconcileUseCase,
@@ -288,6 +298,7 @@ export function buildManualReconcileUseCase(
     defaultJobProgressDirectory(options.agentTeamHome),
   );
   const readInventory = () => readJobProgressInventory(progressStore);
+  const admission = buildIssueAdmissionStore(options.agentTeamHome);
   const resumeJobProgress: ManualReconcileUseCase["resumeJobProgress"] = async (records) => {
     if (records.length === 0) {
       return Object.freeze({ outcomes: Object.freeze([]), blocked: Object.freeze([]) });
@@ -371,6 +382,49 @@ export function buildManualReconcileUseCase(
     reconcileAll: (request) => coordinator.reconcileAll(request),
     readJobProgressInventory: readInventory,
     resumeJobProgress,
+    quarantineWorkStatusOrphans: async () => {
+      const drafts = await listHostRegistrationSetupDrafts(options.agentTeamHome);
+      if (drafts.state !== "available") return Object.freeze([]);
+      const projectIds = [...new Set(drafts.drafts.map((draft) => draft.project.id))].sort();
+      const scans = [];
+      for (const projectId of projectIds) {
+        const built = await (options.buildDispatchComposition ?? buildDispatchComposition)({
+          agentTeamHome: options.agentTeamHome,
+          projectId,
+        });
+        if (
+          built.state !== "ready" ||
+          resolveWorkStatusLifecycleMode(built.value.trustedConfig) !== "enforce"
+        ) {
+          continue;
+        }
+        const workManagement = new LinearWorkManagementAdapter({
+          readModel: built.value.discovery.readModel,
+          mutationClient: built.value.discovery.mutationClient,
+          teamId: built.value.discovery.teamId,
+          linearProjectId: built.value.discovery.linearProjectId,
+        });
+        const locks = new FileIssueScopeLock(
+          join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+        );
+        scans.push(
+          await new WorkStatusOrphanCoordinator({
+            project: built.value.project,
+            workManagement,
+            progress: progressStore,
+            admission,
+            locks,
+            lifecycle: new WorkStatusLifecycleCoordinator({
+              workManagement,
+              history: workManagement,
+              ledger: new JobProgressWorkStatusLifecycleLedger(progressStore),
+              locks,
+            }),
+          }).scan(),
+        );
+      }
+      return Object.freeze(scans);
+    },
     disclosedScope: describeDisclosedScope(wiring),
   };
 }

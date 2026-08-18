@@ -87,6 +87,9 @@ export interface CliHandlers {
   readonly dispatchReviewerReplayPolicy: (
     input: Readonly<{ projectId: string; enabled: boolean }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchWorkStatusRecover: (
+    input: Readonly<{ jobId: string; transitionInstance: string; dryRun?: boolean }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -164,6 +167,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchReviewerResume: () => blocked("dispatch reviewer-resume"),
   dispatchReviewerReplay: () => blocked("dispatch reviewer-replay"),
   dispatchReviewerReplayPolicy: () => blocked("dispatch reviewer-replay-policy"),
+  dispatchWorkStatusRecover: () => blocked("dispatch work-status-recover"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   cycle: () => blocked("cycle"),
@@ -367,6 +371,25 @@ export function createProgram(
             ...(options.expectContractVersion === undefined
               ? {}
               : { expectContractVersion: Number(options.expectContractVersion) }),
+          }),
+        )(),
+    );
+
+  dispatch
+    .command("work-status-recover")
+    .description(
+      "顯式收斂既有 work-status authority ambiguity；只接受 exact Job 與 transition instance",
+    )
+    .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
+    .requiredOption("--transition <digest>", "既有 lifecycle transition instance digest")
+    .option("--dry-run", "只做 admission、identity、history 與預計 mutation 檢查")
+    .action(
+      (options: { readonly job: string; readonly transition: string; readonly dryRun?: boolean }) =>
+        action(state, io, () =>
+          handlers.dispatchWorkStatusRecover({
+            jobId: options.job,
+            transitionInstance: options.transition,
+            ...(options.dryRun === true ? { dryRun: true } : {}),
           }),
         )(),
     );

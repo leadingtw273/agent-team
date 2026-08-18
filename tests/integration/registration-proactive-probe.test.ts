@@ -566,6 +566,8 @@ function buildLinearFixture(teamId: string, projectId: string) {
               description: issue.description,
               priority: issue.priority,
               updatedAt: issue.updatedAt,
+              archivedAt: null,
+              trashed: false,
               team: { id: issue.teamId },
               project: { id: issue.projectId },
               state: { id: issue.stateId },

@@ -47,6 +47,60 @@ export interface UiProjectSummary {
   readonly registrationReason?: string;
   readonly nonTerminalCount?: number | null;
   readonly activeLeaseCount?: number | null;
+  readonly workStatusLifecycleMode?: "off" | "observe" | "enforce";
+  readonly workStatusPendingCount?: number;
+  readonly workStatusInFlightModeCounts?: Readonly<{
+    off: number;
+    observe: number;
+    enforce: number;
+  }>;
+  readonly workStatusCapability?: Readonly<{
+    checkedAt: string | null;
+    workflowStatesReady: boolean;
+    agentLabelsReady: boolean;
+    reasonCodesReady: boolean;
+  }>;
+  readonly workStatusJobs?: readonly UiWorkStatusJobSummary[];
+}
+
+export interface UiWorkStatusJobSummary {
+  readonly jobId: string;
+  readonly workStatusLifecycleMode: "off" | "observe" | "enforce";
+  readonly workStatusPhase:
+    | "idle"
+    | "work_start_pending"
+    | "working"
+    | "review_start_pending"
+    | "reviewing"
+    | "fix_pending"
+    | "blocked_pending_mutation"
+    | "requires_manual"
+    | "completed"
+    | "canceled";
+  readonly expectedLinearStateId: string | null;
+  readonly observedLinearStateId: string | null;
+  readonly transitionInstance: string | null;
+  readonly pendingMutation: Readonly<{
+    jobId: string;
+    step: string;
+    transitionInstance: string;
+    targetKind: "work_status";
+    targetId: string;
+    consecutiveFailureCount: number;
+    lastClosedReason: string | null;
+    lastAttemptAt: string;
+  }> | null;
+  readonly authority: Readonly<{
+    jobId: string;
+    claimId: string;
+    leaseExpiresAt: string;
+  }> | null;
+  readonly incident: Readonly<{
+    kind: "main" | "agent" | "bootstrap";
+    reasonCode: string;
+    state: "active";
+    attemptCount: number;
+  }> | null;
 }
 
 export interface UiEventSummary {
@@ -379,9 +433,43 @@ function renderRuntimeOverview(
             : `<ul class="ui-list">${previewProjects
                 .map(
                   (project) =>
-                    `<li class="ui-list-item"><div><div class="ui-item-title">${escapeHtml(project.name)}</div><div class="ui-item-meta">${escapeHtml(registrationReasonLabel(project.registrationReason))} · 非終態 ${displayRuntimeCount(project.nonTerminalCount)} · 活躍租約 ${displayRuntimeCount(project.activeLeaseCount)}</div></div>${registrationStateBadge(project.registrationState)}</li>`,
+                    `<li class="ui-list-item"><div><div class="ui-item-title">${escapeHtml(project.name)}</div><div class="ui-item-meta">${escapeHtml(registrationReasonLabel(project.registrationReason))} · 非終態 ${displayRuntimeCount(project.nonTerminalCount)} · 活躍租約 ${displayRuntimeCount(project.activeLeaseCount)} · Linear lifecycle ${escapeHtml(project.workStatusLifecycleMode ?? "未知")}（待確認 ${displayRuntimeCount(project.workStatusPendingCount)}）</div></div>${registrationStateBadge(project.registrationState)}</li>`,
                 )
                 .join("")}</ul>`
+        }
+      </div>
+    </section>`;
+}
+
+function lifecycleValue(value: string | null): string {
+  return value === null ? "—" : escapeHtml(value);
+}
+
+function renderWorkStatusJobs(projects: readonly UiProjectSummary[]): string {
+  const rows = projects.flatMap((project) =>
+    (project.workStatusJobs ?? []).map((job) => {
+      const pending =
+        job.pendingMutation === null
+          ? "無"
+          : `${escapeHtml(job.pendingMutation.jobId)}／${escapeHtml(job.pendingMutation.step)}／${escapeHtml(job.pendingMutation.transitionInstance)}／${escapeHtml(job.pendingMutation.targetKind)} → ${escapeHtml(job.pendingMutation.targetId)}；失敗 ${String(job.pendingMutation.consecutiveFailureCount)} 次；末次 ${lifecycleValue(job.pendingMutation.lastClosedReason)}；${escapeHtml(job.pendingMutation.lastAttemptAt)}`;
+      const authority =
+        job.authority === null
+          ? "未持有"
+          : `${escapeHtml(job.authority.jobId)}／${escapeHtml(job.authority.claimId)}；lease 到期 ${escapeHtml(job.authority.leaseExpiresAt)}`;
+      const incident =
+        job.incident === null
+          ? "無"
+          : `${escapeHtml(job.incident.kind)}／${escapeHtml(job.incident.reasonCode)}／${escapeHtml(job.incident.state)}／${String(job.incident.attemptCount)} 次`;
+      return `<tr><th scope="row"><span class="ui-mobile-cell-label" aria-hidden="true">Job</span><div class="ui-mobile-cell-value"><span class="ui-item-title">${escapeHtml(job.jobId)}</span><div class="ui-item-meta">${escapeHtml(project.name)}</div></div></th><td><span class="ui-mobile-cell-label" aria-hidden="true">模式／階段</span><div class="ui-mobile-cell-value">${escapeHtml(job.workStatusLifecycleMode)}／${escapeHtml(job.workStatusPhase)}</div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">Linear 狀態</span><div class="ui-mobile-cell-value">預期 ${lifecycleValue(job.expectedLinearStateId)}<div class="ui-item-meta">觀測 ${lifecycleValue(job.observedLinearStateId)}</div></div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">待確認 mutation</span><div class="ui-mobile-cell-value">${pending}</div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">權限／事故</span><div class="ui-mobile-cell-value">${authority}<div class="ui-item-meta">事故 ${incident}</div><div class="ui-item-meta">transition ${lifecycleValue(job.transitionInstance)}</div></div></td></tr>`;
+    }),
+  );
+  return `<section class="card ui-panel" aria-labelledby="lifecycle-jobs-title">
+      <div class="card-body">
+        <div class="ui-section-heading"><div><h2 id="lifecycle-jobs-title">Linear lifecycle Jobs</h2><p>Controller 的唯讀 checkpoint、Linear 觀測與 authority 摘要；不含原始歷程或 Provider 輸出。</p></div></div>
+        ${
+          rows.length === 0
+            ? emptyState("目前沒有 lifecycle Job", "沒有可安全投影的逐 Job 狀態。")
+            : `<div class="ui-table-wrap" role="region" aria-labelledby="lifecycle-jobs-title" tabindex="0"><table class="table table-vcenter ui-table"><thead><tr><th scope="col">Job／專案</th><th scope="col">模式／階段</th><th scope="col">Linear 狀態</th><th scope="col">待確認 mutation</th><th scope="col">權限／事故</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
         }
       </div>
     </section>`;
@@ -400,15 +488,15 @@ function renderRuntimeProjects(
                 overview.projectCount === null ? "專案資料未取得" : "尚無可讀取專案",
                 "此頁不會推測遺失資料，也不會變更任何設定。",
               )
-            : `<div class="ui-table-wrap" role="region" aria-labelledby="projects-table-title" tabindex="0"><table class="table table-vcenter ui-table ui-table--production-projects"><thead><tr><th scope="col">名稱</th><th scope="col">註冊狀態／原因</th><th scope="col">非終態工作</th><th scope="col">活躍租約</th></tr></thead><tbody>${projects
+            : `<div class="ui-table-wrap" role="region" aria-labelledby="projects-table-title" tabindex="0"><table class="table table-vcenter ui-table ui-table--production-projects"><thead><tr><th scope="col">名稱</th><th scope="col">註冊狀態／原因</th><th scope="col">非終態工作</th><th scope="col">活躍租約</th><th scope="col">Linear lifecycle</th></tr></thead><tbody>${projects
                 .map(
                   (project) =>
-                    `<tr><th scope="row"><span class="ui-mobile-cell-label" aria-hidden="true">名稱</span><div class="ui-mobile-cell-value"><span class="ui-item-title">${escapeHtml(project.name)}</span></div></th><td><span class="ui-mobile-cell-label" aria-hidden="true">註冊狀態／原因</span><div class="ui-mobile-cell-value">${registrationStateBadge(project.registrationState)}<div class="ui-item-meta">${escapeHtml(registrationReasonLabel(project.registrationReason))}</div></div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">非終態工作</span><div class="ui-mobile-cell-value">${displayRuntimeCount(project.nonTerminalCount)}</div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">活躍租約</span><div class="ui-mobile-cell-value">${displayRuntimeCount(project.activeLeaseCount)}</div></td></tr>`,
+                    `<tr><th scope="row"><span class="ui-mobile-cell-label" aria-hidden="true">名稱</span><div class="ui-mobile-cell-value"><span class="ui-item-title">${escapeHtml(project.name)}</span></div></th><td><span class="ui-mobile-cell-label" aria-hidden="true">註冊狀態／原因</span><div class="ui-mobile-cell-value">${registrationStateBadge(project.registrationState)}<div class="ui-item-meta">${escapeHtml(registrationReasonLabel(project.registrationReason))}</div></div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">非終態工作</span><div class="ui-mobile-cell-value">${displayRuntimeCount(project.nonTerminalCount)}</div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">活躍租約</span><div class="ui-mobile-cell-value">${displayRuntimeCount(project.activeLeaseCount)}</div></td><td><span class="ui-mobile-cell-label" aria-hidden="true">Linear lifecycle</span><div class="ui-mobile-cell-value">${escapeHtml(project.workStatusLifecycleMode ?? "未知")}<div class="ui-item-meta">待確認 ${displayRuntimeCount(project.workStatusPendingCount)} · 執行中 E/O/F ${displayRuntimeCount(project.workStatusInFlightModeCounts?.enforce)}/${displayRuntimeCount(project.workStatusInFlightModeCounts?.observe)}/${displayRuntimeCount(project.workStatusInFlightModeCounts?.off)}</div><div class="ui-item-meta">capability ${lifecycleValue(project.workStatusCapability?.checkedAt ?? null)} · workflow ${String(project.workStatusCapability?.workflowStatesReady ?? false)} · labels ${String(project.workStatusCapability?.agentLabelsReady ?? false)} · reasons ${String(project.workStatusCapability?.reasonCodesReady ?? false)}</div></div></td></tr>`,
                 )
                 .join("")}</tbody></table></div>`
         }
       </div>
-    </section>`;
+    </section>${renderWorkStatusJobs(projects)}`;
 }
 
 function renderRuntimeEvents(): string {

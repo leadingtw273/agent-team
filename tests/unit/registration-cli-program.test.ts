@@ -44,6 +44,7 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
     dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerReplay: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerReplayPolicy: vi.fn(() => Promise.resolve(outcome)),
+    dispatchWorkStatusRecover: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     cycle: vi.fn(() => Promise.resolve(outcome)),

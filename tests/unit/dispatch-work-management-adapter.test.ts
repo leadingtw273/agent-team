@@ -164,12 +164,21 @@ class FakeReadModel implements LinearWorkManagementReadModel {
     this.issueOptions.push(args[2]);
     return Promise.resolve(ok(this.issue));
   }
+
+  listIssueIdsInState(
+    ...args: Parameters<LinearWorkManagementReadModel["listIssueIdsInState"]>
+  ): ReturnType<LinearWorkManagementReadModel["listIssueIdsInState"]> {
+    void args;
+    return Promise.resolve(ok(Object.freeze([this.issue.id])));
+  }
 }
 
 class FakeMutationClient implements LinearWorkManagementMutationClient {
   observeGithubMergeCalls = 0;
   requireManualInterventionCalls = 0;
   setAgentConditionCalls: unknown[] = [];
+  clearAgentConditionCalls = 0;
+  transitionWorkStatusCalls: unknown[] = [];
   appendCommentCalls: unknown[] = [];
   constructor(private readonly result: LinearIssueSnapshot = snapshot()) {}
 
@@ -192,6 +201,22 @@ class FakeMutationClient implements LinearWorkManagementMutationClient {
   ): ReturnType<LinearWorkManagementMutationClient["setAgentCondition"]> {
     this.setAgentConditionCalls.push(condition);
     return Promise.resolve(ok({ ...this.result, agentCondition: condition } as never));
+  }
+
+  clearAgentCondition(): ReturnType<LinearWorkManagementMutationClient["clearAgentCondition"]> {
+    this.clearAgentConditionCalls += 1;
+    const { agentCondition: _condition, ...withoutCondition } = this.result;
+    void _condition;
+    return Promise.resolve(ok(withoutCondition as LinearIssueSnapshot));
+  }
+
+  transitionWorkStatus(
+    _context: LinearProjectContext,
+    _issueId: string,
+    request: Parameters<NonNullable<LinearWorkManagementMutationClient["transitionWorkStatus"]>>[2],
+  ): ReturnType<NonNullable<LinearWorkManagementMutationClient["transitionWorkStatus"]>> {
+    this.transitionWorkStatusCalls.push(request);
+    return Promise.resolve(ok({ ...this.result, workStatus: request.target } as never));
   }
 
   appendComment(
@@ -295,7 +320,7 @@ describe("LinearWorkManagementAdapter", () => {
     expect(mutationClient.observeGithubMergeCalls).toBe(0);
   });
 
-  it("setWorkStatus fails closed on unsupported targets without calling the mutation client", async () => {
+  it('setWorkStatus("in_progress") delegates to the work-start transition', async () => {
     const mutationClient = new FakeMutationClient();
     const adapter = new LinearWorkManagementAdapter({
       readModel: new FakeReadModel(),
@@ -307,10 +332,24 @@ describe("LinearWorkManagementAdapter", () => {
     const result = await adapter.setWorkStatus(reference(), "in_progress", {
       idempotencyKey: "k",
     });
+    expect(result.ok).toBe(true);
+    expect(mutationClient.transitionWorkStatusCalls).toEqual([
+      { target: "in_progress", cause: "work_started" },
+    ]);
+  });
+
+  it("setWorkStatus fails closed on unsupported targets without calling the mutation client", async () => {
+    const mutationClient = new FakeMutationClient();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.setWorkStatus(reference(), "backlog", { idempotencyKey: "k" });
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error.code).toBe("invariant_violation");
-    expect(mutationClient.observeGithubMergeCalls).toBe(0);
-    expect(mutationClient.requireManualInterventionCalls).toBe(0);
+    expect(mutationClient.transitionWorkStatusCalls).toHaveLength(0);
   });
 
   it("setAgentCondition maps a single blocking reason through to LinearVisibleAgentCondition", async () => {
@@ -347,6 +386,44 @@ describe("LinearWorkManagementAdapter", () => {
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.code).toBe("invariant_violation");
     expect(mutationClient.setAgentConditionCalls).toHaveLength(0);
+  });
+
+  it("clearAgentCondition delegates to the dedicated Linear mutation", async () => {
+    const mutationClient = new FakeMutationClient(
+      snapshot({ agentCondition: createAgentCondition("waiting", ["waiting_dependency"]) }),
+    );
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.clearAgentCondition(reference(), { idempotencyKey: "clear" });
+    expect(result.ok).toBe(true);
+    expect(mutationClient.clearAgentConditionCalls).toBe(1);
+    if (result.ok) expect(result.value.agentCondition).toBeUndefined();
+  });
+
+  it("listIssues preserves Agent role and review requirement", async () => {
+    const readModel = new FakeReadModel(
+      context(),
+      snapshot({ agentRole: "implementer", reviewRequirement: "code_review" }),
+    );
+    const adapter = new LinearWorkManagementAdapter({
+      readModel,
+      mutationClient: new FakeMutationClient(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.listIssues({ project: project(), workStatuses: ["in_review"] });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).toHaveLength(1);
+      expect(result.value[0]?.issue.agentRole).toBe("implementer");
+      expect(result.value[0]?.issue.reviewRequirement).toBe("code_review");
+    }
   });
 
   it("appendComment delegates and maps the LinearCommentReceipt back into a WorkManagementComment", async () => {

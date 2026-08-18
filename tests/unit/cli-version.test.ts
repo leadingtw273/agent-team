@@ -39,6 +39,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerReplay: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerReplayPolicy: vi.fn(() => Promise.resolve(outcome)),
+    dispatchWorkStatusRecover: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     cycle: vi.fn(() => Promise.resolve(outcome)),
@@ -168,6 +169,27 @@ describe("agent-team CLI contract", () => {
       projectId: "project-a",
       enabled: true,
     });
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
+          "work-status-recover",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--transition",
+          "a".repeat(64),
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchWorkStatusRecover).toHaveBeenCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      transitionInstance: "a".repeat(64),
+      dryRun: true,
+    });
     await expect(runCli(metadata, ["cycle", "--all"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["health"], commands, sink.io)).resolves.toBe(0);
     await expect(runCli(metadata, ["project"], commands, sink.io)).resolves.toBe(0);
@@ -201,7 +223,28 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(16));
+    expect(sink.stdout()).toBe("完成\n".repeat(17));
+  });
+
+  it("maps a blocked work-status recovery to exit 3", async () => {
+    const commands = handlers({ state: "blocked", message: "blocked" });
+    const sink = output();
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
+          "work-status-recover",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--transition",
+          "b".repeat(64),
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(cliExitCodes.blocked);
   });
 
   it.each([

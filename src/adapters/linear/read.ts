@@ -70,6 +70,8 @@ const issueBaseSchema = z
         description: z.string().nullable(),
         priority: z.number().int(),
         updatedAt: z.string(),
+        archivedAt: z.string().nullable(),
+        trashed: z.boolean(),
         team: z.object({ id: idSchema }).strict(),
         project: z.object({ id: idSchema }).strict().nullable(),
         state: z.object({ id: idSchema }).strict(),
@@ -122,6 +124,51 @@ const commentsPageSchema = z
       .nullable(),
   })
   .strict();
+
+const issueHistoryNodeSchema = z
+  .object({
+    id: idSchema,
+    createdAt: z.string(),
+    actorId: idSchema.nullable(),
+    fromStateId: idSchema.nullable(),
+    toStateId: idSchema.nullable(),
+    fromTeamId: idSchema.nullable(),
+    toTeamId: idSchema.nullable(),
+    fromProjectId: idSchema.nullable(),
+    toProjectId: idSchema.nullable(),
+    archived: z.boolean().nullable(),
+    trashed: z.boolean().nullable(),
+  })
+  .strict();
+const issueHistoryPageSchema = z
+  .object({
+    issue: z
+      .object({ history: connectionSchema(issueHistoryNodeSchema) })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+const issueStateSpanSchema = z
+  .object({
+    id: idSchema,
+    stateId: idSchema,
+    startedAt: z.string(),
+    endedAt: z.string().nullable(),
+  })
+  .strict();
+const issueStateHistoryPageSchema = z
+  .object({
+    issue: z
+      .object({ stateHistory: connectionSchema(issueStateSpanSchema) })
+      .strict()
+      .nullable(),
+  })
+  .strict();
+
+export interface LinearIssueHistorySnapshot {
+  readonly entries: readonly z.infer<typeof issueHistoryNodeSchema>[];
+  readonly stateSpans: readonly z.infer<typeof issueStateSpanSchema>[];
+}
 
 const identityQuery = `
   query AgentTeamReadIdentity($teamId: String!, $projectId: String!) {
@@ -183,10 +230,33 @@ const issueIdsInStatePageSchema = z
 const issueBaseQuery = `
   query AgentTeamReadIssue($issueId: String!) {
     issue(id: $issueId) {
-      id identifier title description priority updatedAt
+      id identifier title description priority updatedAt archivedAt trashed
       team { id }
       project { id }
       state { id }
+    }
+  }
+`;
+const issueHistoryQuery = `
+  query AgentTeamReadIssueHistory($issueId: String!, $after: String) {
+    issue(id: $issueId) {
+      history(first: 50, after: $after, includeArchived: true, orderBy: createdAt) {
+        nodes {
+          id createdAt actorId fromStateId toStateId fromTeamId toTeamId
+          fromProjectId toProjectId archived trashed
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+const issueStateHistoryQuery = `
+  query AgentTeamReadIssueStateHistory($issueId: String!, $after: String) {
+    issue(id: $issueId) {
+      stateHistory(first: 50, after: $after) {
+        nodes { id stateId startedAt endedAt }
+        pageInfo { hasNextPage endCursor }
+      }
     }
   }
 `;
@@ -411,6 +481,8 @@ export class LinearReadModel {
       description: raw.description,
       priority: raw.priority,
       updatedAt: raw.updatedAt,
+      archivedAt: raw.archivedAt,
+      trashed: raw.trashed,
       teamId: raw.team.id,
       projectId: raw.project?.id ?? null,
       stateId: raw.state.id,
@@ -422,6 +494,46 @@ export class LinearReadModel {
       issue,
       [...outbound.value, ...inbound.value],
       commentRecords,
+    );
+  }
+
+  async readIssueHistory(
+    issueId: string,
+    options: ReadOptions = {},
+  ): Promise<Result<LinearIssueHistorySnapshot, DomainError>> {
+    const entries = await this.transport.paginate<unknown, z.infer<typeof issueHistoryNodeSchema>>(
+      {
+        operationName: "AgentTeamReadIssueHistory",
+        query: issueHistoryQuery,
+        variables: { issueId },
+        selectConnection: (data) => {
+          const page = issueHistoryPageSchema.parse(data);
+          if (page.issue === null) throw new Error("linear_issue_not_found");
+          return page.issue.history;
+        },
+      },
+      options,
+    );
+    if (!entries.ok) return entries;
+    const stateSpans = await this.transport.paginate<unknown, z.infer<typeof issueStateSpanSchema>>(
+      {
+        operationName: "AgentTeamReadIssueStateHistory",
+        query: issueStateHistoryQuery,
+        variables: { issueId },
+        selectConnection: (data) => {
+          const page = issueStateHistoryPageSchema.parse(data);
+          if (page.issue === null) throw new Error("linear_issue_not_found");
+          return page.issue.stateHistory;
+        },
+      },
+      options,
+    );
+    if (!stateSpans.ok) return stateSpans;
+    return ok(
+      Object.freeze({
+        entries: Object.freeze(entries.value.map((entry) => Object.freeze({ ...entry }))),
+        stateSpans: Object.freeze(stateSpans.value.map((span) => Object.freeze({ ...span }))),
+      }),
     );
   }
 

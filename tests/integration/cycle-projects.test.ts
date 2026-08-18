@@ -30,6 +30,16 @@ function registeredProject(id: string, displayName = "Registered project") {
     },
     nonTerminalProgressCount: null,
     activeLeaseCount: null,
+    workStatusLifecycleMode: "off" as const,
+    workStatusPendingCount: 0,
+    workStatusInFlightModeCounts: { off: 0, observe: 0, enforce: 0 },
+    workStatusCapability: {
+      checkedAt: null,
+      workflowStatesReady: false,
+      agentLabelsReady: false,
+      reasonCodesReady: false,
+    },
+    workStatusJobs: [],
   };
 }
 
@@ -50,6 +60,16 @@ function incompleteProject(
         : { state: "unknown" as const, reason },
     nonTerminalProgressCount: null,
     activeLeaseCount: null,
+    workStatusLifecycleMode: "off" as const,
+    workStatusPendingCount: 0,
+    workStatusInFlightModeCounts: { off: 0, observe: 0, enforce: 0 },
+    workStatusCapability: {
+      checkedAt: null,
+      workflowStatesReady: false,
+      agentLabelsReady: false,
+      reasonCodesReady: false,
+    },
+    workStatusJobs: [],
   };
 }
 

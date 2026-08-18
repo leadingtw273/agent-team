@@ -186,6 +186,7 @@ describe("compiled CLI smoke", () => {
       jobProgressCounts: { resumable: 0, blocked: 0, terminal: 0, total: 0 },
       jobProgressResume: { outcomes: [], blocked: [] },
       jobProgressBlocked: [],
+      workStatusOrphanScans: [],
       modelResumeAttempts: 0,
       scopeDisclosure: {
         wiredCapabilities: [

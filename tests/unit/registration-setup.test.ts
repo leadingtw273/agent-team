@@ -46,6 +46,7 @@ const config = trustedProjectConfigSchema.parse({
   defaultBranch: project.defaultBranch,
   platforms: { workManagement: project.workManagement, sourceControl: project.sourceControl },
   projectRules: ["Run quality checks."],
+  workStatusLifecycleMode: "off",
   roleInstructions: { implementer: ["Stay in scope."] },
   commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
 });

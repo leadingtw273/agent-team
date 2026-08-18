@@ -191,6 +191,99 @@ const quotaSchema = z
   })
   .strict();
 
+const lifecycleModeCountsSchema = z
+  .object({ off: countSchema, observe: countSchema, enforce: countSchema })
+  .strict();
+const lifecycleCapabilitySchema = z
+  .object({
+    checkedAt: instantSchema.nullable(),
+    workflowStatesReady: z.boolean(),
+    agentLabelsReady: z.boolean(),
+    reasonCodesReady: z.boolean(),
+  })
+  .strict();
+const lifecycleAuthoritySchema = z
+  .object({
+    jobId: z.string().regex(/^job_[0-9a-f-]{36}$/u),
+    claimId: z.string().min(1).max(512),
+    leaseExpiresAt: instantSchema,
+  })
+  .strict()
+  .nullable();
+const lifecyclePendingMutationSchema = z
+  .object({
+    jobId: z.string().regex(/^job_[0-9a-f-]{36}$/u),
+    step: z.enum([
+      "work_start",
+      "review_start",
+      "fix_start",
+      "merge_start",
+      "complete",
+      "requires_manual",
+      "clear_condition",
+    ]),
+    transitionInstance: z.string().regex(/^[0-9a-f]{64}$/u),
+    targetKind: z.literal("work_status"),
+    targetId: z.string().min(1).max(255),
+    consecutiveFailureCount: z.number().int().min(0).max(6),
+    lastClosedReason: z.string().min(1).max(64).nullable(),
+    lastAttemptAt: instantSchema,
+  })
+  .strict()
+  .nullable();
+const lifecycleIncidentSchema = z
+  .object({
+    kind: z.enum(["main", "agent", "bootstrap"]),
+    reasonCode: z.enum([
+      "capability_unavailable",
+      "identity_drift",
+      "human_status_drift",
+      "mutation_unconfirmed",
+      "retry_exhausted",
+      "bootstrap_incomplete",
+    ]),
+    state: z.literal("active"),
+    attemptCount: z.number().int().min(0).max(6),
+  })
+  .strict()
+  .nullable();
+const lifecycleJobSchema = z
+  .object({
+    jobId: z.string().regex(/^job_[0-9a-f-]{36}$/u),
+    workStatusLifecycleMode: z.enum(["off", "observe", "enforce"]),
+    workStatusPhase: z.enum([
+      "idle",
+      "work_start_pending",
+      "working",
+      "review_start_pending",
+      "reviewing",
+      "fix_pending",
+      "blocked_pending_mutation",
+      "requires_manual",
+      "completed",
+      "canceled",
+    ]),
+    expectedLinearStateId: z.string().min(1).max(255).nullable(),
+    observedLinearStateId: z.string().min(1).max(255).nullable(),
+    transitionInstance: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/u)
+      .nullable(),
+    pendingMutation: lifecyclePendingMutationSchema,
+    authority: lifecycleAuthoritySchema,
+    incident: lifecycleIncidentSchema,
+  })
+  .strict();
+const workStatusLifecycleProjectionSchema = z
+  .object({
+    workStatusLifecycleMode: z.enum(["off", "observe", "enforce"]),
+    inFlightModeCounts: lifecycleModeCountsSchema,
+    pendingMutationCount: countSchema,
+    capability: lifecycleCapabilitySchema,
+    jobs: z.array(lifecycleJobSchema).max(100_000),
+  })
+  .strict();
+
 const validWakeupHealths = Object.freeze(
   registrationSystemdWakeupStates.flatMap((systemd) =>
     registrationWebhookWakeupStates.map((webhook) =>
@@ -267,6 +360,11 @@ const projectSummarySchema = projectIdentitySchema
     registration: registrationSchema,
     nonTerminalProgressCount: countSchema.nullable(),
     activeLeaseCount: countSchema.nullable(),
+    workStatusLifecycleMode: z.enum(["off", "observe", "enforce"]),
+    workStatusPendingCount: countSchema,
+    workStatusInFlightModeCounts: lifecycleModeCountsSchema,
+    workStatusCapability: lifecycleCapabilitySchema,
+    workStatusJobs: z.array(lifecycleJobSchema).max(100_000),
   })
   .strict();
 
@@ -277,6 +375,7 @@ const projectDetailSchema = projectIdentitySchema
     leases: leasesSchema,
     quota: quotaSchema,
     wakeup: wakeupSchema,
+    workStatusLifecycle: workStatusLifecycleProjectionSchema,
   })
   .strict();
 

@@ -127,6 +127,7 @@ export function buildMergeGateSourceControl(
       expectedHeadSha: string,
       options: Parameters<MergeGatePorts["sourceControl"]["enableAutoMerge"]>[2],
       externalIssueId: string,
+      expectedWorkStatus?: "in_review",
     ): Promise<Result<MergeGateAutoMergeAttempt, DomainError>> => {
       const attempts: MergeMutationReceipt[] = [];
       const observer: GitHubMergeMutationObserver = {
@@ -166,14 +167,40 @@ export function buildMergeGateSourceControl(
         error: DomainError,
       ): Result<MergeGateAutoMergeAttempt, DomainError> => {
         const mutations = mutationHistory();
-        if (mutations.length === 0) return err(error);
         return ok({
           outcome: "mutation_failed" as const,
           stage,
           error,
-          mutations: mutations as readonly [MergeMutationReceipt, ...MergeMutationReceipt[]],
+          mutations,
         });
       };
+
+      if (expectedWorkStatus !== undefined) {
+        const authorization = await workManagement.getIssue(
+          { project: reference.project, externalIssueId },
+          options.signal === undefined ? {} : { signal: options.signal },
+        );
+        if (!authorization.ok) return mutationFailed("authorization", authorization.error);
+        if (
+          authorization.value.issue.projectId !== reference.project.id ||
+          authorization.value.issue.externalId !== externalIssueId
+        ) {
+          return mutationFailed("authorization", domainError("conflict"));
+        }
+        if (authorization.value.workStatus === "canceled") {
+          const current = await github.getChangeRequest(reference, options);
+          return current.ok
+            ? ok({
+                outcome: "authorization_revoked" as const,
+                changeRequest: current.value,
+                mutations: mutationHistory(),
+              })
+            : mutationFailed("authorization", current.error);
+        }
+        if (authorization.value.workStatus !== expectedWorkStatus) {
+          return mutationFailed("authorization", domainError("conflict"));
+        }
+      }
 
       const enabled = await github.enableAutoMerge(reference, expectedHeadSha, options, observer);
       if (enabled.ok) {
@@ -228,6 +255,12 @@ export function buildMergeGateSourceControl(
         });
       }
       if (authorization.value.workStatus === "completed") {
+        return mutationFailed("authorization", domainError("conflict"));
+      }
+      if (
+        expectedWorkStatus !== undefined &&
+        authorization.value.workStatus !== expectedWorkStatus
+      ) {
         return mutationFailed("authorization", domainError("conflict"));
       }
       const merged = await github.squashMergeChangeRequest(

@@ -54,7 +54,9 @@
 import { join } from "node:path";
 
 import {
+  createWorkStatusCapabilitySnapshot,
   discoverReadyDispatchCandidates,
+  FileWorkStatusCapabilityStore,
   type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
@@ -72,6 +74,7 @@ import {
   type DispatcherResult,
 } from "../../application/dispatch/index.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../application/leases/index.js";
+import type { IssueScopeLockPort } from "../../application/pipelines/index.js";
 import type { ProcessPort } from "../../application/ports/index.js";
 import type { NewJobQuotaAdmissionPort } from "../../application/quota/index.js";
 import {
@@ -80,6 +83,8 @@ import {
   type ProjectRegistrySnapshot,
   type TrustedProjectActivationPort,
   type TrustedProjectConfig,
+  resolveWorkStatusLifecycleMode,
+  type WorkStatusLifecycleMode,
   type TrustedProjectGitPort,
   type TrustedProjectRejectionReason,
 } from "../../application/projects/index.js";
@@ -90,7 +95,13 @@ import {
   type ModelRoutingConfig,
 } from "../../application/routing/index.js";
 import type { JobRepository } from "../../application/dispatch/index.js";
-import type { Clock, DomainError } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  ok,
+  type Clock,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import {
@@ -149,7 +160,11 @@ export interface DispatchCompositionReady {
      * can fake this with a plain object instead of a real `LinearMutationClient` instance. */
     readonly mutationClient: Pick<
       LinearMutationClient,
-      "observeGithubMerge" | "requireManualIntervention" | "setAgentCondition" | "appendComment"
+      | "observeGithubMerge"
+      | "requireManualIntervention"
+      | "setAgentCondition"
+      | "clearAgentCondition"
+      | "appendComment"
     > &
       Partial<Pick<LinearMutationClient, "transitionWorkStatus">>;
     /** E102-5: the same transport `readModel`/`mutationClient` above already share -- threaded
@@ -176,6 +191,10 @@ export interface DispatchCompositionReady {
    * supplies Provider-owned identity and both required windows. Tests may inject a controlled
    * policy-backed port; config.account is never used as identity. */
   readonly quotaAdmission: NewJobQuotaAdmissionPort;
+  /** Private evidence store for the independently rolled-out Linear work-status lifecycle. */
+  readonly workStatusCapability?: {
+    readonly store: FileWorkStatusCapabilityStore;
+  };
   /** Q01's private, issue-scoped canary store. It is not a quota port and is only consulted by a
    * non-dry dispatch after ordinary quota observations leave all model routes unavailable. */
   readonly operatorCanary?: {
@@ -226,7 +245,28 @@ export interface DispatchOncePorts {
    * `FileIssueAdmissionStore`; `--dry-run` uses the ephemeral `InMemoryIssueAdmissionStore`
    * (ephemeral-ports.ts), the same "throwaway in-memory" convention `leases`/`jobs` already use. */
   readonly admission: IssueAdmissionPort;
+  readonly locks?: IssueScopeLockPort;
+  /** Durable post-Job bootstrap. It must confirm before the selected claim may attach its Job. */
+  readonly bootstrap?: (input: DispatchBootstrapInput) => Promise<Result<void, DomainError>>;
 }
+
+export interface DispatchBootstrapInput {
+  readonly result: Extract<DispatcherResult, { readonly kind: "dispatched" }>;
+  readonly candidate: DispatcherCandidate;
+  readonly lifecycle: Readonly<{
+    mode: WorkStatusLifecycleMode;
+    capabilityDigest?: string;
+  }>;
+}
+
+export type DispatchBootstrapOutcome =
+  | Readonly<{ state: "skipped" }>
+  | Readonly<{ state: "confirmed" }>
+  | Readonly<{
+      state: "blocked";
+      reason: "job_progress_write_failed" | "claim_attach_failed";
+      error: DomainError;
+    }>;
 
 /** C015o decision 3: an issue whose admission claim was already `state:"active"` when this
  * candidate was considered -- a *different*, still-unresolved job already owns it. Visible,
@@ -234,6 +274,7 @@ export interface DispatchOncePorts {
  * taxonomy) -- this reason only exists past discovery, at the composition root. */
 export type DispatchOnceAdmissionSkippedIssue =
   | Readonly<{ issueId: string; reason: "issue_claim_active" }>
+  | Readonly<{ issueId: string; reason: "issue_scope_lock_unavailable" }>
   | Readonly<{
       issueId: string;
       reason: "quota_unknown" | "quota_blocked" | "provider_route_unavailable";
@@ -241,7 +282,10 @@ export type DispatchOnceAdmissionSkippedIssue =
 
 function routeAdmissionSkipReason(
   decision: Extract<ModelRouteDecision, { kind: "waiting" }>,
-): Exclude<DispatchOnceAdmissionSkippedIssue["reason"], "issue_claim_active"> {
+): Exclude<
+  DispatchOnceAdmissionSkippedIssue["reason"],
+  "issue_claim_active" | "issue_scope_lock_unavailable"
+> {
   const states = new Set(decision.skipped.map((candidate) => candidate.state));
   if (states.has("quota_unknown")) return "quota_unknown";
   if (states.has("quota_blocked")) return "quota_blocked";
@@ -269,8 +313,10 @@ export type DispatchOnceOutcome =
        * different, still-open job -- see `dispatchOnce`'s own comment for the exact claim/
        * reconcile sequence this guards. */
       admissionSkipped: readonly DispatchOnceAdmissionSkippedIssue[];
+      bootstrap: DispatchBootstrapOutcome;
     }>
-  | Readonly<{ outcome: "discovery_failed"; error: DomainError }>;
+  | Readonly<{ outcome: "discovery_failed"; error: DomainError }>
+  | Readonly<{ outcome: "capability_failed"; error: DomainError }>;
 
 /**
  * Runs the real discovery -> `Dispatcher.dispatch()` path exactly once, against whichever ports
@@ -315,6 +361,41 @@ export async function dispatchOnce(
   holderId: string,
   options: Readonly<{ allowOperatorCanary?: boolean }> = {},
 ): Promise<DispatchOnceOutcome> {
+  const configuredMode = resolveWorkStatusLifecycleMode(ready.trustedConfig);
+  let lifecycle: DispatchBootstrapInput["lifecycle"] = Object.freeze({ mode: "off" });
+  if (configuredMode !== "off") {
+    const context = await ready.discovery.readModel.readContext(
+      ready.discovery.teamId,
+      ready.discovery.linearProjectId,
+    );
+    const capability = context.ok ? createWorkStatusCapabilitySnapshot(context.value) : context;
+    let capabilityError: DomainError | undefined;
+    if (!capability.ok) {
+      capabilityError = capability.error;
+    } else if (ready.workStatusCapability === undefined) {
+      capabilityError = domainError("unavailable");
+    } else {
+      const stored = await ready.workStatusCapability.store.save(
+        ready.project.id,
+        capability.value,
+      );
+      if (!stored.ok) capabilityError = stored.error;
+    }
+    if (capabilityError !== undefined) {
+      if (configuredMode === "enforce") {
+        return Object.freeze({
+          outcome: "capability_failed" as const,
+          error: capabilityError,
+        });
+      }
+      lifecycle = Object.freeze({ mode: "observe" });
+    } else if (capability.ok) {
+      lifecycle = Object.freeze({
+        mode: configuredMode,
+        capabilityDigest: capability.value.digest,
+      });
+    }
+  }
   const discovered = await discoverReadyDispatchCandidates({
     project: ready.project,
     teamId: ready.discovery.teamId,
@@ -396,7 +477,37 @@ export async function dispatchOnce(
         continue;
       }
     }
-    const claimed = await ports.admission.claim(ready.project.id, candidate.issue.id);
+    const issueLock =
+      ports.locks === undefined
+        ? undefined
+        : await ports.locks.acquire(
+            { projectId: ready.project.id, externalIssueId: candidate.issue.externalId },
+            `dispatch-admission:${holderId}`,
+          );
+    if (issueLock !== undefined && !issueLock.ok) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "issue_scope_lock_unavailable" as const,
+        }),
+      );
+      continue;
+    }
+    const claimed = await ports.admission.claim(
+      ready.project.id,
+      candidate.issue.id,
+      candidate.issue.externalId,
+    );
+    const releasedIssueLock = await (issueLock?.value.release() ?? Promise.resolve(ok(undefined)));
+    if (!releasedIssueLock.ok) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "issue_scope_lock_unavailable" as const,
+        }),
+      );
+      continue;
+    }
     if (!claimed.ok) {
       admissionSkipped.push(
         Object.freeze({ issueId: candidate.issue.id, reason: "issue_claim_active" as const }),
@@ -409,7 +520,11 @@ export async function dispatchOnce(
 
   const quotaPreventedAllClaims =
     claimedCandidates.length === 0 &&
-    admissionSkipped.some((candidate) => candidate.reason !== "issue_claim_active");
+    admissionSkipped.some(
+      (candidate) =>
+        candidate.reason !== "issue_claim_active" &&
+        candidate.reason !== "issue_scope_lock_unavailable",
+    );
   const result: DispatcherResult = quotaPreventedAllClaims
     ? Object.freeze({
         kind: "waiting" as const,
@@ -426,12 +541,38 @@ export async function dispatchOnce(
       });
 
   const dispatchedIssueId = result.kind === "dispatched" ? result.job.issueId : undefined;
+  let bootstrap: DispatchBootstrapOutcome = Object.freeze({ state: "skipped" });
   for (const [issueId, revision] of claimedRevisions) {
     if (issueId === dispatchedIssueId && result.kind === "dispatched") {
-      // Best-effort: if this fails, the claim stays active but jobless -- still safe (it still
-      // blocks a future duplicate dispatch for this issue), just missing the job id for
-      // observability until `dispatch resolve` or a future retry fixes it up.
-      await ports.admission.attachJob(ready.project.id, issueId, revision, result.job.id);
+      const candidate = claimedCandidates.find((entry) => entry.issue.id === issueId);
+      if (ports.bootstrap !== undefined && candidate !== undefined) {
+        const initialized = await ports.bootstrap({ result, candidate, lifecycle });
+        if (!initialized.ok) {
+          bootstrap = Object.freeze({
+            state: "blocked",
+            reason: "job_progress_write_failed",
+            error: initialized.error,
+          });
+          continue;
+        }
+        const attached = await ports.admission.attachJob(
+          ready.project.id,
+          issueId,
+          revision,
+          result.job.id,
+        );
+        bootstrap = attached.ok
+          ? Object.freeze({ state: "confirmed" })
+          : Object.freeze({
+              state: "blocked",
+              reason: "claim_attach_failed",
+              error: attached.error,
+            });
+      } else {
+        // Dry-run/legacy test seam: no durable bootstrap capability exists, so preserve the old
+        // attach behavior but label it honestly as skipped rather than confirmed.
+        await ports.admission.attachJob(ready.project.id, issueId, revision, result.job.id);
+      }
     } else {
       // Best-effort release: if this fails, the claim stays active and simply blocks this one
       // issue from being claimed again until it is retried or manually resolved -- safe
@@ -446,6 +587,7 @@ export async function dispatchOnce(
     candidates: discovered.value.candidates,
     discoverySkipped: discovered.value.skipped,
     admissionSkipped: Object.freeze(admissionSkipped),
+    bootstrap,
   });
 }
 
@@ -545,6 +687,11 @@ export async function buildDispatchComposition(
       }),
       codex: Object.freeze({ config: providerConfig.value.codex, process: codexProcess }),
       quotaAdmission,
+      workStatusCapability: Object.freeze({
+        store: new FileWorkStatusCapabilityStore(
+          join(stateRoot, "dispatch", "work-status-capability"),
+        ),
+      }),
       operatorCanary: Object.freeze({
         store: options.operatorCanaryStore ?? new FileOperatorCanaryAttestationStore(agentTeamHome),
       }),

@@ -54,6 +54,7 @@ function failed(stage: LifecycleFailureStage, error: DomainError): LifecyclePipe
 }
 
 function validRequest(request: LifecyclePipelineRequest): boolean {
+  const lifecycleAudit = request.workStatusLifecycleAudit;
   return (
     projectSchema.safeParse(request.project).success &&
     request.externalIssueId.trim().length > 0 &&
@@ -65,7 +66,13 @@ function validRequest(request: LifecyclePipelineRequest): boolean {
       (/^[0-9a-f]{64}$/u.test(request.reviewerReplayAudit.checkpointDigest) &&
         Number.isInteger(request.reviewerReplayAudit.attemptTotal) &&
         request.reviewerReplayAudit.attemptTotal >= 1 &&
-        request.reviewerReplayAudit.attemptTotal <= 2))
+        request.reviewerReplayAudit.attemptTotal <= 2)) &&
+    (lifecycleAudit === undefined ||
+      (/^job_[0-9a-f-]{36}$/u.test(lifecycleAudit.jobId) &&
+        (lifecycleAudit.workReceiptDigest === undefined ||
+          /^[0-9a-f]{64}$/u.test(lifecycleAudit.workReceiptDigest)) &&
+        (lifecycleAudit.reviewReceiptDigest === undefined ||
+          /^[0-9a-f]{64}$/u.test(lifecycleAudit.reviewReceiptDigest))))
   );
 }
 
@@ -97,10 +104,22 @@ function mergeComment(
     `- 狀態：GitHub PR 已合併，工單更新為已完成`,
     `- PR：${request.changeRequestId}`,
     `- Head SHA：${headSha}`,
+    ...(request.workStatusLifecycleAudit === undefined
+      ? []
+      : [
+          `- operation：${request.workStatusLifecycleAudit.operation}`,
+          `- Job：${request.workStatusLifecycleAudit.jobId}`,
+          `- Work receipt：${request.workStatusLifecycleAudit.workReceiptDigest ?? "unavailable"}`,
+          `- Review receipt：${request.workStatusLifecycleAudit.reviewReceiptDigest ?? "unavailable"}`,
+          `- Merge provenance：${disposition === "not_required" ? "controller_authorized" : "already_merged_external"}`,
+          `- outcome：${request.workStatusLifecycleAudit.outcome}`,
+        ]),
     ...(request.reviewerReplayAudit === undefined
       ? []
       : [
-          "- operation：reviewer-replay",
+          ...(request.workStatusLifecycleAudit === undefined
+            ? ["- operation：reviewer-replay"]
+            : []),
           `- Review checkpoint：${request.reviewerReplayAudit.checkpointDigest}`,
           `- Reviewer attempts：${String(request.reviewerReplayAudit.attemptTotal)}｜outcome=${request.reviewerReplayAudit.outcome}`,
         ]),
