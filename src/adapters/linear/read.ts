@@ -71,7 +71,7 @@ const issueBaseSchema = z
         priority: z.number().int(),
         updatedAt: z.string(),
         archivedAt: z.string().nullable(),
-        trashed: z.boolean(),
+        trashed: z.boolean().nullable(),
         team: z.object({ id: idSchema }).strict(),
         project: z.object({ id: idSchema }).strict().nullable(),
         state: z.object({ id: idSchema }).strict(),
@@ -482,7 +482,8 @@ export class LinearReadModel {
       priority: raw.priority,
       updatedAt: raw.updatedAt,
       archivedAt: raw.archivedAt,
-      trashed: raw.trashed,
+      // Linear represents an active (not trashed) issue as null; snapshots keep a boolean.
+      trashed: raw.trashed ?? false,
       teamId: raw.team.id,
       projectId: raw.project?.id ?? null,
       stateId: raw.state.id,
