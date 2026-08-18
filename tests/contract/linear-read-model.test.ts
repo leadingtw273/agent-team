@@ -83,7 +83,10 @@ function connection<Node>(nodes: readonly Node[], after: unknown, splitAt?: numb
   throw new Error("unexpected_cursor");
 }
 
-function createFixtureFetch(overrides: Readonly<Record<string, unknown>> = {}): Mock<LinearFetch> {
+function createFixtureFetch(
+  overrides: Readonly<Record<string, unknown>> = {},
+  issueTrashed: boolean | null | "omit" = null,
+): Mock<LinearFetch> {
   return vi.fn<LinearFetch>().mockImplementation((_url, init) => {
     const body = bodyOf(init);
     const operationName = body.operationName;
@@ -132,7 +135,7 @@ function createFixtureFetch(overrides: Readonly<Record<string, unknown>> = {}): 
               priority: fixture.issue.priority,
               updatedAt: fixture.issue.updatedAt,
               archivedAt: null,
-              trashed: false,
+              ...(issueTrashed === "omit" ? {} : { trashed: issueTrashed }),
               team: { id: fixture.issue.teamId },
               project: fixture.issue.projectId === null ? null : { id: fixture.issue.projectId },
               state: { id: fixture.issue.stateId },
@@ -215,6 +218,7 @@ describe("Linear read model contract", () => {
     if (!issue.ok) return;
     expect(issue.value.id).toBe("issue-fixture");
     expect(issue.value.identifier).toBe("FIX-42");
+    expect(issue.value.trashed).toBe(false);
     expect(issue.value.priority).toBe("high");
     expect(issue.value.workStatus).toBe("in_progress");
     expect(issue.value.agentRole).toBe("implementer");
@@ -254,6 +258,39 @@ describe("Linear read model contract", () => {
     expect(Object.keys(result.value.blockingReason.labelIdByValue).sort()).toEqual(
       [...blockingReasons].sort(),
     );
+  });
+
+  it("normalizes nullable trashed values while preserving true and rejecting omission", async () => {
+    for (const [providerValue, expected] of [
+      [null, false],
+      [false, false],
+      [true, true],
+    ] as const) {
+      const readModel = new LinearReadModel(
+        new LinearGraphqlTransport({
+          apiKey: "fixture-key",
+          fetch: createFixtureFetch({}, providerValue),
+        }),
+      );
+      const context = await readModel.readContext(fixture.team.id, fixture.project.id);
+      expect(context.ok).toBe(true);
+      if (!context.ok) continue;
+      const issue = await readModel.readIssue(context.value, fixture.issue.id);
+      expect(issue.ok).toBe(true);
+      if (issue.ok) expect(issue.value.trashed).toBe(expected);
+    }
+
+    const readModel = new LinearReadModel(
+      new LinearGraphqlTransport({
+        apiKey: "fixture-key",
+        fetch: createFixtureFetch({}, "omit"),
+      }),
+    );
+    const context = await readModel.readContext(fixture.team.id, fixture.project.id);
+    expect(context.ok).toBe(true);
+    if (!context.ok) return;
+    const issue = await readModel.readIssue(context.value, fixture.issue.id);
+    expect(issue.ok ? "ok" : issue.error.code).toBe("external_failure");
   });
 
   it("fails closed on unknown, duplicate, or missing controlled Label values", () => {
