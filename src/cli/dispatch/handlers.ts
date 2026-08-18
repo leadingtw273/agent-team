@@ -44,6 +44,7 @@ import type {
 import {
   FileIssueScopeLock,
   JobProgressWorkStatusLifecycleLedger,
+  projectIssueByExternalId,
 } from "../../adapters/dispatch/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import {
@@ -1083,6 +1084,15 @@ export function createDispatchCliHandlers(
               jobs: build.value.jobs,
               admission: durableAdmission,
               workManagement: lifecycleWorkManagement,
+              resolveRequirementIssue: (externalIssueId, readOptions) =>
+                projectIssueByExternalId(
+                  build.value.project,
+                  build.value.discovery.readModel,
+                  build.value.discovery.teamId,
+                  build.value.discovery.linearProjectId,
+                  externalIssueId,
+                  readOptions,
+                ),
               workStatus: new WorkStatusLifecycleCoordinator({
                 workManagement: lifecycleWorkManagement,
                 ...(lifecycleHistory !== undefined
@@ -1115,7 +1125,6 @@ export function createDispatchCliHandlers(
             });
             const coordinated = await prePr.run(prePrRecord.value, {
               holderId: `work-status:${holderId}`,
-              issue,
               onPipelineOutcome: (pipelineOutcome) => {
                 observedPipelineOutcome = pipelineOutcome;
               },
