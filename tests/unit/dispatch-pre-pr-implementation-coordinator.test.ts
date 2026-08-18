@@ -5,10 +5,16 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
-import { PrePrImplementationCoordinator } from "../../src/cli/dispatch/pre-pr-implementation-coordinator.js";
+import type { ImplementerPipeline } from "../../src/application/pipelines/index.js";
+import {
+  PrePrImplementationCoordinator,
+  type PrePrImplementationCoordinatorDependencies,
+} from "../../src/cli/dispatch/pre-pr-implementation-coordinator.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import {
   createFixedClock,
+  domainError,
+  err,
   ok,
   parseIdentifier,
   parseInstant,
@@ -77,6 +83,15 @@ const issue = issueSchema.parse({
   reviewRequirement: "code_review",
   changeRegions: [{ path: "src/feature.ts", coverage: "exact" }],
 });
+const workflowIssue = issueSchema.parse({
+  schemaVersion: 1,
+  id: issueId,
+  projectId,
+  externalId: issue.externalId,
+  title: issue.title,
+  agentRole: "implementer",
+  reviewRequirement: "code_review",
+});
 const trustedConfig = trustedProjectConfigSchema.parse({
   schemaVersion: 1,
   projectId,
@@ -139,6 +154,7 @@ async function harness(
     workStatus: "in_progress",
     agentCondition: { status: "executing", blockingReasons: [] },
   },
+  resolveRequirementIssueOverride?: PrePrImplementationCoordinatorDependencies["resolveRequirementIssue"],
 ) {
   const root = await temporaryDirectory();
   const progress = new FileJobProgressStore(
@@ -148,7 +164,7 @@ async function harness(
   );
   const jobs = new FileJobRepository(join(root, "jobs.json"), join(root, "jobs.lock"));
   await jobs.create(job(processRecoveries));
-  const pipelineRun = vi.fn(() => Promise.resolve(ciWaitingOutcome()));
+  const pipelineRun = vi.fn<ImplementerPipeline["run"]>(() => Promise.resolve(ciWaitingOutcome()));
   const workStatusTransition = vi.fn(() =>
     Promise.resolve({
       state: "permitted" as const,
@@ -160,9 +176,14 @@ async function harness(
   const getIssue = vi
     .fn()
     .mockResolvedValueOnce(
-      ok({ issue, workStatus: "ready" as const, updatedAt: now, revision: "1" }),
+      ok({ issue: workflowIssue, workStatus: "ready" as const, updatedAt: now, revision: "1" }),
     )
-    .mockResolvedValue(ok({ issue, ...providerIssue, updatedAt: now, revision: "2" }));
+    .mockResolvedValue(
+      ok({ issue: workflowIssue, ...providerIssue, updatedAt: now, revision: "2" }),
+    );
+  const resolveRequirementIssue = vi.fn(
+    resolveRequirementIssueOverride ?? (() => Promise.resolve(ok(issue))),
+  );
   const coordinator = new PrePrImplementationCoordinator({
     agentTeamHome: root,
     project,
@@ -188,6 +209,7 @@ async function harness(
     workManagement: {
       getIssue,
     } as never,
+    resolveRequirementIssue,
     workStatus: { transition: workStatusTransition } as never,
     clock: createFixedClock(now),
     ensureWorktreeDirectory: () => Promise.resolve(ok(undefined)),
@@ -195,7 +217,15 @@ async function harness(
       Promise.resolve({ state: "ready" as const, value: { run: pipelineRun } as never }),
     resolveAuthoritativeBase: () => Promise.resolve(ok({ baseRevision, defaultBranch: "main" })),
   });
-  return { coordinator, progress, jobs, pipelineRun, workStatusTransition, getIssue };
+  return {
+    coordinator,
+    progress,
+    jobs,
+    pipelineRun,
+    workStatusTransition,
+    getIssue,
+    resolveRequirementIssue,
+  };
 }
 
 async function seed(
@@ -245,6 +275,14 @@ describe("PrePrImplementationCoordinator", () => {
     ).resolves.toEqual({ jobId, outcome: "still_ci_waiting" });
 
     expect(fixture.pipelineRun).toHaveBeenCalledOnce();
+    expect(fixture.resolveRequirementIssue).toHaveBeenCalledTimes(2);
+    expect(fixture.resolveRequirementIssue).toHaveBeenNthCalledWith(1, issue.externalId, undefined);
+    expect(fixture.resolveRequirementIssue).toHaveBeenNthCalledWith(2, issue.externalId, undefined);
+    const pipelineRequest = fixture.pipelineRun.mock.calls[0]?.[0];
+    expect(pipelineRequest?.requirementSnapshot.issue).toMatchObject({
+      goal: "Recover safely",
+      changeRegions: [{ path: "src/feature.ts", coverage: "exact" }],
+    });
     await expect(fixture.progress.load(jobId)).resolves.toMatchObject({
       ok: true,
       value: { stage: { kind: "ci_waiting" }, baseRevision, headSha, changeRequestId: "100" },
@@ -297,7 +335,7 @@ describe("PrePrImplementationCoordinator", () => {
     if (!record.ok) throw new Error(record.error.code);
 
     await expect(
-      fixture.coordinator.run(record.value, { holderId: "resume-holder", issue }),
+      fixture.coordinator.run(record.value, { holderId: "resume-holder" }),
     ).resolves.toEqual({
       jobId,
       outcome: "requires_manual",
@@ -305,6 +343,70 @@ describe("PrePrImplementationCoordinator", () => {
     });
 
     expect(fixture.getIssue).toHaveBeenCalledTimes(2);
+    expect(fixture.pipelineRun).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before work starts when the initial requirement projection cannot be read", async () => {
+    const resolveRequirementIssue: PrePrImplementationCoordinatorDependencies["resolveRequirementIssue"] =
+      () => Promise.resolve(err(domainError("external_failure")));
+    const fixture = await harness(0, undefined, resolveRequirementIssue);
+    const record = await seed(fixture.progress, { kind: "work_start_pending" });
+    if (!record.ok) throw new Error(record.error.code);
+
+    await expect(
+      fixture.coordinator.run(record.value, { holderId: "resume-holder" }),
+    ).resolves.toEqual({
+      jobId,
+      outcome: "requires_manual",
+      reason: "pre_pr_identity_unrecoverable",
+    });
+
+    expect(fixture.workStatusTransition).not.toHaveBeenCalled();
+    expect(fixture.pipelineRun).not.toHaveBeenCalled();
+  });
+
+  it("returns a transient failure when the final requirement projection cannot be read", async () => {
+    const resolveRequirementIssue = vi
+      .fn<PrePrImplementationCoordinatorDependencies["resolveRequirementIssue"]>()
+      .mockResolvedValueOnce(ok(issue))
+      .mockResolvedValueOnce(err(domainError("external_failure")));
+    const fixture = await harness(0, undefined, resolveRequirementIssue);
+    const record = await seed(fixture.progress, { kind: "work_start_pending" });
+    if (!record.ok) throw new Error(record.error.code);
+
+    await expect(
+      fixture.coordinator.run(record.value, { holderId: "resume-holder" }),
+    ).resolves.toMatchObject({
+      jobId,
+      outcome: "transient_failure",
+      reason: "pre_pr_authority_read_failed",
+      error: { code: "external_failure" },
+    });
+
+    expect(fixture.pipelineRun).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the final requirement projection drifts from the admitted identity", async () => {
+    const driftedIssue = issueSchema.parse({
+      ...issue,
+      id: id("issue", "issue_018f47d2-77a4-7cc1-8ef2-111111111111"),
+    });
+    const resolveRequirementIssue = vi
+      .fn<PrePrImplementationCoordinatorDependencies["resolveRequirementIssue"]>()
+      .mockResolvedValueOnce(ok(issue))
+      .mockResolvedValueOnce(ok(driftedIssue));
+    const fixture = await harness(0, undefined, resolveRequirementIssue);
+    const record = await seed(fixture.progress, { kind: "work_start_pending" });
+    if (!record.ok) throw new Error(record.error.code);
+
+    await expect(
+      fixture.coordinator.run(record.value, { holderId: "resume-holder" }),
+    ).resolves.toEqual({
+      jobId,
+      outcome: "requires_manual",
+      reason: "pre_pr_identity_unrecoverable",
+    });
+
     expect(fixture.pipelineRun).not.toHaveBeenCalled();
   });
 });

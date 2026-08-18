@@ -44,6 +44,10 @@ export interface PrePrImplementationCoordinatorDependencies {
   readonly jobs: ResumeJobRepository;
   readonly admission: Pick<IssueAdmissionPort, "load">;
   readonly workManagement: LifecycleWorkManagement;
+  readonly resolveRequirementIssue: (
+    externalIssueId: string,
+    options?: Readonly<{ signal?: AbortSignal }>,
+  ) => Promise<Result<Issue, DomainError>>;
   readonly workStatus: WorkStatusLifecycleCoordinator;
   readonly clock: Clock;
   readonly ensureWorktreeDirectory: () => Promise<Result<void, DomainError>>;
@@ -142,7 +146,6 @@ export class PrePrImplementationCoordinator {
       holderId: string;
       signal?: AbortSignal;
       onPipelineOutcome?: (outcome: ImplementerPipelineOutcome) => void;
-      issue?: Issue;
     }>,
   ): Promise<ResumeJobOutcome> {
     if (
@@ -173,15 +176,23 @@ export class PrePrImplementationCoordinator {
     // The dispatch candidate passed by the caller is useful context, but it is not authority.
     // Always read Linear here so a cancellation or identity drift between admission and execution
     // cannot be hidden by the in-memory candidate.
-    const issue = await this.dependencies.workManagement.getIssue(
-      { project: this.dependencies.project, externalIssueId: initialRecord.externalIssueId },
-      options.signal === undefined ? undefined : { signal: options.signal },
-    );
+    const readOptions = options.signal === undefined ? undefined : { signal: options.signal };
+    const [issue, requirementIssue] = await Promise.all([
+      this.dependencies.workManagement.getIssue(
+        { project: this.dependencies.project, externalIssueId: initialRecord.externalIssueId },
+        readOptions,
+      ),
+      this.dependencies.resolveRequirementIssue(initialRecord.externalIssueId, readOptions),
+    ]);
     if (
       !issue.ok ||
+      !requirementIssue.ok ||
       issue.value.issue.id !== initialRecord.issueId ||
       issue.value.issue.projectId !== initialRecord.projectId ||
-      issue.value.issue.externalId !== initialRecord.externalIssueId
+      issue.value.issue.externalId !== initialRecord.externalIssueId ||
+      requirementIssue.value.id !== initialRecord.issueId ||
+      requirementIssue.value.projectId !== initialRecord.projectId ||
+      requirementIssue.value.externalId !== initialRecord.externalIssueId
     ) {
       return requiresManual(
         this.dependencies.progress,
@@ -380,22 +391,25 @@ export class PrePrImplementationCoordinator {
     // worktree/pipeline composition, because either operation may take long enough for a human,
     // webhook, or another process to cancel the issue or supersede the claim. A mismatch is a
     // permanent hand-off, never a reason to invoke Provider optimistically.
-    const [providerProgress, providerIssue, providerClaim, providerJob] = await Promise.all([
-      this.dependencies.progress.load(job.id),
-      this.dependencies.workManagement.getIssue(
-        { project: this.dependencies.project, externalIssueId: initialRecord.externalIssueId },
-        options.signal === undefined ? undefined : { signal: options.signal },
-      ),
-      this.dependencies.admission.load(initialRecord.projectId, initialRecord.issueId),
-      uniqueJob(this.dependencies.jobs, armed.value),
-    ]);
+    const [providerProgress, providerIssue, providerClaim, providerJob, providerRequirementIssue] =
+      await Promise.all([
+        this.dependencies.progress.load(job.id),
+        this.dependencies.workManagement.getIssue(
+          { project: this.dependencies.project, externalIssueId: initialRecord.externalIssueId },
+          readOptions,
+        ),
+        this.dependencies.admission.load(initialRecord.projectId, initialRecord.issueId),
+        uniqueJob(this.dependencies.jobs, armed.value),
+        this.dependencies.resolveRequirementIssue(initialRecord.externalIssueId, readOptions),
+      ]);
     if (
       !providerProgress.ok ||
       providerProgress.value === undefined ||
       !providerIssue.ok ||
       !providerClaim.ok ||
       providerClaim.value === undefined ||
-      !providerJob.ok
+      !providerJob.ok ||
+      !providerRequirementIssue.ok
     ) {
       return {
         jobId: job.id,
@@ -409,7 +423,9 @@ export class PrePrImplementationCoordinator {
               ? providerClaim.error
               : !providerJob.ok
                 ? providerJob.error
-                : domainError("not_found"),
+                : !providerRequirementIssue.ok
+                  ? providerRequirementIssue.error
+                  : domainError("not_found"),
       };
     }
     const current = providerProgress.value;
@@ -427,6 +443,9 @@ export class PrePrImplementationCoordinator {
       currentIssue.issue.id !== initialRecord.issueId ||
       currentIssue.issue.projectId !== initialRecord.projectId ||
       currentIssue.issue.externalId !== initialRecord.externalIssueId ||
+      providerRequirementIssue.value.id !== initialRecord.issueId ||
+      providerRequirementIssue.value.projectId !== initialRecord.projectId ||
+      providerRequirementIssue.value.externalId !== initialRecord.externalIssueId ||
       currentIssue.archivedAt !== undefined ||
       currentIssue.trashed === true ||
       currentIssue.workStatus === "canceled" ||
@@ -443,7 +462,7 @@ export class PrePrImplementationCoordinator {
 
     const requestOptions: BuildImplementerPipelineRequestOptions = {
       job: providerJob.value,
-      issue: currentIssue.issue,
+      issue: providerRequirementIssue.value,
       project: this.dependencies.project,
       trustedConfig: this.dependencies.trustedConfig,
       model: current.model,

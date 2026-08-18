@@ -28,6 +28,7 @@ import { createLazyReviewerFacade } from "./reviewer-facade.js";
 import {
   FileIssueScopeLock,
   JobProgressWorkStatusLifecycleLedger,
+  projectIssueByExternalId,
 } from "../../adapters/dispatch/index.js";
 import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
@@ -184,6 +185,15 @@ export async function resumeExistingProjectJobs(
     jobs: options.ready.jobs,
     admission: buildIssueAdmissionStore(options.agentTeamHome),
     workManagement: lifecycleWorkManagement,
+    resolveRequirementIssue: (externalIssueId, readOptions) =>
+      projectIssueByExternalId(
+        options.ready.project,
+        options.ready.discovery.readModel,
+        options.ready.discovery.teamId,
+        options.ready.discovery.linearProjectId,
+        externalIssueId,
+        readOptions,
+      ),
     workStatus: workStatusLifecycle,
     clock: options.clock,
     ensureWorktreeDirectory: () => ensureDispatchWorktreesDirectory(options.agentTeamHome),
