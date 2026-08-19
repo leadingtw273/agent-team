@@ -195,7 +195,7 @@ export const workStatusLifecycleCheckpointSchema = z
           .object({
             epoch: z.number().int().min(1).max(100),
             sourceTransitionInstance: digestSchema,
-            disposition: z.enum(["target_observed", "pre_state_reissued"]),
+            disposition: z.enum(["target_observed", "pre_state_reissued", "pre_state_retained"]),
             operatorReceiptDigest: digestSchema,
             authorizedAt: instantSchema,
             historyDigest: digestSchema,

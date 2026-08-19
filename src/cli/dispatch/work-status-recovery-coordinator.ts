@@ -30,7 +30,7 @@ export type WorkStatusRecoveryOutcome =
       dryRun: true;
       jobId: string;
       transitionInstance: string;
-      disposition: "target_observed" | "pre_state_reissued";
+      disposition: "target_observed" | "pre_state_reissued" | "pre_state_retained";
       plannedMutation: "operator_receipt_only" | "new_bounded_transition";
     }>
   | Readonly<{
@@ -38,7 +38,7 @@ export type WorkStatusRecoveryOutcome =
       dryRun: false;
       jobId: string;
       transitionInstance: string;
-      disposition: "target_observed" | "pre_state_reissued";
+      disposition: "target_observed" | "pre_state_reissued" | "pre_state_retained";
     }>
   | Readonly<{
       state: "blocked";
@@ -139,13 +139,51 @@ function historyPrefixMatches(
   );
 }
 
+type RecoverySourceShape = "sent_unknown" | "fix_start_intent";
+
+function recoverySourceShape(
+  transition: WorkStatusLifecycleTransition,
+): RecoverySourceShape | undefined {
+  if (transition.main.state === "sent_unknown") return "sent_unknown";
+  if (
+    transition.step === "fix_start" &&
+    transition.main.state === "intent" &&
+    transition.mainFailures.count > 0 &&
+    transition.mainFailures.count < 6 &&
+    transition.mainFailures.lastErrorCode === "conflict"
+  ) {
+    return "fix_start_intent";
+  }
+  return undefined;
+}
+
+function preStateSpanIsOpen(
+  transition: WorkStatusLifecycleTransition,
+  history: WorkStatusHistorySnapshot,
+): boolean {
+  const evidence = transition.historyEvidence;
+  return (
+    evidence !== undefined &&
+    history.stateSpans.some(
+      (span) =>
+        span.id === evidence.preStateSpanId &&
+        span.stateId === evidence.preStateId &&
+        span.endedAt === null,
+    )
+  );
+}
+
 function classifyRecoveryState(
   record: JobProgressRecord,
   transition: WorkStatusLifecycleTransition,
+  sourceShape: RecoverySourceShape,
   issue: WorkManagementIssueSnapshot,
   history: WorkStatusHistorySnapshot,
 ):
-  | Readonly<{ ok: true; disposition: "target_observed" | "pre_state_reissued" }>
+  | Readonly<{
+      ok: true;
+      disposition: "target_observed" | "pre_state_reissued" | "pre_state_retained";
+    }>
   | Readonly<{
       ok: false;
       reason:
@@ -171,6 +209,11 @@ function classifyRecoveryState(
   const atPreState =
     issue.workStatusStateId === transition.historyEvidence?.preStateId &&
     transition.allowedMainSources?.includes(issue.workStatus) === true;
+  if (sourceShape === "fix_start_intent") {
+    return atPreState && preStateSpanIsOpen(transition, history)
+      ? { ok: true, disposition: "pre_state_retained" }
+      : { ok: false, reason: "work_status_not_recoverable" };
+  }
   return atTarget
     ? { ok: true, disposition: "target_observed" }
     : atPreState
@@ -228,8 +271,9 @@ export class WorkStatusRecoveryCoordinator {
       (candidate) => candidate.instance === input.transitionInstance,
     );
     if (transition === undefined) return { state: "blocked", reason: "transition_not_found" };
+    const sourceShape = recoverySourceShape(transition);
     if (
-      transition.main.state !== "sent_unknown" ||
+      sourceShape === undefined ||
       transition.mainTarget === undefined ||
       transition.historyEvidence === undefined ||
       transition.allowedMainSources === undefined
@@ -243,7 +287,13 @@ export class WorkStatusRecoveryCoordinator {
     const issue = await this.dependencies.workManagement.getIssue(reference);
     const history = await this.dependencies.workManagement.getIssueHistory(reference);
     if (!issue.ok || !history.ok) return { state: "blocked", reason: "history_unavailable" };
-    const classified = classifyRecoveryState(record, transition, issue.value, history.value);
+    const classified = classifyRecoveryState(
+      record,
+      transition,
+      sourceShape,
+      issue.value,
+      history.value,
+    );
     if (!classified.ok) return { state: "blocked", reason: classified.reason };
     const disposition = classified.disposition;
     if (input.dryRun) {
@@ -254,7 +304,7 @@ export class WorkStatusRecoveryCoordinator {
         transitionInstance: transition.instance,
         disposition,
         plannedMutation:
-          disposition === "target_observed" ? "operator_receipt_only" : "new_bounded_transition",
+          disposition === "pre_state_reissued" ? "new_bounded_transition" : "operator_receipt_only",
       };
     }
 
@@ -290,6 +340,7 @@ export class WorkStatusRecoveryCoordinator {
           const lockedState = classifyRecoveryState(
             current.value,
             transition,
+            sourceShape,
             lockedIssue.value,
             lockedHistory.value,
           );
@@ -330,19 +381,24 @@ export class WorkStatusRecoveryCoordinator {
                 claimRevision: claim.value.revision,
                 historyDigest: historyDigest.ok ? historyDigest.value : "invalid",
               });
-              const continuation = authorityDigest.ok
-                ? createWorkStatusLifecycleTransitionInstance({
-                    jobId: record.jobId,
-                    step: transition.step,
-                    mainTarget: transition.mainTarget,
-                    allowedMainSources: transition.allowedMainSources,
-                    ...(transition.agentTarget === undefined
-                      ? {}
-                      : { agentTarget: transition.agentTarget }),
-                    authorityDigest: authorityDigest.value,
-                  })
-                : authorityDigest;
-              if (!historyDigest.ok || !authorityDigest.ok || !continuation.ok) {
+              const continuation =
+                authorityDigest.ok && disposition === "pre_state_reissued"
+                  ? createWorkStatusLifecycleTransitionInstance({
+                      jobId: record.jobId,
+                      step: transition.step,
+                      mainTarget: transition.mainTarget,
+                      allowedMainSources: transition.allowedMainSources,
+                      ...(transition.agentTarget === undefined
+                        ? {}
+                        : { agentTarget: transition.agentTarget }),
+                      authorityDigest: authorityDigest.value,
+                    })
+                  : undefined;
+              if (
+                !historyDigest.ok ||
+                !authorityDigest.ok ||
+                (continuation !== undefined && !continuation.ok)
+              ) {
                 outcome = { state: "blocked", reason: "history_identity_mismatch" };
               } else {
                 const receipt = Object.freeze({
@@ -352,7 +408,7 @@ export class WorkStatusRecoveryCoordinator {
                   operatorReceiptDigest: authorityDigest.value,
                   authorizedAt: this.#clock.now(),
                   historyDigest: historyDigest.value,
-                  ...(disposition === "pre_state_reissued"
+                  ...(disposition === "pre_state_reissued" && continuation?.ok === true
                     ? { continuationTransitionInstance: continuation.value }
                     : {}),
                 });
@@ -373,7 +429,7 @@ export class WorkStatusRecoveryCoordinator {
                   outcome = await this.#continue(
                     checkpointed.value,
                     transition,
-                    continuation.value,
+                    continuation?.ok === true ? continuation.value : transition.instance,
                     disposition,
                     input.holderId,
                     reference,
@@ -403,7 +459,7 @@ export class WorkStatusRecoveryCoordinator {
     record: JobProgressRecord,
     transition: WorkStatusLifecycleTransition,
     continuationInstance: string,
-    disposition: "target_observed" | "pre_state_reissued",
+    disposition: "target_observed" | "pre_state_reissued" | "pre_state_retained",
     holderId: string,
     reference: Parameters<WorkManagementPort["getIssue"]>[0],
     lock: IssueScopeLockHandle,

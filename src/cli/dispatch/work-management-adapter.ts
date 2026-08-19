@@ -15,11 +15,11 @@
  * `issue.projectId`/`issue.externalId`/top-level `workStatus`/`agentCondition` (confirmed by
  * reading lifecycle.ts directly), so those optional fields would be unread scope creep here.
  *
- * `setWorkStatus` narrows to the one case `LifecyclePipeline` ever actually calls (confirmed via
- * grep: always `target: "completed"`, in `#handleMerge`) -- any other target fails closed with
- * `invariant_violation` rather than pretending to support a general status-to-cause mapping this
- * adapter was never asked to build. `setAgentCondition` similarly fails closed if asked to carry
- * more than one blocking reason: Linear's own label model
+ * `setWorkStatus` accepts only the lifecycle targets supported by the dispatch composition and
+ * requires an explicit domain cause whenever `in_progress` could mean either initial work or a
+ * requested fix. Unsupported or ambiguous transitions fail closed with `invariant_violation`.
+ * `setAgentCondition` similarly fails closed if asked to carry more than one blocking reason:
+ * Linear's own label model
  * (`LinearVisibleAgentCondition.blockingReason`) only ever carries one.
  */
 import type {
@@ -30,6 +30,7 @@ import type {
   WorkManagementIssueRef,
   WorkManagementIssueSnapshot,
   WorkManagementPort,
+  WorkStatusMutationOptions,
 } from "../../application/ports/index.js";
 import {
   domainError,
@@ -237,14 +238,32 @@ export class LinearWorkManagementAdapter implements Pick<
   async setWorkStatus(
     reference: WorkManagementIssueRef,
     status: WorkStatus,
-    _options: MutationOptions,
+    options: WorkStatusMutationOptions,
   ): Promise<Result<WorkManagementIssueSnapshot, DomainError>> {
-    void _options;
     if (
       status !== "completed" &&
       status !== "requires_manual" &&
       status !== "in_review" &&
       status !== "in_progress"
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    const transitionCause =
+      status === "in_review"
+        ? (options.cause ?? "review_started")
+        : status === "in_progress"
+          ? options.cause
+          : undefined;
+    if (status === "in_progress" && transitionCause === undefined) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      (status === "completed" &&
+        options.cause !== undefined &&
+        options.cause !== "github_merge_observed") ||
+      (status === "requires_manual" &&
+        options.cause !== undefined &&
+        options.cause !== "policy_requires_manual")
     ) {
       return err(domainError("invariant_violation"));
     }
@@ -263,9 +282,7 @@ export class LinearWorkManagementAdapter implements Pick<
             : await this.#mutationClient.transitionWorkStatus(
                 context.value,
                 reference.externalIssueId,
-                status === "in_review"
-                  ? { target: "in_review", cause: "review_started" }
-                  : { target: "in_progress", cause: "work_started" },
+                { target: status, cause: transitionCause ?? "review_started" },
               );
     if (!result.ok) return result;
     return toWorkManagementSnapshot(reference.project.id, result.value);

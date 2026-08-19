@@ -8,7 +8,11 @@ import {
   FileJobProgressStore,
   JobProgressWorkStatusLifecycleLedger,
 } from "../../src/adapters/dispatch/index.js";
-import { WorkStatusLifecycleCoordinator } from "../../src/application/pipelines/index.js";
+import {
+  WorkStatusLifecycleCoordinator,
+  type WorkStatusLifecycleTransition,
+} from "../../src/application/pipelines/index.js";
+import type { WorkStatusMutationOptions } from "../../src/application/ports/index.js";
 import {
   domainError,
   err,
@@ -63,10 +67,24 @@ const job = jobSchema.parse({
 const transitionInstance = "1".repeat(64);
 const capabilityDigest = "2".repeat(64);
 
+function stateIdFor(status: WorkStatus): string {
+  switch (status) {
+    case "ready":
+      return "state-ready";
+    case "in_progress":
+      return "state-progress";
+    case "in_review":
+      return "state-review";
+    default:
+      return `state-${status}`;
+  }
+}
+
 class FakeWorkManagement {
   status: WorkStatus;
   stateId: string;
   setStatusCalls = 0;
+  statusCauses: WorkStatusMutationOptions["cause"][] = [];
   readonly entries: {
     id: string;
     createdAt: typeof now;
@@ -83,7 +101,7 @@ class FakeWorkManagement {
 
   constructor(status: WorkStatus) {
     this.status = status;
-    this.stateId = status === "ready" ? "state-ready" : "state-progress";
+    this.stateId = stateIdFor(status);
   }
 
   getIssue() {
@@ -114,30 +132,19 @@ class FakeWorkManagement {
           canceled: "state-canceled",
         },
         entries: this.entries,
-        stateSpans: [
-          {
-            id: "span-ready",
-            stateId: "state-ready",
-            startedAt: now,
-            endedAt: this.status === "ready" ? null : now,
-          },
-          ...(this.status === "in_progress"
-            ? [
-                {
-                  id: "span-progress",
-                  stateId: "state-progress",
-                  startedAt: now,
-                  endedAt: null,
-                },
-              ]
-            : []),
-        ],
+        stateSpans: ["ready", "in_review", "in_progress"].map((status) => ({
+          id: `span-${status === "in_progress" ? "progress" : status === "in_review" ? "review" : "ready"}`,
+          stateId: stateIdFor(status as WorkStatus),
+          startedAt: now,
+          endedAt: this.status === status ? null : now,
+        })),
       }),
     );
   }
 
-  setWorkStatus(_reference: unknown, status: WorkStatus) {
+  setWorkStatus(_reference: unknown, status: WorkStatus, options: WorkStatusMutationOptions) {
     this.setStatusCalls += 1;
+    this.statusCauses.push(options.cause);
     this.entries.push({
       id: `history-${String(this.entries.length + 1)}`,
       createdAt: now,
@@ -152,7 +159,7 @@ class FakeWorkManagement {
       trashed: null,
     });
     this.status = status;
-    this.stateId = status === "in_progress" ? "state-progress" : "state-other";
+    this.stateId = stateIdFor(status);
     return this.getIssue();
   }
 
@@ -167,6 +174,8 @@ class FakeWorkManagement {
 async function harness(
   current: WorkStatus,
   onLockAcquire?: (workManagement: FakeWorkManagement) => void,
+  sourceShape: "sent_unknown" | "fix_start_intent" = "sent_unknown",
+  transitionOverrides: Partial<WorkStatusLifecycleTransition> = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "agent-team-work-status-recovery-"));
   const progress = new FileJobProgressStore(join(root, "progress"));
@@ -191,31 +200,45 @@ async function harness(
     workStatusLifecycle: {
       admissionMode: "enforce",
       capabilityDigest,
-      phase: "work_start",
+      phase: sourceShape === "fix_start_intent" ? "fixing" : "work_start",
       transitions: [
         {
-          step: "work_start",
+          step: sourceShape === "fix_start_intent" ? "fix_start" : "work_start",
           instance: transitionInstance,
           mainTarget: "in_progress",
-          allowedMainSources: ["ready", "in_progress"],
+          allowedMainSources:
+            sourceShape === "fix_start_intent"
+              ? ["in_review", "in_progress"]
+              : ["ready", "in_progress"],
           agentTarget: { kind: "set", status: "executing" },
-          main: { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
-          agent: {
-            state: "confirmed",
-            idempotencyKey: "old-agent",
-            confirmedAt: now,
-            observedRevision: "revision-0",
+          main:
+            sourceShape === "fix_start_intent"
+              ? { state: "intent", idempotencyKey: "old-main" }
+              : { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
+          agent:
+            sourceShape === "fix_start_intent"
+              ? { state: "intent", idempotencyKey: "old-agent" }
+              : {
+                  state: "confirmed",
+                  idempotencyKey: "old-agent",
+                  confirmedAt: now,
+                  observedRevision: "revision-0",
+                },
+          mainFailures: {
+            count: 1,
+            lastErrorCode: sourceShape === "fix_start_intent" ? "conflict" : "timeout",
+            lastInvocation: "3".repeat(64),
           },
-          mainFailures: { count: 1, lastErrorCode: "timeout", lastInvocation: "3".repeat(64) },
           agentFailures: { count: 0 },
           historyEvidence: {
-            preStateId: "state-ready",
+            preStateId: sourceShape === "fix_start_intent" ? "state-review" : "state-ready",
             targetStateId: "state-progress",
             observedRevision: "revision-0",
             historyPrefixDigest: prefixDigest.value,
             historyEntryCount: 0,
-            preStateSpanId: "span-ready",
+            preStateSpanId: sourceShape === "fix_start_intent" ? "span-review" : "span-ready",
           },
+          ...transitionOverrides,
         },
       ],
       incident: { reasonCode: "mutation_unconfirmed", channel: "main" },
@@ -276,7 +299,7 @@ async function harness(
   };
   const makeCoordinator = (progressPort: typeof progress | object = progress) =>
     new WorkStatusRecoveryCoordinator({ ...dependencies, progress: progressPort as never });
-  return { coordinator: makeCoordinator(), makeCoordinator, progress, workManagement };
+  return { coordinator: makeCoordinator(), makeCoordinator, progress, workManagement, lifecycle };
 }
 
 describe("dispatch work-status recovery", () => {
@@ -336,6 +359,137 @@ describe("dispatch work-status recovery", () => {
     expect(test.workManagement.setStatusCalls).toBe(0);
   });
 
+  it("recovers a failed fix-start intent with a receipt only, then lets the original transition confirm", async () => {
+    const test = await harness("in_review", undefined, "fix_start_intent");
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-dry-run",
+        dryRun: true,
+      }),
+    ).resolves.toMatchObject({
+      state: "ready",
+      disposition: "pre_state_retained",
+      plannedMutation: "operator_receipt_only",
+    });
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: false,
+      }),
+    ).resolves.toMatchObject({ state: "recovered", disposition: "pre_state_retained" });
+
+    let record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.stage.kind).toBe("awaiting_review");
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions).toHaveLength(1);
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions[0]).toMatchObject({
+      step: "fix_start",
+      main: { state: "intent" },
+      mainFailures: { count: 1, lastErrorCode: "conflict" },
+    });
+    expect(record.ok && record.value?.workStatusLifecycle?.recoveries).toMatchObject([
+      { disposition: "pre_state_retained" },
+    ]);
+    expect(test.workManagement.setStatusCalls).toBe(0);
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-repeat",
+        dryRun: false,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "job_not_eligible" });
+    record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.workStatusLifecycle?.recoveries).toHaveLength(1);
+
+    const resumed = await test.lifecycle.transition({
+      jobId: job.id,
+      reference: { project, externalIssueId: issue.externalId },
+      holderId: "resume",
+      mode: "enforce",
+      capabilityDigest,
+      phase: "fixing",
+      step: "fix_start",
+      transitionInstance,
+      invocationDigest: "5".repeat(64),
+      mainTarget: "in_progress",
+      allowedMainSources: ["in_review", "in_progress"],
+      agentTarget: { kind: "set", status: "executing" },
+    });
+    expect(resumed).toMatchObject({ state: "permitted", main: "confirmed" });
+    expect(test.workManagement.statusCauses).toEqual(["changes_requested"]);
+    record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions).toHaveLength(1);
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions[0]?.main.state).toBe(
+      "confirmed",
+    );
+  });
+
+  it("rejects target-observed, non-fix, unattempted, exhausted and evidence-free intent shapes", async () => {
+    const targetObserved = await harness("in_progress", undefined, "fix_start_intent");
+    await expect(
+      targetObserved.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-target",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "work_status_not_recoverable" });
+
+    const wrongStep = await harness("in_review", undefined, "fix_start_intent", {
+      step: "complete",
+    });
+    await expect(
+      wrongStep.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-step",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "transition_not_recoverable" });
+
+    const unattempted = await harness("in_review", undefined, "fix_start_intent", {
+      mainFailures: { count: 0 },
+    });
+    await expect(
+      unattempted.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-unattempted",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "transition_not_recoverable" });
+
+    const exhausted = await harness("in_review", undefined, "fix_start_intent", {
+      mainFailures: { count: 6, lastErrorCode: "conflict", lastInvocation: "3".repeat(64) },
+    });
+    await expect(
+      exhausted.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-exhausted",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "transition_not_recoverable" });
+
+    const missingEvidence = await harness("in_review", undefined, "fix_start_intent", {
+      historyEvidence: undefined,
+    });
+    await expect(
+      missingEvidence.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-evidence",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "transition_not_recoverable" });
+  });
+
   it("fails closed on work-status drift without writing a receipt or mutation", async () => {
     const test = await harness("in_review");
     await expect(
@@ -371,7 +525,7 @@ describe("dispatch work-status recovery", () => {
   });
 
   it("restarts from the durable operator receipt without appending another recovery epoch", async () => {
-    const test = await harness("in_progress");
+    const test = await harness("in_review", undefined, "fix_start_intent");
     let writes = 0;
     const crashAfterReceipt = {
       load: test.progress.load.bind(test.progress),
@@ -401,9 +555,11 @@ describe("dispatch work-status recovery", () => {
         holderId: "operator-second",
         dryRun: false,
       }),
-    ).resolves.toMatchObject({ state: "recovered", disposition: "target_observed" });
+    ).resolves.toMatchObject({ state: "recovered", disposition: "pre_state_retained" });
     record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.stage.kind).toBe("awaiting_review");
     expect(record.ok && record.value?.workStatusLifecycle?.recoveries).toHaveLength(1);
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions).toHaveLength(1);
     expect(test.workManagement.setStatusCalls).toBe(0);
   });
 });
