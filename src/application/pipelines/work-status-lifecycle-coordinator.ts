@@ -103,7 +103,7 @@ function transitionCauseForStep(
     case "requires_manual":
       return "policy_requires_manual";
     case "clear_condition":
-      return undefined;
+      return "ready_gate_passed";
   }
 }
 

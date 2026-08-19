@@ -339,6 +339,25 @@ describe("LinearWorkManagementAdapter", () => {
     ]);
   });
 
+  it('setWorkStatus("ready") delegates to the explicit ready-gate transition', async () => {
+    const mutationClient = new FakeMutationClient();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.setWorkStatus(reference(), "ready", {
+      idempotencyKey: "k-ready",
+      cause: "ready_gate_passed",
+    });
+    expect(result.ok).toBe(true);
+    expect(mutationClient.transitionWorkStatusCalls).toEqual([
+      { target: "ready", cause: "ready_gate_passed" },
+    ]);
+  });
+
   it('setWorkStatus("in_progress") preserves the explicit changes-requested authority', async () => {
     const mutationClient = new FakeMutationClient();
     const adapter = new LinearWorkManagementAdapter({

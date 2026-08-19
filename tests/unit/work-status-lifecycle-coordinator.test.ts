@@ -360,6 +360,53 @@ describe("WorkStatusLifecycleCoordinator", () => {
     expect(test.workManagement.clearAgentCalls).toBe(1);
   });
 
+  it("uses the ready-gate cause when clearing an exact requires-manual condition", async () => {
+    const test = harness();
+    test.workManagement.current = {
+      ...snapshot("requires_manual", createAgentCondition("blocked", ["integration_failure"])),
+    };
+    test.ledger.checkpoint.transitions.push({
+      step: "requires_manual",
+      instance: "e".repeat(64),
+      mainTarget: "requires_manual",
+      allowedMainSources: ["in_progress"],
+      agentTarget: {
+        kind: "set",
+        status: "blocked",
+        blockingReason: "integration_failure",
+      },
+      main: {
+        state: "confirmed",
+        idempotencyKey: "manual:main",
+        confirmedAt: now,
+        observedRevision: "linear-manual",
+      },
+      agent: {
+        state: "confirmed",
+        idempotencyKey: "manual:agent",
+        confirmedAt: now,
+        observedRevision: "linear-manual",
+      },
+      mainFailures: { count: 0 },
+      agentFailures: { count: 0 },
+    });
+
+    const result = await test.coordinator.transition(
+      request({
+        phase: "work_start",
+        step: "clear_condition",
+        transitionInstance: "f".repeat(64),
+        mainTarget: "ready",
+        allowedMainSources: ["requires_manual"],
+        agentTarget: { kind: "clear" },
+      }),
+    );
+
+    expect(result).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
+    expect(test.workManagement.statusCauses).toEqual(["ready_gate_passed"]);
+    expect(test.workManagement.clearAgentCalls).toBe(1);
+  });
+
   it("fails closed on human main-status drift without any mutation", async () => {
     const test = harness();
     test.workManagement.current = snapshot("backlog");

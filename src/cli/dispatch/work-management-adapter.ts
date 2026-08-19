@@ -244,17 +244,18 @@ export class LinearWorkManagementAdapter implements Pick<
       status !== "completed" &&
       status !== "requires_manual" &&
       status !== "in_review" &&
-      status !== "in_progress"
+      status !== "in_progress" &&
+      status !== "ready"
     ) {
       return err(domainError("invariant_violation"));
     }
     const transitionCause =
       status === "in_review"
         ? (options.cause ?? "review_started")
-        : status === "in_progress"
+        : status === "in_progress" || status === "ready"
           ? options.cause
           : undefined;
-    if (status === "in_progress" && transitionCause === undefined) {
+    if ((status === "in_progress" || status === "ready") && transitionCause === undefined) {
       return err(domainError("invariant_violation"));
     }
     if (
