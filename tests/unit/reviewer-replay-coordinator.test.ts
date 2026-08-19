@@ -343,6 +343,7 @@ async function harness(
     seedReplay?: "legacy_exhausted" | "legacy_mixed_exhausted" | "v2_exhausted" | "v2_zero";
     reviewRequirement?: "code_review" | "dual_review";
     finalReview?: boolean;
+    workStatusLifecycleUnavailable?: boolean;
     throwOnProvider?: boolean;
   }> = {},
 ): Promise<Harness> {
@@ -624,7 +625,12 @@ async function harness(
     jobRepository: {
       create: () => Promise.resolve(ok({ durability: "confirmed" as const })),
       readAll: () => Promise.resolve(ok(jobs)),
-      update: () => Promise.resolve(ok({ durability: "confirmed" as const })),
+      update: (next) => {
+        const index = jobs.findIndex((candidate) => candidate.id === next.id);
+        if (index < 0) return Promise.resolve(err(domainError("not_found")));
+        jobs[index] = next;
+        return Promise.resolve(ok({ durability: "confirmed" as const }));
+      },
     },
     leases: leaseCoordinator,
     sourceControl: {
@@ -727,7 +733,7 @@ async function harness(
           }),
         ),
     },
-    ...(overrides.finalReview === true
+    ...(overrides.finalReview === true && overrides.workStatusLifecycleUnavailable !== true
       ? {
           workStatusLifecycle: {
             transition: () =>
@@ -917,6 +923,64 @@ describe("ReviewerReplayCoordinator", () => {
     await expect(value.progress.load(jobId)).resolves.toMatchObject({
       ok: true,
       value: { reviewerReplay: { state: "review_succeeded" } },
+    });
+    await expect(value.deps.jobRepository.readAll()).resolves.toMatchObject({
+      ok: true,
+      value: [{ attempts: { reviewRuns: 2 } }],
+    });
+  });
+
+  it("final-review resumes a persisted success after lifecycle wiring returns without another provider", async () => {
+    const value = await harness(["approved"], {
+      finalReview: true,
+      workStatusLifecycleUnavailable: true,
+    });
+    const first = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+    expect(first).toMatchObject({
+      state: "continued",
+      outcome: { outcome: "requires_manual", reason: "work_status_lifecycle_unavailable" },
+    });
+    await expect(value.progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: { stage: "review", reasonCode: "work_status_lifecycle_failed" },
+        },
+        reviewerReplay: { state: "review_succeeded" },
+      },
+    });
+
+    const resumed = new ReviewerReplayCoordinator({
+      ...value.coordinator.dependencies,
+      resume: {
+        ...value.deps,
+        workStatusLifecycle: {
+          transition: () =>
+            Promise.resolve({
+              state: "permitted" as const,
+              mode: "enforce" as const,
+              main: "confirmed" as const,
+              agent: "confirmed" as const,
+            }),
+        },
+      },
+    });
+    const second = await resumed.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(second).toMatchObject({ state: "continued" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).toContain("reviewStatus.record");
+    expect(value.calls).toContain("autoMerge.enable");
+    await expect(value.deps.jobRepository.readAll()).resolves.toMatchObject({
+      ok: true,
+      value: [{ attempts: { reviewRuns: 2 } }],
     });
   });
 

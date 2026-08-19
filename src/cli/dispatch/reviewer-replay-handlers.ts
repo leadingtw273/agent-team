@@ -10,6 +10,11 @@ import { jobIdSchema } from "../../domain/jobs/index.js";
 import { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
 import { FileFinalReviewRecoveryStore } from "../../adapters/dispatch/final-review-recovery-store.js";
+import {
+  FileIssueScopeLock,
+  JobProgressWorkStatusLifecycleLedger,
+} from "../../adapters/dispatch/index.js";
+import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
 import type { CliCommandOutcome } from "../program.js";
 import { readStdinConfirmation } from "../registration/confirmation.js";
 import { buildDispatchComposition } from "./composition.js";
@@ -220,6 +225,9 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       teamId: built.value.discovery.teamId,
       linearProjectId: built.value.discovery.linearProjectId,
     });
+    const issueScopeLocks = new FileIssueScopeLock(
+      join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+    );
     const resume: ResumeCycleDependencies = {
       progress,
       jobRepository: built.value.jobs,
@@ -270,6 +278,13 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       prepare,
       reviewReportSidecar: buildReviewReportDiagnosticsSidecar(options.agentTeamHome),
       admission,
+      workStatusLifecycle: new WorkStatusLifecycleCoordinator({
+        workManagement,
+        history: workManagement,
+        ledger: new JobProgressWorkStatusLifecycleLedger(progress),
+        locks: issueScopeLocks,
+        clock,
+      }),
       resolveAuthoritativeBase: (project, resolveOptions) =>
         resolveAuthoritativeBaseRevision(
           project,
