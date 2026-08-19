@@ -227,11 +227,12 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       sourceControl: {
         getChangeRequest: (...args) => prepared().sourceControl.getChangeRequest(...args),
         getCommitStatuses: (...args) => {
-          const getCommitStatuses = prepared().sourceControl.getCommitStatuses;
+          const sourceControl = prepared().sourceControl;
+          const getCommitStatuses = sourceControl.getCommitStatuses;
           if (getCommitStatuses === undefined) {
             throw new Error("reviewer_replay_status_read_unavailable");
           }
-          return getCommitStatuses(...args);
+          return getCommitStatuses.call(sourceControl, ...args);
         },
       },
       workManagement,
