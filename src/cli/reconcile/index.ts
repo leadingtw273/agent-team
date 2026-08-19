@@ -9,6 +9,7 @@ import type { DomainError, Result } from "../../domain/foundation/index.js";
 import type { JobProgressRecord } from "../../adapters/dispatch/job-progress-store.js";
 import type { ResumeJobOutcome } from "../dispatch/resume-composition.js";
 import type { WorkStatusOrphanScanOutcome } from "../dispatch/work-status-orphan-coordinator.js";
+import type { WorkStatusJobReconcileOutcome } from "../dispatch/work-status-orphan-coordinator.js";
 import type { CliCommandOutcome } from "../program.js";
 import { countJobProgressInventory, type JobProgressInventory } from "./active-job-inventory.js";
 
@@ -62,6 +63,7 @@ export interface ManualReconcileUseCase {
     records: readonly JobProgressRecord[],
   ) => Promise<JobProgressResumeBatch>;
   readonly quarantineWorkStatusOrphans?: () => Promise<readonly WorkStatusOrphanScanOutcome[]>;
+  readonly reconcileJob?: (jobId: string) => Promise<WorkStatusJobReconcileOutcome>;
   /** E010c: which `ReconcilePorts` capabilities this use case's composition actually backed. */
   readonly disclosedScope: ReconcileDisclosedScope;
 }
@@ -79,6 +81,8 @@ export interface CreateManualReconcileHandlerOptions {
   readonly reconcile: ManualReconcileUseCase;
   readonly createRequest?: () => ReconcileAllRequest;
 }
+
+export type ManualReconcileInput = Readonly<{ all: true }> | Readonly<{ jobId: string }>;
 
 interface TargetCounts {
   readonly healthy: number;
@@ -225,10 +229,25 @@ function renderReconcileOutcome(
  */
 export function createManualReconcileHandler(
   options: CreateManualReconcileHandlerOptions,
-): (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome> {
+): (input: ManualReconcileInput) => Promise<CliCommandOutcome> {
   const createRequest = options.createRequest ?? createDefaultRequest;
-  return async () => {
+  return async (input) => {
     try {
+      if ("jobId" in input) {
+        if (options.reconcile.reconcileJob === undefined) {
+          return outcome("blocked", {
+            operation: "manual_reconcile_job",
+            state: "blocked",
+            jobId: input.jobId,
+            reason: "runtime_unavailable",
+          });
+        }
+        const exact = await options.reconcile.reconcileJob(input.jobId);
+        return outcome(exact.state === "completed" ? "success" : "blocked", {
+          operation: "manual_reconcile_job",
+          ...exact,
+        });
+      }
       const inventory = await options.reconcile.readJobProgressInventory();
       if (!inventory.ok) {
         return outcome("failed", {
@@ -285,7 +304,7 @@ export function createManualReconcileHandler(
 
 /** The compiled CLI has no Reconcile Runtime composition yet, so it must block. */
 export function createUnwiredManualReconcileHandler(): (
-  input: Readonly<{ all: true }>,
+  input: ManualReconcileInput,
 ) => Promise<CliCommandOutcome> {
   return () =>
     Promise.resolve(

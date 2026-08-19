@@ -27,6 +27,22 @@ function record(checkpoint: boolean) {
 }
 
 describe("reviewer-replay reconcile bridge", () => {
+  it("passes exact-job reconcile through without scanning or replaying reviewer checkpoints", async () => {
+    const base = vi.fn(() => Promise.resolve({ state: "success" as const }));
+    const listAll = vi.fn();
+    const replay = vi.fn();
+    const handler = createReviewerReplayReconcileHandler({
+      base,
+      progress: { listAll },
+      replay,
+    });
+
+    await expect(handler({ jobId })).resolves.toEqual({ state: "success" });
+    expect(base).toHaveBeenCalledWith({ jobId });
+    expect(listAll).not.toHaveBeenCalled();
+    expect(replay).not.toHaveBeenCalled();
+  });
+
   it("AC7/AC14 invokes only exact successful checkpoints and never bare requires_manual jobs", async () => {
     const replay = vi.fn(() =>
       Promise.resolve({

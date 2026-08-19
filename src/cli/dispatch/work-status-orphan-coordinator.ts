@@ -39,6 +39,24 @@ export interface WorkStatusOrphanScanOutcome {
   readonly blocked: number;
 }
 
+export type WorkStatusJobReconcileOutcome = Readonly<
+  | { state: "completed"; projectId: string; jobId: string }
+  | {
+      state: "blocked";
+      projectId: string;
+      jobId: string;
+      reason:
+        | "project_mismatch"
+        | "job_not_reconcilable"
+        | "issue_unavailable"
+        | "issue_not_automation_owned"
+        | "issue_lock_unavailable"
+        | "projection_blocked"
+        | "projection_stale"
+        | "issue_lock_release_failed";
+    }
+>;
+
 type TerminalProjectionOutcome = "completed" | "stale" | "blocked";
 
 export class WorkStatusOrphanCoordinator {
@@ -52,6 +70,49 @@ export class WorkStatusOrphanCoordinator {
       readonly lifecycle: Pick<WorkStatusLifecycleCoordinator, "transitionWhileLockHeld">;
     },
   ) {}
+
+  /**
+   * Exact-job recovery surface. Unlike scan(), this never enumerates or mutates another Linear
+   * issue. The terminal projector still re-reads progress, claim, competing jobs and Linear state
+   * while holding the per-issue lock before it performs any mutation.
+   */
+  async reconcileJob(record: JobProgressRecord): Promise<WorkStatusJobReconcileOutcome> {
+    const blocked = (
+      reason: Extract<WorkStatusJobReconcileOutcome, { state: "blocked" }>["reason"],
+    ): WorkStatusJobReconcileOutcome =>
+      Object.freeze({ state: "blocked", projectId: record.projectId, jobId: record.jobId, reason });
+    if (record.projectId !== this.dependencies.project.id) return blocked("project_mismatch");
+    if (
+      record.stage.kind !== "requires_manual" ||
+      !mayProjectRequiresManual(record) ||
+      !hasConfirmedWorkStart(record)
+    ) {
+      return blocked("job_not_reconcilable");
+    }
+    const reference = {
+      project: this.dependencies.project,
+      externalIssueId: record.externalIssueId,
+    };
+    const candidate = await this.dependencies.workManagement.getIssue(reference);
+    if (!candidate.ok) return blocked("issue_unavailable");
+    if (
+      candidate.value.issue.agentRole === undefined ||
+      candidate.value.issue.externalId !== record.externalIssueId
+    ) {
+      return blocked("issue_not_automation_owned");
+    }
+    const lock = await this.dependencies.locks.acquire(
+      { projectId: record.projectId, externalIssueId: record.externalIssueId },
+      `work-status-orphan:${record.jobId}`,
+    );
+    if (!lock.ok) return blocked("issue_lock_unavailable");
+    const projected = await this.#finishTerminalProjection(record, candidate.value, lock.value);
+    const released = await lock.value.release();
+    if (!released.ok) return blocked("issue_lock_release_failed");
+    if (projected === "blocked") return blocked("projection_blocked");
+    if (projected === "stale") return blocked("projection_stale");
+    return Object.freeze({ state: "completed", projectId: record.projectId, jobId: record.jobId });
+  }
 
   async scan(): Promise<WorkStatusOrphanScanOutcome> {
     const listed = await this.dependencies.workManagement.listIssues({
@@ -242,7 +303,23 @@ export class WorkStatusOrphanCoordinator {
           ? "canceled"
           : "requires_manual";
     const step = target === "requires_manual" ? "requires_manual" : "complete";
-    const confirmedSource = latestConfirmedActiveWorkStatus(record);
+    const prior = [...checkpoint.transitions]
+      .reverse()
+      .find((transition) => transition.step === step && transition.mainTarget === target);
+    const latestConfirmedTransition = [...checkpoint.transitions]
+      .reverse()
+      .find((transition) => transition.main.state === "confirmed");
+    const priorSource =
+      prior?.allowedMainSources !== undefined && latestConfirmedTransition === prior
+        ? prior.allowedMainSources.find(
+            (source): source is "in_progress" | "in_review" =>
+              source === "in_progress" || source === "in_review",
+          )
+        : undefined;
+    // A confirmed terminal receipt intentionally becomes the latest confirmed transition. Reuse
+    // that same receipt's immutable active source when retrying only the safe comment; do not skip
+    // an unrelated later terminal transition or infer a new source from live Linear state.
+    const confirmedSource = priorSource ?? latestConfirmedActiveWorkStatus(record);
     if (confirmedSource === undefined) return "blocked";
     const allowedMainSources = [confirmedSource] as const;
     const agentTarget =
@@ -303,9 +380,6 @@ export class WorkStatusOrphanCoordinator {
     ) {
       return "blocked";
     }
-    const prior = [...checkpoint.transitions]
-      .reverse()
-      .find((transition) => transition.step === step && transition.mainTarget === target);
     if (prior?.main.state === "sent_unknown") return "blocked";
     const authority = sha256Digest({
       schemaVersion: 1,

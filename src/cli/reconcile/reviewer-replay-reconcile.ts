@@ -1,9 +1,10 @@
 import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
 import { isReviewerReplayCheckpointReconcilable } from "../dispatch/resume-composition.js";
 import type { CliCommandOutcome } from "../program.js";
+import type { ManualReconcileInput } from "./index.js";
 
 export interface CreateReviewerReplayReconcileHandlerOptions {
-  readonly base: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
+  readonly base: (input: ManualReconcileInput) => Promise<CliCommandOutcome>;
   readonly progress: Pick<FileJobProgressStore, "listAll">;
   readonly replay: (input: Readonly<{ jobId: string }>) => Promise<CliCommandOutcome>;
 }
@@ -12,9 +13,10 @@ export interface CreateReviewerReplayReconcileHandlerOptions {
  * requires_manual record. A successful replay checkpoint is the only additional inventory item. */
 export function createReviewerReplayReconcileHandler(
   options: CreateReviewerReplayReconcileHandlerOptions,
-): (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome> {
+): (input: ManualReconcileInput) => Promise<CliCommandOutcome> {
   return async (input) => {
     const base = await options.base(input);
+    if ("jobId" in input) return base;
     if (base.state !== "success") return base;
     const records = await options.progress.listAll();
     if (!records.ok) {

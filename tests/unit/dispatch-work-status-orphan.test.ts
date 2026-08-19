@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   domainError,
@@ -57,6 +57,133 @@ function snapshot(item: ReturnType<typeof issue>, executing = false) {
 }
 
 describe("work-status orphan quarantine", () => {
+  it("projects only the exact eligible Job and never enumerates another Linear issue", async () => {
+    const item = issue(8, true);
+    const jobId = "job_018f47d2-77a4-7cc1-8ef2-012345678908";
+    const record = {
+      projectId: project.id,
+      issueId: item.id,
+      externalIssueId: item.externalId,
+      jobId,
+      revision: 7,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "ci_recovery",
+          reasonCode: "ci_recovery_paused",
+          attempts: { count: 1 },
+        },
+      },
+      workStatusLifecycle: {
+        admissionMode: "enforce",
+        capabilityDigest: "a".repeat(64),
+        transitions: [
+          { step: "work_start", mainTarget: "in_progress", main: { state: "confirmed" } },
+        ],
+      },
+    } as never;
+    const claim = {
+      state: "active",
+      projectId: project.id,
+      issueId: item.id,
+      externalIssueId: item.externalId,
+      jobId,
+      revision: 1,
+    } as never;
+    const listIssues = vi.fn();
+    const transitionWhileLockHeld = vi.fn(() =>
+      Promise.resolve({
+        state: "permitted" as const,
+        mode: "enforce" as const,
+        main: "confirmed" as const,
+        agent: "confirmed" as const,
+      }),
+    );
+    const coordinator = new WorkStatusOrphanCoordinator({
+      project,
+      workManagement: {
+        listIssues,
+        getIssue: () => Promise.resolve(ok(snapshot(item, true))),
+        setWorkStatus: () => Promise.resolve(err(domainError("invariant_violation"))),
+        setAgentCondition: () => Promise.resolve(err(domainError("invariant_violation"))),
+        appendComment: (_reference, body) =>
+          Promise.resolve(ok({ id: "comment-1", body, createdAt: now })),
+      },
+      progress: {
+        listAll: () => Promise.resolve(ok([record])),
+        load: () => Promise.resolve(ok(record)),
+      },
+      admission: {
+        listForProject: vi.fn(),
+        load: () => Promise.resolve(ok(claim)),
+      } as never,
+      locks: {
+        acquire: (_scope: unknown, holderId: string) =>
+          Promise.resolve(
+            ok({
+              scopeDigest: "b".repeat(64),
+              holderId,
+              release: () => Promise.resolve(ok(undefined)),
+            }),
+          ),
+      },
+      lifecycle: { transitionWhileLockHeld },
+    });
+
+    await expect(coordinator.reconcileJob(record)).resolves.toEqual({
+      state: "completed",
+      projectId: project.id,
+      jobId,
+    });
+    expect(listIssues).not.toHaveBeenCalled();
+    expect(transitionWhileLockHeld).toHaveBeenCalledTimes(1);
+    expect(transitionWhileLockHeld).toHaveBeenCalledWith(
+      expect.objectContaining({
+        jobId,
+        step: "requires_manual",
+        mainTarget: "requires_manual",
+      }),
+      expect.objectContaining({ holderId: `work-status-orphan:${jobId}` }),
+    );
+  });
+
+  it("does zero mutation when the exact Job is not an eligible manual handoff", async () => {
+    const item = issue(8, true);
+    const record = {
+      projectId: project.id,
+      issueId: item.id,
+      externalIssueId: item.externalId,
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-012345678908",
+      revision: 1,
+      stage: { kind: "implementing" },
+    } as never;
+    const getIssue = vi.fn();
+    const acquire = vi.fn();
+    const transitionWhileLockHeld = vi.fn();
+    const coordinator = new WorkStatusOrphanCoordinator({
+      project,
+      workManagement: {
+        listIssues: vi.fn(),
+        getIssue,
+        setWorkStatus: vi.fn(),
+        setAgentCondition: vi.fn(),
+        appendComment: vi.fn(),
+      },
+      progress: { listAll: vi.fn(), load: vi.fn() },
+      admission: { listForProject: vi.fn(), load: vi.fn() } as never,
+      locks: { acquire },
+      lifecycle: { transitionWhileLockHeld },
+    });
+
+    await expect(coordinator.reconcileJob(record)).resolves.toMatchObject({
+      state: "blocked",
+      reason: "job_not_reconcilable",
+    });
+    expect(getIssue).not.toHaveBeenCalled();
+    expect(acquire).not.toHaveBeenCalled();
+    expect(transitionWhileLockHeld).not.toHaveBeenCalled();
+  });
+
   it("quarantines only the true automation-owned orphan", async () => {
     const human = snapshot(issue(1, false));
     const active = snapshot(issue(2, true), true);
@@ -434,6 +561,13 @@ describe("work-status orphan quarantine", () => {
     let commentAttempt = 0;
     const requests: WorkStatusLifecycleRequest[] = [];
     const commentKeys: string[] = [];
+    const transitions: unknown[] = [
+      {
+        step: "work_start",
+        mainTarget: "in_progress",
+        main: { state: "confirmed" },
+      },
+    ];
     const record = () =>
       ({
         projectId: project.id,
@@ -452,13 +586,7 @@ describe("work-status orphan quarantine", () => {
         workStatusLifecycle: {
           admissionMode: "enforce",
           capabilityDigest: "a".repeat(64),
-          transitions: [
-            {
-              step: "work_start",
-              mainTarget: "in_progress",
-              main: { state: "confirmed" },
-            },
-          ],
+          transitions,
         },
       }) as never;
     const claim = {
@@ -524,6 +652,17 @@ describe("work-status orphan quarantine", () => {
           workStatus = "requires_manual";
           agentCondition = createAgentCondition("blocked", ["integration_failure"]);
           revision += 1;
+          if (commentAttempt === 0) {
+            transitions.push({
+              step: request.step,
+              instance: request.transitionInstance,
+              mainTarget: request.mainTarget,
+              allowedMainSources: request.allowedMainSources,
+              agentTarget: request.agentTarget,
+              main: { state: "confirmed" },
+              agent: { state: "confirmed" },
+            });
+          }
           return Promise.resolve({
             state: "permitted" as const,
             mode: "enforce" as const,

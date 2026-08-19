@@ -95,7 +95,9 @@ export interface CliHandlers {
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
-  readonly reconcile: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
+  readonly reconcile: (
+    input: Readonly<{ all: true }> | Readonly<{ jobId: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly cycle: (input: Readonly<{ all: true }>) => Promise<CliCommandOutcome>;
   readonly health: () => Promise<CliCommandOutcome>;
   readonly project: (input: Readonly<{ projectId?: string }>) => Promise<CliCommandOutcome>;
@@ -505,8 +507,22 @@ export function createProgram(
   program
     .command("reconcile")
     .description("對帳本機狀態、事件與權威服務")
-    .addOption(new Option("--all", "對帳所有已註冊專案").makeOptionMandatory())
-    .action(() => action(state, io, () => handlers.reconcile({ all: true }))());
+    .addOption(new Option("--all", "對帳所有已註冊專案").conflicts("job"))
+    .addOption(new Option("--job <job-id>", "只對帳指定既有 Job").conflicts("all"))
+    .action((options: Readonly<{ all?: boolean; job?: string }>) =>
+      action(state, io, () => {
+        if (options.all === true) return handlers.reconcile({ all: true });
+        if (options.job !== undefined) return handlers.reconcile({ jobId: options.job });
+        return Promise.resolve({
+          state: "rejected" as const,
+          message: JSON.stringify({
+            operation: "manual_reconcile",
+            state: "rejected",
+            reason: "scope_required",
+          }),
+        });
+      })(),
+    );
 
   program
     .command("cycle")

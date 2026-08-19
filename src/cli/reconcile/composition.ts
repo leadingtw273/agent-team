@@ -382,6 +382,55 @@ export function buildManualReconcileUseCase(
     reconcileAll: (request) => coordinator.reconcileAll(request),
     readJobProgressInventory: readInventory,
     resumeJobProgress,
+    reconcileJob: async (jobId) => {
+      const loaded = await progressStore.load(jobId);
+      if (!loaded.ok || loaded.value === undefined) {
+        return Object.freeze({
+          state: "blocked" as const,
+          projectId: "unknown",
+          jobId,
+          reason: "job_not_reconcilable" as const,
+        });
+      }
+      const record = loaded.value;
+      const built = await (options.buildDispatchComposition ?? buildDispatchComposition)({
+        agentTeamHome: options.agentTeamHome,
+        projectId: record.projectId,
+      });
+      if (
+        built.state !== "ready" ||
+        resolveWorkStatusLifecycleMode(built.value.trustedConfig) !== "enforce"
+      ) {
+        return Object.freeze({
+          state: "blocked" as const,
+          projectId: record.projectId,
+          jobId,
+          reason: "job_not_reconcilable" as const,
+        });
+      }
+      const workManagement = new LinearWorkManagementAdapter({
+        readModel: built.value.discovery.readModel,
+        mutationClient: built.value.discovery.mutationClient,
+        teamId: built.value.discovery.teamId,
+        linearProjectId: built.value.discovery.linearProjectId,
+      });
+      const locks = new FileIssueScopeLock(
+        join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
+      );
+      return new WorkStatusOrphanCoordinator({
+        project: built.value.project,
+        workManagement,
+        progress: progressStore,
+        admission,
+        locks,
+        lifecycle: new WorkStatusLifecycleCoordinator({
+          workManagement,
+          history: workManagement,
+          ledger: new JobProgressWorkStatusLifecycleLedger(progressStore),
+          locks,
+        }),
+      }).reconcileJob(record);
+    },
     quarantineWorkStatusOrphans: async () => {
       const drafts = await listHostRegistrationSetupDrafts(options.agentTeamHome);
       if (drafts.state !== "available") return Object.freeze([]);
