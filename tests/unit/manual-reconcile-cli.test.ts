@@ -40,6 +40,63 @@ const emptyResume = () =>
   Promise.resolve(Object.freeze({ outcomes: Object.freeze([]), blocked: Object.freeze([]) }));
 
 describe("O008 manual reconcile CLI adapter", () => {
+  it("reconciles one exact Job without invoking global inventory, lease, or resume paths", async () => {
+    const reconcileAll = vi.fn();
+    const readJobProgressInventory = vi.fn();
+    const resumeJobProgress = vi.fn();
+    const reconcileJob = vi.fn(() =>
+      Promise.resolve({
+        state: "completed" as const,
+        projectId: "project-1",
+        jobId: "job-1",
+      }),
+    );
+    const handler = createManualReconcileHandler({
+      reconcile: {
+        reconcileAll,
+        readJobProgressInventory,
+        resumeJobProgress,
+        reconcileJob,
+        disclosedScope: fixtureDisclosedScope,
+      },
+    });
+
+    const result = await handler({ jobId: "job-1" });
+
+    expect(result.state).toBe("success");
+    expect(payload(result.message)).toEqual({
+      operation: "manual_reconcile_job",
+      state: "completed",
+      projectId: "project-1",
+      jobId: "job-1",
+    });
+    expect(reconcileJob).toHaveBeenCalledWith("job-1");
+    expect(reconcileAll).not.toHaveBeenCalled();
+    expect(readJobProgressInventory).not.toHaveBeenCalled();
+    expect(resumeJobProgress).not.toHaveBeenCalled();
+  });
+
+  it("fails closed with zero global work when exact-job Runtime support is absent", async () => {
+    const reconcileAll = vi.fn();
+    const result = await createManualReconcileHandler({
+      reconcile: {
+        reconcileAll,
+        readJobProgressInventory: vi.fn(),
+        resumeJobProgress: vi.fn(),
+        disclosedScope: fixtureDisclosedScope,
+      },
+    })({ jobId: "job-1" });
+
+    expect(result.state).toBe("blocked");
+    expect(payload(result.message)).toEqual({
+      operation: "manual_reconcile_job",
+      state: "blocked",
+      jobId: "job-1",
+      reason: "runtime_unavailable",
+    });
+    expect(reconcileAll).not.toHaveBeenCalled();
+  });
+
   it("reports a real completed reconcile rather than manufacturing a generic success", async () => {
     const reconcileAll = vi.fn(() =>
       Promise.resolve({
