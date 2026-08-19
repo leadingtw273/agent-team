@@ -108,6 +108,12 @@ import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildDirective } from "./implementer-request.js";
 import type { ReviewerWaitPublicationPort } from "./reviewer-wait-publication.js";
 import {
+  hasConfirmedWorkStart,
+  latestConfirmedActiveWorkStatus,
+  mayProjectRequiresManual,
+  requiresManualBlockingReason,
+} from "./requires-manual-projection.js";
+import {
   createReviewerReplayIdentityForCheckpoint,
   createReviewerReplaySuccessCheckpointDigest,
   replayIdentityMatches,
@@ -1476,11 +1482,85 @@ async function requiresManual(
   reason: string,
   cause: RequiresManualCause,
 ): Promise<ResumeJobOutcome> {
-  return transitionOrReport(deps, record, { stage: { kind: "requires_manual", cause } }, () => ({
-    jobId: record.jobId,
-    outcome: "requires_manual",
-    reason,
-  }));
+  const written = await transition(deps, record, { stage: { kind: "requires_manual", cause } });
+  if (!written.ok) {
+    return { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
+  }
+
+  // Work-status lifecycle failures are themselves evidence that authority is ambiguous. Never
+  // recurse through the same failed transition, and never overwrite a human-owned main state.
+  if (
+    cause.reasonCode !== "work_status_lifecycle_failed" &&
+    mayProjectRequiresManual(written.value) &&
+    hasConfirmedWorkStart(written.value)
+  ) {
+    const coordinator = deps.workStatusLifecycle;
+    const capabilityDigest = written.value.workStatusLifecycle?.capabilityDigest;
+    const allowedMainSource = latestConfirmedActiveWorkStatus(written.value);
+    if (
+      coordinator !== undefined &&
+      capabilityDigest !== undefined &&
+      allowedMainSource !== undefined
+    ) {
+      const authorityDigest = sha256Digest({
+        schemaVersion: 1,
+        operation: "requires-manual-projection",
+        jobId: written.value.jobId,
+        externalIssueId: written.value.externalIssueId,
+        cause,
+      });
+      if (authorityDigest.ok) {
+        const agentTarget = {
+          kind: "set" as const,
+          status: "blocked" as const,
+          blockingReason: requiresManualBlockingReason(cause),
+        };
+        const transitionInstance = createWorkStatusLifecycleTransitionInstance({
+          jobId: written.value.jobId,
+          step: "requires_manual",
+          mainTarget: "requires_manual",
+          allowedMainSources: [allowedMainSource],
+          agentTarget,
+          authorityDigest: authorityDigest.value,
+        });
+        const invocationDigest = sha256Digest({
+          schemaVersion: 1,
+          operation: "requires-manual-projection-invocation",
+          jobId: written.value.jobId,
+          progressRevision: written.value.revision,
+          ...(transitionInstance.ok ? { transitionInstance: transitionInstance.value } : {}),
+        });
+        if (transitionInstance.ok && invocationDigest.ok) {
+          // The Job is already durably fail-closed. A projection outage must never reopen it or
+          // change the terminal outcome; reconcile will retry the receipted projection later.
+          await whileResumeLeaseHeld(deps, () =>
+            coordinator.transition({
+              jobId: written.value.jobId,
+              reference: {
+                project: deps.project,
+                externalIssueId: written.value.externalIssueId,
+              },
+              holderId: `work-status:${deps.holderId}`,
+              mode: "enforce",
+              capabilityDigest,
+              phase: "terminal",
+              step: "requires_manual",
+              transitionInstance: transitionInstance.value,
+              invocationDigest: invocationDigest.value,
+              mainTarget: "requires_manual",
+              allowedMainSources: [allowedMainSource],
+              agentTarget,
+            }),
+          );
+          // The periodic reconcile path publishes the human-readable handoff with the same
+          // deterministic transition instance. Keeping publication there avoids widening this
+          // composition's work-management authority; LinearMutationClient marker-dedupes retries.
+        }
+      }
+    }
+  }
+
+  return { jobId: record.jobId, outcome: "requires_manual", reason };
 }
 
 /**

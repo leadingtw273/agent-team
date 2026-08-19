@@ -16,6 +16,13 @@ import type {
 import { sha256Digest } from "../../domain/review/index.js";
 import type { Project } from "../../domain/project/index.js";
 import { createAgentCondition } from "../../domain/workflow/index.js";
+import {
+  hasConfirmedWorkStart,
+  latestConfirmedActiveWorkStatus,
+  mayProjectRequiresManual,
+  requiresManualBlockingReason,
+  requiresManualHandoffComment,
+} from "./requires-manual-projection.js";
 
 type OrphanWorkManagement = Pick<
   WorkManagementPort,
@@ -32,12 +39,14 @@ export interface WorkStatusOrphanScanOutcome {
   readonly blocked: number;
 }
 
+type TerminalProjectionOutcome = "completed" | "stale" | "blocked";
+
 export class WorkStatusOrphanCoordinator {
   constructor(
     readonly dependencies: {
       readonly project: Project;
       readonly workManagement: OrphanWorkManagement;
-      readonly progress: Pick<FileJobProgressStore, "listAll">;
+      readonly progress: Pick<FileJobProgressStore, "listAll" | "load">;
       readonly admission: IssueAdmissionInventoryPort;
       readonly locks: IssueScopeLockPort;
       readonly lifecycle: Pick<WorkStatusLifecycleCoordinator, "transitionWhileLockHeld">;
@@ -47,7 +56,7 @@ export class WorkStatusOrphanCoordinator {
   async scan(): Promise<WorkStatusOrphanScanOutcome> {
     const listed = await this.dependencies.workManagement.listIssues({
       project: this.dependencies.project,
-      workStatuses: ["in_progress", "requires_manual"],
+      workStatuses: ["in_progress", "in_review", "requires_manual"],
     });
     const progress = await this.dependencies.progress.listAll();
     const claims = await this.dependencies.admission.listForProject(this.dependencies.project.id);
@@ -73,24 +82,39 @@ export class WorkStatusOrphanCoordinator {
         (claim) => claim.state === "active" && claim.externalIssueId === candidate.issue.externalId,
       );
       const live = records.filter(
-        (record) => !["completed", "failed", "superseded", "cancelled"].includes(record.stage.kind),
-      );
-      if (
-        live.length === 1 &&
-        activeClaims.length === 1 &&
-        activeClaims[0]?.jobId === live[0]?.jobId
-      ) {
-        activeManaged += 1;
-        continue;
-      }
-      const attributableTerminal = records.find(
         (record) =>
-          ["completed", "cancelled"].includes(record.stage.kind) &&
-          record.workStatusLifecycle?.transitions.some(
-            (transition) =>
-              transition.step === "work_start" && transition.main.state === "confirmed",
-          ) === true,
+          !["completed", "failed", "superseded", "cancelled", "requires_manual"].includes(
+            record.stage.kind,
+          ),
       );
+      const activeManagedJobId =
+        live.length === 1 && activeClaims.length === 1 && activeClaims[0]?.jobId === live[0]?.jobId
+          ? live[0]?.jobId
+          : undefined;
+      const manualHandoff = records.find(
+        (record) =>
+          record.stage.kind === "requires_manual" &&
+          mayProjectRequiresManual(record) &&
+          activeClaims.length === 1 &&
+          activeClaims[0]?.jobId === record.jobId &&
+          hasConfirmedWorkStart(record),
+      );
+      const autoReentryHandoff = records.some(
+        (record) =>
+          record.stage.kind === "requires_manual" &&
+          !mayProjectRequiresManual(record) &&
+          activeClaims.length === 1 &&
+          activeClaims[0]?.jobId === record.jobId,
+      );
+      const attributableTerminal =
+        manualHandoff ??
+        (activeManagedJobId === undefined
+          ? records.find(
+              (record) =>
+                ["completed", "cancelled"].includes(record.stage.kind) &&
+                hasConfirmedWorkStart(record),
+            )
+          : undefined);
       if (attributableTerminal !== undefined) {
         const holderId = `work-status-orphan:${attributableTerminal.jobId}`;
         const lock = await this.dependencies.locks.acquire(
@@ -110,8 +134,16 @@ export class WorkStatusOrphanCoordinator {
           lock.value,
         );
         const released = await lock.value.release();
-        if (finished && released.ok) terminalResidue += 1;
-        else blocked += 1;
+        if (!released.ok || finished === "blocked") blocked += 1;
+        else if (finished === "completed") terminalResidue += 1;
+        continue;
+      }
+      if (activeManagedJobId !== undefined) {
+        activeManaged += 1;
+        continue;
+      }
+      if (autoReentryHandoff) {
+        activeManaged += 1;
         continue;
       }
       const automationOwned =
@@ -140,7 +172,7 @@ export class WorkStatusOrphanCoordinator {
       const current = await this.dependencies.workManagement.getIssue(reference);
       if (
         !current.ok ||
-        !["in_progress", "requires_manual"].includes(current.value.workStatus) ||
+        !["in_progress", "in_review", "requires_manual"].includes(current.value.workStatus) ||
         current.value.issue.agentRole === undefined ||
         current.value.issue.externalId !== candidate.issue.externalId
       ) {
@@ -198,56 +230,111 @@ export class WorkStatusOrphanCoordinator {
     record: JobProgressRecord,
     candidate: WorkManagementIssueSnapshot,
     lock: IssueScopeLockHandle,
-  ): Promise<boolean> {
+  ): Promise<TerminalProjectionOutcome> {
     const checkpoint = record.workStatusLifecycle;
     if (checkpoint?.admissionMode !== "enforce" || checkpoint.capabilityDigest === undefined) {
-      return false;
+      return "blocked";
     }
-    const target = record.stage.kind === "completed" ? "completed" : "canceled";
+    const target =
+      record.stage.kind === "completed"
+        ? "completed"
+        : record.stage.kind === "cancelled"
+          ? "canceled"
+          : "requires_manual";
+    const step = target === "requires_manual" ? "requires_manual" : "complete";
+    const confirmedSource = latestConfirmedActiveWorkStatus(record);
+    if (confirmedSource === undefined) return "blocked";
+    const allowedMainSources = [confirmedSource] as const;
+    const agentTarget =
+      target === "requires_manual" && record.stage.kind === "requires_manual"
+        ? {
+            kind: "set" as const,
+            status: "blocked" as const,
+            blockingReason: requiresManualBlockingReason(record.stage.cause),
+          }
+        : ({ kind: "clear" as const } as const);
     const reference = {
       project: this.dependencies.project,
       externalIssueId: candidate.issue.externalId,
     };
+    const [latest, claim, latestInventory] = await Promise.all([
+      this.dependencies.progress.load(record.jobId),
+      this.dependencies.admission.load(record.projectId, record.issueId),
+      this.dependencies.progress.listAll(),
+    ]);
+    if (!latest.ok || !claim.ok || !latestInventory.ok) return "blocked";
+    const expectedStage =
+      target === "requires_manual"
+        ? "requires_manual"
+        : target === "completed"
+          ? "completed"
+          : "cancelled";
+    const competingLiveRecord = latestInventory.value.some(
+      (candidateRecord) =>
+        candidateRecord.projectId === record.projectId &&
+        candidateRecord.externalIssueId === record.externalIssueId &&
+        candidateRecord.jobId !== record.jobId &&
+        !["completed", "failed", "superseded", "cancelled"].includes(candidateRecord.stage.kind),
+    );
+    const conflictingClaim = claim.value?.state === "active" && claim.value.jobId !== record.jobId;
+    const manualClaimMissing =
+      target === "requires_manual" &&
+      (claim.value?.state !== "active" ||
+        claim.value.jobId !== record.jobId ||
+        claim.value.externalIssueId !== record.externalIssueId);
+    if (
+      latest.value?.revision !== record.revision ||
+      latest.value.stage.kind !== expectedStage ||
+      competingLiveRecord ||
+      conflictingClaim ||
+      manualClaimMissing
+    ) {
+      return "stale";
+    }
     const current = await this.dependencies.workManagement.getIssue(reference);
     if (
       !current.ok ||
-      current.value.workStatus !== "in_progress" ||
+      !(
+        current.value.workStatus === target ||
+        allowedMainSources.includes(current.value.workStatus as (typeof allowedMainSources)[number])
+      ) ||
       current.value.issue.agentRole === undefined ||
       current.value.issue.externalId !== candidate.issue.externalId
     ) {
-      return false;
+      return "blocked";
     }
     const prior = [...checkpoint.transitions]
       .reverse()
-      .find((transition) => transition.step === "complete" && transition.mainTarget === target);
-    if (prior?.main.state === "sent_unknown" || prior?.main.state === "confirmed") return false;
+      .find((transition) => transition.step === step && transition.mainTarget === target);
+    if (prior?.main.state === "sent_unknown") return "blocked";
     const authority = sha256Digest({
       schemaVersion: 1,
       operation: "work-status-orphan-terminal-projection",
       jobId: record.jobId,
-      progressRevision: record.revision,
       target,
+      ...(record.stage.kind === "requires_manual" ? { cause: record.stage.cause } : {}),
     });
-    if (!authority.ok) return false;
+    if (!authority.ok) return "blocked";
     const instance =
       prior?.instance ??
       createWorkStatusLifecycleTransitionInstance({
         jobId: record.jobId,
-        step: "complete",
+        step,
         mainTarget: target,
-        allowedMainSources: ["in_progress"],
-        agentTarget: { kind: "clear" },
+        allowedMainSources,
+        agentTarget,
         authorityDigest: authority.value,
       });
-    if (typeof instance !== "string" && !instance.ok) return false;
+    if (typeof instance !== "string" && !instance.ok) return "blocked";
     const transitionInstance = typeof instance === "string" ? instance : instance.value;
     const invocation = sha256Digest({
       schemaVersion: 1,
       operation: "work-status-orphan-terminal-projection-invocation",
       jobId: record.jobId,
       transitionInstance,
+      progressRevision: record.revision,
     });
-    if (!invocation.ok) return false;
+    if (!invocation.ok) return "blocked";
     const result = await this.dependencies.lifecycle.transitionWhileLockHeld(
       {
         jobId: record.jobId,
@@ -256,16 +343,25 @@ export class WorkStatusOrphanCoordinator {
         mode: "enforce",
         capabilityDigest: checkpoint.capabilityDigest,
         phase: "terminal",
-        step: "complete",
+        step,
         transitionInstance,
         invocationDigest: invocation.value,
         mainTarget: target,
-        allowedMainSources: prior?.allowedMainSources ?? ["in_progress"],
-        agentTarget: prior?.agentTarget ?? { kind: "clear" },
+        allowedMainSources: prior?.allowedMainSources ?? allowedMainSources,
+        agentTarget: prior?.agentTarget ?? agentTarget,
       },
       lock,
     );
-    return result.state === "permitted";
+    if (result.state !== "permitted") return "blocked";
+    if (target !== "requires_manual") return "completed";
+    const comment = await this.dependencies.workManagement.appendComment(
+      reference,
+      requiresManualHandoffComment(record),
+      {
+        idempotencyKey: `work-status-lifecycle:${record.jobId}:${transitionInstance}:requires-manual-comment`,
+      },
+    );
+    return comment.ok ? "completed" : "blocked";
   }
 
   #outcome(overrides: Partial<Omit<WorkStatusOrphanScanOutcome, "projectId">>) {
