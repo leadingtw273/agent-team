@@ -107,6 +107,7 @@ describe("FileFinalReviewRecoveryStore", () => {
       ...ready(),
       state: "review_succeeded",
       providerRuns: 1,
+      reviewStatusRetries: 0,
       completedAt: timestamp as never,
       reports: [report],
       reportDigests: ["1".repeat(64)],
@@ -115,8 +116,33 @@ describe("FileFinalReviewRecoveryStore", () => {
     expect(succeeded.ok).toBe(true);
     await expect(subject.load(identity().jobId)).resolves.toMatchObject({
       ok: true,
-      value: { state: "review_succeeded", providerRuns: 1 },
+      value: { state: "review_succeeded", providerRuns: 1, reviewStatusRetries: 0 },
     });
+
+    if (succeeded.ok && succeeded.value.state === "review_succeeded") {
+      const {
+        schemaVersion: _schemaVersion,
+        revision: _revision,
+        updatedAt: _updatedAt,
+        ...next
+      } = succeeded.value;
+      void _schemaVersion;
+      void _revision;
+      void _updatedAt;
+      const retried = await subject.compareAndSwap(identity().jobId, succeeded.value.revision, {
+        ...next,
+        reviewStatusRetries: 1,
+      });
+      expect(retried.ok).toBe(true);
+      if (retried.ok) {
+        await expect(
+          subject.compareAndSwap(identity().jobId, retried.value.revision, {
+            ...next,
+            reviewStatusRetries: 0,
+          }),
+        ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+      }
+    }
   });
 
   it("allows only a proven pre-provider failure to return to ready", async () => {

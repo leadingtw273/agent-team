@@ -337,7 +337,9 @@ async function harness(
     inspectIdentities?: readonly ReviewIdentity[];
     failSuccessCheckpoint?: boolean;
     crashOnFirstReviewRecord?: boolean;
+    crashOnSecondReviewRecordAfterStatus?: boolean;
     reviewRecordMismatch?: boolean;
+    reviewRecordMismatchOnce?: boolean;
     approvedIdentity?: ReviewIdentity;
     autoMergePending?: boolean;
     seedReplay?: "legacy_exhausted" | "legacy_mixed_exhausted" | "v2_exhausted" | "v2_zero";
@@ -520,6 +522,7 @@ async function harness(
   let reviewerIndex = 0;
   let inspectIndex = 0;
   let reviewRecordCalls = 0;
+  let reviewStatusState: "pending" | "success" = "pending";
   const jobs = [job(overrides.finalReview === true)];
   const reviewer = {
     inspect: (request: ReviewerPipelineRequest) => {
@@ -639,7 +642,7 @@ async function harness(
         Promise.resolve(
           ok({
             headSha,
-            statuses: [{ context: "agent-team/review", state: "pending" as const }],
+            statuses: [{ context: "agent-team/review", state: reviewStatusState }],
           }),
         ),
     },
@@ -756,12 +759,21 @@ async function harness(
         if (overrides.crashOnFirstReviewRecord === true && reviewRecordCalls === 1) {
           throw new Error("simulated_crash_after_checkpoint");
         }
+        if (overrides.crashOnSecondReviewRecordAfterStatus === true && reviewRecordCalls === 2) {
+          reviewStatusState = "success";
+          throw new Error("simulated_crash_after_status_success");
+        }
         const checkpoint = await progress.load(jobId);
         expect(checkpoint.ok && checkpoint.value?.reviewerReplay?.state).toBe("review_succeeded");
         calls.push("reviewStatus.record");
-        return overrides.reviewRecordMismatch === true
-          ? ({ state: "not_approved" } as never)
-          : ({ state: "approved", approval: { identity: {}, reports: [] } } as never);
+        if (
+          overrides.reviewRecordMismatch === true ||
+          (overrides.reviewRecordMismatchOnce === true && reviewRecordCalls === 1)
+        ) {
+          return { state: "not_approved" } as never;
+        }
+        reviewStatusState = "success";
+        return { state: "approved", approval: { identity: {}, reports: [] } } as never;
       },
     },
     autoMerge: {
@@ -974,7 +986,7 @@ describe("ReviewerReplayCoordinator", () => {
       expectCheckpoint: finalCheckpointId,
     });
 
-    expect(second).toMatchObject({ state: "continued" });
+    expect(second, JSON.stringify(second)).toMatchObject({ state: "continued" });
     expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
     expect(value.calls).toContain("reviewStatus.record");
     expect(value.calls).toContain("autoMerge.enable");
@@ -982,6 +994,98 @@ describe("ReviewerReplayCoordinator", () => {
       ok: true,
       value: [{ attempts: { reviewRuns: 2 } }],
     });
+  });
+
+  it("final-review retries one failed review-status record from success without another provider", async () => {
+    const value = await harness(["approved"], {
+      finalReview: true,
+      reviewRecordMismatchOnce: true,
+    });
+    const first = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+    expect(first).toMatchObject({
+      state: "continued",
+      outcome: { outcome: "requires_manual", reason: "review_record_did_not_approve" },
+    });
+    await expect(value.progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: {
+            stage: "review",
+            reasonCode: "review_not_approved",
+            attempts: { count: 1 },
+          },
+        },
+        reviewerReplay: { state: "review_succeeded" },
+      },
+    });
+
+    const second = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(second).toMatchObject({ state: "continued" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls.filter((call) => call === "reviewStatus.record")).toHaveLength(2);
+    expect(value.calls).toContain("autoMerge.enable");
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "review_succeeded", reviewStatusRetries: 1 },
+    });
+  });
+
+  it("final-review does not retry review-status after the bounded second failure", async () => {
+    const value = await harness(["approved"], {
+      finalReview: true,
+      reviewRecordMismatch: true,
+    });
+    const options = {
+      finalReviewEpoch: true as const,
+      expectCheckpoint: finalCheckpointId,
+    };
+    await value.coordinator.run(jobId, false, options);
+    const second = await value.coordinator.run(jobId, false, options);
+    expect(second, JSON.stringify(second)).toMatchObject({
+      state: "continued",
+      outcome: { outcome: "requires_manual" },
+    });
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "review_succeeded", reviewStatusRetries: 1 },
+    });
+
+    const third = await value.coordinator.run(jobId, false, options);
+
+    expect(third).toMatchObject({ state: "blocked", reason: "final_review_status_mismatch" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls.filter((call) => call === "autoMerge.enable")).toHaveLength(0);
+  });
+
+  it("final-review resumes after a crash that left the exact review status successful", async () => {
+    const value = await harness(["approved"], {
+      finalReview: true,
+      reviewRecordMismatchOnce: true,
+      crashOnSecondReviewRecordAfterStatus: true,
+    });
+    const options = {
+      finalReviewEpoch: true as const,
+      expectCheckpoint: finalCheckpointId,
+    };
+    await value.coordinator.run(jobId, false, options);
+    await expect(value.coordinator.run(jobId, false, options)).rejects.toThrow(
+      "simulated_crash_after_status_success",
+    );
+
+    const resumed = await value.coordinator.run(jobId, false, options);
+
+    expect(resumed, JSON.stringify(resumed)).toMatchObject({ state: "continued" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).toContain("autoMerge.enable");
   });
 
   it("final-review changes-requested consumes the one run and never invokes fixer, status, or merge", async () => {
