@@ -1039,7 +1039,7 @@ describe("ReviewerReplayCoordinator", () => {
     });
   });
 
-  it("final-review does not retry review-status after the bounded second failure", async () => {
+  it("final-review allows one canonicalization recovery, then blocks further pending status", async () => {
     const value = await harness(["approved"], {
       finalReview: true,
       reviewRecordMismatch: true,
@@ -1059,9 +1059,26 @@ describe("ReviewerReplayCoordinator", () => {
       value: { state: "review_succeeded", reviewStatusRetries: 1 },
     });
 
-    const third = await value.coordinator.run(jobId, false, options);
+    const canonicalizationRecovery = await value.coordinator.run(jobId, false, options);
+    expect(canonicalizationRecovery).toMatchObject({
+      state: "continued",
+      outcome: { outcome: "requires_manual" },
+    });
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        state: "review_succeeded",
+        reviewStatusRetries: 1,
+        reviewCommentCanonicalizationRetries: 1,
+      },
+    });
 
-    expect(third).toMatchObject({ state: "blocked", reason: "final_review_status_mismatch" });
+    const finalAttempt = await value.coordinator.run(jobId, false, options);
+
+    expect(finalAttempt).toMatchObject({
+      state: "blocked",
+      reason: "final_review_status_mismatch",
+    });
     expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
     expect(value.calls.filter((call) => call === "autoMerge.enable")).toHaveLength(0);
   });

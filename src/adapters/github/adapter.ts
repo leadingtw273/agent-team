@@ -360,6 +360,14 @@ function rawField(name: string, value: string): readonly string[] {
   return ["-f", `${name}=${value}`];
 }
 
+function commentReadBackMatches(expected: string, actual: string): boolean {
+  if (actual === expected) return true;
+  const providerCanonical = expected
+    .replaceAll(String.raw`\u0000`, String.raw`\^@`)
+    .replaceAll(String.raw`\u001F`, String.raw`\^_`);
+  return actual === providerCanonical;
+}
+
 function typedField(name: string, value: string): readonly string[] {
   return ["-F", `${name}=${value}`];
 }
@@ -746,7 +754,11 @@ export class GitHubAdapter implements SourceControlPort {
     const existing = await findExisting();
     if (!existing.ok) return existing;
     if (existing.value.length > 0) {
-      if (existing.value.length !== 1 || existing.value[0]?.body !== storedBody) {
+      if (
+        existing.value.length !== 1 ||
+        existing.value[0] === undefined ||
+        !commentReadBackMatches(storedBody, existing.value[0].body)
+      ) {
         return failure("conflict");
       }
       return commentFromProjection(existing.value[0]);
@@ -767,7 +779,13 @@ export class GitHubAdapter implements SourceControlPort {
     if (!created.ok) return created;
     const readBack = await findExisting();
     if (!readBack.ok) return readBack;
-    if (readBack.value.length !== 1 || readBack.value[0]?.body !== storedBody) return failure();
+    if (
+      readBack.value.length !== 1 ||
+      readBack.value[0] === undefined ||
+      !commentReadBackMatches(storedBody, readBack.value[0].body)
+    ) {
+      return failure();
+    }
     const finalHead = await this.getChangeRequest(command.changeRequest, options);
     if (!finalHead.ok) return finalHead;
     if (finalHead.value.headSha.toLowerCase() !== command.expectedHeadSha.toLowerCase()) {
