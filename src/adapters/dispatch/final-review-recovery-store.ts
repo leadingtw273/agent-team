@@ -96,6 +96,7 @@ const succeededSchema = providerTerminalBase
   .extend({
     state: z.literal("review_succeeded"),
     reviewStatusRetries: z.number().int().nonnegative().max(1).default(0),
+    reviewCommentCanonicalizationRetries: z.number().int().nonnegative().max(1).default(0),
     reports: z.array(reviewerReportSchema).length(1),
     reportDigests: z.array(digestSchema).length(1),
     reviewerReplayCheckpointDigest: digestSchema,
@@ -215,6 +216,14 @@ function transitionAllowed(
       next.reviewStatusRetries === 1
     ) {
       return sameJson({ ...mutationFrom(current), reviewStatusRetries: 1 }, next);
+    }
+    if (
+      current.state === "review_succeeded" &&
+      next.state === "review_succeeded" &&
+      current.reviewCommentCanonicalizationRetries === 0 &&
+      next.reviewCommentCanonicalizationRetries === 1
+    ) {
+      return sameJson({ ...mutationFrom(current), reviewCommentCanonicalizationRetries: 1 }, next);
     }
     return sameJson(mutationFrom(current), next);
   }

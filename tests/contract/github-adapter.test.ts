@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -356,6 +358,38 @@ describe("GitHub source-control adapter", () => {
     expect(created.ok && created.value.id).toBe("100");
     expect(reused).toEqual(created);
     expect(transport.calls.filter((call) => call.includes("POST"))).toHaveLength(1);
+    transport.expectDone();
+  });
+
+  it("accepts only the observed GitHub C0 escape canonicalization on comment read-back", async () => {
+    const command = {
+      changeRequest: reference,
+      expectedHeadSha: sha,
+      kind: "review_evidence" as const,
+      body: String.raw`Literal \u0000-\u001F`,
+    };
+    const marker = `<!-- agent-team:${command.kind}:${createHash("sha256").update(mutation.idempotencyKey, "utf8").digest("hex")} -->`;
+    const storedBody = `${command.body}\n\n${marker}`;
+    const canonicalBody = storedBody
+      .replaceAll(String.raw`\u0000`, String.raw`\^@`)
+      .replaceAll(String.raw`\u001F`, String.raw`\^_`);
+    const receipt = {
+      id: "100",
+      url: "https://github.com/owner/repository/pull/42#issuecomment-100",
+      createdAt: timestamp,
+    };
+    const transport = new ScriptedTransport([
+      { value: pull() },
+      { value: { count: 1, matches: [{ ...receipt, body: canonicalBody }] } },
+    ]);
+
+    const result = await new GitHubAdapter(transport).appendChangeRequestComment(command, mutation);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { id: receipt.id, url: receipt.url },
+    });
+    expect(transport.calls.some((call) => call.includes("POST"))).toBe(false);
     transport.expectDone();
   });
 

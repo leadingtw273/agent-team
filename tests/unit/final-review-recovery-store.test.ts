@@ -108,6 +108,7 @@ describe("FileFinalReviewRecoveryStore", () => {
       state: "review_succeeded",
       providerRuns: 1,
       reviewStatusRetries: 0,
+      reviewCommentCanonicalizationRetries: 0,
       completedAt: timestamp as never,
       reports: [report],
       reportDigests: ["1".repeat(64)],
@@ -116,7 +117,12 @@ describe("FileFinalReviewRecoveryStore", () => {
     expect(succeeded.ok).toBe(true);
     await expect(subject.load(identity().jobId)).resolves.toMatchObject({
       ok: true,
-      value: { state: "review_succeeded", providerRuns: 1, reviewStatusRetries: 0 },
+      value: {
+        state: "review_succeeded",
+        providerRuns: 1,
+        reviewStatusRetries: 0,
+        reviewCommentCanonicalizationRetries: 0,
+      },
     });
 
     if (succeeded.ok && succeeded.value.state === "review_succeeded") {
@@ -135,12 +141,24 @@ describe("FileFinalReviewRecoveryStore", () => {
       });
       expect(retried.ok).toBe(true);
       if (retried.ok) {
-        await expect(
-          subject.compareAndSwap(identity().jobId, retried.value.revision, {
+        const canonicalized = await subject.compareAndSwap(
+          identity().jobId,
+          retried.value.revision,
+          {
             ...next,
-            reviewStatusRetries: 0,
-          }),
-        ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+            reviewStatusRetries: 1,
+            reviewCommentCanonicalizationRetries: 1,
+          },
+        );
+        expect(canonicalized.ok).toBe(true);
+        if (canonicalized.ok) {
+          await expect(
+            subject.compareAndSwap(identity().jobId, canonicalized.value.revision, {
+              ...next,
+              reviewStatusRetries: 0,
+            }),
+          ).resolves.toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+        }
       }
     }
   });

@@ -680,6 +680,7 @@ async function inspectFinalReviewAdmission(
     checkLease: boolean;
     allowSuccessReplay?: boolean;
     allowExistingSuccessStatus?: boolean;
+    allowPendingCanonicalizationRecovery?: boolean;
   }>,
 ): Promise<FinalReviewAdmission | ReviewerReplayOutcome> {
   const successReplayStage = options.allowSuccessReplay === true && finalSuccessReplayCause(record);
@@ -751,8 +752,12 @@ async function inspectFinalReviewAdmission(
   );
   if (
     reviewStatuses.length !== 1 ||
-    reviewStatuses[0]?.state !==
-      (options.allowExistingSuccessStatus === true ? "success" : "pending")
+    (!(reviewStatuses[0]?.state === "success" && options.allowExistingSuccessStatus === true) &&
+      !(
+        reviewStatuses[0]?.state === "pending" &&
+        (options.allowExistingSuccessStatus !== true ||
+          options.allowPendingCanonicalizationRecovery === true)
+      ))
   ) {
     return finalBlocked(record.jobId, "final_review_status_mismatch");
   }
@@ -887,6 +892,10 @@ export class ReviewerReplayCoordinator {
         allowSuccessReplay: recovery.value?.state === "review_succeeded",
         allowExistingSuccessStatus:
           recovery.value?.state === "review_succeeded" && recovery.value.reviewStatusRetries === 1,
+        allowPendingCanonicalizationRecovery:
+          recovery.value?.state === "review_succeeded" &&
+          recovery.value.reviewStatusRetries === 1 &&
+          recovery.value.reviewCommentCanonicalizationRetries === 0,
       },
     );
     if (finalAdmissionBlocked(admission)) return admission;
@@ -974,6 +983,10 @@ export class ReviewerReplayCoordinator {
           allowExistingSuccessStatus:
             currentRecovery.value?.state === "review_succeeded" &&
             currentRecovery.value.reviewStatusRetries === 1,
+          allowPendingCanonicalizationRecovery:
+            currentRecovery.value?.state === "review_succeeded" &&
+            currentRecovery.value.reviewStatusRetries === 1 &&
+            currentRecovery.value.reviewCommentCanonicalizationRetries === 0,
         },
       );
       if (finalAdmissionBlocked(underLeaseAdmission)) return underLeaseAdmission;
@@ -1079,6 +1092,7 @@ export class ReviewerReplayCoordinator {
             state: "review_succeeded",
             providerRuns: 1,
             reviewStatusRetries: 0,
+            reviewCommentCanonicalizationRetries: 0,
             completedAt: guardedDeps.clock.now(),
             reports: [...reviewOutcome.reports],
             reportDigests: [...checkpoint.value.reportDigests],
@@ -1141,6 +1155,30 @@ export class ReviewerReplayCoordinator {
           {
             ...recoveryMutation,
             reviewStatusRetries: 1,
+          },
+          deps.signal === undefined ? {} : { signal: deps.signal },
+        );
+        if (!reserved.ok) {
+          return finalBlocked(record.jobId, "checkpoint_write_failed", reserved.error.code);
+        }
+      } else if (recovery.reviewCommentCanonicalizationRetries === 0) {
+        const store = this.dependencies.finalReviewRecovery?.store;
+        if (store === undefined) return finalBlocked(record.jobId, "runtime_unavailable");
+        const {
+          schemaVersion: _schemaVersion,
+          revision: _revision,
+          updatedAt: _updatedAt,
+          ...recoveryMutation
+        } = recovery;
+        void _schemaVersion;
+        void _revision;
+        void _updatedAt;
+        const reserved = await store.compareAndSwap(
+          record.jobId,
+          recovery.revision,
+          {
+            ...recoveryMutation,
+            reviewCommentCanonicalizationRetries: 1,
           },
           deps.signal === undefined ? {} : { signal: deps.signal },
         );
