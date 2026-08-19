@@ -397,7 +397,7 @@ export function createProgram(
   dispatch
     .command("ci-resume")
     .description(
-      "只針對既有 requires_manual(ci_recovery_paused) Job，在同 Head CI 權威成功後接回既有流程",
+      "只針對既有 requires_manual(ci_recovery_paused/ci_failed_after_ready) Job，在同 Head CI 權威成功後接回既有流程",
     )
     .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
     .option("--dry-run", "只做 Job、claim、PR、Head、CI 與 Linear identity 檢查")
