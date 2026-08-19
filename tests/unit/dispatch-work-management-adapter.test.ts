@@ -331,11 +331,47 @@ describe("LinearWorkManagementAdapter", () => {
 
     const result = await adapter.setWorkStatus(reference(), "in_progress", {
       idempotencyKey: "k",
+      cause: "work_started",
     });
     expect(result.ok).toBe(true);
     expect(mutationClient.transitionWorkStatusCalls).toEqual([
       { target: "in_progress", cause: "work_started" },
     ]);
+  });
+
+  it('setWorkStatus("in_progress") preserves the explicit changes-requested authority', async () => {
+    const mutationClient = new FakeMutationClient();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.setWorkStatus(reference(), "in_progress", {
+      idempotencyKey: "k-fix",
+      cause: "changes_requested",
+    });
+    expect(result.ok).toBe(true);
+    expect(mutationClient.transitionWorkStatusCalls).toEqual([
+      { target: "in_progress", cause: "changes_requested" },
+    ]);
+  });
+
+  it('setWorkStatus("in_progress") fails closed when its ambiguous cause is omitted', async () => {
+    const mutationClient = new FakeMutationClient();
+    const adapter = new LinearWorkManagementAdapter({
+      readModel: new FakeReadModel(),
+      mutationClient,
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.setWorkStatus(reference(), "in_progress", {
+      idempotencyKey: "k-missing-cause",
+    });
+    expect(result).toEqual(err(domainError("invariant_violation")));
+    expect(mutationClient.transitionWorkStatusCalls).toHaveLength(0);
   });
 
   it("setWorkStatus fails closed on unsupported targets without calling the mutation client", async () => {

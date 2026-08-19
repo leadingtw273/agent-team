@@ -7,7 +7,10 @@ import type {
   WorkStatusLifecycleLedgerPort,
   WorkStatusLifecycleRequest,
 } from "../../src/application/pipelines/work-status-lifecycle-model.js";
-import type { WorkManagementIssueSnapshot } from "../../src/application/ports/index.js";
+import type {
+  WorkManagementIssueSnapshot,
+  WorkStatusMutationOptions,
+} from "../../src/application/ports/index.js";
 import {
   createFixedClock,
   domainError,
@@ -70,6 +73,7 @@ class FakeWorkManagement {
   current = snapshot();
   getCalls = 0;
   setStatusCalls = 0;
+  statusCauses: WorkStatusMutationOptions["cause"][] = [];
   setAgentCalls = 0;
   clearAgentCalls = 0;
   getError: DomainError | undefined;
@@ -82,8 +86,9 @@ class FakeWorkManagement {
     return Promise.resolve(this.getError === undefined ? ok(this.current) : err(this.getError));
   }
 
-  setWorkStatus(_reference: unknown, status: WorkStatus) {
+  setWorkStatus(_reference: unknown, status: WorkStatus, options: WorkStatusMutationOptions) {
     this.setStatusCalls += 1;
+    this.statusCauses.push(options.cause);
     if (this.statusError !== undefined) {
       if (this.mutateBeforeStatusError) {
         this.current = { ...this.current, workStatus: status, revision: "linear-revision-mutated" };
@@ -271,11 +276,30 @@ describe("WorkStatusLifecycleCoordinator", () => {
     expect(first).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
     expect(replay).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
     expect(test.workManagement.setStatusCalls).toBe(1);
+    expect(test.workManagement.statusCauses).toEqual(["work_started"]);
     expect(test.workManagement.setAgentCalls).toBe(1);
     expect(test.ledger.checkpoint.transitions[0]).toMatchObject({
       main: { state: "confirmed" },
       agent: { state: "confirmed" },
     });
+  });
+
+  it("uses changes_requested authority for the in-review to in-progress fix transition", async () => {
+    const test = harness();
+    test.workManagement.current = snapshot("in_review", createAgentCondition("waiting"));
+
+    const result = await test.coordinator.transition(
+      request({
+        phase: "fixing",
+        step: "fix_start",
+        mainTarget: "in_progress",
+        allowedMainSources: ["in_review", "in_progress"],
+        agentTarget: { kind: "set", status: "executing" },
+      }),
+    );
+
+    expect(result).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
+    expect(test.workManagement.statusCauses).toEqual(["changes_requested"]);
   });
 
   it("a post-mutation checkpoint CAS conflict never returns Provider permission", async () => {

@@ -5,7 +5,7 @@ import {
   type Clock,
   type DomainError,
 } from "../../domain/foundation/index.js";
-import { createAgentCondition } from "../../domain/workflow/index.js";
+import { createAgentCondition, type WorkTransitionCause } from "../../domain/workflow/index.js";
 import { sha256Digest } from "../../domain/review/index.js";
 import type {
   IssueScopeLockPort,
@@ -85,6 +85,26 @@ function failureMayHaveMutated(error: DomainError): boolean {
   return (
     error.code === "timeout" || error.code === "interrupted" || error.code === "external_failure"
   );
+}
+
+function transitionCauseForStep(
+  step: WorkStatusLifecycleRequest["step"],
+): WorkTransitionCause | undefined {
+  switch (step) {
+    case "work_start":
+      return "work_started";
+    case "review_start":
+    case "merge_start":
+      return "review_started";
+    case "fix_start":
+      return "changes_requested";
+    case "complete":
+      return "github_merge_observed";
+    case "requires_manual":
+      return "policy_requires_manual";
+    case "clear_condition":
+      return undefined;
+  }
 }
 
 function blocked(
@@ -369,10 +389,17 @@ export class WorkStatusLifecycleCoordinator {
             transition.mainFailures.count >= retryLimit ? "retry_exhausted" : "main_unconfirmed",
           );
         }
+        const cause = transitionCauseForStep(request.step);
+        if (cause === undefined) {
+          return blocked("checkpoint_identity_mismatch", domainError("invariant_violation"));
+        }
         const changed = await this.#workManagement.setWorkStatus(
           request.reference,
           request.mainTarget,
-          { idempotencyKey: this.#idempotencyKey(request, "main") },
+          {
+            idempotencyKey: this.#idempotencyKey(request, "main"),
+            cause,
+          },
         );
         if (!changed.ok)
           return this.#mainMutationFailure(request, ledger, transition, changed.error);

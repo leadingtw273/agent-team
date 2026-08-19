@@ -1,7 +1,16 @@
 import type { Instant } from "../../domain/foundation/index.js";
 import type { Issue, Project } from "../../domain/project/index.js";
-import type { AgentCondition, WorkStatus } from "../../domain/workflow/index.js";
+import type {
+  AgentCondition,
+  WorkStatus,
+  WorkTransitionCause,
+} from "../../domain/workflow/index.js";
 import type { AsyncPortResult, MutationOptions, ReadOptions } from "./common.js";
+
+export interface WorkStatusMutationOptions extends MutationOptions {
+  /** Explicit domain authority for targets whose cause cannot be inferred safely. */
+  readonly cause?: WorkTransitionCause;
+}
 
 export interface WorkManagementIssueRef {
   readonly project: Project;
@@ -70,7 +79,7 @@ export interface WorkManagementPort {
   setWorkStatus(
     reference: WorkManagementIssueRef,
     status: WorkStatus,
-    options: MutationOptions,
+    options: WorkStatusMutationOptions,
   ): AsyncPortResult<WorkManagementIssueSnapshot>;
   setAgentCondition(
     reference: WorkManagementIssueRef,
