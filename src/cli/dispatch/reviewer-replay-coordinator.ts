@@ -58,6 +58,8 @@ import {
 
 const maximumReplayAttempts = 2;
 const transportRetryBackoffMs = 1_000;
+const finalReviewStartingRuns = 1;
+const finalReviewCompletedRuns = 2;
 
 export type ReviewerReplayBlockedReason =
   | "job_not_found"
@@ -597,8 +599,21 @@ function finalCheckpointFingerprintMatches(
   record: JobProgressRecord,
   receipt: CheckpointReadReceipt,
   inspection: ReplayInspection,
+  expectedCheckpoint: string,
+  allowSuccessReplay: boolean,
 ): boolean {
-  if (record.stage.kind !== "paused") return false;
+  if (
+    record.stage.kind !== "paused" &&
+    !(
+      allowSuccessReplay &&
+      record.stage.kind === "requires_manual" &&
+      record.stage.cause?.stage === "review" &&
+      record.stage.cause.reasonCode === "work_status_lifecycle_failed" &&
+      record.stage.cause.attempts.count === 1
+    )
+  ) {
+    return false;
+  }
   const checkpoint = receipt.checkpoint;
   const expectedChecks = inspection.checks.checks
     .map((check) => ({
@@ -610,7 +625,8 @@ function finalCheckpointFingerprintMatches(
     .map((test) => ({ commandSummary: test.commandSummary, passed: test.status === "passed" }))
     .sort((left, right) => left.commandSummary.localeCompare(right.commandSummary));
   return (
-    checkpoint.id === record.stage.checkpointId &&
+    checkpoint.id ===
+      (record.stage.kind === "paused" ? record.stage.checkpointId : expectedCheckpoint) &&
     checkpoint.jobId === record.jobId &&
     checkpoint.projectId === record.projectId &&
     checkpoint.issueId === record.issueId &&
@@ -659,9 +675,17 @@ async function inspectFinalReviewAdmission(
   checkpoints: Pick<LocalYamlCheckpointReader, "load">,
   options: Readonly<{ checkLease: boolean; allowSuccessReplay?: boolean }>,
 ): Promise<FinalReviewAdmission | ReviewerReplayOutcome> {
+  const successReplayStage =
+    options.allowSuccessReplay === true &&
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "work_status_lifecycle_failed" &&
+    record.stage.cause.attempts.count === 1;
   if (
-    record.stage.kind !== "paused" ||
-    record.stage.checkpointId !== expectedCheckpoint ||
+    !(
+      (record.stage.kind === "paused" && record.stage.checkpointId === expectedCheckpoint) ||
+      successReplayStage
+    ) ||
     record.changeRequestId === undefined ||
     record.headSha === undefined ||
     record.baseRevision === undefined ||
@@ -685,11 +709,23 @@ async function inspectFinalReviewAdmission(
     inspected.changeRequest.mergeability === "conflicting" ||
     inspected.changeRequest.mergeStateStatus === "behind" ||
     inspected.request.job.attempts.reviewerFixRounds !== attemptLimits.reviewerFixRounds ||
-    inspected.request.job.attempts.reviewRuns >= attemptLimits.reviewRuns
+    (options.allowSuccessReplay === true
+      ? ![finalReviewStartingRuns, finalReviewCompletedRuns].includes(
+          inspected.request.job.attempts.reviewRuns,
+        )
+      : inspected.request.job.attempts.reviewRuns !== finalReviewStartingRuns)
   ) {
     return finalBlocked(record.jobId, "final_review_not_supported");
   }
-  if (!finalCheckpointFingerprintMatches(record, checkpoint.value, inspected)) {
+  if (
+    !finalCheckpointFingerprintMatches(
+      record,
+      checkpoint.value,
+      inspected,
+      expectedCheckpoint,
+      options.allowSuccessReplay === true,
+    )
+  ) {
     return finalBlocked(record.jobId, "final_checkpoint_mismatch");
   }
   const getCommitStatuses = deps.sourceControl.getCommitStatuses;
@@ -1067,6 +1103,12 @@ export class ReviewerReplayCoordinator {
     admission: FinalReviewAdmission,
     deps: ResumeCycleDependencies,
   ): Promise<ReviewerReplayOutcome> {
+    const counterFailure = await this.#ensureFinalReviewRunCounter(
+      record.jobId,
+      recovery.identityDigest,
+      deps,
+    );
+    if (counterFailure !== undefined) return counterFailure;
     let current = record;
     if (current.reviewerReplay === undefined) {
       const replayIdentity = createReviewerReplayIdentity(current, admission.inspection.identity, {
@@ -1123,6 +1165,55 @@ export class ReviewerReplayCoordinator {
       providerAttempts: 1,
       outcome: continued,
     };
+  }
+
+  async #ensureFinalReviewRunCounter(
+    jobId: string,
+    identityDigest: string,
+    deps: ResumeCycleDependencies,
+  ): Promise<ReviewerReplayOutcome | undefined> {
+    const loaded = await deps.jobRepository.readAll();
+    if (!loaded.ok) {
+      return finalBlocked(jobId, "authoritative_read_failed", loaded.error.code);
+    }
+    const job = loaded.value.find((candidate) => candidate.id === jobId);
+    if (
+      job?.attempts.reviewerFixRounds !== attemptLimits.reviewerFixRounds ||
+      ![finalReviewStartingRuns, finalReviewCompletedRuns].includes(job.attempts.reviewRuns)
+    ) {
+      return finalBlocked(jobId, "identity_mismatch");
+    }
+    if (job.attempts.reviewRuns === finalReviewStartingRuns) {
+      const updated = await deps.jobRepository.update(
+        {
+          ...job,
+          attempts: { ...job.attempts, reviewRuns: finalReviewCompletedRuns },
+        },
+        {
+          idempotencyKey: `reviewer-final-replay:${jobId}:${identityDigest}:job-attempt`,
+          ...(deps.signal === undefined ? {} : { signal: deps.signal }),
+        },
+      );
+      if (!updated.ok || updated.value.durability !== "confirmed") {
+        return finalBlocked(
+          jobId,
+          "checkpoint_write_failed",
+          updated.ok ? undefined : updated.error.code,
+        );
+      }
+    }
+    const verified = await deps.jobRepository.readAll();
+    const persisted = verified.ok
+      ? verified.value.find((candidate) => candidate.id === jobId)
+      : undefined;
+    if (!verified.ok || persisted?.attempts.reviewRuns !== finalReviewCompletedRuns) {
+      return finalBlocked(
+        jobId,
+        "authoritative_read_failed",
+        verified.ok ? undefined : verified.error.code,
+      );
+    }
+    return undefined;
   }
 
   async #finishFinalFailure(
