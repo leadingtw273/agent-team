@@ -82,6 +82,8 @@ export interface CliHandlers {
       dryRun?: boolean;
       newContractEpoch?: boolean;
       expectContractVersion?: number;
+      finalReviewEpoch?: boolean;
+      expectCheckpoint?: string;
     }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplayPolicy: (
@@ -356,12 +358,16 @@ export function createProgram(
       "--expect-contract-version <version>",
       "建立新 epoch 時操作者預期的 committed reviewer contract version",
     )
+    .option("--final-review-epoch", "只救回 exact paused(retry_exhausted) 最終代碼審查")
+    .option("--expect-checkpoint <checkpoint-id>", "final-review epoch 綁定的既有 checkpoint id")
     .action(
       (options: {
         readonly job: string;
         readonly dryRun?: boolean;
         readonly newContractEpoch?: boolean;
         readonly expectContractVersion?: string;
+        readonly finalReviewEpoch?: boolean;
+        readonly expectCheckpoint?: string;
       }) =>
         action(state, io, () =>
           handlers.dispatchReviewerReplay({
@@ -371,6 +377,10 @@ export function createProgram(
             ...(options.expectContractVersion === undefined
               ? {}
               : { expectContractVersion: Number(options.expectContractVersion) }),
+            ...(options.finalReviewEpoch === true ? { finalReviewEpoch: true } : {}),
+            ...(options.expectCheckpoint === undefined
+              ? {}
+              : { expectCheckpoint: options.expectCheckpoint }),
           }),
         )(),
     );

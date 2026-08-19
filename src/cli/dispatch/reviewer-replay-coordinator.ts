@@ -9,11 +9,26 @@ import {
   requiredReviewerRoles,
 } from "../../application/pipelines/reviewer-policy.js";
 import { defaultLeaseDurationMs } from "../../application/leases/index.js";
-import { createRequirementSnapshot, type ReviewIdentity } from "../../domain/review/index.js";
+import { attemptLimits, leaseState, watchdogHardStopMs } from "../../domain/jobs/index.js";
+import {
+  createRequirementSnapshot,
+  sha256Digest,
+  type ReviewIdentity,
+} from "../../domain/review/index.js";
 import { instantFromDate } from "../../domain/foundation/index.js";
-import { watchdogHardStopMs } from "../../domain/jobs/index.js";
+import type { WorkStatus } from "../../domain/workflow/index.js";
+import type {
+  CheckpointReadReceipt,
+  LocalYamlCheckpointReader,
+} from "../../adapters/checkpoint/index.js";
 import { aggregateLinearPublicationDigest } from "../../adapters/dispatch/linear-publication-store.js";
 import { projectIssueByExternalId } from "../../adapters/dispatch/linear-discovery.js";
+import type {
+  FileFinalReviewRecoveryStore,
+  FinalReviewRecoveryIdentity,
+  FinalReviewRecoveryRecord,
+  FinalReviewRecoveryRecordMutation,
+} from "../../adapters/dispatch/final-review-recovery-store.js";
 import type {
   JobProgressRecord,
   JobProgressRecordMutation,
@@ -21,7 +36,12 @@ import type {
   ReviewerReplayIdentity,
 } from "../../adapters/dispatch/job-progress-store.js";
 import type { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
-import type { SourceControlPort, WorkManagementPort } from "../../application/ports/index.js";
+import type {
+  ChangeRequestSnapshot,
+  CommitChecksSnapshot,
+  SourceControlPort,
+  WorkManagementPort,
+} from "../../application/ports/index.js";
 import {
   createReviewerReplayIdentity,
   createReviewerReplayIdentityForCheckpoint,
@@ -61,7 +81,13 @@ export type ReviewerReplayBlockedReason =
   | "checkpoint_write_failed"
   | "diagnostic_write_failed"
   | "public_summary_failed"
-  | "lease_lost";
+  | "lease_lost"
+  | "final_checkpoint_mismatch"
+  | "final_recovery_state_conflict"
+  | "final_review_not_supported"
+  | "final_review_status_mismatch"
+  | "final_pre_provider_failure"
+  | "final_provider_outcome_unknown";
 
 export type ReviewerReplayOutcome =
   | Readonly<{
@@ -101,11 +127,17 @@ export interface ReviewerReplayCoordinatorDependencies {
   readonly publication: ReviewerReplayPublicationPorts;
   readonly delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly leaseHeartbeatIntervalMs?: number;
+  readonly finalReviewRecovery?: Readonly<{
+    store: Pick<FileFinalReviewRecoveryStore, "load" | "compareAndSwap">;
+    checkpoints: Pick<LocalYamlCheckpointReader, "load">;
+  }>;
 }
 
 export interface ReviewerReplayRunOptions {
   readonly newContractEpoch?: boolean;
   readonly expectContractVersion?: number;
+  readonly finalReviewEpoch?: boolean;
+  readonly expectCheckpoint?: string;
 }
 
 interface ReplayInspection {
@@ -116,6 +148,9 @@ interface ReplayInspection {
     identity: ReviewerReplayIdentity;
     identityDigest: string;
   }>;
+  readonly changeRequest: ChangeRequestSnapshot;
+  readonly checks: CommitChecksSnapshot;
+  readonly workStatus: WorkStatus;
 }
 
 function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
@@ -328,11 +363,20 @@ async function inspectReplay(
     request,
     identity: inspected.identity,
     replayIdentity: replayIdentity.value,
+    changeRequest: inspected.changeRequest,
+    checks: inspected.checks,
+    workStatus: workItem.value.workStatus,
   });
 }
 
 function replayBlocked(
   value: ReplayInspection | ReviewerReplayOutcome,
+): value is ReviewerReplayOutcome {
+  return "state" in value;
+}
+
+function finalAdmissionBlocked(
+  value: FinalReviewAdmission | ReviewerReplayOutcome,
 ): value is ReviewerReplayOutcome {
   return "state" in value;
 }
@@ -487,6 +531,227 @@ function leaseWasLost(signal: AbortSignal): boolean {
   return signal.aborted;
 }
 
+const finalReviewNextStep =
+  "審查回合已達上限，請人工檢視 Reviewer 意見與變更請求 diff 後決定下一步。";
+
+interface FinalReviewAdmission {
+  readonly inspection: ReplayInspection;
+  readonly checkpoint: CheckpointReadReceipt;
+  readonly identity: FinalReviewRecoveryIdentity;
+  readonly identityDigest: string;
+}
+
+function finalBaseFrom(
+  record: FinalReviewRecoveryRecord,
+): Pick<
+  FinalReviewRecoveryRecord,
+  "jobId" | "identity" | "identityDigest" | "preProviderFailures"
+> {
+  return {
+    jobId: record.jobId,
+    identity: record.identity,
+    identityDigest: record.identityDigest,
+    preProviderFailures: record.preProviderFailures,
+  };
+}
+
+function finalBlocked(
+  jobId: string,
+  reason: ReviewerReplayBlockedReason,
+  errorCode?: string,
+): ReviewerReplayOutcome {
+  return {
+    state: "blocked",
+    jobId,
+    reason,
+    ...(errorCode === undefined ? {} : { errorCode }),
+  };
+}
+
+function finalLifecycleFingerprintMatches(
+  record: JobProgressRecord,
+  checkpoint: CheckpointReadReceipt["checkpoint"],
+): boolean {
+  const lifecycle = record.workStatusLifecycle;
+  if (lifecycle?.phase !== "reviewing") return false;
+  const lastReview = [...lifecycle.transitions]
+    .reverse()
+    .find((transition) => transition.step === "review_start");
+  const agentTarget = lastReview?.agentTarget;
+  if (
+    lastReview?.mainTarget !== "in_review" ||
+    agentTarget?.kind !== "set" ||
+    agentTarget.status !== "waiting" ||
+    lastReview.main.state !== "confirmed" ||
+    lastReview.agent.state !== "confirmed"
+  ) {
+    return false;
+  }
+  return (
+    checkpoint.createdAt >= lastReview.main.confirmedAt &&
+    checkpoint.createdAt >= lastReview.agent.confirmedAt
+  );
+}
+
+function finalCheckpointFingerprintMatches(
+  record: JobProgressRecord,
+  receipt: CheckpointReadReceipt,
+  inspection: ReplayInspection,
+): boolean {
+  if (record.stage.kind !== "paused") return false;
+  const checkpoint = receipt.checkpoint;
+  const expectedChecks = inspection.checks.checks
+    .map((check) => ({
+      commandSummary: check.name,
+      passed: check.status === "completed" && check.conclusion === "success",
+    }))
+    .sort((left, right) => left.commandSummary.localeCompare(right.commandSummary));
+  const actualChecks = checkpoint.tests
+    .map((test) => ({ commandSummary: test.commandSummary, passed: test.status === "passed" }))
+    .sort((left, right) => left.commandSummary.localeCompare(right.commandSummary));
+  return (
+    checkpoint.id === record.stage.checkpointId &&
+    checkpoint.jobId === record.jobId &&
+    checkpoint.projectId === record.projectId &&
+    checkpoint.issueId === record.issueId &&
+    checkpoint.reason === "retry_exhausted" &&
+    checkpoint.completedItems.length === 0 &&
+    checkpoint.remainingItems.length === 0 &&
+    checkpoint.blockers.length === 0 &&
+    checkpoint.nextSteps.length === 1 &&
+    checkpoint.nextSteps[0] === finalReviewNextStep &&
+    checkpoint.model.provider === "dispatch-cli" &&
+    checkpoint.model.model === "unassigned" &&
+    checkpoint.worktree.path === record.worktreePath &&
+    checkpoint.worktree.branch === record.branch &&
+    checkpoint.worktree.commitSha === record.headSha &&
+    checkpoint.worktree.pushed &&
+    checkpoint.worktree.draftPullRequestUrl === undefined &&
+    checkpoint.requirementSnapshot.requirementsDigest ===
+      inspection.request.requirementSnapshot.requirementsDigest &&
+    checkpoint.requirementSnapshot.issue.reviewRequirement === "code_review" &&
+    inspection.checks.aggregate === "success" &&
+    expectedChecks.length > 0 &&
+    expectedChecks.every((check) => check.passed) &&
+    JSON.stringify(actualChecks) === JSON.stringify(expectedChecks) &&
+    finalLifecycleFingerprintMatches(record, checkpoint)
+  );
+}
+
+async function hasActiveTargetLease(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<boolean | undefined> {
+  const leases = await deps.leases.repository.readAll();
+  if (!leases.ok) return undefined;
+  const now = deps.clock.now();
+  return leases.value.some(
+    (lease) =>
+      (lease.jobId === record.jobId || lease.issueId === record.issueId) &&
+      leaseState(lease, now) === "active",
+  );
+}
+
+async function inspectFinalReviewAdmission(
+  record: JobProgressRecord,
+  expectedCheckpoint: string,
+  deps: ResumeCycleDependencies,
+  checkpoints: Pick<LocalYamlCheckpointReader, "load">,
+  options: Readonly<{ checkLease: boolean; allowSuccessReplay?: boolean }>,
+): Promise<FinalReviewAdmission | ReviewerReplayOutcome> {
+  if (
+    record.stage.kind !== "paused" ||
+    record.stage.checkpointId !== expectedCheckpoint ||
+    record.changeRequestId === undefined ||
+    record.headSha === undefined ||
+    record.baseRevision === undefined ||
+    (!options.allowSuccessReplay &&
+      (record.reviewerReplay !== undefined || record.previousReviewerReplay !== undefined))
+  ) {
+    return finalBlocked(record.jobId, "job_not_eligible");
+  }
+  const checkpoint = await checkpoints.load(expectedCheckpoint);
+  if (!checkpoint.ok) {
+    return finalBlocked(record.jobId, "final_checkpoint_mismatch", checkpoint.error.code);
+  }
+  const inspected = await inspectReplay(record, deps);
+  if (replayBlocked(inspected)) return inspected;
+  if (
+    inspected.request.requirementSnapshot.issue.reviewRequirement !== "code_review" ||
+    requiredReviewerRoles(inspected.request).length !== 1 ||
+    requiredReviewerRoles(inspected.request)[0] !== "code_reviewer" ||
+    inspected.workStatus !== "in_review" ||
+    inspected.changeRequest.draft ||
+    inspected.changeRequest.mergeability === "conflicting" ||
+    inspected.changeRequest.mergeStateStatus === "behind" ||
+    inspected.request.job.attempts.reviewerFixRounds !== attemptLimits.reviewerFixRounds ||
+    inspected.request.job.attempts.reviewRuns >= attemptLimits.reviewRuns
+  ) {
+    return finalBlocked(record.jobId, "final_review_not_supported");
+  }
+  if (!finalCheckpointFingerprintMatches(record, checkpoint.value, inspected)) {
+    return finalBlocked(record.jobId, "final_checkpoint_mismatch");
+  }
+  const getCommitStatuses = deps.sourceControl.getCommitStatuses;
+  if (getCommitStatuses === undefined) {
+    return finalBlocked(record.jobId, "runtime_unavailable");
+  }
+  const statuses = await getCommitStatuses(
+    { project: deps.project },
+    record.headSha,
+    deps.signal === undefined ? {} : { signal: deps.signal },
+  );
+  if (!statuses.ok || statuses.value.headSha.toLowerCase() !== record.headSha.toLowerCase()) {
+    return finalBlocked(
+      record.jobId,
+      "authoritative_read_failed",
+      statuses.ok ? undefined : statuses.error.code,
+    );
+  }
+  const reviewStatuses = statuses.value.statuses.filter(
+    (status) => status.context === "agent-team/review",
+  );
+  if (reviewStatuses.length !== 1 || reviewStatuses[0]?.state !== "pending") {
+    return finalBlocked(record.jobId, "final_review_status_mismatch");
+  }
+  if (options.checkLease) {
+    const active = await hasActiveTargetLease(record, deps);
+    if (active === undefined) return finalBlocked(record.jobId, "authoritative_read_failed");
+    if (active) return finalBlocked(record.jobId, "lease_conflict");
+  }
+  const identity: FinalReviewRecoveryIdentity = {
+    schemaVersion: 1,
+    operation: "reviewer-final-replay",
+    jobId: record.jobId,
+    projectId: record.projectId,
+    issueId: record.issueId,
+    externalIssueId: record.externalIssueId,
+    changeRequestId: record.changeRequestId,
+    sourceCheckpointId: expectedCheckpoint,
+    sourceCheckpointDigest: checkpoint.value.sha256,
+    baseRevision: record.baseRevision,
+    requirementsDigest: inspected.identity.requirementsDigest,
+    headSha: inspected.identity.headSha,
+    diffDigest: inspected.identity.diffDigest,
+    ...(inspected.identity.evidenceDigest === undefined
+      ? {}
+      : { evidenceDigest: inspected.identity.evidenceDigest }),
+    ...(inspected.identity.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: inspected.identity.publicationDigest }),
+    reviewContractBinding: currentReviewerReportContractBinding,
+  };
+  const identityDigest = sha256Digest(identity);
+  return identityDigest.ok
+    ? {
+        inspection: inspected,
+        checkpoint: checkpoint.value,
+        identity,
+        identityDigest: identityDigest.value,
+      }
+    : finalBlocked(record.jobId, "identity_mismatch");
+}
+
 async function publishFormatExhaustion(
   record: JobProgressRecord,
   checkpoint: Extract<ReviewerReplayCheckpoint, { state: "attempting" }>,
@@ -521,11 +786,468 @@ async function publishFormatExhaustion(
 export class ReviewerReplayCoordinator {
   constructor(readonly dependencies: ReviewerReplayCoordinatorDependencies) {}
 
+  async #runFinalReview(
+    jobId: string,
+    dryRun: boolean,
+    expectedCheckpoint: string | undefined,
+  ): Promise<ReviewerReplayOutcome> {
+    const final = this.dependencies.finalReviewRecovery;
+    const deps = this.dependencies.resume;
+    if (final === undefined || expectedCheckpoint === undefined) {
+      return finalBlocked(jobId, "runtime_unavailable");
+    }
+    const loaded = await deps.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) {
+      return finalBlocked(
+        jobId,
+        loaded.ok ? "job_not_found" : "authoritative_read_failed",
+        loaded.ok ? undefined : loaded.error.code,
+      );
+    }
+    let record = loaded.value;
+    const policy = await deps.reviewerReplayPolicy?.load(record.projectId);
+    if (policy === undefined || !policy.ok || policy.value?.enabled !== true) {
+      return finalBlocked(
+        jobId,
+        policy !== undefined && !policy.ok ? "policy_read_failed" : "policy_disabled",
+        policy !== undefined && !policy.ok ? policy.error.code : undefined,
+      );
+    }
+    const claimFailure = await admissionCheck(record, deps);
+    if (claimFailure !== undefined) return finalBlocked(jobId, claimFailure);
+    if (deps.prepare !== undefined) {
+      try {
+        await deps.prepare();
+      } catch {
+        return finalBlocked(jobId, "runtime_unavailable");
+      }
+    }
+    const recovery = await final.store.load(jobId);
+    if (!recovery.ok) {
+      return finalBlocked(jobId, "authoritative_read_failed", recovery.error.code);
+    }
+    if (recovery.value?.state === "provider_reserved") {
+      if (dryRun) return finalBlocked(jobId, "final_provider_outcome_unknown");
+    } else if (
+      recovery.value !== undefined &&
+      recovery.value.state !== "ready" &&
+      recovery.value.state !== "review_succeeded"
+    ) {
+      return finalBlocked(jobId, "final_recovery_state_conflict");
+    }
+    const admission = await inspectFinalReviewAdmission(
+      record,
+      expectedCheckpoint,
+      deps,
+      final.checkpoints,
+      { checkLease: dryRun, allowSuccessReplay: recovery.value?.state === "review_succeeded" },
+    );
+    if (finalAdmissionBlocked(admission)) return admission;
+    if (
+      recovery.value !== undefined &&
+      (recovery.value.identityDigest !== admission.identityDigest ||
+        JSON.stringify(recovery.value.identity) !== JSON.stringify(admission.identity))
+    ) {
+      return finalBlocked(jobId, "identity_mismatch");
+    }
+    if (dryRun) {
+      return {
+        state: "ready",
+        jobId,
+        identityDigest: admission.identityDigest,
+        providerAttemptsUsed: recovery.value?.state === "review_succeeded" ? 1 : 0,
+        providerAttemptsRemaining: recovery.value?.state === "review_succeeded" ? 0 : 1,
+        plannedMutations: Object.freeze([
+          ...(recovery.value?.state === "review_succeeded"
+            ? []
+            : ["final-review-reservation", "provider-attempt", "final-review-success"]),
+          "review-success-checkpoint",
+          "review-status",
+          "auto-merge-gate",
+          "lifecycle",
+          "job-completion",
+          "claim-release",
+        ]),
+      };
+    }
+
+    const lease = await deps.leases.acquire({
+      jobId: record.jobId,
+      issueId: record.issueId,
+      holderId: deps.holderId,
+    });
+    if (!lease.ok) return finalBlocked(jobId, "lease_conflict");
+    const beat = heartbeat(deps, lease.value.value.id, this.dependencies.leaseHeartbeatIntervalMs);
+    const guardedDeps: ResumeCycleDependencies = { ...deps, signal: beat.signal };
+    try {
+      const current = await guardedDeps.progress.load(jobId, { signal: beat.signal });
+      if (!current.ok || current.value?.revision !== record.revision) {
+        return finalBlocked(jobId, "candidate_changed");
+      }
+      record = current.value;
+      const claimUnderLease = await admissionCheck(record, guardedDeps);
+      if (claimUnderLease !== undefined) return finalBlocked(jobId, claimUnderLease);
+      let currentRecovery = await final.store.load(jobId, { signal: beat.signal });
+      if (!currentRecovery.ok) {
+        return finalBlocked(jobId, "authoritative_read_failed", currentRecovery.error.code);
+      }
+      if (currentRecovery.value?.state === "provider_reserved") {
+        const unknown = await final.store.compareAndSwap(
+          jobId,
+          currentRecovery.value.revision,
+          {
+            ...finalBaseFrom(currentRecovery.value),
+            state: "provider_outcome_unknown",
+            providerRuns: 1,
+            completedAt: guardedDeps.clock.now(),
+          },
+          { signal: beat.signal },
+        );
+        return finalBlocked(
+          jobId,
+          unknown.ok ? "final_provider_outcome_unknown" : "checkpoint_write_failed",
+          unknown.ok ? undefined : unknown.error.code,
+        );
+      }
+      if (
+        currentRecovery.value !== undefined &&
+        currentRecovery.value.state !== "ready" &&
+        currentRecovery.value.state !== "review_succeeded"
+      ) {
+        return finalBlocked(jobId, "final_recovery_state_conflict");
+      }
+      const underLeaseAdmission = await inspectFinalReviewAdmission(
+        record,
+        expectedCheckpoint,
+        guardedDeps,
+        final.checkpoints,
+        {
+          checkLease: false,
+          allowSuccessReplay: currentRecovery.value?.state === "review_succeeded",
+        },
+      );
+      if (finalAdmissionBlocked(underLeaseAdmission)) return underLeaseAdmission;
+      if (
+        currentRecovery.value !== undefined &&
+        (currentRecovery.value.identityDigest !== underLeaseAdmission.identityDigest ||
+          JSON.stringify(currentRecovery.value.identity) !==
+            JSON.stringify(underLeaseAdmission.identity))
+      ) {
+        return finalBlocked(jobId, "identity_mismatch");
+      }
+
+      if (currentRecovery.value?.state === "review_succeeded") {
+        const continued = await this.#continueFinalSuccess(
+          record,
+          currentRecovery.value,
+          underLeaseAdmission,
+          guardedDeps,
+        );
+        return continued;
+      }
+      if (currentRecovery.value === undefined) {
+        const initialized = await final.store.compareAndSwap(
+          jobId,
+          null,
+          {
+            state: "ready",
+            jobId: record.jobId,
+            identity: underLeaseAdmission.identity,
+            identityDigest: underLeaseAdmission.identityDigest,
+            preProviderFailures: 0,
+          },
+          { signal: beat.signal },
+        );
+        if (!initialized.ok) {
+          return finalBlocked(jobId, "checkpoint_write_failed", initialized.error.code);
+        }
+        currentRecovery = { ok: true, value: initialized.value };
+      }
+      if (currentRecovery.value?.state !== "ready") {
+        return finalBlocked(jobId, "final_recovery_state_conflict");
+      }
+      const reserved = await final.store.compareAndSwap(
+        jobId,
+        currentRecovery.value.revision,
+        {
+          ...finalBaseFrom(currentRecovery.value),
+          state: "provider_reserved",
+          reservedAt: guardedDeps.clock.now(),
+        },
+        { signal: beat.signal },
+      );
+      if (!reserved.ok) {
+        return finalBlocked(jobId, "checkpoint_write_failed", reserved.error.code);
+      }
+      if (reserved.value.state !== "provider_reserved") {
+        return finalBlocked(jobId, "checkpoint_write_failed");
+      }
+      const reviewOutcome = await guardedDeps.reviewer.run(
+        withPrefix(underLeaseAdmission.inspection.request, underLeaseAdmission.identityDigest, 1),
+      );
+      if (leaseWasLost(beat.signal)) return finalBlocked(jobId, "lease_lost");
+      if (reviewOutcome.state === "approved") {
+        const replayIdentity = createReviewerReplayIdentity(record, reviewOutcome.identity, {
+          schemaVersion: 2,
+          epochOrdinal: 1,
+        });
+        if (
+          !replayIdentity.ok ||
+          reviewOutcome.reports.length !== 1 ||
+          reviewOutcome.reports.some(
+            (report) => !reviewerReportMatchesIdentity(report, reviewOutcome.identity),
+          ) ||
+          replayIdentity.value.identity.requirementsDigest !==
+            underLeaseAdmission.identity.requirementsDigest ||
+          replayIdentity.value.identity.headSha !== underLeaseAdmission.identity.headSha ||
+          replayIdentity.value.identity.diffDigest !== underLeaseAdmission.identity.diffDigest ||
+          replayIdentity.value.identity.evidenceDigest !==
+            underLeaseAdmission.identity.evidenceDigest ||
+          replayIdentity.value.identity.publicationDigest !==
+            underLeaseAdmission.identity.publicationDigest
+        ) {
+          return finalBlocked(jobId, "identity_mismatch");
+        }
+        const replayAttempt: Extract<ReviewerReplayCheckpoint, { state: "attempting" }> = {
+          state: "attempting",
+          identity: replayIdentity.value.identity,
+          identityDigest: replayIdentity.value.identityDigest,
+          reviewContractBinding: currentReviewerReportContractBinding,
+          counters: { providerAttempts: 1, formatFailures: 0, transportFailures: 0 },
+        };
+        const checkpoint = createReviewerReplaySuccessCheckpoint(
+          replayAttempt,
+          reviewOutcome.reports,
+          guardedDeps.clock.now(),
+        );
+        if (!checkpoint.ok) return finalBlocked(jobId, "checkpoint_write_failed");
+        const success = await final.store.compareAndSwap(
+          jobId,
+          reserved.value.revision,
+          {
+            ...finalBaseFrom(reserved.value),
+            state: "review_succeeded",
+            providerRuns: 1,
+            completedAt: guardedDeps.clock.now(),
+            reports: [...reviewOutcome.reports],
+            reportDigests: [...checkpoint.value.reportDigests],
+            reviewerReplayCheckpointDigest: checkpoint.value.checkpointDigest,
+          },
+          { signal: beat.signal },
+        );
+        if (!success.ok) {
+          return finalBlocked(jobId, "checkpoint_write_failed", success.error.code);
+        }
+        if (success.value.state !== "review_succeeded") {
+          return finalBlocked(jobId, "checkpoint_write_failed");
+        }
+        return await this.#continueFinalSuccess(
+          record,
+          success.value,
+          underLeaseAdmission,
+          guardedDeps,
+        );
+      }
+      return await this.#finishFinalFailure(
+        record,
+        reserved.value,
+        reviewOutcome,
+        underLeaseAdmission,
+        guardedDeps,
+      );
+    } finally {
+      await beat.stop();
+      await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
+    }
+  }
+
+  async #continueFinalSuccess(
+    record: JobProgressRecord,
+    recovery: Extract<FinalReviewRecoveryRecord, { state: "review_succeeded" }>,
+    admission: FinalReviewAdmission,
+    deps: ResumeCycleDependencies,
+  ): Promise<ReviewerReplayOutcome> {
+    let current = record;
+    if (current.reviewerReplay === undefined) {
+      const replayIdentity = createReviewerReplayIdentity(current, admission.inspection.identity, {
+        schemaVersion: 2,
+        epochOrdinal: 1,
+      });
+      if (!replayIdentity.ok) return finalBlocked(record.jobId, "identity_mismatch");
+      const replayAttempt: Extract<ReviewerReplayCheckpoint, { state: "attempting" }> = {
+        state: "attempting",
+        identity: replayIdentity.value.identity,
+        identityDigest: replayIdentity.value.identityDigest,
+        reviewContractBinding: currentReviewerReportContractBinding,
+        counters: { providerAttempts: 1, formatFailures: 0, transportFailures: 0 },
+      };
+      const checkpoint = createReviewerReplaySuccessCheckpoint(
+        replayAttempt,
+        recovery.reports,
+        recovery.completedAt,
+      );
+      if (
+        !checkpoint.ok ||
+        checkpoint.value.checkpointDigest !== recovery.reviewerReplayCheckpointDigest ||
+        JSON.stringify(checkpoint.value.reportDigests) !== JSON.stringify(recovery.reportDigests)
+      ) {
+        return finalBlocked(record.jobId, "identity_mismatch");
+      }
+      const written = await deps.progress.compareAndSwap(
+        record.jobId,
+        record.revision,
+        { ...mutationFrom(record), reviewerReplay: checkpoint.value },
+        deps.signal === undefined ? {} : { signal: deps.signal },
+      );
+      if (!written.ok) {
+        return finalBlocked(record.jobId, "checkpoint_write_failed", written.error.code);
+      }
+      current = written.value;
+    } else if (
+      current.reviewerReplay.state !== "review_succeeded" ||
+      current.reviewerReplay.checkpointDigest !== recovery.reviewerReplayCheckpointDigest ||
+      current.previousReviewerReplay !== undefined
+    ) {
+      return finalBlocked(record.jobId, "identity_mismatch");
+    }
+    const replay = current.reviewerReplay;
+    if (replay?.state !== "review_succeeded") {
+      return finalBlocked(record.jobId, "checkpoint_write_failed");
+    }
+    const continued = await resumeUnderLease(current, deps);
+    return {
+      state: "continued",
+      jobId: record.jobId,
+      identityDigest: recovery.identityDigest,
+      checkpointDigest: replay.checkpointDigest,
+      providerAttempts: 1,
+      outcome: continued,
+    };
+  }
+
+  async #finishFinalFailure(
+    record: JobProgressRecord,
+    reserved: Extract<FinalReviewRecoveryRecord, { state: "provider_reserved" }>,
+    reviewOutcome: ReviewerPipelineOutcome,
+    admission: FinalReviewAdmission,
+    deps: ResumeCycleDependencies,
+  ): Promise<ReviewerReplayOutcome> {
+    const store = this.dependencies.finalReviewRecovery?.store;
+    if (store === undefined) return finalBlocked(record.jobId, "runtime_unavailable");
+    let next: FinalReviewRecoveryRecordMutation;
+    if (reviewOutcome.state === "not_ready") {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "ready",
+        preProviderFailures: reserved.preProviderFailures + 1,
+        lastPreProviderFailure: { kind: "not_ready", stage: "checks" },
+      };
+    } else if (
+      reviewOutcome.state === "failed" &&
+      ["request", "change_request", "checks", "worktree", "diff", "ready"].includes(
+        reviewOutcome.stage,
+      )
+    ) {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "ready",
+        preProviderFailures: reserved.preProviderFailures + 1,
+        lastPreProviderFailure: {
+          kind: "failed",
+          stage: reviewOutcome.stage as
+            "request" | "change_request" | "checks" | "worktree" | "diff" | "ready",
+          errorCode: reviewOutcome.error.code,
+        },
+      };
+    } else if (
+      reviewOutcome.state === "changes_requested" ||
+      reviewOutcome.state === "clarification_required"
+    ) {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "review_not_approved",
+        providerRuns: 1,
+        completedAt: deps.clock.now(),
+        verdict: reviewOutcome.state,
+      };
+    } else if (reviewOutcome.state === "paused") {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "provider_paused",
+        providerRuns: 1,
+        completedAt: deps.clock.now(),
+        reason: reviewOutcome.reason,
+      };
+    } else if (reviewOutcome.state === "failed" && reviewOutcome.stage === "report") {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "report_failed",
+        providerRuns: 1,
+        completedAt: deps.clock.now(),
+        category: reviewOutcome.reportFailureCategory ?? "schema_invalid",
+        diagnosticCount: reviewOutcome.diagnostics?.length ?? 0,
+      };
+    } else {
+      next = {
+        ...finalBaseFrom(reserved),
+        state: "provider_failed",
+        providerRuns: 1,
+        completedAt: deps.clock.now(),
+        stage:
+          reviewOutcome.state === "failed"
+            ? (reviewOutcome.stage as
+                | "evidence"
+                | "checkpoint"
+                | "provider_start"
+                | "provider_run"
+                | "tool_decision"
+                | "post_review_worktree"
+                | "attempt_persistence")
+            : "unknown",
+        errorCode:
+          reviewOutcome.state === "failed" ? reviewOutcome.error.code : "invariant_violation",
+      };
+    }
+    const written = await store.compareAndSwap(
+      record.jobId,
+      reserved.revision,
+      next,
+      deps.signal === undefined ? {} : { signal: deps.signal },
+    );
+    if (!written.ok) {
+      return finalBlocked(record.jobId, "checkpoint_write_failed", written.error.code);
+    }
+    if (reviewOutcome.state === "failed" && reviewOutcome.stage === "report") {
+      const diagnostic = await this.dependencies.diagnostics.append(
+        record.jobId,
+        admission.identityDigest,
+        {
+          attempt: 1,
+          kind: "format",
+          category: reviewOutcome.reportFailureCategory ?? "schema_invalid",
+          diagnostics: [...(reviewOutcome.diagnostics ?? [])],
+        },
+        { epochScoped: true },
+      );
+      if (!diagnostic.ok) {
+        return finalBlocked(record.jobId, "diagnostic_write_failed", diagnostic.error.code);
+      }
+    }
+    return finalBlocked(
+      record.jobId,
+      next.state === "ready" ? "final_pre_provider_failure" : "review_not_approved",
+      reviewOutcome.state === "failed" ? reviewOutcome.error.code : undefined,
+    );
+  }
+
   async run(
     jobId: string,
     dryRun: boolean,
     options: ReviewerReplayRunOptions = {},
   ): Promise<ReviewerReplayOutcome> {
+    if (options.finalReviewEpoch === true) {
+      return this.#runFinalReview(jobId, dryRun, options.expectCheckpoint);
+    }
     const deps = this.dependencies.resume;
     const newContractEpoch = options.newContractEpoch === true;
     if (

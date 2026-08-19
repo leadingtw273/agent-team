@@ -720,25 +720,33 @@ describe("ReviewerPipeline", () => {
     });
   });
 
-  it.each([
-    ["CI", { ciFixRounds: 2 }],
-    ["Reviewer fix", { reviewerFixRounds: 2 }],
-    ["review run", { reviewRuns: 3 }],
-  ] as const)(
-    "checkpoints before Provider work when the %s limit is reached",
-    async (_name, attempts) => {
-      const input = request("code_review", attempts);
-      const setup = fixture(input);
-      const outcome = await setup.pipeline.run(input.value);
+  it("checkpoints before Provider work when the review-run limit is reached", async () => {
+    const input = request("code_review", { reviewRuns: 3 });
+    const setup = fixture(input);
+    const outcome = await setup.pipeline.run(input.value);
 
-      expect(outcome).toMatchObject({
-        state: "checkpointed",
-        checkpointId: "checkpoint-review-limit",
-        job: input.value.job,
-      });
-      expect(setup.calls).toEqual(["pr:get", "ci:get", "checkpoint"]);
-    },
-  );
+    expect(outcome).toMatchObject({
+      state: "checkpointed",
+      checkpointId: "checkpoint-review-limit",
+      job: input.value.job,
+    });
+    expect(setup.calls).toEqual(["pr:get", "ci:get", "checkpoint"]);
+  });
+
+  it("still runs the final review after both fixer budgets are exhausted", async () => {
+    const input = request("code_review", {
+      ciFixRounds: 2,
+      reviewerFixRounds: 2,
+      reviewRuns: 2,
+    });
+    const setup = fixture(input);
+
+    await expect(setup.pipeline.run(input.value)).resolves.toMatchObject({
+      state: "approved",
+      job: { attempts: { ciFixRounds: 2, reviewerFixRounds: 2, reviewRuns: 3 } },
+    });
+    expect(setup.calls).toContain("provider:code_reviewer");
+  });
 
   it("allows the third full review and preserves independent fix counters", async () => {
     const input = request("code_review", {

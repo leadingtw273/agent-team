@@ -335,6 +335,8 @@ interface Harness {
   /** C015r decision 4: every request this test run's fake `reviewer.run` received, in order -- lets
    * a test assert `reportRetryFeedback` was (or was not) threaded in. */
   readonly reviewerRequests: unknown[];
+  /** Requests sent to ReviewerRecovery; used to prove reviewed Job counters are not rolled back. */
+  readonly reviewerRecoveryRequests: Readonly<{ job: Job }>[];
   /** E102-5: every request this test run's fake `linearPublication.publish` received, in order --
    * lets a test assert the exact `visualManifest`/`worktreePath`/`externalIssueId` threaded to it. */
   readonly linearPublicationRequests: unknown[];
@@ -515,6 +517,7 @@ async function harness(
   const sidecarRecords: Readonly<{ jobId: string; category: string; rejectedOutput: string }>[] =
     [];
   const reviewerRequests: unknown[] = [];
+  const reviewerRecoveryRequests: { job: Job }[] = [];
   const linearPublicationRequests: unknown[] = [];
   const lifecycleRequests: unknown[] = [];
   const admission = new InMemoryAdmissionFake();
@@ -668,8 +671,9 @@ async function harness(
           },
         }),
     reviewerRecovery: {
-      run: () => {
+      run: (request) => {
         calls.push("reviewerRecovery.run");
+        reviewerRecoveryRequests.push({ job: request.job });
         return Promise.resolve(
           overrides.reviewerRecoveryOutcome ??
             ({
@@ -794,6 +798,7 @@ async function harness(
     repositoryPath,
     sidecarRecords,
     reviewerRequests,
+    reviewerRecoveryRequests,
     linearPublicationRequests,
     lifecycleRequests,
     admission,
@@ -1638,6 +1643,33 @@ describe("runResumeCycle", () => {
     const reloaded = await progress.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("passes ReviewerPipeline's incremented reviewRuns into ReviewerRecovery without rolling counters back", async () => {
+    const reviewedJob = job({
+      attempts: { ...emptyAttemptCounters(), reviewerFixRounds: 1, reviewRuns: 2 },
+    });
+    const { deps, progress, reviewerRecoveryRequests } = await harness({
+      reviewerOutcome: {
+        state: "changes_requested",
+        job: reviewedJob,
+        changeRequest: changeRequest(),
+        checks: {} as never,
+        identity: {} as never,
+        reports: [],
+        findings: [],
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+
+    await runResumeCycle(deps);
+
+    expect(reviewerRecoveryRequests).toHaveLength(1);
+    expect(reviewerRecoveryRequests[0]?.job.attempts).toEqual({
+      ...emptyAttemptCounters(),
+      reviewerFixRounds: 1,
+      reviewRuns: 2,
+    });
   });
 
   it("clarification_required keeps the existing fix_round transition without reviewer recovery", async () => {

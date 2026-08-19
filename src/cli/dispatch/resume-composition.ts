@@ -380,7 +380,8 @@ export interface ResumeCycleDependencies {
   readonly progress: FileJobProgressStore;
   readonly jobRepository: ResumeJobRepository;
   readonly leases: LeaseCoordinator;
-  readonly sourceControl: Pick<SourceControlPort, "getChangeRequest">;
+  readonly sourceControl: Pick<SourceControlPort, "getChangeRequest"> &
+    Partial<Pick<SourceControlPort, "getCommitStatuses">>;
   /** C035: authoritative Linear state read, separate from the requirement projection. */
   readonly workManagement: Pick<WorkManagementPort, "getIssue">;
   readonly reviewWaitPublication?: ReviewerWaitPublicationPort;
@@ -2820,7 +2821,7 @@ async function resumeReview(
           requirementsDigest: context.requirementSnapshot.requirementsDigest,
           headSha: expectedHeadSha,
           baseRevision: context.baseRevision,
-          fixRound: context.job.attempts.reviewerFixRounds + 1,
+          fixRound: reviewOutcome.job.attempts.reviewerFixRounds + 1,
         },
       });
       if ("outcome" in fixLifecycleGate) return fixLifecycleGate;
@@ -2843,7 +2844,7 @@ async function resumeReview(
       if (fixAuthority !== undefined) return fixAuthority;
       const recoveryOutcome = await whileResumeLeaseHeld(deps, () =>
         deps.reviewerRecovery.run({
-          job: context.job,
+          job: reviewOutcome.job,
           project: deps.project,
           trustedConfig: deps.trustedConfig,
           requirementSnapshot: context.requirementSnapshot,

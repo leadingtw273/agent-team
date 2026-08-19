@@ -193,11 +193,7 @@ export function validReviewerRequest(request: ReviewerPipelineRequest): boolean 
 }
 
 export function anyReviewerAttemptLimitReached(job: Job): boolean {
-  return (
-    job.attempts.ciFixRounds >= attemptLimits.ciFixRounds ||
-    job.attempts.reviewerFixRounds >= attemptLimits.reviewerFixRounds ||
-    job.attempts.reviewRuns >= attemptLimits.reviewRuns
-  );
+  return job.attempts.reviewRuns >= attemptLimits.reviewRuns;
 }
 
 export function evidenceForReviewerRole(

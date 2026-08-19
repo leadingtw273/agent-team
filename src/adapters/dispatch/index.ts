@@ -1,6 +1,7 @@
 export * from "./auto-merge-pause-store.js";
 export * from "./reviewer-replay-policy-store.js";
 export * from "./reviewer-replay-diagnostic-store.js";
+export * from "./final-review-recovery-store.js";
 export * from "./work-status-capability-store.js";
 export * from "./work-status-lifecycle-ledger.js";
 export * from "./issue-admission-store.js";
