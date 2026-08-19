@@ -930,6 +930,9 @@ describe("runResumeCycle", () => {
         { outcome: "requires_manual", reason: "work_status_review_start_human_status_drift" },
       ],
     });
+    expect(calls.filter((call) => call.startsWith("workStatusLifecycle.transition:"))).toEqual([
+      "workStatusLifecycle.transition:review_start",
+    ]);
     expect(calls).not.toContain("reviewer.run");
   });
 
@@ -2246,6 +2249,169 @@ describe("runResumeCycle", () => {
         kind: "requires_manual",
         cause: { stage: "ci_recovery", reasonCode: "ci_recovery_failed" },
       });
+  });
+
+  it("projects a controller-owned CI recovery handoff to Linear requires-manual and blocked", async () => {
+    const requests: Record<string, unknown>[] = [];
+    const { deps, progress, calls } = await harness({
+      workStatus: "in_progress",
+      changeRequestState: { draft: true },
+      ciRecoveryOutcome: {
+        state: "paused",
+        reason: "no_changes",
+        job: job(),
+      },
+      workStatusTransition: (request) => {
+        requests.push(request as unknown as Record<string, unknown>);
+        return Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        });
+      },
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [
+            {
+              step: "work_start",
+              instance: "d".repeat(64),
+              mainTarget: "in_progress",
+              allowedMainSources: ["ready"],
+              agentTarget: { kind: "set", status: "executing" },
+              main: {
+                state: "confirmed",
+                idempotencyKey: "work-start-main",
+                confirmedAt: now,
+                observedRevision: "linear-revision",
+              },
+              agent: {
+                state: "confirmed",
+                idempotencyKey: "work-start-agent",
+                confirmedAt: now,
+                observedRevision: "linear-revision",
+              },
+              mainFailures: { count: 0 },
+              agentFailures: { count: 0 },
+            },
+          ],
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "ci_recovery_paused:no_changes" }]),
+    );
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      step: "requires_manual",
+      phase: "terminal",
+      mainTarget: "requires_manual",
+      allowedMainSources: ["in_progress"],
+      agentTarget: {
+        kind: "set",
+        status: "blocked",
+        blockingReason: "integration_failure",
+      },
+    });
+    expect(calls).not.toContain("reviewer.run");
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "ci_recovery", reasonCode: "ci_recovery_paused" },
+    });
+  });
+
+  it("never projects a requires-manual main status without a confirmed work-start receipt", async () => {
+    const requests: unknown[] = [];
+    const { deps, progress } = await harness({
+      workStatus: "in_progress",
+      changeRequestState: { draft: true },
+      ciRecoveryOutcome: { state: "paused", reason: "no_changes", job: job() },
+      workStatusTransition: (request) => {
+        requests.push(request);
+        return Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        });
+      },
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [],
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "ci_recovery_paused:no_changes" }]),
+    );
+    expect(requests).toHaveLength(0);
+  });
+
+  it("keeps the Job durably requires-manual when its Linear handoff projection is blocked", async () => {
+    const requests: unknown[] = [];
+    const { deps, progress } = await harness({
+      workStatus: "in_progress",
+      changeRequestState: { draft: true },
+      ciRecoveryOutcome: { state: "paused", reason: "no_changes", job: job() },
+      workStatusTransition: (request) => {
+        requests.push(request);
+        return Promise.resolve({ state: "blocked", reason: "provider_outage" });
+      },
+    });
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "c".repeat(64),
+          phase: "implementing",
+          transitions: [
+            {
+              step: "work_start",
+              instance: "d".repeat(64),
+              mainTarget: "in_progress",
+              main: {
+                state: "confirmed",
+                idempotencyKey: "work-start-main",
+                confirmedAt: now,
+                observedRevision: "linear-revision",
+              },
+              agent: { state: "not_required" },
+              mainFailures: { count: 0 },
+              agentFailures: { count: 0 },
+            },
+          ],
+        },
+      },
+    );
+
+    await expect(runResumeCycle(deps)).resolves.toEqual(
+      ok([{ jobId, outcome: "requires_manual", reason: "ci_recovery_paused:no_changes" }]),
+    );
+    expect(requests).toHaveLength(1);
+    const reloaded = await progress.load(jobId);
+    expect(reloaded.ok && reloaded.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: { stage: "ci_recovery", reasonCode: "ci_recovery_paused" },
+    });
   });
 
   /**
