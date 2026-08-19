@@ -100,6 +100,7 @@ import { createReviewerResumeHandler } from "./reviewer-resume-handlers.js";
 import { createReviewerReplayHandlers } from "./reviewer-replay-handlers.js";
 import { createWorkStatusRecoveryHandler } from "./work-status-recovery-handlers.js";
 import { createCiResumeHandler } from "./ci-resume-handlers.js";
+import { createJobResumeHandler } from "./job-resume-handlers.js";
 import {
   reconcileBootstrapClaims,
   type BootstrapReconciliationOutcome,
@@ -347,6 +348,7 @@ type DispatchHandlers = Pick<
   | "dispatchReviewerReplayPolicy"
   | "dispatchWorkStatusRecover"
   | "dispatchCiResume"
+  | "dispatchJobResume"
   | "quota"
 >;
 
@@ -573,6 +575,12 @@ export function createDispatchCliHandlers(
     clock,
     generateHolderId,
   });
+  const dispatchJobResume = createJobResumeHandler({
+    agentTeamHome: options.agentTeamHome,
+    ...(options.environment === undefined ? {} : { environment: options.environment }),
+    clock,
+    generateHolderId,
+  });
 
   return Object.freeze({
     dispatchResolve,
@@ -583,6 +591,7 @@ export function createDispatchCliHandlers(
     dispatchReviewerReplayPolicy: reviewerReplayHandlers.reviewerReplayPolicy,
     dispatchWorkStatusRecover,
     dispatchCiResume,
+    dispatchJobResume,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {

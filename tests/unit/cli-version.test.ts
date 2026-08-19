@@ -41,6 +41,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     dispatchReviewerReplayPolicy: vi.fn(() => Promise.resolve(outcome)),
     dispatchWorkStatusRecover: vi.fn(() => Promise.resolve(outcome)),
     dispatchCiResume: vi.fn(() => Promise.resolve(outcome)),
+    dispatchJobResume: vi.fn(() => Promise.resolve(outcome)),
     ingest: vi.fn(() => Promise.resolve(outcome)),
     reconcile: vi.fn(() => Promise.resolve(outcome)),
     cycle: vi.fn(() => Promise.resolve(outcome)),
@@ -137,6 +138,24 @@ describe("agent-team CLI contract", () => {
       ),
     ).resolves.toBe(0);
     expect(commands.dispatchCiResume).toHaveBeenCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      dryRun: true,
+    });
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
+          "job-resume",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchJobResume).toHaveBeenCalledWith({
       jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
       dryRun: true,
     });
@@ -270,7 +289,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(20));
+    expect(sink.stdout()).toBe("完成\n".repeat(21));
   });
 
   it("maps a blocked work-status recovery to exit 3", async () => {

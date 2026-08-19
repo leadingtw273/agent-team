@@ -95,6 +95,9 @@ export interface CliHandlers {
   readonly dispatchCiResume?: (
     input: Readonly<{ jobId: string; dryRun?: boolean }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchJobResume?: (
+    input: Readonly<{ jobId: string; dryRun?: boolean }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -407,6 +410,23 @@ export function createProgram(
             jobId: options.job,
             ...(options.dryRun === true ? { dryRun: true } : {}),
           }) ?? blocked("dispatch ci-resume"),
+      )(),
+    );
+
+  dispatch
+    .command("job-resume")
+    .description("只續跑一個既有 resumable Job 的精確 revision；不做 discovery、不建立新 Job")
+    .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
+    .option("--dry-run", "只做 Job、claim、revision 與 resumable admission 檢查")
+    .action((options: { readonly job: string; readonly dryRun?: boolean }) =>
+      action(
+        state,
+        io,
+        () =>
+          handlers.dispatchJobResume?.({
+            jobId: options.job,
+            ...(options.dryRun === true ? { dryRun: true } : {}),
+          }) ?? blocked("dispatch job-resume"),
       )(),
     );
 
