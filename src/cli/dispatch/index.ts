@@ -1,4 +1,6 @@
 export * from "./auto-merge-pause-handlers.js";
+export * from "./ci-resume-coordinator.js";
+export * from "./ci-resume-handlers.js";
 export * from "./composition.js";
 export * from "./ephemeral-ports.js";
 export * from "./handlers.js";

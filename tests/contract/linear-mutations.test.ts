@@ -297,6 +297,20 @@ describe("Linear mutation contract", () => {
     expect(harness.issue.stateId).toBe(context.catalog.stateIdByWorkStatus.requires_manual);
   });
 
+  it("restores requires-manual to Ready only through the explicit ready gate", async () => {
+    const harness = new MutationHarness();
+    harness.issue = {
+      ...harness.issue,
+      stateId: context.catalog.stateIdByWorkStatus.requires_manual,
+    };
+    const result = await harness.client().transitionWorkStatus(context, harness.issue.id, {
+      target: "ready",
+      cause: "ready_gate_passed",
+    });
+    expect(result.ok ? result.value.workStatus : result.error.code).toBe("ready");
+    expect(harness.issue.stateId).toBe(context.catalog.stateIdByWorkStatus.ready);
+  });
+
   it("replaces ordinary labels while preserving all controlled Label Group values", async () => {
     const harness = new MutationHarness();
     const client = harness.client();

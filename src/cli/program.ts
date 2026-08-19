@@ -92,6 +92,9 @@ export interface CliHandlers {
   readonly dispatchWorkStatusRecover: (
     input: Readonly<{ jobId: string; transitionInstance: string; dryRun?: boolean }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchCiResume?: (
+    input: Readonly<{ jobId: string; dryRun?: boolean }>,
+  ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -172,6 +175,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   dispatchReviewerReplay: () => blocked("dispatch reviewer-replay"),
   dispatchReviewerReplayPolicy: () => blocked("dispatch reviewer-replay-policy"),
   dispatchWorkStatusRecover: () => blocked("dispatch work-status-recover"),
+  dispatchCiResume: () => blocked("dispatch ci-resume"),
   ingest: () => blocked("ingest"),
   reconcile: () => blocked("reconcile"),
   cycle: () => blocked("cycle"),
@@ -385,6 +389,25 @@ export function createProgram(
               : { expectCheckpoint: options.expectCheckpoint }),
           }),
         )(),
+    );
+
+  dispatch
+    .command("ci-resume")
+    .description(
+      "只針對既有 requires_manual(ci_recovery_paused) Job，在同 Head CI 權威成功後接回既有流程",
+    )
+    .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
+    .option("--dry-run", "只做 Job、claim、PR、Head、CI 與 Linear identity 檢查")
+    .action((options: { readonly job: string; readonly dryRun?: boolean }) =>
+      action(
+        state,
+        io,
+        () =>
+          handlers.dispatchCiResume?.({
+            jobId: options.job,
+            ...(options.dryRun === true ? { dryRun: true } : {}),
+          }) ?? blocked("dispatch ci-resume"),
+      )(),
     );
 
   dispatch
