@@ -188,6 +188,23 @@ function lifecycleConfirmed(outcome: WorkStatusLifecycleOutcome): boolean {
   );
 }
 
+function hasRecoverableCiManualCause(record: JobProgressRecord): boolean {
+  if (record.stage.kind !== "requires_manual") return false;
+  const cause = record.stage.cause;
+  return (
+    (cause?.stage === "ci_recovery" && cause.reasonCode === "ci_recovery_paused") ||
+    (cause?.stage === "review" && cause.reasonCode === "ci_failed_after_ready")
+  );
+}
+
+function isReviewRepairCiManualCause(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "ci_failed_after_ready"
+  );
+}
+
 export class CiResumeCoordinator {
   constructor(readonly dependencies: CiResumeCoordinatorDependencies) {}
 
@@ -203,9 +220,7 @@ export class CiResumeCoordinator {
     }
     if (
       record.projectId !== this.dependencies.project.id ||
-      record.stage.kind !== "requires_manual" ||
-      record.stage.cause?.stage !== "ci_recovery" ||
-      record.stage.cause.reasonCode !== "ci_recovery_paused" ||
+      !hasRecoverableCiManualCause(record) ||
       record.changeRequestId === undefined ||
       record.headSha === undefined
     ) {
@@ -261,7 +276,7 @@ export class CiResumeCoordinator {
     }
     if (
       changeRequest.value.state !== "open" ||
-      !changeRequest.value.draft ||
+      (!changeRequest.value.draft && !isReviewRepairCiManualCause(record)) ||
       changeRequest.value.headBranch !== record.branch ||
       changeRequest.value.headSha.toLowerCase() !== record.headSha.toLowerCase() ||
       changeRequest.value.mergeability === "conflicting" ||
@@ -422,12 +437,7 @@ export class CiResumeCoordinator {
         }
       }
 
-      if (
-        mayStart &&
-        current.stage.kind === "requires_manual" &&
-        current.stage.cause?.stage === "ci_recovery" &&
-        current.stage.cause.reasonCode === "ci_recovery_paused"
-      ) {
+      if (mayStart && hasRecoverableCiManualCause(current)) {
         const started = await this.#transition(current, lock.value, {
           step: "work_start",
           phase: "implementing",
@@ -445,9 +455,8 @@ export class CiResumeCoordinator {
             const error = !afterStart.ok ? afterStart.error : !claim.ok ? claim.error : undefined;
             result = failed(input.jobId, "authoritative_read_failed", error?.code);
           } else if (
-            afterStart.value?.stage.kind !== "requires_manual" ||
-            afterStart.value.stage.cause?.stage !== "ci_recovery" ||
-            afterStart.value.stage.cause.reasonCode !== "ci_recovery_paused" ||
+            afterStart.value === undefined ||
+            !hasRecoverableCiManualCause(afterStart.value) ||
             claim.value?.state !== "active" ||
             claim.value.jobId !== input.jobId ||
             claim.value.revision !== admitted.claimRevision

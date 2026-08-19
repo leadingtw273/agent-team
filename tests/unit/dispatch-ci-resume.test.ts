@@ -49,6 +49,8 @@ function fixture(
     ci?: "success" | "failure";
     failClearOnce?: boolean;
     failWorkStartOnce?: boolean;
+    manualCause?: Readonly<{ stage: string; reasonCode: string }>;
+    draft?: boolean;
   } = {},
 ) {
   let record = {
@@ -62,8 +64,10 @@ function fixture(
     stage: {
       kind: "requires_manual",
       cause: {
-        stage: "ci_recovery",
-        reasonCode: "ci_recovery_paused",
+        ...(options.manualCause ?? {
+          stage: "ci_recovery",
+          reasonCode: "ci_recovery_paused",
+        }),
         attempts: { count: 1 },
       },
     },
@@ -249,7 +253,7 @@ function fixture(
             number: 26,
             url: "https://example.test/pr/26",
             state: "open",
-            draft: true,
+            draft: options.draft ?? true,
             baseBranch: "main",
             headBranch: `agent-team/${jobId}`,
             headSha,
@@ -313,6 +317,60 @@ describe("exact-job CI resume", () => {
     expect(test.record().stage).toEqual({ kind: "ci_waiting" });
     expect(test.acquire).toHaveBeenCalledTimes(1);
     expect(test.release).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores review repair CI failure after the exact same-Head checks become successful", async () => {
+    const test = fixture({
+      manualCause: { stage: "review", reasonCode: "ci_failed_after_ready" },
+      draft: false,
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: false }),
+    ).resolves.toMatchObject({ state: "checkpointed", jobId, headSha });
+    expect(test.lifecycleRequests.map((request) => request.step)).toEqual([
+      "clear_condition",
+      "work_start",
+    ]);
+    expect(test.record().stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("admits a ready PR for review repair in dry-run without mutation", async () => {
+    const test = fixture({
+      manualCause: { stage: "review", reasonCode: "ci_failed_after_ready" },
+      draft: false,
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: true }),
+    ).resolves.toMatchObject({ state: "ready", dryRun: true, jobId, headSha });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.acquireLock).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original CI-recovery cause restricted to a draft PR", async () => {
+    const test = fixture({ draft: false });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: false }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "change_request_mismatch" });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+  });
+
+  it("does not widen exact recovery to an unrelated review manual cause", async () => {
+    const test = fixture({
+      manualCause: { stage: "review", reasonCode: "review_provider_failed" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: false }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "job_not_eligible" });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
   });
 
   it("fails closed before Lease and lifecycle when same-Head CI is not successful", async () => {
