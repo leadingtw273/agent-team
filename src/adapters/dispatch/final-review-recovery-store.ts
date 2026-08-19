@@ -95,6 +95,7 @@ const providerTerminalBase = finalReviewRecoveryBaseSchema.extend({
 const succeededSchema = providerTerminalBase
   .extend({
     state: z.literal("review_succeeded"),
+    reviewStatusRetries: z.number().int().nonnegative().max(1).default(0),
     reports: z.array(reviewerReportSchema).length(1),
     reportDigests: z.array(digestSchema).length(1),
     reviewerReplayCheckpointDigest: digestSchema,
@@ -206,7 +207,17 @@ function transitionAllowed(
   ) {
     return false;
   }
-  if (terminal(current)) return sameJson(mutationFrom(current), next);
+  if (terminal(current)) {
+    if (
+      current.state === "review_succeeded" &&
+      next.state === "review_succeeded" &&
+      current.reviewStatusRetries === 0 &&
+      next.reviewStatusRetries === 1
+    ) {
+      return sameJson({ ...mutationFrom(current), reviewStatusRetries: 1 }, next);
+    }
+    return sameJson(mutationFrom(current), next);
+  }
   if (current.state === "ready") {
     return (
       next.state === "provider_reserved" && next.preProviderFailures === current.preProviderFailures

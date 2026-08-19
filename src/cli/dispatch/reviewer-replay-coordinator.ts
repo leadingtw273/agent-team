@@ -1,7 +1,8 @@
-import type {
-  ReviewerPipelineOutcome,
-  ReviewerPipelineRequest,
-  VisualEvidenceBuildSuccess,
+import {
+  REVIEW_STATUS_CONTEXT,
+  type ReviewerPipelineOutcome,
+  type ReviewerPipelineRequest,
+  type VisualEvidenceBuildSuccess,
 } from "../../application/pipelines/index.js";
 import {
   computeReviewerReportContractDigest,
@@ -595,6 +596,17 @@ function finalLifecycleFingerprintMatches(
   );
 }
 
+function finalSuccessReplayCause(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    ["work_status_lifecycle_failed", "review_not_approved"].includes(
+      record.stage.cause.reasonCode,
+    ) &&
+    record.stage.cause.attempts.count === 1
+  );
+}
+
 function finalCheckpointFingerprintMatches(
   record: JobProgressRecord,
   receipt: CheckpointReadReceipt,
@@ -602,16 +614,7 @@ function finalCheckpointFingerprintMatches(
   expectedCheckpoint: string,
   allowSuccessReplay: boolean,
 ): boolean {
-  if (
-    record.stage.kind !== "paused" &&
-    !(
-      allowSuccessReplay &&
-      record.stage.kind === "requires_manual" &&
-      record.stage.cause?.stage === "review" &&
-      record.stage.cause.reasonCode === "work_status_lifecycle_failed" &&
-      record.stage.cause.attempts.count === 1
-    )
-  ) {
+  if (record.stage.kind !== "paused" && !(allowSuccessReplay && finalSuccessReplayCause(record))) {
     return false;
   }
   const checkpoint = receipt.checkpoint;
@@ -673,14 +676,13 @@ async function inspectFinalReviewAdmission(
   expectedCheckpoint: string,
   deps: ResumeCycleDependencies,
   checkpoints: Pick<LocalYamlCheckpointReader, "load">,
-  options: Readonly<{ checkLease: boolean; allowSuccessReplay?: boolean }>,
+  options: Readonly<{
+    checkLease: boolean;
+    allowSuccessReplay?: boolean;
+    allowExistingSuccessStatus?: boolean;
+  }>,
 ): Promise<FinalReviewAdmission | ReviewerReplayOutcome> {
-  const successReplayStage =
-    options.allowSuccessReplay === true &&
-    record.stage.kind === "requires_manual" &&
-    record.stage.cause?.stage === "review" &&
-    record.stage.cause.reasonCode === "work_status_lifecycle_failed" &&
-    record.stage.cause.attempts.count === 1;
+  const successReplayStage = options.allowSuccessReplay === true && finalSuccessReplayCause(record);
   if (
     !(
       (record.stage.kind === "paused" && record.stage.checkpointId === expectedCheckpoint) ||
@@ -745,9 +747,13 @@ async function inspectFinalReviewAdmission(
     );
   }
   const reviewStatuses = statuses.value.statuses.filter(
-    (status) => status.context === "agent-team/review",
+    (status) => status.context === REVIEW_STATUS_CONTEXT,
   );
-  if (reviewStatuses.length !== 1 || reviewStatuses[0]?.state !== "pending") {
+  if (
+    reviewStatuses.length !== 1 ||
+    reviewStatuses[0]?.state !==
+      (options.allowExistingSuccessStatus === true ? "success" : "pending")
+  ) {
     return finalBlocked(record.jobId, "final_review_status_mismatch");
   }
   if (options.checkLease) {
@@ -876,7 +882,12 @@ export class ReviewerReplayCoordinator {
       expectedCheckpoint,
       deps,
       final.checkpoints,
-      { checkLease: dryRun, allowSuccessReplay: recovery.value?.state === "review_succeeded" },
+      {
+        checkLease: dryRun,
+        allowSuccessReplay: recovery.value?.state === "review_succeeded",
+        allowExistingSuccessStatus:
+          recovery.value?.state === "review_succeeded" && recovery.value.reviewStatusRetries === 1,
+      },
     );
     if (finalAdmissionBlocked(admission)) return admission;
     if (
@@ -960,6 +971,9 @@ export class ReviewerReplayCoordinator {
         {
           checkLease: false,
           allowSuccessReplay: currentRecovery.value?.state === "review_succeeded",
+          allowExistingSuccessStatus:
+            currentRecovery.value?.state === "review_succeeded" &&
+            currentRecovery.value.reviewStatusRetries === 1,
         },
       );
       if (finalAdmissionBlocked(underLeaseAdmission)) return underLeaseAdmission;
@@ -1064,6 +1078,7 @@ export class ReviewerReplayCoordinator {
             ...finalBaseFrom(reserved.value),
             state: "review_succeeded",
             providerRuns: 1,
+            reviewStatusRetries: 0,
             completedAt: guardedDeps.clock.now(),
             reports: [...reviewOutcome.reports],
             reportDigests: [...checkpoint.value.reportDigests],
@@ -1103,6 +1118,37 @@ export class ReviewerReplayCoordinator {
     admission: FinalReviewAdmission,
     deps: ResumeCycleDependencies,
   ): Promise<ReviewerReplayOutcome> {
+    if (
+      record.stage.kind === "requires_manual" &&
+      record.stage.cause?.stage === "review" &&
+      record.stage.cause.reasonCode === "review_not_approved"
+    ) {
+      if (recovery.reviewStatusRetries === 0) {
+        const store = this.dependencies.finalReviewRecovery?.store;
+        if (store === undefined) return finalBlocked(record.jobId, "runtime_unavailable");
+        const {
+          schemaVersion: _schemaVersion,
+          revision: _revision,
+          updatedAt: _updatedAt,
+          ...recoveryMutation
+        } = recovery;
+        void _schemaVersion;
+        void _revision;
+        void _updatedAt;
+        const reserved = await store.compareAndSwap(
+          record.jobId,
+          recovery.revision,
+          {
+            ...recoveryMutation,
+            reviewStatusRetries: 1,
+          },
+          deps.signal === undefined ? {} : { signal: deps.signal },
+        );
+        if (!reserved.ok) {
+          return finalBlocked(record.jobId, "checkpoint_write_failed", reserved.error.code);
+        }
+      }
+    }
     const counterFailure = await this.#ensureFinalReviewRunCounter(
       record.jobId,
       recovery.identityDigest,
