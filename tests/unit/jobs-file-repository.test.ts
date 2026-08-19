@@ -215,5 +215,42 @@ describe("FileJobRepository", () => {
       expect(all.ok).toBe(true);
       if (all.ok) expect(all.value).toEqual([job()]);
     });
+
+    it.each([
+      ["processRecoveries", { processRecoveries: 1 }],
+      ["ciFixRounds", { ciFixRounds: 1 }],
+      ["reviewerFixRounds", { reviewerFixRounds: 1 }],
+      ["reviewRuns", { reviewRuns: 1 }],
+    ] as const)("rejects a %s counter rollback", async (_counter, attempts) => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+      const current = job({ attempts: { ...emptyAttemptCounters(), ...attempts } });
+      await repository.create(current);
+
+      const result = await repository.update(job(), { idempotencyKey: "rollback" });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+      await expect(repository.readAll()).resolves.toEqual({ ok: true, value: [current] });
+    });
+
+    it.each([
+      ["projectId", { projectId: id("project", "project_018f47d2-77a4-7cc1-8ef2-1123456789ab") }],
+      ["issueId", { issueId: id("issue", "issue_018f47d2-77a4-7cc1-8ef2-1123456789ab") }],
+      ["createdAt", { createdAt: instant("2026-08-07T12:01:00.000Z") }],
+    ] as const)("rejects a %s identity mutation", async (_field, override) => {
+      const root = await temporaryDirectory();
+      const location = paths(root);
+      const repository = new FileJobRepository(location.file, location.lock);
+      const current = job();
+      await repository.create(current);
+
+      const result = await repository.update(job(override), { idempotencyKey: "identity-change" });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error.code).toBe("invariant_violation");
+      await expect(repository.readAll()).resolves.toEqual({ ok: true, value: [current] });
+    });
   });
 });

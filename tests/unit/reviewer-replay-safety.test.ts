@@ -221,6 +221,19 @@ describe("reviewer-replay CLI outcome", () => {
     });
     expect(dryRunMissingVersion.state).toBe("blocked");
     expect(dryRunMissingVersion.message).toContain("contract_epoch_options_invalid");
+
+    const missingCheckpoint = await handlers.reviewerReplay({ jobId, finalReviewEpoch: true });
+    expect(missingCheckpoint.state).toBe("rejected");
+    expect(missingCheckpoint.message).toContain("contract_epoch_options_invalid");
+    const mutuallyExclusive = await handlers.reviewerReplay({
+      jobId,
+      newContractEpoch: true,
+      expectContractVersion: 2,
+      finalReviewEpoch: true,
+      expectCheckpoint: "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+    });
+    expect(mutuallyExclusive.state).toBe("rejected");
+    expect(mutuallyExclusive.message).toContain("contract_epoch_options_invalid");
   });
 });
 

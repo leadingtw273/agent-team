@@ -428,7 +428,6 @@ describe("CiRecoveryPipeline", () => {
 
   it.each([
     ["CI", { ciFixRounds: 2 }],
-    ["Reviewer fix", { reviewerFixRounds: 2 }],
     ["review run", { reviewRuns: 3 }],
   ] as const)(
     "checkpoints before model work when the %s limit is reached",
@@ -446,6 +445,18 @@ describe("CiRecoveryPipeline", () => {
       expect(setup.calls).toEqual([`checks:${baseSha}`, "checkpoint:attempt_limit_reached"]);
     },
   );
+
+  it("does not let an exhausted Reviewer-fix budget block a CI repair", async () => {
+    const setup = fixture();
+    const outcome = await setup.pipeline.run(
+      request({ job: job({ reviewerFixRounds: 2, reviewRuns: 2 }) }),
+    );
+
+    expect(outcome).toMatchObject({
+      state: "repair_pushed",
+      job: { attempts: { ciFixRounds: 1, reviewerFixRounds: 2, reviewRuns: 2 } },
+    });
+  });
 
   it("fails closed when the consumed attempt is not durably persisted", async () => {
     const setup = fixture({ durability: "unknown" });

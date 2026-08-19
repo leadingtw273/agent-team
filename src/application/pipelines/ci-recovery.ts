@@ -173,7 +173,6 @@ function requestShapeValid(request: CiRecoveryPipelineRequest): boolean {
 function anyAttemptLimitReached(job: Job): boolean {
   return (
     job.attempts.ciFixRounds >= attemptLimits.ciFixRounds ||
-    job.attempts.reviewerFixRounds >= attemptLimits.reviewerFixRounds ||
     job.attempts.reviewRuns >= attemptLimits.reviewRuns
   );
 }

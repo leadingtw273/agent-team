@@ -145,6 +145,18 @@ export class FileJobRepository implements JobRepository {
     if (!current.ok) return current;
     const index = current.value.findIndex((existing) => existing.id === job.id);
     if (index === -1) return err(domainError("not_found"));
+    const existing = current.value[index];
+    if (
+      existing?.projectId !== job.projectId ||
+      existing.issueId !== job.issueId ||
+      existing.createdAt !== job.createdAt ||
+      job.attempts.processRecoveries < existing.attempts.processRecoveries ||
+      job.attempts.ciFixRounds < existing.attempts.ciFixRounds ||
+      job.attempts.reviewerFixRounds < existing.attempts.reviewerFixRounds ||
+      job.attempts.reviewRuns < existing.attempts.reviewRuns
+    ) {
+      return err(domainError("invariant_violation"));
+    }
 
     const nextJobs = current.value.slice();
     nextJobs[index] = job;

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
+import { LocalYamlCheckpointReader } from "../../adapters/checkpoint/index.js";
 import { GitHubAdapter, GhTransport } from "../../adapters/github/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
@@ -8,6 +9,7 @@ import { createClock, type Clock } from "../../domain/foundation/index.js";
 import { jobIdSchema } from "../../domain/jobs/index.js";
 import { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import { FileReviewerReplayPolicyStore } from "../../adapters/dispatch/reviewer-replay-policy-store.js";
+import { FileFinalReviewRecoveryStore } from "../../adapters/dispatch/final-review-recovery-store.js";
 import type { CliCommandOutcome } from "../program.js";
 import { readStdinConfirmation } from "../registration/confirmation.js";
 import { buildDispatchComposition } from "./composition.js";
@@ -38,6 +40,8 @@ export interface ReviewerReplayHandlerInput {
   readonly dryRun?: boolean;
   readonly newContractEpoch?: boolean;
   readonly expectContractVersion?: number;
+  readonly finalReviewEpoch?: boolean;
+  readonly expectCheckpoint?: string;
 }
 
 export interface ReviewerReplayPolicyHandlerInput {
@@ -118,10 +122,19 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
     undefined,
     clock,
   );
+  const finalReviewRecovery = new FileFinalReviewRecoveryStore(
+    join(options.agentTeamHome, "state", "dispatch", "final-review-recovery"),
+    undefined,
+    clock,
+  );
+  const checkpoints = new LocalYamlCheckpointReader(
+    join(options.agentTeamHome, "state", "checkpoints"),
+  );
   const stdin = options.stdin ?? process.stdin;
 
   const buildCoordinator = async (
     jobId: string,
+    finalReviewEpoch = false,
   ): Promise<ReviewerReplayCoordinator | CliCommandOutcome> => {
     if (options.coordinatorFactory !== undefined) return options.coordinatorFactory(jobId);
     const record = await progress.load(jobId);
@@ -133,11 +146,11 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
         ...(!record.ok ? { errorCode: record.error.code } : {}),
       });
     }
-    if (
-      record.value.stage.kind !== "requires_manual" ||
-      record.value.stage.cause?.stage !== "review" ||
-      record.value.stage.cause.reasonCode !== "review_report_contract"
-    ) {
+    const ordinaryEligible =
+      record.value.stage.kind === "requires_manual" &&
+      record.value.stage.cause?.stage === "review" &&
+      record.value.stage.cause.reasonCode === "review_report_contract";
+    if (!finalReviewEpoch && !ordinaryEligible) {
       return outcome("blocked", {
         operation: "reviewer-replay",
         state: "blocked",
@@ -213,6 +226,13 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       leases,
       sourceControl: {
         getChangeRequest: (...args) => prepared().sourceControl.getChangeRequest(...args),
+        getCommitStatuses: (...args) => {
+          const getCommitStatuses = prepared().sourceControl.getCommitStatuses;
+          if (getCommitStatuses === undefined) {
+            throw new Error("reviewer_replay_status_read_unavailable");
+          }
+          return getCommitStatuses(...args);
+        },
       },
       workManagement,
       reviewWaitPublication: {
@@ -263,6 +283,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
         sourceControl: new GitHubAdapter(new GhTransport()),
         workManagement,
       },
+      finalReviewRecovery: { store: finalReviewRecovery, checkpoints },
     });
   };
 
@@ -277,11 +298,16 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       }
       const hasNewEpoch = input.newContractEpoch === true;
       const hasExpectedVersion = input.expectContractVersion !== undefined;
+      const hasFinalEpoch = input.finalReviewEpoch === true;
+      const hasExpectedCheckpoint = input.expectCheckpoint !== undefined;
       if (
         hasNewEpoch !== hasExpectedVersion ||
+        hasFinalEpoch !== hasExpectedCheckpoint ||
+        (hasNewEpoch && hasFinalEpoch) ||
         (hasExpectedVersion &&
           (!Number.isSafeInteger(input.expectContractVersion) ||
-            (input.expectContractVersion ?? 0) < 2))
+            (input.expectContractVersion ?? 0) < 2)) ||
+        (hasExpectedCheckpoint && input.expectCheckpoint.trim().length === 0)
       ) {
         return outcome(input.dryRun === true ? "blocked" : "rejected", {
           operation: "reviewer-replay",
@@ -290,13 +316,15 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
           reason: "contract_epoch_options_invalid",
         });
       }
-      const coordinator = await buildCoordinator(input.jobId);
+      const coordinator = await buildCoordinator(input.jobId, hasFinalEpoch);
       if (!(coordinator instanceof ReviewerReplayCoordinator)) return coordinator;
       const dryRun = input.dryRun === true;
       return reviewerReplayCliOutcome(
         await coordinator.run(input.jobId, dryRun, {
           ...(hasNewEpoch ? { newContractEpoch: true } : {}),
           ...(hasExpectedVersion ? { expectContractVersion: input.expectContractVersion } : {}),
+          ...(hasFinalEpoch ? { finalReviewEpoch: true } : {}),
+          ...(hasExpectedCheckpoint ? { expectCheckpoint: input.expectCheckpoint } : {}),
         }),
         dryRun,
       );

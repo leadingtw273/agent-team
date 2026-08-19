@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ReviewerReplayCoordinator } from "../../src/cli/dispatch/reviewer-replay-coordinator.js";
+import { LocalYamlCheckpointStore } from "../../src/adapters/checkpoint/local-yaml.js";
+import { LocalYamlCheckpointReader } from "../../src/adapters/checkpoint/local-yaml-reader.js";
+import { checkpointSchema } from "../../src/domain/checkpoint/index.js";
+import { FileFinalReviewRecoveryStore } from "../../src/adapters/dispatch/final-review-recovery-store.js";
 import {
   resumeUnderLease,
   type ResumeCycleDependencies,
@@ -28,6 +32,7 @@ import {
   currentReviewerReportContractBinding,
   requiredReviewerRoles,
 } from "../../src/application/pipelines/reviewer-policy.js";
+import { workStatusLifecycleCheckpointSchema } from "../../src/application/pipelines/work-status-lifecycle-model.js";
 import {
   buildLinearReadCatalog,
   linearAgentRoleNames,
@@ -55,6 +60,7 @@ import {
   createFixedClock,
   domainError,
   err,
+  generateDeterministicIdentifier,
   ok,
   parseIdentifier,
   parseInstant,
@@ -95,14 +101,17 @@ function instant(value: string): Instant {
 }
 
 const now = instant("2026-08-17T08:00:00.000Z");
+const externalIssueId = "linear-issue-1";
 const projectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab");
-const issueId = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+const generatedIssueId = generateDeterministicIdentifier("issue", externalIssueId);
+if (!generatedIssueId.ok) throw new Error(generatedIssueId.error.code);
+const issueId = generatedIssueId.value;
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const headSha = headShaSchema.parse("a".repeat(40));
 const baseRevision = headShaSchema.parse("b".repeat(40));
 const requirementsDigest = "c".repeat(64);
 const diffDigest = "d".repeat(64);
-const externalIssueId = "linear-issue-1";
+const finalCheckpointId = id("checkpoint", "checkpoint_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 
 function project() {
   return projectSchema.parse({
@@ -116,7 +125,7 @@ function project() {
   });
 }
 
-function job(): Job {
+function job(finalReview = false): Job {
   return jobSchema.parse({
     schemaVersion: 1,
     id: jobId,
@@ -124,7 +133,9 @@ function job(): Job {
     issueId,
     createdAt: now,
     watchdogExtensionGranted: false,
-    attempts: { ...emptyAttemptCounters(), reviewRuns: 3 },
+    attempts: finalReview
+      ? { ...emptyAttemptCounters(), reviewerFixRounds: 2, reviewRuns: 1 }
+      : { ...emptyAttemptCounters(), reviewRuns: 3 },
   });
 }
 
@@ -226,14 +237,24 @@ function identity(requirements = requirementsDigest): ReviewIdentity {
   return { requirementsDigest: requirements as never, headSha, diffDigest: diffDigest as never };
 }
 
-function report(request: ReviewerPipelineRequest): ReviewerReport {
+function report(
+  request: ReviewerPipelineRequest,
+  approvedIdentity?: ReviewIdentity,
+): ReviewerReport {
   return {
     schemaVersion: 1,
     role: "code_reviewer",
     verdict: "passed",
-    requirementsDigest: request.requirementSnapshot.requirementsDigest,
-    headSha: request.expectedHeadSha,
-    diffDigest,
+    requirementsDigest:
+      approvedIdentity?.requirementsDigest ?? request.requirementSnapshot.requirementsDigest,
+    headSha: approvedIdentity?.headSha ?? request.expectedHeadSha,
+    diffDigest: approvedIdentity?.diffDigest ?? diffDigest,
+    ...(approvedIdentity?.evidenceDigest === undefined
+      ? {}
+      : { evidenceDigest: approvedIdentity.evidenceDigest }),
+    ...(approvedIdentity?.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: approvedIdentity.publicationDigest }),
     summary: "All acceptance criteria pass.",
     acceptanceCriteria: [
       { criterion: "Review passes", status: "passed", summary: "Verified.", evidenceSources: [] },
@@ -290,6 +311,7 @@ interface Harness {
   readonly leases: InMemoryLeaseRepository;
   readonly deps: ResumeCycleDependencies;
   readonly policy: { enabled: boolean };
+  readonly finalRecovery?: FileFinalReviewRecoveryStore;
 }
 
 class FailSuccessCheckpointProgressStore extends FileJobProgressStore {
@@ -307,7 +329,7 @@ class FailSuccessCheckpointProgressStore extends FileJobProgressStore {
 }
 
 async function harness(
-  reviewerOutcomes: readonly ("approved" | "format" | "transport")[],
+  reviewerOutcomes: readonly ("approved" | "changes" | "format" | "transport")[],
   overrides: Readonly<{
     enabled?: boolean;
     workStatus?: "in_review" | "canceled";
@@ -320,6 +342,8 @@ async function harness(
     autoMergePending?: boolean;
     seedReplay?: "legacy_exhausted" | "legacy_mixed_exhausted" | "v2_exhausted" | "v2_zero";
     reviewRequirement?: "code_review" | "dual_review";
+    finalReview?: boolean;
+    throwOnProvider?: boolean;
   }> = {},
 ): Promise<Harness> {
   const progressRoot = await temporaryDirectory("reviewer-replay-progress-");
@@ -418,7 +442,51 @@ async function harness(
   };
   const initialProgress =
     overrides.seedReplay === undefined
-      ? baseProgress
+      ? {
+          ...baseProgress,
+          ...(overrides.finalReview === true
+            ? {
+                stage: { kind: "paused" as const, checkpointId: finalCheckpointId },
+                workStatusLifecycle: workStatusLifecycleCheckpointSchema.parse({
+                  admissionMode: "enforce" as const,
+                  capabilityDigest: "9".repeat(64),
+                  phase: "reviewing" as const,
+                  transitions: [
+                    {
+                      step: "review_start" as const,
+                      instance: "8".repeat(64),
+                      mainTarget: "in_review" as const,
+                      allowedMainSources: ["in_progress", "in_review"],
+                      agentTarget: { kind: "set" as const, status: "waiting" as const },
+                      main: {
+                        state: "confirmed" as const,
+                        idempotencyKey: "lifecycle:main",
+                        confirmedAt: now,
+                        observedRevision: now,
+                      },
+                      agent: {
+                        state: "confirmed" as const,
+                        idempotencyKey: "lifecycle:agent",
+                        confirmedAt: now,
+                        observedRevision: now,
+                      },
+                      mainFailures: { count: 0 },
+                      agentFailures: { count: 0 },
+                      historyEvidence: {
+                        preStateId: "state-progress",
+                        targetStateId: "state-review",
+                        observedRevision: now,
+                        historyPrefixDigest: "7".repeat(64),
+                        historyEntryCount: 1,
+                        historyTailId: "history-tail",
+                        preStateSpanId: "history-span",
+                      },
+                    },
+                  ],
+                }),
+              }
+            : {}),
+        }
       : {
           ...baseProgress,
           reviewerReplay:
@@ -451,7 +519,7 @@ async function harness(
   let reviewerIndex = 0;
   let inspectIndex = 0;
   let reviewRecordCalls = 0;
-  const jobs = [job()];
+  const jobs = [job(overrides.finalReview === true)];
   const reviewer = {
     inspect: (request: ReviewerPipelineRequest) => {
       calls.push("inspect");
@@ -463,7 +531,13 @@ async function harness(
         state: "ready" as const,
         job: request.job,
         changeRequest: changeRequest(),
-        checks: { headSha, aggregate: "success" as const, checks: [] },
+        checks: {
+          headSha,
+          aggregate: "success" as const,
+          checks: [
+            { name: "quality", status: "completed" as const, conclusion: "success" as const },
+          ],
+        },
         identity: selected,
         diff: [],
       });
@@ -472,6 +546,7 @@ async function harness(
       calls.push("provider");
       providerStarts.push(...requiredReviewerRoles(request));
       requests.push(request);
+      if (overrides.throwOnProvider === true) throw new Error("simulated_provider_process_crash");
       const scripted = reviewerOutcomes[reviewerIndex] ?? "approved";
       reviewerIndex += 1;
       if (scripted === "format") {
@@ -499,14 +574,47 @@ async function harness(
           job: request.job,
         });
       }
+      if (scripted === "changes") {
+        const blocking = {
+          ...report(request),
+          verdict: "changes_requested" as const,
+          findings: [
+            {
+              severity: "blocking" as const,
+              title: "Blocking finding",
+              description: "A blocking issue remains.",
+              acceptanceCriteria: ["Review passes"],
+              evidenceSources: [],
+            },
+          ],
+        };
+        return Promise.resolve({
+          state: "changes_requested",
+          job: request.job,
+          changeRequest: changeRequest(),
+          checks: {
+            headSha,
+            aggregate: "success",
+            checks: [{ name: "quality", status: "completed", conclusion: "success" }],
+          },
+          identity: identity(request.requirementSnapshot.requirementsDigest),
+          reports: [blocking],
+          findings: blocking.findings,
+        });
+      }
+      const approvedIdentity =
+        overrides.approvedIdentity ?? identity(request.requirementSnapshot.requirementsDigest);
       return Promise.resolve({
         state: "approved",
         job: request.job,
         changeRequest: changeRequest(),
-        checks: { headSha, aggregate: "success", checks: [] },
-        identity:
-          overrides.approvedIdentity ?? identity(request.requirementSnapshot.requirementsDigest),
-        reports: [report(request)],
+        checks: {
+          headSha,
+          aggregate: "success",
+          checks: [{ name: "quality", status: "completed", conclusion: "success" }],
+        },
+        identity: approvedIdentity,
+        reports: [report(request, approvedIdentity)],
       });
     },
   };
@@ -521,6 +629,13 @@ async function harness(
     leases: leaseCoordinator,
     sourceControl: {
       getChangeRequest: () => Promise.resolve(ok(changeRequest())),
+      getCommitStatuses: () =>
+        Promise.resolve(
+          ok({
+            headSha,
+            statuses: [{ context: "agent-team/review", state: "pending" as const }],
+          }),
+        ),
     },
     workManagement: {
       getIssue: () =>
@@ -612,6 +727,19 @@ async function harness(
           }),
         ),
     },
+    ...(overrides.finalReview === true
+      ? {
+          workStatusLifecycle: {
+            transition: () =>
+              Promise.resolve({
+                state: "permitted" as const,
+                mode: "enforce" as const,
+                main: "confirmed" as const,
+                agent: "confirmed" as const,
+              }),
+          },
+        }
+      : {}),
     reviewStatus: {
       begin: () => {
         calls.push("reviewStatus.begin");
@@ -661,6 +789,51 @@ async function harness(
     admission,
     resolveAuthoritativeBase: () => Promise.reject(new Error("must not resolve live base")),
   };
+  let finalRecovery: FileFinalReviewRecoveryStore | undefined;
+  let finalReviewDependencies:
+    | Readonly<{
+        store: FileFinalReviewRecoveryStore;
+        checkpoints: LocalYamlCheckpointReader;
+      }>
+    | undefined;
+  if (overrides.finalReview === true) {
+    const finalRoot = await temporaryDirectory("final-review-recovery-");
+    const checkpointRoot = await temporaryDirectory("final-review-checkpoint-");
+    finalRecovery = new FileFinalReviewRecoveryStore(finalRoot, undefined, createFixedClock(now));
+    const checkpoint = {
+      schemaVersion: 1 as const,
+      id: finalCheckpointId,
+      projectId,
+      issueId,
+      jobId,
+      createdAt: now,
+      reason: "retry_exhausted" as const,
+      completedItems: [],
+      remainingItems: [],
+      tests: [{ commandSummary: "quality", status: "passed" as const }],
+      nextSteps: ["審查回合已達上限，請人工檢視 Reviewer 意見與變更請求 diff 後決定下一步。"],
+      blockers: [],
+      requirementSnapshot: snapshot.value,
+      model: { provider: "dispatch-cli", model: "unassigned" },
+      worktree: {
+        path: "/tmp/reviewer-replay-project",
+        branch: "agent-team/replay",
+        commitSha: headSha,
+        pushed: true,
+      },
+    };
+    const persisted = await new LocalYamlCheckpointStore(checkpointRoot).persist(
+      checkpointSchema.parse(checkpoint),
+      {
+        idempotencyKey: "final-review:test-checkpoint",
+      },
+    );
+    if (!persisted.ok) throw new Error(`final checkpoint setup failed: ${persisted.error.code}`);
+    finalReviewDependencies = {
+      store: finalRecovery,
+      checkpoints: new LocalYamlCheckpointReader(checkpointRoot),
+    };
+  }
   const coordinator = new ReviewerReplayCoordinator({
     resume: deps,
     diagnostics: {
@@ -686,6 +859,9 @@ async function harness(
       },
     },
     delay: () => Promise.resolve(),
+    ...(finalReviewDependencies === undefined
+      ? {}
+      : { finalReviewRecovery: finalReviewDependencies }),
   });
   return {
     coordinator,
@@ -698,10 +874,123 @@ async function harness(
     leases,
     deps,
     policy,
+    ...(finalRecovery === undefined ? {} : { finalRecovery }),
   };
 }
 
 describe("ReviewerReplayCoordinator", () => {
+  it("final-review dry-run validates the exact paused checkpoint with zero mutation", async () => {
+    const value = await harness(["approved"], { finalReview: true });
+    const before = await value.progress.load(jobId);
+    const result = await value.coordinator.run(jobId, true, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+    const after = await value.progress.load(jobId);
+
+    expect(result).toMatchObject({
+      state: "ready",
+      providerAttemptsUsed: 0,
+      providerAttemptsRemaining: 1,
+    });
+    expect(value.calls).toEqual(["inspect"]);
+    expect(after).toEqual(before);
+    await expect(value.finalRecovery?.load(jobId)).resolves.toEqual({ ok: true, value: undefined });
+    await expect(value.leases.readAll()).resolves.toEqual({ ok: true, value: [] });
+  });
+
+  it("final-review approval calls one provider, checkpoints success, then resumes the existing gate", async () => {
+    const value = await harness(["approved"], { finalReview: true });
+    const result = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(result).toMatchObject({ state: "continued", providerAttempts: 1 });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls, JSON.stringify(result)).toContain("reviewStatus.record");
+    expect(value.calls).toContain("autoMerge.enable");
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "review_succeeded", providerRuns: 1 },
+    });
+    await expect(value.progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { reviewerReplay: { state: "review_succeeded" } },
+    });
+  });
+
+  it("final-review changes-requested consumes the one run and never invokes fixer, status, or merge", async () => {
+    const value = await harness(["changes"], { finalReview: true });
+    const result = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(result).toMatchObject({ state: "blocked", reason: "review_not_approved" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).not.toContain("reviewStatus.record");
+    expect(value.calls).not.toContain("autoMerge.enable");
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "review_not_approved", verdict: "changes_requested" },
+    });
+    await expect(value.progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { stage: { kind: "paused", checkpointId: finalCheckpointId } },
+    });
+  });
+
+  it("final-review crash after reservation converges to outcome-unknown without a second provider", async () => {
+    const value = await harness(["approved"], { finalReview: true, throwOnProvider: true });
+    await expect(
+      value.coordinator.run(jobId, false, {
+        finalReviewEpoch: true,
+        expectCheckpoint: finalCheckpointId,
+      }),
+    ).rejects.toThrow("simulated_provider_process_crash");
+    const second = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(second).toMatchObject({
+      state: "blocked",
+      reason: "final_provider_outcome_unknown",
+    });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    await expect(value.finalRecovery?.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { state: "provider_outcome_unknown", providerRuns: 1 },
+    });
+  });
+
+  it("final-review wrong checkpoint is read-only and never reaches the provider", async () => {
+    const value = await harness(["approved"], { finalReview: true });
+    const result = await value.coordinator.run(jobId, true, {
+      finalReviewEpoch: true,
+      expectCheckpoint: "checkpoint_018f47d2-77a4-7cc1-8ef2-1123456789ab",
+    });
+    expect(result).toMatchObject({ state: "blocked", reason: "job_not_eligible" });
+    expect(value.calls).toEqual([]);
+  });
+
+  it("final-review rejects evidence identity drift even when the report is internally consistent", async () => {
+    const value = await harness(["approved"], {
+      finalReview: true,
+      approvedIdentity: { ...identity(), evidenceDigest: "e".repeat(64) as never },
+    });
+    const result = await value.coordinator.run(jobId, false, {
+      finalReviewEpoch: true,
+      expectCheckpoint: finalCheckpointId,
+    });
+
+    expect(result).toMatchObject({ state: "blocked", reason: "identity_mismatch" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).not.toContain("reviewStatus.record");
+    expect(value.calls).not.toContain("autoMerge.enable");
+  });
+
   it("contract epoch dry-run admits the exhausted legacy identity without mutation", async () => {
     const value = await harness(["approved"], { seedReplay: "legacy_exhausted" });
     const before = await value.progress.load(jobId);
