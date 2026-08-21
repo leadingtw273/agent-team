@@ -7,13 +7,9 @@
  *
  * `LinearIssueSnapshot` (src/adapters/linear/model.ts) is not `WorkManagementIssueSnapshot`
  * (src/application/ports/work-management.ts) -- the former is Linear's own read shape, the latter
- * wraps a full domain `Issue`. `toWorkManagementSnapshot` below builds the minimal, honestly-
- * derivable `Issue` (`id`/`projectId`/`externalId`/`title` only -- the same
- * `generateDeterministicIdentifier("issue", externalId)` convention `linear-discovery.ts` already
- * established for turning a Linear id into a domain id). It deliberately does not re-parse the
- * Ready Gate template (goal/acceptanceCriteria/...): `LifecyclePipeline` only ever reads
- * `issue.projectId`/`issue.externalId`/top-level `workStatus`/`agentCondition` (confirmed by
- * reading lifecycle.ts directly), so those optional fields would be unread scope creep here.
+ * wraps a full domain `Issue`. `toWorkManagementSnapshot` below deliberately reuses discovery's
+ * canonical Ready Gate mapping so requirement identity remains stable between dispatch and later
+ * merge/acceptance readback.
  *
  * `setWorkStatus` accepts only the lifecycle targets supported by the dispatch composition and
  * requires an explicit domain cause whenever `in_progress` could mean either initial work or a
@@ -35,18 +31,18 @@ import type {
 import {
   domainError,
   err,
-  generateDeterministicIdentifier,
   ok,
   parseInstant,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import { issueSchema } from "../../domain/project/index.js";
+import type { Project } from "../../domain/project/index.js";
 import { workStatuses, type AgentCondition, type WorkStatus } from "../../domain/workflow/index.js";
 import type { LinearIssueSnapshot } from "../../adapters/linear/model.js";
 import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
 import { parseReadyGateTemplate } from "../../adapters/linear/requirement-template.js";
+import { toDomainIssue } from "../../adapters/dispatch/linear-discovery.js";
 
 /** Same narrowing convention as `LinearDiscoveryReadModel` (linear-discovery.ts): only the
  * methods this adapter actually calls, so callers/tests can fake a plain object instead of a
@@ -74,34 +70,19 @@ export interface LinearWorkManagementAdapterOptions {
 }
 
 function toWorkManagementSnapshot(
-  projectId: string,
+  project: Project,
   snapshot: LinearIssueSnapshot,
 ): Result<WorkManagementIssueSnapshot, DomainError> {
-  const issueId = generateDeterministicIdentifier("issue", snapshot.id);
-  if (!issueId.ok) return issueId;
   const template = parseReadyGateTemplate(snapshot.description);
-  const issue = issueSchema.safeParse({
-    schemaVersion: 1,
-    id: issueId.value,
-    projectId,
-    externalId: snapshot.id,
-    title: snapshot.title,
-    ...(snapshot.agentRole === undefined ? {} : { agentRole: snapshot.agentRole }),
-    ...(snapshot.reviewRequirement === undefined
-      ? {}
-      : { reviewRequirement: snapshot.reviewRequirement }),
-    ...(template.humanSummary === undefined ? {} : { humanSummary: template.humanSummary }),
-    ...(snapshot.humanAcceptanceRequirement === undefined
-      ? {}
-      : { humanAcceptanceRequirement: snapshot.humanAcceptanceRequirement }),
-    ...(snapshot.verificationLevel === undefined
-      ? {}
-      : { verificationLevel: snapshot.verificationLevel }),
+  if (template.dependencies.kind === "unparsed") return err(domainError("conflict"));
+  const issue = toDomainIssue(project, snapshot, {
+    ...template,
+    dependencies: template.dependencies,
   });
-  if (!issue.success) return err(domainError("invariant_violation"));
+  if (!issue.ok) return issue;
   return ok(
     Object.freeze({
-      issue: issue.data,
+      issue: issue.value,
       workStatus: snapshot.workStatus,
       ...(snapshot.stateId === undefined ? {} : { workStatusStateId: snapshot.stateId }),
       ...(snapshot.agentCondition === undefined ? {} : { agentCondition: snapshot.agentCondition }),
@@ -207,7 +188,7 @@ export class LinearWorkManagementAdapter implements Pick<
     if (!context.ok) return context;
     const read = await this.#readModel.readIssue(context.value, reference.externalIssueId, options);
     if (!read.ok) return read;
-    return toWorkManagementSnapshot(reference.project.id, read.value);
+    return toWorkManagementSnapshot(reference.project, read.value);
   }
 
   async listIssues(
@@ -237,7 +218,7 @@ export class LinearWorkManagementAdapter implements Pick<
       ) {
         continue;
       }
-      const snapshot = toWorkManagementSnapshot(query.project.id, read.value);
+      const snapshot = toWorkManagementSnapshot(query.project, read.value);
       if (!snapshot.ok) return snapshot;
       snapshots.push(snapshot.value);
     }
@@ -295,7 +276,7 @@ export class LinearWorkManagementAdapter implements Pick<
                 { target: status, cause: transitionCause ?? "review_started" },
               );
     if (!result.ok) return result;
-    return toWorkManagementSnapshot(reference.project.id, result.value);
+    return toWorkManagementSnapshot(reference.project, result.value);
   }
 
   async setAgentCondition(
@@ -318,7 +299,7 @@ export class LinearWorkManagementAdapter implements Pick<
       },
     );
     if (!result.ok) return result;
-    return toWorkManagementSnapshot(reference.project.id, result.value);
+    return toWorkManagementSnapshot(reference.project, result.value);
   }
 
   async clearAgentCondition(
@@ -333,7 +314,7 @@ export class LinearWorkManagementAdapter implements Pick<
       reference.externalIssueId,
     );
     if (!result.ok) return result;
-    return toWorkManagementSnapshot(reference.project.id, result.value);
+    return toWorkManagementSnapshot(reference.project, result.value);
   }
 
   async appendComment(
