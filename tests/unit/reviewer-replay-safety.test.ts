@@ -473,6 +473,7 @@ describe("reviewer-replay scheduler selection", () => {
     ).resolves.toMatchObject({ ok: true });
 
     let selectedJobIds: readonly string[] = [];
+    let humanAcceptanceWired = false;
     const result = await resumeExistingProjectJobs({
       agentTeamHome: root,
       ready: {
@@ -484,13 +485,15 @@ describe("reviewer-replay scheduler selection", () => {
       } as never,
       holderId: "selection-test",
       clock: createFixedClock(completedAt.value),
-      runResumeCycle: (_deps, selection) => {
+      runResumeCycle: (deps, selection) => {
+        humanAcceptanceWired = deps.humanAcceptance !== undefined;
         selectedJobIds = selection?.selections.map((candidate) => candidate.jobId) ?? [];
         return Promise.resolve(ok([]));
       },
     });
 
     expect(result.state).toBe("resumed");
+    expect(humanAcceptanceWired).toBe(true);
     expect(selectedJobIds).toEqual([ordinaryJobId]);
   });
 });

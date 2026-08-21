@@ -298,6 +298,10 @@ export async function resumeExistingProjectJobs(
         },
         autoMerge: { enable: (...args) => prepared().autoMerge.enable(...args) },
         lifecycle: { run: (...args) => prepared().lifecycle.run(...args) },
+        humanAcceptance: {
+          createPending: (...args) =>
+            preparedCapability((composition) => composition.humanAcceptance).createPending(...args),
+        },
         visualEvidence: {
           build: (...args) =>
             preparedCapability((composition) => composition.visualEvidence).build(...args),
