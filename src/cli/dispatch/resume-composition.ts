@@ -856,9 +856,9 @@ function persistedMergeMutations(
  * general reconciliation classifier scanning every stuck job; the coordinator's decision 3 draws the
  * line at exactly the two reasonCodes where the underlying failure was itself about whether an
  * *external* system (GitHub's merge, then Lifecycle's Linear transition) had already succeeded --
- * `auto_merge_not_enabled` (this ticket's own root-cause incident) and `lifecycle_not_completed`
- * (the same class of drift one stage later: Lifecycle itself failed to complete, but the merge that
- * triggered it may have still gone through). Every other `requires_manual` reasonCode
+ * `auto_merge_not_enabled` (this ticket's own root-cause incident), `lifecycle_not_completed`, and
+ * `human_acceptance_checkpoint_failed` (the same class of drift one stage later: the merge may
+ * already have succeeded while local completion work failed). Every other `requires_manual` reasonCode
  * (`change_request_unavailable`, `job_unavailable`, `review_not_approved`, ...) describes a genuine
  * state mismatch or a review-side rejection that no readback can safely second-guess, and stays
  * exactly as fail-closed as C015o's admission design always intended.
@@ -870,7 +870,8 @@ export function isMergeReconcilable(record: JobProgressRecord): record is JobPro
     record.stage.kind === "requires_manual" &&
     record.stage.cause !== undefined &&
     (record.stage.cause.reasonCode === "auto_merge_not_enabled" ||
-      record.stage.cause.reasonCode === "lifecycle_not_completed")
+      record.stage.cause.reasonCode === "lifecycle_not_completed" ||
+      record.stage.cause.reasonCode === "human_acceptance_checkpoint_failed")
   );
 }
 
