@@ -1463,6 +1463,9 @@ describe("ReviewerReplayCoordinator", () => {
       updatedAt: _updatedAt,
       ...record
     } = checkpoint.value;
+    void _schemaVersion;
+    void _revision;
+    void _updatedAt;
     const lifecycleFailed = await value.progress.compareAndSwap(jobId, checkpoint.value.revision, {
       ...record,
       stage: {
@@ -1506,6 +1509,9 @@ describe("ReviewerReplayCoordinator", () => {
       updatedAt: _updatedAt,
       ...record
     } = loaded.value;
+    void _schemaVersion;
+    void _revision;
+    void _updatedAt;
     const changed = await value.progress.compareAndSwap(jobId, loaded.value.revision, {
       ...record,
       stage: {
