@@ -58,7 +58,6 @@ import {
   discoverReadyDispatchCandidates,
   FileWorkStatusCapabilityStore,
   type HumanAcceptanceStorePort,
-  type HumanOwnedRegionReservationPort,
   type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
@@ -176,8 +175,6 @@ export interface DispatchCompositionReady {
     readonly linearTransport: LinearGraphqlTransport;
   };
   readonly project: ProjectRegistrySnapshot["ready"][number]["project"];
-  /** Exact trusted default-branch revision used to bind active human-owned reservations. */
-  readonly projectRevision?: string;
   /** The same entry's trusted config (src/application/projects/loader.ts) -- C015b's run-flow
    * needs this to build an `ImplementerPipelineRequest`; C015a never needed it because it never
    * ran a pipeline. */
@@ -250,7 +247,6 @@ export interface DispatchOncePorts {
    * (ephemeral-ports.ts), the same "throwaway in-memory" convention `leases`/`jobs` already use. */
   readonly admission: IssueAdmissionPort;
   readonly humanAcceptance?: Pick<HumanAcceptanceStorePort, "listPending">;
-  readonly humanOwnedRegions?: Pick<HumanOwnedRegionReservationPort, "checkAdmission">;
   readonly locks?: IssueScopeLockPort;
   /** Durable post-Job bootstrap. It must confirm before the selected claim may attach its Job. */
   readonly bootstrap?: (input: DispatchBootstrapInput) => Promise<Result<void, DomainError>>;
@@ -284,14 +280,6 @@ export type DispatchOnceAdmissionSkippedIssue =
   | Readonly<{
       issueId: string;
       reason: "human_acceptance_pending" | "human_acceptance_state_unavailable";
-    }>
-  | Readonly<{
-      issueId: string;
-      reason:
-        | "human_owned_region_overlap"
-        | "reservation_identity_drift"
-        | "human_owned_region_state_unavailable"
-        | "invalid_change_regions";
     }>
   | Readonly<{
       issueId: string;
@@ -424,7 +412,7 @@ export async function dispatchOnce(
     return Object.freeze({ outcome: "discovery_failed" as const, error: discovered.error });
   }
   const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
-  const ownershipClearedCandidates: DispatcherCandidate[] = [];
+  const acceptanceClearedCandidates: DispatcherCandidate[] = [];
   const humanWorkflowCandidates = discovered.value.candidates.filter(
     (candidate) => candidate.issue.verificationLevel !== undefined,
   );
@@ -441,7 +429,7 @@ export async function dispatchOnce(
     // Absence marks a legacy candidate from a project that has not switched to the new contract.
     // Existing in-flight Jobs never enter this discovery path at all.
     if (candidate.issue.verificationLevel === undefined) {
-      ownershipClearedCandidates.push(candidate);
+      acceptanceClearedCandidates.push(candidate);
       continue;
     }
     if (pendingHumanAcceptanceIssueIds === undefined) {
@@ -462,58 +450,13 @@ export async function dispatchOnce(
       );
       continue;
     }
-    if (
-      ports.humanOwnedRegions === undefined ||
-      ready.projectRevision === undefined ||
-      candidate.issue.changeRegions === undefined
-    ) {
-      admissionSkipped.push(
-        Object.freeze({
-          issueId: candidate.issue.id,
-          reason:
-            candidate.issue.changeRegions === undefined
-              ? ("invalid_change_regions" as const)
-              : ("human_owned_region_state_unavailable" as const),
-        }),
-      );
-      continue;
-    }
-    const ownership = await ports.humanOwnedRegions.checkAdmission({
-      projectId: ready.project.id,
-      repositoryId: `${ready.project.sourceControl.provider}:${ready.project.sourceControl.repository}`,
-      currentRevision: ready.projectRevision,
-      regions: candidate.issue.changeRegions,
-    });
-    if (!ownership.ok) {
-      admissionSkipped.push(
-        Object.freeze({
-          issueId: candidate.issue.id,
-          reason: "human_owned_region_state_unavailable" as const,
-        }),
-      );
-      continue;
-    }
-    if (ownership.value.state === "blocked") {
-      admissionSkipped.push(
-        Object.freeze({
-          issueId: candidate.issue.id,
-          reason:
-            ownership.value.reason === "human_owned_region_overlap"
-              ? ("human_owned_region_overlap" as const)
-              : ownership.value.reason === "reservation_identity_drift"
-                ? ("reservation_identity_drift" as const)
-                : ("invalid_change_regions" as const),
-        }),
-      );
-      continue;
-    }
-    ownershipClearedCandidates.push(candidate);
+    acceptanceClearedCandidates.push(candidate);
   }
   // T03A: quota resolves before provider liveness. Unknown quota therefore performs no CLI probe,
   // creates no admission claim, and cannot reach lease/Job/provider pipeline creation.
   const quotaObservations = await observeQuotaRouteCandidates({
     routingConfig: ready.routingConfig,
-    candidates: ownershipClearedCandidates,
+    candidates: acceptanceClearedCandidates,
     quota: ready.quotaAdmission,
   });
   const codexQuotaReady = quotaObservations.some(
@@ -533,13 +476,13 @@ export async function dispatchOnce(
    * probe, or consume occurs in that case. For the exceptional route, `consume...` returns one
    * exact candidate only after a matching, live CLI version has atomically consumed its private
    * attestation; every other candidate remains outside the admission loop. */
-  let candidatesForAdmission: readonly DispatcherCandidate[] = ownershipClearedCandidates;
+  let candidatesForAdmission: readonly DispatcherCandidate[] = acceptanceClearedCandidates;
   let routeObservationsForAdmission: readonly CandidateObservation[] = routeObservations;
   if (
     options.allowOperatorCanary === true &&
     ready.operatorCanary !== undefined &&
     !hasNormalModelAdmissionCandidate(
-      ownershipClearedCandidates,
+      acceptanceClearedCandidates,
       ready.routingConfig,
       routeObservations,
     )
@@ -547,7 +490,7 @@ export async function dispatchOnce(
     const canary = await consumeExactOperatorCanaryCandidate({
       store: ready.operatorCanary.store,
       projectId: ready.project.id,
-      candidates: ownershipClearedCandidates,
+      candidates: acceptanceClearedCandidates,
       routingConfig: ready.routingConfig,
       claude: {
         config: ready.claude.config,
@@ -783,7 +726,6 @@ export async function buildDispatchComposition(
         linearTransport,
       }),
       project: readyEntry.project,
-      projectRevision: readyEntry.revisionSha,
       trustedConfig: readyEntry.config,
       claude: Object.freeze({
         config: providerConfig.value.claude,

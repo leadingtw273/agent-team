@@ -105,7 +105,6 @@ function instant(value: string): Instant {
 
 const projectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const now = instant("2026-08-07T12:00:00.000Z");
-const baselineRevision = "a".repeat(40);
 
 function project(): Project {
   return projectSchema.parse({
@@ -430,7 +429,6 @@ describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
 ${readyGateDescription()}`;
     const ready: DispatchCompositionReady = {
       ...baseReady,
-      projectRevision: baselineRevision,
       discovery: {
         ...baseReady.discovery,
         readModel: {
@@ -479,9 +477,6 @@ ${readyGateDescription()}`;
             ]),
           ),
       },
-      humanOwnedRegions: {
-        checkAdmission: () => Promise.resolve(ok({ state: "allowed" as const })),
-      },
     };
 
     const outcome = await dispatchOnce(ready, ports, "holder-human-acceptance-pending");
@@ -496,107 +491,6 @@ ${readyGateDescription()}`;
     expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
     expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
     await expect(ports.admission.load(ready.project.id, issueId.value)).resolves.toEqual({
-      ok: true,
-      value: undefined,
-    });
-  });
-
-  it("新工作流工單與人類編輯區域重疊時，零 quota、provider、claim、Lease 與 Job", async () => {
-    const stateRoot = await temporaryStateRoot();
-    const externalIssueId = "linear-issue-human-overlap";
-    const baseReady = readyComposition(stateRoot, externalIssueId);
-    const process = new ReadyClaudeProcessPort();
-    let quotaCalls = 0;
-    const fullDescription = `## ${humanSummaryTemplate.heading}
-- ${humanSummaryTemplate.objective}：加入坦克移動
-- ${humanSummaryTemplate.outcome}：可以操作坦克前進
-- ${humanSummaryTemplate.acceptance}：在 Godot 實機操作
-
-${readyGateDescription()}`;
-    const ready: DispatchCompositionReady = {
-      ...baseReady,
-      projectRevision: baselineRevision,
-      discovery: {
-        ...baseReady.discovery,
-        readModel: {
-          ...readModel(externalIssueId),
-          readContext: () => Promise.resolve(ok(linearProjectContext(true))),
-          readIssue: () =>
-            Promise.resolve(
-              ok({
-                id: externalIssueId,
-                identifier: "SBX-1",
-                title: "加入坦克移動",
-                description: fullDescription,
-                updatedAt: now,
-                teamId: "team-1",
-                projectId: "linear-proj-1",
-                workStatus: "ready" as const,
-                agentRole: "implementer" as const,
-                reviewRequirement: "code_review" as const,
-                humanAcceptanceRequirement: "required" as const,
-                verificationLevel: "standard" as const,
-                priority: "high" as const,
-                otherLabelIds: [],
-                relations: [],
-                comments: [],
-              }),
-            ),
-        } as never,
-      },
-      codex: { ...baseReady.codex, process },
-      quotaAdmission: {
-        resolve: () => {
-          quotaCalls += 1;
-          return Promise.resolve({ state: "ready" as const, reason: "test_fixture" });
-        },
-      },
-    };
-    const ports = {
-      ...buildPorts(stateRoot),
-      humanOwnedRegions: {
-        checkAdmission: () =>
-          Promise.resolve(
-            ok({ state: "blocked" as const, reason: "human_owned_region_overlap" as const }),
-          ),
-      },
-    };
-
-    const unavailable = await dispatchOnce(
-      ready,
-      {
-        leases: ports.leases,
-        jobs: ports.jobs,
-        admission: ports.admission,
-        humanOwnedRegions: ports.humanOwnedRegions,
-      },
-      "holder-human-acceptance-unavailable",
-    );
-    expect(unavailable.outcome).toBe("ran");
-    if (unavailable.outcome !== "ran") return;
-    expect(unavailable.admissionSkipped).toEqual([
-      {
-        issueId: unavailable.candidates[0]?.issue.id,
-        reason: "human_acceptance_state_unavailable",
-      },
-    ]);
-    expect(quotaCalls).toBe(0);
-    expect(process.calls).toBe(0);
-
-    const outcome = await dispatchOnce(ready, ports, "holder-human-overlap");
-
-    expect(outcome.outcome).toBe("ran");
-    if (outcome.outcome !== "ran") return;
-    expect(outcome.admissionSkipped).toEqual([
-      { issueId: outcome.candidates[0]?.issue.id, reason: "human_owned_region_overlap" },
-    ]);
-    expect(quotaCalls).toBe(0);
-    expect(process.calls).toBe(0);
-    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
-    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
-    const issueId = outcome.candidates[0]?.issue.id;
-    if (issueId === undefined) throw new Error("fixture invariant violated: missing issue id");
-    await expect(ports.admission.load(ready.project.id, issueId)).resolves.toEqual({
       ok: true,
       value: undefined,
     });

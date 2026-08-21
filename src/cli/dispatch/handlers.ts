@@ -92,7 +92,6 @@ import {
 } from "./implementer-composition.js";
 import {
   buildAutoMergePauseStore,
-  buildHumanOwnedRegionReservationStore,
   buildIssueAdmissionStore,
   buildJobProgressStore,
   type ResumeJobOutcome,
@@ -688,7 +687,6 @@ export function createDispatchCliHandlers(
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
       const durableAdmission = buildIssueAdmissionStore(options.agentTeamHome);
-      const humanOwnedRegions = buildHumanOwnedRegionReservationStore(options.agentTeamHome);
       const linearWorkManagement = new LinearWorkManagementAdapter({
         readModel: build.value.discovery.readModel,
         mutationClient: build.value.discovery.mutationClient,
@@ -796,14 +794,12 @@ export function createDispatchCliHandlers(
             jobs: new InMemoryJobRepository(),
             admission: new InMemoryIssueAdmissionStore(),
             humanAcceptance,
-            humanOwnedRegions,
           }
         : {
             leases: new LeaseCoordinator(build.value.leases),
             jobs: build.value.jobs,
             admission: durableAdmission,
             humanAcceptance,
-            humanOwnedRegions,
             locks: new FileIssueScopeLock(
               join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
             ),
