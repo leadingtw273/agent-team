@@ -110,6 +110,7 @@ import { createReviewerReplayHandlers } from "./reviewer-replay-handlers.js";
 import { createWorkStatusRecoveryHandler } from "./work-status-recovery-handlers.js";
 import { createCiResumeHandler } from "./ci-resume-handlers.js";
 import { createJobResumeHandler } from "./job-resume-handlers.js";
+import { createHumanAcceptanceHandlers } from "./human-acceptance-handlers.js";
 import {
   reconcileBootstrapClaims,
   type BootstrapReconciliationOutcome,
@@ -380,6 +381,9 @@ type DispatchHandlers = Pick<
   | "dispatchWorkStatusRecover"
   | "dispatchCiResume"
   | "dispatchJobResume"
+  | "humanAcceptanceList"
+  | "humanAcceptanceAccept"
+  | "humanAcceptanceRequestAdjustment"
   | "quota"
 >;
 
@@ -612,6 +616,29 @@ export function createDispatchCliHandlers(
     clock,
     generateHolderId,
   });
+  const humanAcceptance = new FileHumanAcceptanceStore(
+    defaultHumanAcceptanceDirectory(options.agentTeamHome),
+  );
+  const humanAcceptanceHandlers = createHumanAcceptanceHandlers({
+    store: humanAcceptance,
+    runtime: async (projectId) => {
+      const build = await (options.buildComposition ?? buildDispatchComposition)({
+        agentTeamHome: options.agentTeamHome,
+        projectId,
+        ...(options.environment === undefined ? {} : { environment: options.environment }),
+      });
+      if (build.state !== "ready") return err(domainError("unavailable"));
+      return ok({
+        project: build.value.project,
+        workManagement: new LinearWorkManagementAdapter({
+          readModel: build.value.discovery.readModel,
+          mutationClient: build.value.discovery.mutationClient,
+          teamId: build.value.discovery.teamId,
+          linearProjectId: build.value.discovery.linearProjectId,
+        }),
+      });
+    },
+  });
 
   return Object.freeze({
     dispatchResolve,
@@ -623,6 +650,7 @@ export function createDispatchCliHandlers(
     dispatchWorkStatusRecover,
     dispatchCiResume,
     dispatchJobResume,
+    ...humanAcceptanceHandlers,
     quota,
     async run(input) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
@@ -653,9 +681,6 @@ export function createDispatchCliHandlers(
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
       const durableAdmission = buildIssueAdmissionStore(options.agentTeamHome);
-      const humanAcceptance = new FileHumanAcceptanceStore(
-        defaultHumanAcceptanceDirectory(options.agentTeamHome),
-      );
       const humanOwnedRegions = buildHumanOwnedRegionReservationStore(options.agentTeamHome);
       const linearWorkManagement = new LinearWorkManagementAdapter({
         readModel: build.value.discovery.readModel,

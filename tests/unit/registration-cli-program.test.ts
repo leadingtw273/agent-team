@@ -38,6 +38,9 @@ function output() {
 function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHandlers {
   return {
     run: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceList: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceAccept: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceRequestAdjustment: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),

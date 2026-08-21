@@ -43,6 +43,10 @@ export interface HumanAcceptanceStorePort {
     identityDigest: string,
   ): Promise<Result<HumanAcceptanceRecord | undefined, DomainError>>;
   listPending(projectId: string): Promise<Result<readonly HumanAcceptanceRecord[], DomainError>>;
+  listForIssue(
+    projectId: string,
+    externalIssueId: string,
+  ): Promise<Result<readonly HumanAcceptanceRecord[], DomainError>>;
   createPending(
     input: CreateHumanAcceptanceInput,
   ): Promise<Result<HumanAcceptanceRecord, DomainError>>;
@@ -143,6 +147,22 @@ export class FileHumanAcceptanceStore implements HumanAcceptanceStorePort {
       Object.freeze(
         (ledger.value?.records ?? []).filter(
           (record) => record.state === "pending" || record.state === "adjustment_pending",
+        ),
+      ),
+    );
+  }
+
+  async listForIssue(
+    projectId: string,
+    externalIssueId: string,
+  ): Promise<Result<readonly HumanAcceptanceRecord[], DomainError>> {
+    if (externalIssueId.trim().length === 0) return err(domainError("invariant_violation"));
+    const ledger = await this.#read(projectId);
+    if (!ledger.ok) return ledger;
+    return ok(
+      Object.freeze(
+        (ledger.value?.records ?? []).filter(
+          (record) => record.externalIssueId === externalIssueId,
         ),
       ),
     );

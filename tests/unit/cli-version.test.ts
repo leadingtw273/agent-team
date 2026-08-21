@@ -33,6 +33,9 @@ function output() {
 function handlers(outcome: CliCommandOutcome = { state: "success" }) {
   return {
     run: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceList: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceAccept: vi.fn(() => Promise.resolve(outcome)),
+    humanAcceptanceRequestAdjustment: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
@@ -79,6 +82,7 @@ describe("agent-team CLI contract", () => {
 
       Commands:
         run [options]                輪詢 Linear 待執行工單、恢復既有 Job，並驅動 implementer pipeline
+        acceptance                   列出或處理合併後等待產品負責人驗收的工單
         dispatch                     C015o：手動收斂卡住的 dispatch job
         quota                        受控的 provider quota host 操作
         ingest [options] <provider>  接收已由外部 HTTPS Runtime 轉交的 Webhook
@@ -109,6 +113,34 @@ describe("agent-team CLI contract", () => {
     await expect(
       runCli(metadata, ["run", "--project", "project-a"], commands, sink.io),
     ).resolves.toBe(0);
+    await expect(
+      runCli(metadata, ["acceptance", "list", "--project", "project-a"], commands, sink.io),
+    ).resolves.toBe(0);
+    expect(commands.humanAcceptanceList).toHaveBeenCalledWith({ projectId: "project-a" });
+    await expect(
+      runCli(
+        metadata,
+        ["acceptance", "accept", "--project", "project-a", "--issue", "linear-1"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.humanAcceptanceAccept).toHaveBeenCalledWith({
+      projectId: "project-a",
+      externalIssueId: "linear-1",
+    });
+    await expect(
+      runCli(
+        metadata,
+        ["acceptance", "request-adjustment", "--project", "project-a", "--issue", "linear-1"],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.humanAcceptanceRequestAdjustment).toHaveBeenCalledWith({
+      projectId: "project-a",
+      externalIssueId: "linear-1",
+    });
     await expect(
       runCli(
         metadata,
@@ -289,7 +321,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(21));
+    expect(sink.stdout()).toBe("完成\n".repeat(24));
   });
 
   it("maps a blocked work-status recovery to exit 3", async () => {
