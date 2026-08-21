@@ -39,6 +39,17 @@ export const projectCommandSchema = z
   })
   .strict();
 
+export const verificationCommandCatalogSchema = z
+  .object({
+    static: z.array(projectCommandSchema).min(1).max(50),
+    smoke: z.array(projectCommandSchema).min(1).max(50),
+    targeted: z.array(projectCommandSchema).min(1).max(50),
+    full: z.array(projectCommandSchema).min(1).max(50),
+    negative: z.array(projectCommandSchema).min(1).max(50),
+    readback: z.array(projectCommandSchema).min(1).max(50),
+  })
+  .strict();
+
 const roleInstructionsSchema = z
   .object(
     Object.fromEntries(
@@ -83,12 +94,14 @@ export const trustedProjectConfigSchema = z
       .object({
         quality: z.array(projectCommandSchema).min(1).max(50),
         visualReview: z.array(projectCommandSchema).max(50),
+        verification: verificationCommandCatalogSchema.optional(),
       })
       .strict(),
   })
   .strict();
 
 export type ProjectCommand = z.infer<typeof projectCommandSchema>;
+export type VerificationCommandCatalog = z.infer<typeof verificationCommandCatalogSchema>;
 export type TrustedProjectConfig = z.infer<typeof trustedProjectConfigSchema>;
 
 /** Legacy trusted configs intentionally omit this field; omission is the immutable off default. */

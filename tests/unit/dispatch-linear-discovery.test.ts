@@ -18,7 +18,9 @@ import {
   linearAgentRoleNames,
   linearAgentStatusNames,
   linearBlockingReasonNames,
+  linearHumanAcceptanceNames,
   linearReviewRequirementNames,
+  linearVerificationLevelNames,
   linearWorkStatusNames,
   type LinearIssueSnapshot,
   type LinearLabelRecord,
@@ -33,8 +35,10 @@ import {
 } from "../../src/domain/foundation/index.js";
 import {
   agentRoleSchema,
+  humanAcceptanceRequirementSchema,
   reviewRequirementSchema,
   projectSchema,
+  verificationLevelSchema,
   type Project,
 } from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
@@ -58,7 +62,7 @@ function project(): Project {
 /** Builds a genuinely complete, `buildLinearReadCatalog`-validated catalog -- same technique the
  * O006 integration test fixtures use -- so this fixture is exactly as strict as the real
  * `LinearReadModel.readContext` would produce, without needing any `any`/unsafe cast. */
-function context(): LinearProjectContext {
+function context(humanWorkflowProvisioned = false): LinearProjectContext {
   const states: LinearWorkflowStateRecord[] = Object.entries(linearWorkStatusNames).map(
     ([status, name], index) => ({ id: `state-${status}-${String(index)}`, name, type: status }),
   );
@@ -73,6 +77,8 @@ function context(): LinearProjectContext {
     reviewRequirement: "label-group-review-requirement",
     agentStatus: "label-group-agent-status",
     blockingReason: "label-group-blocking-reason",
+    humanAcceptance: "label-group-human-acceptance",
+    verificationLevel: "label-group-verification-level",
   };
   const labels: LinearLabelRecord[] = [
     group("Agent 角色", groupIds.agentRole),
@@ -103,6 +109,26 @@ function context(): LinearProjectContext {
         `label-blocking-reason-${String(index)}`,
       ),
     ),
+    ...(humanWorkflowProvisioned
+      ? [
+          group("人類驗收", groupIds.humanAcceptance),
+          ...humanAcceptanceRequirementSchema.options.map((key, index) =>
+            child(
+              linearHumanAcceptanceNames[key],
+              groupIds.humanAcceptance,
+              `label-human-acceptance-${String(index)}`,
+            ),
+          ),
+          group("驗證強度", groupIds.verificationLevel),
+          ...verificationLevelSchema.options.map((key, index) =>
+            child(
+              linearVerificationLevelNames[key],
+              groupIds.verificationLevel,
+              `label-verification-level-${String(index)}`,
+            ),
+          ),
+        ]
+      : []),
   ];
   const catalog = buildLinearReadCatalog(states, labels);
   if (!catalog.ok) throw new Error("fixture invariant violated: catalog must build cleanly");
@@ -196,9 +222,10 @@ C015a 發現沒有解析器；C015b 補上。
 
 function fakeReadModel(
   overrides: Partial<LinearDiscoveryReadModel> = {},
+  options: Readonly<{ humanWorkflowProvisioned?: boolean }> = {},
 ): LinearDiscoveryReadModel {
   return {
-    readContext: () => Promise.resolve(ok(context())),
+    readContext: () => Promise.resolve(ok(context(options.humanWorkflowProvisioned))),
     listIssueIdsInState: () => Promise.resolve(ok(["linear-issue-1"])),
     readIssue: () => Promise.resolve(ok(snapshot())),
     ...overrides,
@@ -271,6 +298,76 @@ describe("discoverReadyDispatchCandidates", () => {
     });
     expect(candidate?.issue.humanAcceptanceRequirement).toBe("required");
     expect(candidate?.issue.verificationLevel).toBe("standard");
+  });
+
+  it.each([
+    {
+      name: "人類摘要",
+      snapshot: snapshot({
+        humanAcceptanceRequirement: "required",
+        verificationLevel: "standard",
+      }),
+      reason: "missing_human_summary",
+    },
+    {
+      name: "人類驗收分類",
+      snapshot: snapshot({
+        description: filledTemplateDescription(),
+        verificationLevel: "standard",
+      }),
+      reason: "missing_human_acceptance_requirement",
+    },
+    {
+      name: "驗證強度",
+      snapshot: snapshot({
+        description: filledTemplateDescription(),
+        humanAcceptanceRequirement: "required",
+      }),
+      reason: "missing_verification_level",
+    },
+  ] as const)("新工作流已 provisioning 時缺少 $name 會在 admission 前被拒絕", async (entry) => {
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel: fakeReadModel(
+        { readIssue: () => Promise.resolve(ok(entry.snapshot)) },
+        { humanWorkflowProvisioned: true },
+      ),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: entry.reason } },
+    ]);
+  });
+
+  it("新工作流 provisioning 後，欄位齊全的新單可正常 admission", async () => {
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel: fakeReadModel(
+        {
+          readIssue: () =>
+            Promise.resolve(
+              ok(
+                snapshot({
+                  description: filledTemplateDescription(),
+                  humanAcceptanceRequirement: "required",
+                  verificationLevel: "standard",
+                }),
+              ),
+            ),
+        },
+        { humanWorkflowProvisioned: true },
+      ),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.skipped).toEqual([]);
+    expect(result.value.candidates).toHaveLength(1);
   });
 
   it("C015b: skips (visibly, with its own reason) an issue whose dependencies section has unresolvable free text", async () => {

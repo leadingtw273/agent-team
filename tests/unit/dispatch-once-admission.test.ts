@@ -35,7 +35,9 @@ import {
   linearAgentRoleNames,
   linearAgentStatusNames,
   linearBlockingReasonNames,
+  linearHumanAcceptanceNames,
   linearReviewRequirementNames,
+  linearVerificationLevelNames,
   linearWorkStatusNames,
   type LinearLabelRecord,
   type LinearProjectContext,
@@ -59,8 +61,10 @@ import {
 import type { ProcessPort } from "../../src/application/ports/index.js";
 import {
   agentRoleSchema,
+  humanAcceptanceRequirementSchema,
   projectSchema,
   reviewRequirementSchema,
+  verificationLevelSchema,
   type Project,
 } from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
@@ -147,7 +151,7 @@ const routingConfig: ModelRoutingConfig = {
 };
 
 /** Same technique as tests/integration/dispatch-run-end-to-end.test.ts's own `linearProjectContext`. */
-function linearProjectContext(): LinearProjectContext {
+function linearProjectContext(humanWorkflowProvisioned = false): LinearProjectContext {
   const states: LinearWorkflowStateRecord[] = Object.entries(linearWorkStatusNames).map(
     ([status, name], index) => ({ id: `state-${status}-${String(index)}`, name, type: status }),
   );
@@ -162,6 +166,8 @@ function linearProjectContext(): LinearProjectContext {
     reviewRequirement: "label-group-review-requirement",
     agentStatus: "label-group-agent-status",
     blockingReason: "label-group-blocking-reason",
+    humanAcceptance: "label-group-human-acceptance",
+    verificationLevel: "label-group-verification-level",
   };
   const labels: LinearLabelRecord[] = [
     group("Agent 角色", groupIds.agentRole),
@@ -192,6 +198,26 @@ function linearProjectContext(): LinearProjectContext {
         `label-blocking-reason-${String(index)}`,
       ),
     ),
+    ...(humanWorkflowProvisioned
+      ? [
+          group("人類驗收", groupIds.humanAcceptance),
+          ...humanAcceptanceRequirementSchema.options.map((key, index) =>
+            child(
+              linearHumanAcceptanceNames[key],
+              groupIds.humanAcceptance,
+              `label-human-acceptance-${String(index)}`,
+            ),
+          ),
+          group("驗證強度", groupIds.verificationLevel),
+          ...verificationLevelSchema.options.map((key, index) =>
+            child(
+              linearVerificationLevelNames[key],
+              groupIds.verificationLevel,
+              `label-verification-level-${String(index)}`,
+            ),
+          ),
+        ]
+      : []),
   ];
   const catalog = buildLinearReadCatalog(states, labels);
   if (!catalog.ok) throw new Error("fixture invariant violated: catalog must build cleanly");
@@ -378,6 +404,40 @@ function buildPorts(stateRoot: string) {
 }
 
 describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
+  it("新工作流已 provisioning 但新單缺契約時，零 provider、claim、Lease 與 Job", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const baseReady = readyComposition(stateRoot, "linear-issue-missing-human-contract");
+    const process = new ReadyClaudeProcessPort();
+    const legacyReadModel = readModel("linear-issue-missing-human-contract");
+    const ready: DispatchCompositionReady = {
+      ...baseReady,
+      discovery: {
+        ...baseReady.discovery,
+        readModel: {
+          ...legacyReadModel,
+          readContext: () => Promise.resolve(ok(linearProjectContext(true))),
+        } as never,
+      },
+      codex: { ...baseReady.codex, process },
+    };
+    const ports = buildPorts(stateRoot);
+
+    const outcome = await dispatchOnce(ready, ports, "holder-missing-human-contract");
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.candidates).toEqual([]);
+    expect(outcome.discoverySkipped).toEqual([
+      {
+        externalIssueId: "linear-issue-missing-human-contract",
+        reason: { code: "missing_human_summary" },
+      },
+    ]);
+    expect(process.calls).toBe(0);
+    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
+    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
+  });
+
   it("quota unknown performs zero claim, lease, Job, or Claude liveness process mutation", async () => {
     const stateRoot = await temporaryStateRoot();
     const baseReady = readyComposition(stateRoot, "linear-issue-quota-unknown");

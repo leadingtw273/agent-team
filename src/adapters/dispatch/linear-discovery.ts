@@ -42,6 +42,9 @@ export type LinearDiscoverySkipReason =
   | Readonly<{ code: "not_ready" }>
   | Readonly<{ code: "no_agent_role" }>
   | Readonly<{ code: "dependencies_unparsed" }>
+  | Readonly<{ code: "missing_human_summary" }>
+  | Readonly<{ code: "missing_human_acceptance_requirement" }>
+  | Readonly<{ code: "missing_verification_level" }>
   | Readonly<{ code: "issue_invalid" }>
   | Readonly<{ code: "missing_change_regions" }>;
 
@@ -137,6 +140,9 @@ export async function discoverReadyDispatchCandidates(
   const context = await options.readModel.readContext(options.teamId, options.linearProjectId);
   if (!context.ok) return context;
   const readyStateId = context.value.catalog.stateIdByWorkStatus.ready;
+  const humanWorkflowProvisioned =
+    context.value.catalog.humanAcceptance !== undefined &&
+    context.value.catalog.verificationLevel !== undefined;
   const issueIds = await options.readModel.listIssueIdsInState(context.value, readyStateId);
   if (!issueIds.ok) return issueIds;
 
@@ -185,6 +191,33 @@ export async function discoverReadyDispatchCandidates(
         Object.freeze({
           externalIssueId,
           reason: Object.freeze({ code: "dependencies_unparsed" as const }),
+        }),
+      );
+      continue;
+    }
+    if (humanWorkflowProvisioned && template.humanSummary === undefined) {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "missing_human_summary" as const }),
+        }),
+      );
+      continue;
+    }
+    if (humanWorkflowProvisioned && snapshot.value.humanAcceptanceRequirement === undefined) {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "missing_human_acceptance_requirement" as const }),
+        }),
+      );
+      continue;
+    }
+    if (humanWorkflowProvisioned && snapshot.value.verificationLevel === undefined) {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "missing_verification_level" as const }),
         }),
       );
       continue;
