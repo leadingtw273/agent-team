@@ -236,11 +236,7 @@ export class FileHumanAcceptanceStore implements HumanAcceptanceStorePort {
           : err(domainError("conflict"));
       }
       const current = ledger.records.find((record) => record.identityDigest === identityDigest);
-      if (
-        current === undefined ||
-        current.revision !== expectedRevision ||
-        current.state !== "pending"
-      ) {
+      if (current?.revision !== expectedRevision || current.state !== "pending") {
         return err(domainError("conflict"));
       }
       const decidedAt = this.#clock.now();

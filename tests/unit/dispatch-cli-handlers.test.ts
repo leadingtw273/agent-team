@@ -125,15 +125,11 @@ describe("humanDeliveryForNewJob", () => {
       "2026-08-07T00:00:00.000Z" as never,
     );
 
-    expect(value).toMatchObject({
-      ok: true,
-      value: {
-        acceptanceRequirement: "required",
-        verificationLevel: "strict",
-        requirementDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
-        humanSummaryDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
-      },
-    });
+    if (!value.ok || value.value === undefined) throw new Error("expected human delivery");
+    expect(value.value.acceptanceRequirement).toBe("required");
+    expect(value.value.verificationLevel).toBe("strict");
+    expect(value.value.requirementDigest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(value.value.humanSummaryDigest).toMatch(/^[0-9a-f]{64}$/u);
   });
 });
 

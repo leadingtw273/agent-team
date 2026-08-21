@@ -228,17 +228,24 @@ export function humanDeliveryForNewJob(
   issue: Issue,
   capturedAt: ReturnType<Clock["now"]>,
 ): Result<JobProgressRecordMutation["humanDelivery"] | undefined, DomainError> {
-  const fields = [issue.humanSummary, issue.humanAcceptanceRequirement, issue.verificationLevel];
+  const { humanSummary, humanAcceptanceRequirement, verificationLevel } = issue;
+  const fields = [humanSummary, humanAcceptanceRequirement, verificationLevel];
   if (fields.every((field) => field === undefined)) return ok(undefined);
-  if (fields.some((field) => field === undefined)) return err(domainError("invariant_violation"));
+  if (
+    humanSummary === undefined ||
+    humanAcceptanceRequirement === undefined ||
+    verificationLevel === undefined
+  ) {
+    return err(domainError("invariant_violation"));
+  }
   const requirement = createRequirementSnapshot(issue, capturedAt);
-  const humanSummaryDigest = sha256Digest(issue.humanSummary);
+  const humanSummaryDigest = sha256Digest(humanSummary);
   if (!requirement.ok) return requirement;
   if (!humanSummaryDigest.ok) return humanSummaryDigest;
   return ok(
     Object.freeze({
-      acceptanceRequirement: issue.humanAcceptanceRequirement!,
-      verificationLevel: issue.verificationLevel!,
+      acceptanceRequirement: humanAcceptanceRequirement,
+      verificationLevel,
       requirementDigest: requirement.value.requirementsDigest,
       humanSummaryDigest: humanSummaryDigest.value,
     }),

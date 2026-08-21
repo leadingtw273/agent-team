@@ -105,7 +105,12 @@ async function fixture() {
       setWorkStatusCalls += 1;
       workStatus = status;
       return Promise.resolve(
-        ok({ issue, workStatus, updatedAt: now, revision: `revision-${setWorkStatusCalls + 1}` }),
+        ok({
+          issue,
+          workStatus,
+          updatedAt: now,
+          revision: `revision-${String(setWorkStatusCalls + 1)}`,
+        }),
       );
     },
     appendComment: (_reference: unknown, body: string, options: { idempotencyKey: string }) => {

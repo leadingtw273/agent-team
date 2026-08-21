@@ -137,7 +137,9 @@ describe("O009d createGitHubSquashMergePort: direct-merge fallback", () => {
       { value: pull() }, // squashMerge.enable's fallback re-read: still open/mergeable/matching head
       { value: pull() }, // squashMergeChangeRequest's own internal pre-check
       { value: { merged: true } }, // direct PUT merge succeeds
-      { value: pull({ state: "merged" }) }, // squashMergeChangeRequest's own readback
+      {
+        value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }),
+      }, // squashMergeChangeRequest's own readback
     ]);
     const port = createGitHubSquashMergePort(new GitHubAdapter(transport));
 
@@ -198,7 +200,9 @@ describe("O009d createGitHubSquashMergePort: direct-merge fallback", () => {
   });
 
   it("is idempotent when the PR is already merged before the fallback is ever reached -- unrelated to, and unaffected by, this fix", async () => {
-    const transport = new ScriptedTransport([{ value: pull({ state: "merged" }) }]);
+    const transport = new ScriptedTransport([
+      { value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }) },
+    ]);
     const port = createGitHubSquashMergePort(new GitHubAdapter(transport));
 
     const result = await port.enable(command, mutation);

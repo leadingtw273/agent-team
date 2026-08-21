@@ -1364,7 +1364,8 @@ async function prepareHumanAcceptance(
 ): Promise<Result<PreparedHumanAcceptance, DomainError>> {
   const policy = record.humanDelivery;
   if (policy?.acceptanceRequirement !== "required") return ok({ record });
-  if (deps.humanAcceptance === undefined) return err(domainError("invariant_violation"));
+  const humanAcceptance = deps.humanAcceptance;
+  if (humanAcceptance === undefined) return err(domainError("invariant_violation"));
 
   const readbackResult =
     mergedReadback === undefined
@@ -1377,12 +1378,14 @@ async function prepareHumanAcceptance(
       : ok(mergedReadback);
   if (!readbackResult.ok) return readbackResult;
   const readback = readbackResult.value;
+  const mergeCommit = readback.mergeCommitSha;
+  const mergedAt = readback.mergedAt;
   if (readback.state !== "merged") return err(domainError("unavailable"));
   if (
     readback.baseBranch !== deps.project.defaultBranch ||
     String(readback.number) !== changeRequestId ||
-    readback.mergeCommitSha === undefined ||
-    readback.mergedAt === undefined ||
+    mergeCommit === undefined ||
+    mergedAt === undefined ||
     (record.headSha !== undefined && readback.headSha !== record.headSha)
   ) {
     return err(domainError("conflict"));
@@ -1416,13 +1419,13 @@ async function prepareHumanAcceptance(
   }
 
   const created = await whileResumeLeaseHeld(deps, () =>
-    deps.humanAcceptance!.createPending({
+    humanAcceptance.createPending({
       identity: {
         projectId: record.projectId,
         issueId: record.issueId,
         jobId: record.jobId,
         requirementDigest: policy.requirementDigest,
-        mergeCommit: readback.mergeCommitSha!,
+        mergeCommit,
       },
       externalIssueId: record.externalIssueId,
       changeRequest: {
@@ -1431,7 +1434,7 @@ async function prepareHumanAcceptance(
         headSha: readback.headSha,
       },
       humanSummaryDigest: policy.humanSummaryDigest,
-      mergedAt: readback.mergedAt!,
+      mergedAt,
     }),
   );
   if (!created.ok) return created;
@@ -1460,8 +1463,8 @@ async function prepareHumanAcceptance(
       identityDigest: created.value.identityDigest,
       requirementDigest: policy.requirementDigest,
       humanSummaryDigest: policy.humanSummaryDigest,
-      mergeCommit: readback.mergeCommitSha,
-      mergedAt: readback.mergedAt,
+      mergeCommit,
+      mergedAt,
       headSha: readback.headSha,
     },
   });

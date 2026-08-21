@@ -235,7 +235,7 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
         value: { data: { enablePullRequestAutoMerge: { pullRequest: { id: "PR_node_fixture" } } } },
       },
       { error: "external_failure" },
-      { value: pull({ state: "merged" }) },
+      { value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }) },
     ]);
     const sourceControl = buildMergeGateSourceControl(
       new GitHubAdapter(transport),
@@ -269,7 +269,9 @@ describe("buildMergeGateSourceControl: O009d direct-merge fallback", () => {
       { value: pull() }, // our fallback re-read: still open/mergeable/matching head
       { value: pull() }, // squashMergeChangeRequest's own internal pre-check
       { value: { merged: true } }, // direct PUT merge succeeds
-      { value: pull({ state: "merged" }) }, // squashMergeChangeRequest's own readback
+      {
+        value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }),
+      }, // squashMergeChangeRequest's own readback
     ]);
     const sourceControl = buildMergeGateSourceControl(
       new GitHubAdapter(transport),

@@ -64,8 +64,7 @@ function validRequest(request: LifecyclePipelineRequest): boolean {
     (request.mergeAuthorizationHeadSha === undefined ||
       shaPattern.test(request.mergeAuthorizationHeadSha)) &&
     (request.humanAcceptance === undefined ||
-      (request.humanAcceptance.state === "pending" &&
-        /^[0-9a-f]{64}$/u.test(request.humanAcceptance.identityDigest) &&
+      (/^[0-9a-f]{64}$/u.test(request.humanAcceptance.identityDigest) &&
         /^[0-9a-f]{64}$/u.test(request.humanAcceptance.requirementDigest) &&
         /^[0-9a-f]{64}$/u.test(request.humanAcceptance.humanSummaryDigest) &&
         shaPattern.test(request.humanAcceptance.mergeCommit) &&

@@ -136,6 +136,8 @@ const changeRequestSchema = z
       .optional(),
     baseSha: shaSchema.optional(),
     autoMergeEnabled: z.boolean(),
+    mergeCommitSha: shaSchema.optional(),
+    mergedAt: instantSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict();
