@@ -26,7 +26,8 @@
 - 規格起點：`a3c7257`。
 - 最新權威主線 read-back：`origin/main=f21e4cc`。
 - Linear Work Status Lifecycle（LWS）候選基線：`agent-team/linear-work-status-lifecycle=a406898`，其中功能 commit `83df064`、qualification evidence commit `a406898`。
-- LWS qualification 文件記載 local release gates、fresh validation 與 Claude review 均 PASS；live canary 尚未開始。
+- LWS PR #170 已於 `2026-08-18T05:54:40Z` squash merge 為 `3a4996813ca6f21c9f59e33dfda8eefb684d91a6`；該 merge commit 是目前 `origin/main=f21e4cc` 的祖先。原 branch commits `83df064`／`a406898` 因 squash merge 不是 main 祖先，權威整合 identity 改採 GitHub merge receipt＋`3a499681` ancestry。
+- LWS qualification 文件記載 local release gates、fresh validation 與 Claude review 均 PASS；截至 HDW00 read-back，公開 PR／repo 證據仍沒有獨立標記 LWS live canary 已收斂，因此它保留為 Core 最終合併前置，不冒稱完成。
 - 共享 `/home/markchou/project/agent-team` 仍有另一 session 的 dirty worktree，不得 stash、reset、commit、覆蓋或作本功能基底。
 
 ### 2.2 接合策略
@@ -345,7 +346,24 @@ git diff --check
 
 具體focused test檔名在HDW00完成baseline後依現有test boundaries確定，不預先創造重複suite。
 
-HDW00完成時必須把實際focused suite檔名寫回本節；在此之前不得宣稱任何後續Task已完成focused驗收。
+HDW00確定的focused suite如下；後續Task依直接變更邊界取其子集，HDW07才跑完整release gate：
+
+```text
+tests/unit/dispatch-bootstrap-reconciliation.test.ts
+tests/unit/dispatch-issue-scope-lock.test.ts
+tests/unit/dispatch-once-admission.test.ts
+tests/unit/dispatch-pre-pr-implementation-coordinator.test.ts
+tests/unit/dispatch-work-status-capability-store.test.ts
+tests/unit/dispatch-work-status-orphan.test.ts
+tests/unit/dispatch-work-status-recovery.test.ts
+tests/unit/project-read-model.test.ts
+tests/unit/ui-production.test.ts
+tests/unit/work-status-lifecycle-coordinator.test.ts
+tests/integration/ui-production.test.ts
+tests/browser/ui-production.browser.ts
+```
+
+HDW00證據：`HEAD=49ab2b6`時，`origin/main=f21e4cc`與LWS squash merge `3a499681` ancestry PASS；typecheck PASS；上述Vitest 103 tests PASS；Playwright 1 test PASS。localhost UI probes在sandbox內因禁止bind立即失敗，依相同build在非sandbox重跑一次即PASS；這是執行環境分類，不是code retry。
 
 ## 7. Commit／PR策略
 
