@@ -47,7 +47,10 @@ import {
   blockingReasons,
   createAgentCondition,
 } from "../../src/domain/workflow/index.js";
-import { humanSummaryTemplate } from "../../src/application/registration/linear-provision-model.js";
+import {
+  humanSummaryTemplate,
+  readyGateTemplateHeadings,
+} from "../../src/application/registration/linear-provision-model.js";
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
   const parsed = parseIdentifier(scope, value);
@@ -261,7 +264,17 @@ describe("LinearWorkManagementAdapter", () => {
     const description = `## ${humanSummaryTemplate.heading}
 - ${humanSummaryTemplate.objective}：讓玩家能操作坦克
 - ${humanSummaryTemplate.outcome}：坦克可以前進與轉向
-- ${humanSummaryTemplate.acceptance}：在 Godot 手動繞場一圈`;
+- ${humanSummaryTemplate.acceptance}：在 Godot 手動繞場一圈
+
+## ${readyGateTemplateHeadings.goal}
+完成坦克基本操作
+
+## ${readyGateTemplateHeadings.acceptanceCriteria}
+- 坦克可以前進
+- 坦克可以轉向
+
+## ${readyGateTemplateHeadings.dependencies}
+無`;
     const readModel = new FakeReadModel(
       context(),
       snapshot({
@@ -287,6 +300,9 @@ describe("LinearWorkManagementAdapter", () => {
     });
     expect(result.value.issue.humanAcceptanceRequirement).toBe("required");
     expect(result.value.issue.verificationLevel).toBe("standard");
+    expect(result.value.issue.goal).toBe("完成坦克基本操作");
+    expect(result.value.issue.acceptanceCriteria).toEqual(["坦克可以前進", "坦克可以轉向"]);
+    expect(result.value.issue.dependencies).toEqual({ kind: "none" });
   });
 
   it("passes the same AbortSignal through both Linear context and issue multi-read", async () => {
