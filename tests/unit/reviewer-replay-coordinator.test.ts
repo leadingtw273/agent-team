@@ -4,12 +4,16 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ReviewerReplayCoordinator } from "../../src/cli/dispatch/reviewer-replay-coordinator.js";
+import {
+  isReviewerReplayCommandEligible,
+  ReviewerReplayCoordinator,
+} from "../../src/cli/dispatch/reviewer-replay-coordinator.js";
 import { LocalYamlCheckpointStore } from "../../src/adapters/checkpoint/local-yaml.js";
 import { LocalYamlCheckpointReader } from "../../src/adapters/checkpoint/local-yaml-reader.js";
 import { checkpointSchema } from "../../src/domain/checkpoint/index.js";
 import { FileFinalReviewRecoveryStore } from "../../src/adapters/dispatch/final-review-recovery-store.js";
 import {
+  isReviewerReplayCheckpointReconcilable,
   resumeUnderLease,
   type ResumeCycleDependencies,
 } from "../../src/cli/dispatch/resume-composition.js";
@@ -332,7 +336,7 @@ async function harness(
   reviewerOutcomes: readonly ("approved" | "changes" | "format" | "transport")[],
   overrides: Readonly<{
     enabled?: boolean;
-    workStatus?: "in_review" | "canceled";
+    workStatus?: "in_progress" | "in_review" | "canceled";
     claimJobId?: Identifier<"job">;
     inspectIdentities?: readonly ReviewIdentity[];
     failSuccessCheckpoint?: boolean;
@@ -345,6 +349,7 @@ async function harness(
     seedReplay?: "legacy_exhausted" | "legacy_mixed_exhausted" | "v2_exhausted" | "v2_zero";
     reviewRequirement?: "code_review" | "dual_review";
     finalReview?: boolean;
+    lifecycleEnforce?: boolean;
     workStatusLifecycleUnavailable?: boolean;
     throwOnProvider?: boolean;
   }> = {},
@@ -448,8 +453,10 @@ async function harness(
       ? {
           ...baseProgress,
           ...(overrides.finalReview === true
+            ? { stage: { kind: "paused" as const, checkpointId: finalCheckpointId } }
+            : {}),
+          ...(overrides.finalReview === true || overrides.lifecycleEnforce === true
             ? {
-                stage: { kind: "paused" as const, checkpointId: finalCheckpointId },
                 workStatusLifecycle: workStatusLifecycleCheckpointSchema.parse({
                   admissionMode: "enforce" as const,
                   capabilityDigest: "9".repeat(64),
@@ -736,7 +743,8 @@ async function harness(
           }),
         ),
     },
-    ...(overrides.finalReview === true && overrides.workStatusLifecycleUnavailable !== true
+    ...((overrides.finalReview === true || overrides.lifecycleEnforce === true) &&
+    overrides.workStatusLifecycleUnavailable !== true
       ? {
           workStatusLifecycle: {
             transition: () =>
@@ -807,17 +815,18 @@ async function harness(
     admission,
     resolveAuthoritativeBase: () => Promise.reject(new Error("must not resolve live base")),
   };
-  let finalRecovery: FileFinalReviewRecoveryStore | undefined;
-  let finalReviewDependencies:
-    | Readonly<{
-        store: FileFinalReviewRecoveryStore;
-        checkpoints: LocalYamlCheckpointReader;
-      }>
-    | undefined;
+  const finalRoot = await temporaryDirectory("final-review-recovery-");
+  const checkpointRoot = await temporaryDirectory("final-review-checkpoint-");
+  const finalRecovery = new FileFinalReviewRecoveryStore(
+    finalRoot,
+    undefined,
+    createFixedClock(now),
+  );
+  const finalReviewDependencies = {
+    store: finalRecovery,
+    checkpoints: new LocalYamlCheckpointReader(checkpointRoot),
+  };
   if (overrides.finalReview === true) {
-    const finalRoot = await temporaryDirectory("final-review-recovery-");
-    const checkpointRoot = await temporaryDirectory("final-review-checkpoint-");
-    finalRecovery = new FileFinalReviewRecoveryStore(finalRoot, undefined, createFixedClock(now));
     const checkpoint = {
       schemaVersion: 1 as const,
       id: finalCheckpointId,
@@ -847,10 +856,6 @@ async function harness(
       },
     );
     if (!persisted.ok) throw new Error(`final checkpoint setup failed: ${persisted.error.code}`);
-    finalReviewDependencies = {
-      store: finalRecovery,
-      checkpoints: new LocalYamlCheckpointReader(checkpointRoot),
-    };
   }
   const coordinator = new ReviewerReplayCoordinator({
     resume: deps,
@@ -877,9 +882,7 @@ async function harness(
       },
     },
     delay: () => Promise.resolve(),
-    ...(finalReviewDependencies === undefined
-      ? {}
-      : { finalReviewRecovery: finalReviewDependencies }),
+    finalReviewRecovery: finalReviewDependencies,
   });
   return {
     coordinator,
@@ -892,7 +895,7 @@ async function harness(
     leases,
     deps,
     policy,
-    ...(finalRecovery === undefined ? {} : { finalRecovery }),
+    ...(overrides.finalReview === true ? { finalRecovery } : {}),
   };
 }
 
@@ -964,6 +967,11 @@ describe("ReviewerReplayCoordinator", () => {
         },
         reviewerReplay: { state: "review_succeeded" },
       },
+    });
+
+    expect(await value.coordinator.run(jobId, false)).toMatchObject({
+      state: "blocked",
+      reason: "final_recovery_state_conflict",
     });
 
     const resumed = new ReviewerReplayCoordinator({
@@ -1436,6 +1444,89 @@ describe("ReviewerReplayCoordinator", () => {
     expect(resumed.state).toBe("continued");
     expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
     expect(value.calls).toContain("lifecycle.run");
+  });
+
+  it("continues a lifecycle-failed success checkpoint without widening scheduler admission", async () => {
+    const value = await harness(["approved"], {
+      crashOnFirstReviewRecord: true,
+      lifecycleEnforce: true,
+      workStatus: "in_progress",
+    });
+    await expect(value.coordinator.run(jobId, false)).rejects.toThrow(
+      "simulated_crash_after_checkpoint",
+    );
+    const checkpoint = await value.progress.load(jobId);
+    if (!checkpoint.ok || checkpoint.value === undefined) throw new Error("missing checkpoint");
+    const {
+      schemaVersion: _schemaVersion,
+      revision: _revision,
+      updatedAt: _updatedAt,
+      ...record
+    } = checkpoint.value;
+    const lifecycleFailed = await value.progress.compareAndSwap(jobId, checkpoint.value.revision, {
+      ...record,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "work_status_lifecycle_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    expect(lifecycleFailed.ok).toBe(true);
+    if (!lifecycleFailed.ok) throw new Error(lifecycleFailed.error.code);
+
+    expect(isReviewerReplayCommandEligible(lifecycleFailed.value)).toBe(true);
+    expect(isReviewerReplayCheckpointReconcilable(lifecycleFailed.value)).toBe(false);
+    const dryRun = await value.coordinator.run(jobId, true);
+    expect(dryRun).toMatchObject({
+      state: "ready",
+      providerAttemptsUsed: 1,
+      providerAttemptsRemaining: 0,
+    });
+    if (dryRun.state === "ready") {
+      expect(dryRun.plannedMutations).not.toContain("provider-attempt");
+    }
+
+    const resumed = await value.coordinator.run(jobId, false);
+    expect(resumed).toMatchObject({ state: "continued" });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).toContain("reviewStatus.record");
+    expect(value.calls).toContain("autoMerge.enable");
+  });
+
+  it("rejects lifecycle-failed records without the exact bounded success checkpoint", async () => {
+    const value = await harness(["approved"], { lifecycleEnforce: true });
+    const loaded = await value.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) throw new Error("missing progress");
+    const {
+      schemaVersion: _schemaVersion,
+      revision: _revision,
+      updatedAt: _updatedAt,
+      ...record
+    } = loaded.value;
+    const changed = await value.progress.compareAndSwap(jobId, loaded.value.revision, {
+      ...record,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "work_status_lifecycle_failed",
+          attempts: { count: 1 },
+        },
+      },
+      reviewerReplay: undefined,
+    });
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.error.code);
+
+    expect(isReviewerReplayCommandEligible(changed.value)).toBe(false);
+    expect(await value.coordinator.run(jobId, true)).toMatchObject({
+      state: "blocked",
+      reason: "job_not_eligible",
+    });
+    expect(value.calls).toEqual([]);
   });
 
   it("AC8 concurrent invocations share one Lease and never duplicate provider or completion", async () => {
