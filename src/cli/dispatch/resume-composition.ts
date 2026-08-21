@@ -1402,10 +1402,15 @@ async function prepareHumanAcceptance(
     workItem.value.issue.humanSummary === undefined
       ? undefined
       : sha256Digest(workItem.value.issue.humanSummary);
+  const workStatusEligible =
+    workItem.value.workStatus === "in_progress" ||
+    workItem.value.workStatus === "in_review" ||
+    (record.workStatusLifecycle?.admissionMode === "observe" &&
+      workItem.value.workStatus === "ready");
   if (
     workItem.value.issue.projectId !== record.projectId ||
     workItem.value.issue.externalId !== record.externalIssueId ||
-    (workItem.value.workStatus !== "in_progress" && workItem.value.workStatus !== "in_review") ||
+    !workStatusEligible ||
     !currentRequirement.ok ||
     currentRequirement.value.requirementsDigest !== policy.requirementDigest ||
     workItem.value.issue.humanAcceptanceRequirement !== policy.acceptanceRequirement ||

@@ -1448,6 +1448,48 @@ describe("runResumeCycle", () => {
     expect(fixture.admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
   });
 
+  it("creates the acceptance checkpoint from ready when status lifecycle is observe-only", async () => {
+    const workIssue = humanWorkflowIssue("light");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatus: "ready",
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "observe",
+          main: "observed",
+          agent: "observed",
+        }),
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-observe-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "observe",
+          capabilityDigest: "4".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle({ ...fixture.deps, humanAcceptance: acceptance });
+
+    expect(result).toEqual(ok([{ jobId, outcome: "completed" }]));
+    expect(await acceptance.listPending(projectId)).toMatchObject({
+      ok: true,
+      value: [{ state: "pending", externalIssueId }],
+    });
+  });
+
   it("reuses the same acceptance checkpoint after a lifecycle crash without duplicating it", async () => {
     const workIssue = humanWorkflowIssue("standard");
     const fixture = await harness({
