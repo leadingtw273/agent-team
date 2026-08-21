@@ -55,6 +55,10 @@ import {
   leaseIdSchema,
   projectIdSchema,
 } from "../../domain/jobs/index.js";
+import {
+  humanAcceptanceRequirementSchema,
+  verificationLevelSchema,
+} from "../../domain/project/index.js";
 import { headShaSchema, sha256Digest } from "../../domain/review/index.js";
 import {
   reportContractFailureCategorySchema,
@@ -93,6 +97,18 @@ const providerRetryCountSchema = z.number().int().min(0).max(100);
  * `retryable` before ever reaching this stage at all. */
 const lastErrorCodeSchema = z.string().trim().min(1).max(64);
 const reviewBindingDigestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
+
+/** Approved human-delivery policy captured when a new workflow Job is admitted. Absent means a
+ * legacy Job created before the project provisioned the human-directed workflow. */
+const humanDeliveryCheckpointSchema = z
+  .object({
+    acceptanceRequirement: humanAcceptanceRequirementSchema,
+    verificationLevel: verificationLevelSchema,
+    requirementDigest: reviewBindingDigestSchema,
+    humanSummaryDigest: reviewBindingDigestSchema,
+    acceptanceIdentityDigest: reviewBindingDigestSchema.optional(),
+  })
+  .strict();
 
 /**
  * C016 fix: mirrors `ImplementerPipelineOutcome`'s own `paused` `reason` union
@@ -231,6 +247,7 @@ export const requiresManualReasonCodeSchema = z.enum([
   "work_item_canceled",
   "cancellation_after_merge",
   "lifecycle_not_completed",
+  "human_acceptance_checkpoint_failed",
   // E102-4b: `resumeReview`'s own pre-arm merge recheck (immediately before
   // `AutoMergeGate.enable()`, resume-composition.ts) could not obtain a currently-valid
   // `VisualManifest` for a `dual_review`/`visual_review` job -- either `deps.visualEvidence` itself
@@ -789,6 +806,9 @@ export const jobProgressRecordSchema = z
     previousReviewerReplay: reviewerReplayCheckpointSchema.optional(),
     /** Optional for every legacy record. New work-status-aware Jobs persist it before Provider. */
     workStatusLifecycle: workStatusLifecycleCheckpointSchema.optional(),
+    /** Optional only for legacy Jobs. New human-directed Jobs persist this approved policy before
+     * Provider execution; merge completion may attach one immutable acceptance identity digest. */
+    humanDelivery: humanDeliveryCheckpointSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict()
@@ -929,6 +949,26 @@ function lifecycleCheckpointCanAdvance(
   });
 }
 
+function humanDeliveryCanAdvance(
+  current: JobProgressRecord["humanDelivery"],
+  next: JobProgressRecord["humanDelivery"],
+): boolean {
+  if (current === undefined) return next === undefined;
+  if (next === undefined) return false;
+  if (
+    current.acceptanceRequirement !== next.acceptanceRequirement ||
+    current.verificationLevel !== next.verificationLevel ||
+    current.requirementDigest !== next.requirementDigest ||
+    current.humanSummaryDigest !== next.humanSummaryDigest
+  ) {
+    return false;
+  }
+  return (
+    current.acceptanceIdentityDigest === next.acceptanceIdentityDigest ||
+    (current.acceptanceIdentityDigest === undefined && next.acceptanceIdentityDigest !== undefined)
+  );
+}
+
 function isNotFound(error: DomainError): boolean {
   return error.code === "not_found";
 }
@@ -1033,6 +1073,12 @@ export class FileJobProgressStore {
         normalizedCurrent.value?.workStatusLifecycle,
         next.workStatusLifecycle,
       )
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      normalizedCurrent.value !== undefined &&
+      !humanDeliveryCanAdvance(normalizedCurrent.value.humanDelivery, next.humanDelivery)
     ) {
       return err(domainError("invariant_violation"));
     }

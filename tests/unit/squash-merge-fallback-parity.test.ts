@@ -119,7 +119,9 @@ async function runRegistrationSideFallback(
       ? [
           { value: pull() }, // squashMergeChangeRequest's own internal pre-check
           { value: { merged: true } }, // direct PUT merge succeeds
-          { value: pull({ state: "merged" }) }, // squashMergeChangeRequest's own readback
+          {
+            value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }),
+          }, // squashMergeChangeRequest's own readback
         ]
       : []),
   ]);
@@ -158,7 +160,9 @@ async function runMergeGateSideFallback(
       ? [
           { value: pull() }, // squashMergeChangeRequest's own internal pre-check
           { value: { merged: true } }, // direct PUT merge succeeds
-          { value: pull({ state: "merged" }) }, // squashMergeChangeRequest's own readback
+          {
+            value: pull({ state: "merged", mergeCommitSha: otherSha, mergedAt: timestamp }),
+          }, // squashMergeChangeRequest's own readback
         ]
       : []),
   ]);

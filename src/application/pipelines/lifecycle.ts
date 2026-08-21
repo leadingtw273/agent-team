@@ -22,6 +22,7 @@
  */
 import { domainError, type DomainError } from "../../domain/foundation/index.js";
 import { projectSchema } from "../../domain/project/index.js";
+import { createRequirementSnapshot, sha256Digest } from "../../domain/review/index.js";
 import { transitionWorkStatus } from "../../domain/workflow/index.js";
 import type {
   ChangeRequestSnapshot,
@@ -62,6 +63,13 @@ function validRequest(request: LifecyclePipelineRequest): boolean {
     idempotencyPattern.test(request.idempotencyKeyPrefix) &&
     (request.mergeAuthorizationHeadSha === undefined ||
       shaPattern.test(request.mergeAuthorizationHeadSha)) &&
+    (request.humanAcceptance === undefined ||
+      (/^[0-9a-f]{64}$/u.test(request.humanAcceptance.identityDigest) &&
+        /^[0-9a-f]{64}$/u.test(request.humanAcceptance.requirementDigest) &&
+        /^[0-9a-f]{64}$/u.test(request.humanAcceptance.humanSummaryDigest) &&
+        shaPattern.test(request.humanAcceptance.mergeCommit) &&
+        shaPattern.test(request.humanAcceptance.headSha) &&
+        !Number.isNaN(Date.parse(request.humanAcceptance.mergedAt)))) &&
     (request.reviewerReplayAudit === undefined ||
       (/^[0-9a-f]{64}$/u.test(request.reviewerReplayAudit.checkpointDigest) &&
         Number.isInteger(request.reviewerReplayAudit.attemptTotal) &&
@@ -98,10 +106,14 @@ function mergeComment(
   request: LifecyclePipelineRequest,
   headSha: string,
   disposition: "not_required" | "paused" | "not_applicable",
+  issue: WorkManagementIssueSnapshot,
 ): string {
+  const awaitingAcceptance = request.humanAcceptance !== undefined;
   const common = [
     "🤖 Agent Team｜團隊管理者",
-    `- 狀態：GitHub PR 已合併，工單更新為已完成`,
+    awaitingAcceptance
+      ? "- 狀態：GitHub PR 已合併，工程已完成；工單保留在審查中等待人類驗收"
+      : "- 狀態：GitHub PR 已合併，工單更新為已完成",
     `- PR：${request.changeRequestId}`,
     `- Head SHA：${headSha}`,
     ...(request.workStatusLifecycleAudit === undefined
@@ -122,6 +134,13 @@ function mergeComment(
             : []),
           `- Review checkpoint：${request.reviewerReplayAudit.checkpointDigest}`,
           `- Reviewer attempts：${String(request.reviewerReplayAudit.attemptTotal)}｜outcome=${request.reviewerReplayAudit.outcome}`,
+        ]),
+    ...(request.humanAcceptance === undefined
+      ? []
+      : [
+          `- Human acceptance：pending｜${request.humanAcceptance.identityDigest}`,
+          `- 完成後會看到／能操作什麼：${issue.issue.humanSummary?.outcome ?? "請依工單的人類摘要確認成果"}`,
+          `- 如何驗收：${issue.issue.humanSummary?.acceptance ?? "請由專案負責人明確接受或要求調整"}`,
         ]),
   ];
   if (disposition === "not_required") {
@@ -228,7 +247,7 @@ export class LifecyclePipeline {
       return this.#handleCancellation(request, changeRequest.value, issue.value);
     }
     if (changeRequest.value.state === "merged") {
-      return this.#handleMerge(request, issue.value, changeRequest.value.headSha);
+      return this.#handleMerge(request, issue.value, changeRequest.value);
     }
     if (issue.value.workStatus === "completed") {
       return Object.freeze({ state: "unchanged", reason: "terminal_issue" });
@@ -242,8 +261,27 @@ export class LifecyclePipeline {
   async #handleMerge(
     request: LifecyclePipelineRequest,
     issue: WorkManagementIssueSnapshot,
-    mergedHeadSha: string,
+    changeRequest: ChangeRequestSnapshot,
   ): Promise<LifecyclePipelineOutcome> {
+    const mergedHeadSha = changeRequest.headSha;
+    const currentRequirement = createRequirementSnapshot(issue.issue, issue.updatedAt);
+    const currentHumanSummaryDigest =
+      issue.issue.humanSummary === undefined ? undefined : sha256Digest(issue.issue.humanSummary);
+    if (
+      request.humanAcceptance !== undefined &&
+      (changeRequest.mergeCommitSha === undefined ||
+        changeRequest.mergedAt === undefined ||
+        !sameSha(request.humanAcceptance.headSha, mergedHeadSha) ||
+        !sameSha(request.humanAcceptance.mergeCommit, changeRequest.mergeCommitSha) ||
+        request.humanAcceptance.mergedAt !== changeRequest.mergedAt ||
+        !currentRequirement.ok ||
+        currentRequirement.value.requirementsDigest !== request.humanAcceptance.requirementDigest ||
+        currentHumanSummaryDigest === undefined ||
+        !currentHumanSummaryDigest.ok ||
+        currentHumanSummaryDigest.value !== request.humanAcceptance.humanSummaryDigest)
+    ) {
+      return failed("request", domainError("conflict"));
+    }
     const authorized =
       issue.workStatus !== "canceled" &&
       request.mergeAuthorizationHeadSha !== undefined &&
@@ -275,7 +313,10 @@ export class LifecyclePipeline {
       autoMergeDisposition = paused.value.state;
     }
 
-    if (issue.workStatus !== "completed") {
+    if (request.humanAcceptance !== undefined && issue.workStatus !== "in_review") {
+      return failed("work_status", domainError("conflict"));
+    }
+    if (request.humanAcceptance === undefined && issue.workStatus !== "completed") {
       const transition = transitionWorkStatus(issue.workStatus, {
         target: "completed",
         cause: "github_merge_observed",
@@ -296,8 +337,17 @@ export class LifecyclePipeline {
     }
     const comment = await this.ports.workManagement.appendComment(
       { project: request.project, externalIssueId: request.externalIssueId },
-      mergeComment(request, mergedHeadSha, autoMergeDisposition),
-      mutation(request, authorized ? "authorized-merge-comment" : "out-of-process-merge-comment"),
+      mergeComment(request, mergedHeadSha, autoMergeDisposition, issue),
+      mutation(
+        request,
+        request.humanAcceptance === undefined
+          ? authorized
+            ? "authorized-merge-comment"
+            : "out-of-process-merge-comment"
+          : authorized
+            ? "human-acceptance-merge-comment"
+            : "human-acceptance-external-merge-comment",
+      ),
     );
     if (!comment.ok) return failed("comment", comment.error);
     return Object.freeze({
@@ -305,6 +355,7 @@ export class LifecyclePipeline {
       merge: authorized ? "authorized" : "out_of_process",
       headSha: mergedHeadSha,
       autoMergeDisposition,
+      ...(request.humanAcceptance === undefined ? {} : { humanAcceptance: "pending" as const }),
     });
   }
 

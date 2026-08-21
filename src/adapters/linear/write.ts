@@ -11,7 +11,13 @@ import {
   type Instant,
   type Result,
 } from "../../domain/foundation/index.js";
-import type { AgentRole, Priority, ReviewRequirement } from "../../domain/project/index.js";
+import type {
+  AgentRole,
+  HumanAcceptanceRequirement,
+  Priority,
+  ReviewRequirement,
+  VerificationLevel,
+} from "../../domain/project/index.js";
 import {
   canTransitionAgentStatus,
   transitionWorkStatus as validateWorkTransition,
@@ -75,6 +81,8 @@ export interface CreateLinearIssueInput {
   readonly workStatus: WorkStatus;
   readonly agentRole?: AgentRole;
   readonly reviewRequirement?: ReviewRequirement;
+  readonly humanAcceptanceRequirement?: HumanAcceptanceRequirement;
+  readonly verificationLevel?: VerificationLevel;
   readonly agentStatus?: AgentStatus;
   readonly blockingReason?: BlockingReason;
   readonly otherLabelIds?: readonly string[];
@@ -108,6 +116,8 @@ function controlledLabelIds(
   values: {
     readonly agentRole?: AgentRole;
     readonly reviewRequirement?: ReviewRequirement;
+    readonly humanAcceptanceRequirement?: HumanAcceptanceRequirement;
+    readonly verificationLevel?: VerificationLevel;
     readonly agentStatus?: AgentStatus;
     readonly blockingReason?: BlockingReason;
   },
@@ -119,6 +129,12 @@ function controlledLabelIds(
     values.reviewRequirement === undefined
       ? undefined
       : context.catalog.reviewRequirement.labelIdByValue[values.reviewRequirement],
+    values.humanAcceptanceRequirement === undefined
+      ? undefined
+      : context.catalog.humanAcceptance?.labelIdByValue[values.humanAcceptanceRequirement],
+    values.verificationLevel === undefined
+      ? undefined
+      : context.catalog.verificationLevel?.labelIdByValue[values.verificationLevel],
     values.agentStatus === undefined
       ? undefined
       : context.catalog.agentStatus.labelIdByValue[values.agentStatus],
@@ -137,6 +153,12 @@ function controlledLabelIdsFromSnapshot(
     ...(snapshot.reviewRequirement === undefined
       ? {}
       : { reviewRequirement: snapshot.reviewRequirement }),
+    ...(snapshot.humanAcceptanceRequirement === undefined
+      ? {}
+      : { humanAcceptanceRequirement: snapshot.humanAcceptanceRequirement }),
+    ...(snapshot.verificationLevel === undefined
+      ? {}
+      : { verificationLevel: snapshot.verificationLevel }),
     ...(snapshot.agentCondition === undefined
       ? {}
       : {
@@ -179,6 +201,13 @@ export class LinearMutationClient {
     context: LinearProjectContext,
     input: CreateLinearIssueInput,
   ): Promise<Result<LinearIssueSnapshot, DomainError>> {
+    if (
+      (input.humanAcceptanceRequirement !== undefined &&
+        context.catalog.humanAcceptance === undefined) ||
+      (input.verificationLevel !== undefined && context.catalog.verificationLevel === undefined)
+    ) {
+      return failure();
+    }
     if (
       !validVisibleCondition({
         status: input.agentStatus ?? "queued",
@@ -282,6 +311,12 @@ export class LinearMutationClient {
         ...(current.value.reviewRequirement === undefined
           ? {}
           : { reviewRequirement: current.value.reviewRequirement }),
+        ...(current.value.humanAcceptanceRequirement === undefined
+          ? {}
+          : { humanAcceptanceRequirement: current.value.humanAcceptanceRequirement }),
+        ...(current.value.verificationLevel === undefined
+          ? {}
+          : { verificationLevel: current.value.verificationLevel }),
         agentStatus: condition.status,
         ...(condition.blockingReason === undefined
           ? {}
@@ -312,6 +347,12 @@ export class LinearMutationClient {
         ...(current.value.reviewRequirement === undefined
           ? {}
           : { reviewRequirement: current.value.reviewRequirement }),
+        ...(current.value.humanAcceptanceRequirement === undefined
+          ? {}
+          : { humanAcceptanceRequirement: current.value.humanAcceptanceRequirement }),
+        ...(current.value.verificationLevel === undefined
+          ? {}
+          : { verificationLevel: current.value.verificationLevel }),
       }),
       ...current.value.otherLabelIds,
     ];
@@ -332,6 +373,8 @@ export class LinearMutationClient {
     const controlledIds = new Set([
       ...Object.keys(context.catalog.agentRole.valueByLabelId),
       ...Object.keys(context.catalog.reviewRequirement.valueByLabelId),
+      ...Object.keys(context.catalog.humanAcceptance?.valueByLabelId ?? {}),
+      ...Object.keys(context.catalog.verificationLevel?.valueByLabelId ?? {}),
       ...Object.keys(context.catalog.agentStatus.valueByLabelId),
       ...Object.keys(context.catalog.blockingReason.valueByLabelId),
     ]);

@@ -56,6 +56,15 @@ export interface CliHandlers {
   readonly run: (
     input: Readonly<{ projectId?: string; dryRun?: boolean }>,
   ) => Promise<CliCommandOutcome>;
+  readonly humanAcceptanceList: (
+    input: Readonly<{ projectId: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly humanAcceptanceAccept: (
+    input: Readonly<{ projectId: string; externalIssueId: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly humanAcceptanceRequestAdjustment: (
+    input: Readonly<{ projectId: string; externalIssueId: string }>,
+  ) => Promise<CliCommandOutcome>;
   /** C015o decision 4: the human-issued escape hatch out of `requires_manual` (or any other
    * stuck, non-terminal job-progress stage) -- see src/cli/dispatch/resolve-handlers.ts's own
    * header for the full rationale. */
@@ -171,6 +180,9 @@ const defaultQuotaHandlers: QuotaCliHandlers = Object.freeze({
 
 export const defaultCliHandlers: CliHandlers = Object.freeze({
   run: () => blocked("run"),
+  humanAcceptanceList: () => blocked("acceptance list"),
+  humanAcceptanceAccept: () => blocked("acceptance accept"),
+  humanAcceptanceRequestAdjustment: () => blocked("acceptance request-adjustment"),
   dispatchResolve: () => blocked("dispatch resolve"),
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
@@ -308,6 +320,43 @@ export function createProgram(
         handlers.run({
           projectId: options.project,
           ...(options.dryRun === true ? { dryRun: true } : {}),
+        }),
+      )(),
+    );
+
+  const acceptance = program
+    .command("acceptance")
+    .description("列出或處理合併後等待產品負責人驗收的工單");
+  acceptance
+    .command("list")
+    .description("列出指定專案目前待驗收項目")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .action((options: { readonly project: string }) =>
+      action(state, io, () => handlers.humanAcceptanceList({ projectId: options.project }))(),
+    );
+  acceptance
+    .command("accept")
+    .description("明確接受一張待驗收工單並將 Linear 轉為完成")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .requiredOption("--issue <linear-issue-id>", "Linear 工單 id")
+    .action((options: { readonly project: string; readonly issue: string }) =>
+      action(state, io, () =>
+        handlers.humanAcceptanceAccept({
+          projectId: options.project,
+          externalIssueId: options.issue,
+        }),
+      )(),
+    );
+  acceptance
+    .command("request-adjustment")
+    .description("記錄需要調整；原工單維持待驗收，由 Team Lead 沿用既有流程開修正單")
+    .requiredOption("--project <project-id>", "專案識別碼")
+    .requiredOption("--issue <linear-issue-id>", "Linear 工單 id")
+    .action((options: { readonly project: string; readonly issue: string }) =>
+      action(state, io, () =>
+        handlers.humanAcceptanceRequestAdjustment({
+          projectId: options.project,
+          externalIssueId: options.issue,
         }),
       )(),
     );

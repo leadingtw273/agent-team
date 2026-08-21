@@ -57,6 +57,7 @@ import {
   createWorkStatusCapabilitySnapshot,
   discoverReadyDispatchCandidates,
   FileWorkStatusCapabilityStore,
+  type HumanAcceptanceStorePort,
   type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
 } from "../../adapters/dispatch/index.js";
@@ -245,6 +246,7 @@ export interface DispatchOncePorts {
    * `FileIssueAdmissionStore`; `--dry-run` uses the ephemeral `InMemoryIssueAdmissionStore`
    * (ephemeral-ports.ts), the same "throwaway in-memory" convention `leases`/`jobs` already use. */
   readonly admission: IssueAdmissionPort;
+  readonly humanAcceptance?: Pick<HumanAcceptanceStorePort, "listPending">;
   readonly locks?: IssueScopeLockPort;
   /** Durable post-Job bootstrap. It must confirm before the selected claim may attach its Job. */
   readonly bootstrap?: (input: DispatchBootstrapInput) => Promise<Result<void, DomainError>>;
@@ -275,6 +277,10 @@ export type DispatchBootstrapOutcome =
 export type DispatchOnceAdmissionSkippedIssue =
   | Readonly<{ issueId: string; reason: "issue_claim_active" }>
   | Readonly<{ issueId: string; reason: "issue_scope_lock_unavailable" }>
+  | Readonly<{
+      issueId: string;
+      reason: "human_acceptance_pending" | "human_acceptance_state_unavailable";
+    }>
   | Readonly<{
       issueId: string;
       reason: "quota_unknown" | "quota_blocked" | "provider_route_unavailable";
@@ -405,11 +411,52 @@ export async function dispatchOnce(
   if (!discovered.ok) {
     return Object.freeze({ outcome: "discovery_failed" as const, error: discovered.error });
   }
+  const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
+  const acceptanceClearedCandidates: DispatcherCandidate[] = [];
+  const humanWorkflowCandidates = discovered.value.candidates.filter(
+    (candidate) => candidate.issue.verificationLevel !== undefined,
+  );
+  let pendingHumanAcceptanceIssueIds: ReadonlySet<string> | undefined;
+  if (humanWorkflowCandidates.length > 0 && ports.humanAcceptance !== undefined) {
+    const pending = await ports.humanAcceptance.listPending(ready.project.id);
+    if (pending.ok) {
+      pendingHumanAcceptanceIssueIds = new Set(
+        pending.value.map((record) => record.identity.issueId),
+      );
+    }
+  }
+  for (const candidate of discovered.value.candidates) {
+    // Absence marks a legacy candidate from a project that has not switched to the new contract.
+    // Existing in-flight Jobs never enter this discovery path at all.
+    if (candidate.issue.verificationLevel === undefined) {
+      acceptanceClearedCandidates.push(candidate);
+      continue;
+    }
+    if (pendingHumanAcceptanceIssueIds === undefined) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "human_acceptance_state_unavailable" as const,
+        }),
+      );
+      continue;
+    }
+    if (pendingHumanAcceptanceIssueIds.has(candidate.issue.id)) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "human_acceptance_pending" as const,
+        }),
+      );
+      continue;
+    }
+    acceptanceClearedCandidates.push(candidate);
+  }
   // T03A: quota resolves before provider liveness. Unknown quota therefore performs no CLI probe,
   // creates no admission claim, and cannot reach lease/Job/provider pipeline creation.
   const quotaObservations = await observeQuotaRouteCandidates({
     routingConfig: ready.routingConfig,
-    candidates: discovered.value.candidates,
+    candidates: acceptanceClearedCandidates,
     quota: ready.quotaAdmission,
   });
   const codexQuotaReady = quotaObservations.some(
@@ -429,13 +476,13 @@ export async function dispatchOnce(
    * probe, or consume occurs in that case. For the exceptional route, `consume...` returns one
    * exact candidate only after a matching, live CLI version has atomically consumed its private
    * attestation; every other candidate remains outside the admission loop. */
-  let candidatesForAdmission: readonly DispatcherCandidate[] = discovered.value.candidates;
+  let candidatesForAdmission: readonly DispatcherCandidate[] = acceptanceClearedCandidates;
   let routeObservationsForAdmission: readonly CandidateObservation[] = routeObservations;
   if (
     options.allowOperatorCanary === true &&
     ready.operatorCanary !== undefined &&
     !hasNormalModelAdmissionCandidate(
-      discovered.value.candidates,
+      acceptanceClearedCandidates,
       ready.routingConfig,
       routeObservations,
     )
@@ -443,7 +490,7 @@ export async function dispatchOnce(
     const canary = await consumeExactOperatorCanaryCandidate({
       store: ready.operatorCanary.store,
       projectId: ready.project.id,
-      candidates: discovered.value.candidates,
+      candidates: acceptanceClearedCandidates,
       routingConfig: ready.routingConfig,
       claude: {
         config: ready.claude.config,
@@ -457,7 +504,6 @@ export async function dispatchOnce(
     }
   }
 
-  const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
   const claimedRevisions = new Map<string, number>();
   const claimedCandidates: DispatcherCandidate[] = [];
   for (const candidate of candidatesForAdmission) {

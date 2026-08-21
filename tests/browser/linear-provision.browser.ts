@@ -136,7 +136,7 @@ test.describe("O003 Linear provision UI", () => {
     await visit(page);
     const section = page.getByRole("region", { name: "Linear 設定預覽" });
     await expect(section.getByText("設定未完成", { exact: true })).toBeVisible();
-    await expect(section.getByText("可自動建立").locator("..").getByText("27")).toBeVisible();
+    await expect(section.getByText("可自動建立").locator("..").getByText("34")).toBeVisible();
     await expect(section.getByText("人工步驟").locator("..").getByText("7")).toBeVisible();
     await expect(section).toContainText("不刪除、不改名");
     await expect(section).toContainText("不從 Linear 留言取得核可");
@@ -153,7 +153,7 @@ test.describe("O003 Linear provision UI", () => {
     await expect(review).toBeFocused();
     await page.keyboard.press("Enter");
     await page.keyboard.press("Enter");
-    await expect(section.locator(".js-linear-status")).toContainText("已建立並 read-back 27 項");
+    await expect(section.locator(".js-linear-status")).toContainText("已建立並 read-back 34 項");
   });
 
   test("has no horizontal overflow at 390px and 320px and captures synthetic evidence", async ({

@@ -66,6 +66,7 @@ class ScriptedTransport implements GhJsonTransport {
 function pull(
   overrides: Readonly<Record<string, unknown>> = {},
 ): Readonly<Record<string, unknown>> {
+  const merged = overrides["state"] === "merged";
   return {
     id: "PR_node_fixture",
     number: 42,
@@ -79,6 +80,8 @@ function pull(
     mergeStateStatus: "clean",
     baseSha: baseCommitSha,
     autoMergeEnabled: false,
+    mergeCommitSha: merged ? "3333333333333333333333333333333333333333" : null,
+    mergedAt: merged ? timestamp : null,
     updatedAt: timestamp,
     ...overrides,
   };
@@ -447,6 +450,8 @@ describe("GitHub source-control adapter", () => {
       mutation,
     );
     expect(merged.ok && merged.value.state).toBe("merged");
+    expect(merged.ok && merged.value.mergeCommitSha).toBe("3".repeat(40));
+    expect(merged.ok && merged.value.mergedAt).toBe("2026-08-04T12:34:56.000Z");
     successTransport.expectDone();
 
     // Idempotent: already-merged never even issues the PUT.

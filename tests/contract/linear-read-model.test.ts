@@ -14,7 +14,12 @@ import {
   type LinearRelationRecord,
   type LinearWorkflowStateRecord,
 } from "../../src/adapters/linear/index.js";
-import { agentRoleSchema, reviewRequirementSchema } from "../../src/domain/project/index.js";
+import {
+  agentRoleSchema,
+  humanAcceptanceRequirementSchema,
+  reviewRequirementSchema,
+  verificationLevelSchema,
+} from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons, workStatuses } from "../../src/domain/workflow/index.js";
 
 interface Fixture {
@@ -258,6 +263,88 @@ describe("Linear read model contract", () => {
     expect(Object.keys(result.value.blockingReason.labelIdByValue).sort()).toEqual(
       [...blockingReasons].sort(),
     );
+    expect(result.value.humanAcceptance).toBeUndefined();
+    expect(result.value.verificationLevel).toBeUndefined();
+  });
+
+  it("reads the optional human-workflow groups strictly once they are provisioned", () => {
+    const humanLabels: readonly LinearLabelRecord[] = [
+      { id: "group-human-acceptance", name: "人類驗收", isGroup: true, parentId: null },
+      {
+        id: "human-required",
+        name: "需要",
+        isGroup: false,
+        parentId: "group-human-acceptance",
+      },
+      {
+        id: "human-not-required",
+        name: "不需要",
+        isGroup: false,
+        parentId: "group-human-acceptance",
+      },
+      { id: "group-verification", name: "驗證強度", isGroup: true, parentId: null },
+      { id: "verify-light", name: "輕量", isGroup: false, parentId: "group-verification" },
+      { id: "verify-standard", name: "標準", isGroup: false, parentId: "group-verification" },
+      { id: "verify-strict", name: "嚴格", isGroup: false, parentId: "group-verification" },
+    ];
+    const catalog = buildLinearReadCatalog(fixture.states, [...fixture.labels, ...humanLabels]);
+    expect(catalog.ok).toBe(true);
+    if (!catalog.ok) return;
+    expect(Object.keys(catalog.value.humanAcceptance?.labelIdByValue ?? {}).sort()).toEqual(
+      [...humanAcceptanceRequirementSchema.options].sort(),
+    );
+    expect(Object.keys(catalog.value.verificationLevel?.labelIdByValue ?? {}).sort()).toEqual(
+      [...verificationLevelSchema.options].sort(),
+    );
+
+    const context = { team: fixture.team, project: fixture.project, catalog: catalog.value };
+    const snapshot = createLinearIssueSnapshot(
+      context,
+      {
+        ...fixture.issue,
+        labelIds: [...fixture.issue.labelIds, "human-required", "verify-standard"],
+      },
+      fixture.relations,
+      fixture.comments,
+    );
+    expect(snapshot.ok).toBe(true);
+    if (snapshot.ok) {
+      expect(snapshot.value.humanAcceptanceRequirement).toBe("required");
+      expect(snapshot.value.verificationLevel).toBe("standard");
+    }
+
+    const duplicateSelection = createLinearIssueSnapshot(
+      context,
+      {
+        ...fixture.issue,
+        labelIds: [
+          ...fixture.issue.labelIds,
+          "human-required",
+          "human-not-required",
+          "verify-standard",
+        ],
+      },
+      fixture.relations,
+      fixture.comments,
+    );
+    expect(duplicateSelection.ok ? "ok" : duplicateSelection.error.code).toBe("external_failure");
+
+    const partiallyProvisioned = buildLinearReadCatalog(fixture.states, [
+      ...fixture.labels,
+      ...humanLabels.filter(
+        (label) =>
+          label.id === "group-human-acceptance" || label.parentId === "group-human-acceptance",
+      ),
+    ]);
+    expect(partiallyProvisioned.ok ? "ok" : partiallyProvisioned.error.code).toBe(
+      "external_failure",
+    );
+
+    const partial = buildLinearReadCatalog(fixture.states, [
+      ...fixture.labels,
+      ...humanLabels.filter((label) => label.id !== "verify-strict"),
+    ]);
+    expect(partial.ok ? "ok" : partial.error.code).toBe("external_failure");
   });
 
   it("normalizes nullable trashed values while preserving true and rejecting omission", async () => {

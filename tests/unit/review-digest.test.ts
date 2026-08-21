@@ -107,6 +107,32 @@ describe("requirement snapshots", () => {
     );
     expect(first.requirementsDigest).not.toBe(changed.requirementsDigest);
   });
+
+  it.each([
+    {
+      field: "human summary",
+      issue: issue({
+        humanSummary: {
+          objective: "讓負責人看懂工單",
+          outcome: "Linear 顯示三句摘要",
+          acceptance: "逐句核對",
+        },
+      }),
+    },
+    {
+      field: "human acceptance requirement",
+      issue: issue({ humanAcceptanceRequirement: "required" }),
+    },
+    { field: "verification level", issue: issue({ verificationLevel: "strict" }) },
+  ])("binds $field into the approved requirement digest", (entry) => {
+    const baseline = valueOf(
+      createRequirementSnapshot(issue(), instant("2026-08-04T12:00:00.000Z")),
+    );
+    const changed = valueOf(
+      createRequirementSnapshot(entry.issue, instant("2026-08-04T12:00:00.000Z")),
+    );
+    expect(changed.requirementsDigest).not.toBe(baseline.requirementsDigest);
+  });
 });
 
 describe("effective tree diff digest", () => {

@@ -87,8 +87,8 @@ describe("O003 Linear provision localhost UI", () => {
     expect(await applied.json()).toMatchObject({
       state: "applied",
       result: "incomplete",
-      createdCount: 27,
-      preview: { summary: { unchanged: 27, manual: 7, conflict: 0 } },
+      createdCount: 34,
+      preview: { summary: { unchanged: 34, manual: 7, conflict: 0 } },
     });
     expect(retried.status).toBe(409);
     expect(await retried.json()).toEqual({ state: "error", code: "conflict" });
@@ -165,7 +165,7 @@ describe("O003 Linear provision localhost UI", () => {
     expect(applied.status).toBe(200);
     expect(await applied.json()).toMatchObject({
       state: "manual_applied",
-      preview: { summary: { unchanged: 1, create: 27, manual: 6, conflict: 0 } },
+      preview: { summary: { unchanged: 1, create: 34, manual: 6, conflict: 0 } },
     });
     expect(replayed.status).toBe(409);
     expect(await replayed.json()).toEqual({ state: "error", code: "conflict" });

@@ -186,6 +186,8 @@ class FakeGh implements Pick<
       mergeStateStatus: "clean" as const,
       baseSha: "2".repeat(40),
       autoMergeEnabled: pr.autoMergeEnabled,
+      mergeCommitSha: pr.mergeCommitSha ?? null,
+      mergedAt: pr.state === "merged" ? new Date().toISOString() : null,
       updatedAt: new Date().toISOString(),
     };
   }
@@ -262,7 +264,7 @@ class FakeGh implements Pick<
     } else if (
       /\/pulls\/[1-9][0-9]*$/u.test(endpoint) &&
       method === "GET" &&
-      jq.includes("mergeCommitSha")
+      jq.includes("repository:.base.repo.full_name")
     ) {
       // Same REST endpoint as the branch below, but `mergedConfig.read`'s own jq projection asks
       // for a different (also-real, GitHub-defined) shape of the same underlying PR resource.

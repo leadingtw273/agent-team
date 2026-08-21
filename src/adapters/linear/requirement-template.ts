@@ -67,9 +67,11 @@
  *   are still not accepted: the template's own instruction asks for bullets, not an ordered list.
  */
 import {
+  humanSummaryTemplate,
   readyGateTemplateHeadings,
   readyGateTemplatePlaceholder,
 } from "../../application/registration/linear-provision-model.js";
+import type { HumanSummary } from "../../domain/project/index.js";
 
 export type ReadyGateDependenciesField =
   Readonly<{ kind: "none" }> | Readonly<{ kind: "unparsed" }> | Readonly<{ kind: "absent" }>;
@@ -80,6 +82,7 @@ export interface ReadyGateChangeRegion {
 }
 
 export interface ReadyGateTemplateFields {
+  readonly humanSummary?: HumanSummary;
   readonly goal?: string;
   readonly background?: string;
   readonly acceptanceCriteria?: readonly string[];
@@ -190,6 +193,53 @@ function nonEmptyText(body: string | undefined): string | undefined {
  * space" regardless of which one matched. */
 const bulletMarkerPattern = /^[-*+] /u;
 
+function parseHumanSummary(sections: ParsedSections): HumanSummary | undefined {
+  const body = bodyIfUnique(sections, humanSummaryTemplate.heading);
+  if (body === undefined) return undefined;
+  const entries = body
+    .split(/\r\n|\r|\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (entries.length !== 3) return undefined;
+
+  const labels = [
+    ["objective", humanSummaryTemplate.objective],
+    ["outcome", humanSummaryTemplate.outcome],
+    ["acceptance", humanSummaryTemplate.acceptance],
+  ] as const;
+  const values: Partial<Record<(typeof labels)[number][0], string>> = {};
+  for (const entry of entries) {
+    if (!bulletMarkerPattern.test(entry)) return undefined;
+    const content = entry.slice(2).trim();
+    const matching = labels.filter(([, label]) => content.startsWith(`${label}：`));
+    if (matching.length !== 1 || matching[0] === undefined) return undefined;
+    const [key, label] = matching[0];
+    if (values[key] !== undefined) return undefined;
+    const value = content.slice(`${label}：`.length).trim();
+    if (
+      value.length === 0 ||
+      value === readyGateTemplatePlaceholder ||
+      /##\s/u.test(value) ||
+      Object.values(readyGateTemplateHeadings).some((heading) => value === heading)
+    ) {
+      return undefined;
+    }
+    values[key] = value;
+  }
+  if (
+    values.objective === undefined ||
+    values.outcome === undefined ||
+    values.acceptance === undefined
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    objective: values.objective,
+    outcome: values.outcome,
+    acceptance: values.acceptance,
+  });
+}
+
 function parseBulletList(body: string | undefined): readonly string[] | undefined {
   if (body === undefined) return undefined;
   const items = body
@@ -243,6 +293,7 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
   }
 
   const sections = splitSections(description);
+  const humanSummary = parseHumanSummary(sections);
   const goal = nonEmptyText(bodyIfUnique(sections, readyGateTemplateHeadings.goal));
   const background = nonEmptyText(bodyIfUnique(sections, readyGateTemplateHeadings.background));
   const acceptanceCriteria = parseBulletList(
@@ -266,6 +317,7 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
   );
 
   return Object.freeze({
+    ...(humanSummary === undefined ? {} : { humanSummary }),
     ...(goal === undefined ? {} : { goal }),
     ...(background === undefined ? {} : { background }),
     ...(acceptanceCriteria === undefined ? {} : { acceptanceCriteria }),

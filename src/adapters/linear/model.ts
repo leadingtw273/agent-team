@@ -9,10 +9,14 @@ import {
 } from "../../domain/foundation/index.js";
 import {
   agentRoleSchema,
+  humanAcceptanceRequirementSchema,
   reviewRequirementSchema,
+  verificationLevelSchema,
   type AgentRole,
+  type HumanAcceptanceRequirement,
   type Priority,
   type ReviewRequirement,
+  type VerificationLevel,
 } from "../../domain/project/index.js";
 import {
   agentStatuses,
@@ -83,6 +87,8 @@ export interface LinearReadCatalog {
   readonly stateIdByWorkStatus: Readonly<Record<WorkStatus, string>>;
   readonly agentRole: LinearLabelGroupCatalog<AgentRole>;
   readonly reviewRequirement: LinearLabelGroupCatalog<ReviewRequirement>;
+  readonly humanAcceptance?: LinearLabelGroupCatalog<HumanAcceptanceRequirement>;
+  readonly verificationLevel?: LinearLabelGroupCatalog<VerificationLevel>;
   readonly agentStatus: LinearLabelGroupCatalog<AgentStatus>;
   readonly blockingReason: LinearLabelGroupCatalog<BlockingReason>;
 }
@@ -108,6 +114,8 @@ export interface LinearIssueSnapshot {
   readonly stateId?: string;
   readonly agentRole?: AgentRole;
   readonly reviewRequirement?: ReviewRequirement;
+  readonly humanAcceptanceRequirement?: HumanAcceptanceRequirement;
+  readonly verificationLevel?: VerificationLevel;
   readonly agentCondition?: AgentCondition;
   readonly otherLabelIds: readonly string[];
   readonly relations: readonly LinearRelationRecord[];
@@ -142,6 +150,17 @@ export const linearReviewRequirementNames = {
   dual_review: "雙重審查",
 } as const satisfies Readonly<Record<ReviewRequirement, string>>;
 
+export const linearHumanAcceptanceNames = {
+  required: "需要",
+  not_required: "不需要",
+} as const satisfies Readonly<Record<HumanAcceptanceRequirement, string>>;
+
+export const linearVerificationLevelNames = {
+  light: "輕量",
+  standard: "標準",
+  strict: "嚴格",
+} as const satisfies Readonly<Record<VerificationLevel, string>>;
+
 export const linearAgentStatusNames = {
   queued: "排隊中",
   executing: "執行中",
@@ -172,6 +191,16 @@ const labelGroups = {
     groupName: "審查需求",
     values: linearReviewRequirementNames,
     keys: reviewRequirementSchema.options,
+  },
+  humanAcceptance: {
+    groupName: "人類驗收",
+    values: linearHumanAcceptanceNames,
+    keys: humanAcceptanceRequirementSchema.options,
+  },
+  verificationLevel: {
+    groupName: "驗證強度",
+    values: linearVerificationLevelNames,
+    keys: verificationLevelSchema.options,
   },
   agentStatus: { groupName: "Agent 狀態", values: linearAgentStatusNames, keys: agentStatuses },
   blockingReason: {
@@ -242,6 +271,19 @@ function buildLabelGroup<Value extends string>(
   );
 }
 
+function buildOptionalLabelGroup<Value extends string>(
+  labels: readonly LinearLabelRecord[],
+  definition: {
+    readonly groupName: string;
+    readonly values: Readonly<Record<Value, string>>;
+    readonly keys: readonly Value[];
+  },
+): Result<LinearLabelGroupCatalog<Value> | undefined, DomainError> {
+  const groups = labels.filter((label) => label.isGroup && label.name === definition.groupName);
+  if (groups.length === 0) return ok(undefined);
+  return buildLabelGroup(labels, definition);
+}
+
 export function buildLinearReadCatalog(
   states: readonly LinearWorkflowStateRecord[],
   labels: readonly LinearLabelRecord[],
@@ -253,6 +295,13 @@ export function buildLinearReadCatalog(
   if (!agentRole.ok) return agentRole;
   const reviewRequirement = buildLabelGroup(labels, labelGroups.reviewRequirement);
   if (!reviewRequirement.ok) return reviewRequirement;
+  const humanAcceptance = buildOptionalLabelGroup(labels, labelGroups.humanAcceptance);
+  if (!humanAcceptance.ok) return humanAcceptance;
+  const verificationLevel = buildOptionalLabelGroup(labels, labelGroups.verificationLevel);
+  if (!verificationLevel.ok) return verificationLevel;
+  if ((humanAcceptance.value === undefined) !== (verificationLevel.value === undefined)) {
+    return fail();
+  }
   const agentStatus = buildLabelGroup(labels, labelGroups.agentStatus);
   if (!agentStatus.ok) return agentStatus;
   const blockingReason = buildLabelGroup(labels, labelGroups.blockingReason);
@@ -262,6 +311,10 @@ export function buildLinearReadCatalog(
       ...statuses.value,
       agentRole: agentRole.value,
       reviewRequirement: reviewRequirement.value,
+      ...(humanAcceptance.value === undefined ? {} : { humanAcceptance: humanAcceptance.value }),
+      ...(verificationLevel.value === undefined
+        ? {}
+        : { verificationLevel: verificationLevel.value }),
       agentStatus: agentStatus.value,
       blockingReason: blockingReason.value,
     }),
@@ -313,6 +366,16 @@ export function createLinearIssueSnapshot(
   if (!agentRole.ok) return agentRole;
   const reviewRequirement = selectedValue(issue.labelIds, context.catalog.reviewRequirement);
   if (!reviewRequirement.ok) return reviewRequirement;
+  const humanAcceptance =
+    context.catalog.humanAcceptance === undefined
+      ? ok(undefined)
+      : selectedValue(issue.labelIds, context.catalog.humanAcceptance);
+  if (!humanAcceptance.ok) return humanAcceptance;
+  const verificationLevel =
+    context.catalog.verificationLevel === undefined
+      ? ok(undefined)
+      : selectedValue(issue.labelIds, context.catalog.verificationLevel);
+  if (!verificationLevel.ok) return verificationLevel;
   const agentStatus = selectedValue(issue.labelIds, context.catalog.agentStatus);
   if (!agentStatus.ok) return agentStatus;
   const blockingReason = selectedValue(issue.labelIds, context.catalog.blockingReason);
@@ -333,6 +396,8 @@ export function createLinearIssueSnapshot(
   const controlledIds = new Set([
     ...Object.keys(context.catalog.agentRole.valueByLabelId),
     ...Object.keys(context.catalog.reviewRequirement.valueByLabelId),
+    ...Object.keys(context.catalog.humanAcceptance?.valueByLabelId ?? {}),
+    ...Object.keys(context.catalog.verificationLevel?.valueByLabelId ?? {}),
     ...Object.keys(context.catalog.agentStatus.valueByLabelId),
     ...Object.keys(context.catalog.blockingReason.valueByLabelId),
   ]);
@@ -361,6 +426,12 @@ export function createLinearIssueSnapshot(
       ...(reviewRequirement.value === undefined
         ? {}
         : { reviewRequirement: reviewRequirement.value }),
+      ...(humanAcceptance.value === undefined
+        ? {}
+        : { humanAcceptanceRequirement: humanAcceptance.value }),
+      ...(verificationLevel.value === undefined
+        ? {}
+        : { verificationLevel: verificationLevel.value }),
       ...(agentCondition === undefined ? {} : { agentCondition }),
       otherLabelIds: Object.freeze(issue.labelIds.filter((labelId) => !controlledIds.has(labelId))),
       relations: Object.freeze([...relations]),

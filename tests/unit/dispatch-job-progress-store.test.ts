@@ -194,6 +194,78 @@ describe("FileJobProgressStore", () => {
     if (!removed.ok) expect(removed.error.code).toBe("invariant_violation");
   });
 
+  it("keeps the approved human-delivery snapshot immutable and attaches one acceptance identity", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const humanDelivery = {
+      acceptanceRequirement: "required" as const,
+      verificationLevel: "light" as const,
+      requirementDigest: "a".repeat(64),
+      humanSummaryDigest: "b".repeat(64),
+    };
+    const first = await store.compareAndSwap(jobId, null, baseRecord({ humanDelivery }));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const attached = await store.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        humanDelivery: { ...humanDelivery, acceptanceIdentityDigest: "c".repeat(64) },
+      }),
+    );
+    expect(attached.ok).toBe(true);
+    if (!attached.ok) return;
+
+    const changedPolicy = await store.compareAndSwap(
+      jobId,
+      attached.value.revision,
+      baseRecord({
+        humanDelivery: {
+          ...humanDelivery,
+          acceptanceRequirement: "not_required",
+          acceptanceIdentityDigest: "c".repeat(64),
+        },
+      }),
+    );
+    expect(changedPolicy.ok).toBe(false);
+    if (!changedPolicy.ok) expect(changedPolicy.error.code).toBe("invariant_violation");
+
+    const changedIdentity = await store.compareAndSwap(
+      jobId,
+      attached.value.revision,
+      baseRecord({
+        humanDelivery: { ...humanDelivery, acceptanceIdentityDigest: "d".repeat(64) },
+      }),
+    );
+    expect(changedIdentity.ok).toBe(false);
+    if (!changedIdentity.ok) expect(changedIdentity.error.code).toBe("invariant_violation");
+  });
+
+  it("does not silently migrate a legacy Job by attaching a human-delivery policy later", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const first = await store.compareAndSwap(jobId, null, baseRecord());
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const migrated = await store.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        humanDelivery: {
+          acceptanceRequirement: "required",
+          verificationLevel: "standard",
+          requirementDigest: "a".repeat(64),
+          humanSummaryDigest: "b".repeat(64),
+        },
+      }),
+    );
+
+    expect(migrated.ok).toBe(false);
+    if (!migrated.ok) expect(migrated.error.code).toBe("invariant_violation");
+  });
+
   it("rejects a changeRequestId shaped like a GitHub node id instead of a decimal PR number (O009c)", () => {
     const parsed = jobProgressRecordSchema.safeParse({
       schemaVersion: 1,

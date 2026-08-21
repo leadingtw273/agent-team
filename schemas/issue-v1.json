@@ -117,6 +117,36 @@
       "type": "string",
       "enum": ["code_review", "visual_review", "dual_review"]
     },
+    "humanSummary": {
+      "type": "object",
+      "properties": {
+        "objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        },
+        "acceptance": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10000
+        }
+      },
+      "required": ["objective", "outcome", "acceptance"],
+      "additionalProperties": false
+    },
+    "humanAcceptanceRequirement": {
+      "type": "string",
+      "enum": ["required", "not_required"]
+    },
+    "verificationLevel": {
+      "type": "string",
+      "enum": ["light", "standard", "strict"]
+    },
     "estimatedMinutes": {
       "type": "integer",
       "exclusiveMinimum": 0,

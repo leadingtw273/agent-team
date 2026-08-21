@@ -97,6 +97,8 @@ const projectedChangeRequestSchema = z
     // why the prior comment here calling it "current base-branch tip" was wrong -- C015z decision Q3).
     baseSha: z.string().regex(shaPattern),
     autoMergeEnabled: z.boolean(),
+    mergeCommitSha: z.string().regex(shaPattern).nullable().optional(),
+    mergedAt: z.string().nullable().optional(),
     updatedAt: z.string(),
   })
   .strict();
@@ -213,7 +215,7 @@ const squashMergeResultSchema = z.object({ merged: z.boolean() }).strict();
 // 2-valued-boolean-to-3-state map (GitHub's `.mergeable` is `true`/`false`/`null`), not a
 // many-values-collapsed-into-one-catch-all like the one this ticket removes.
 const changeRequestProjection =
-  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:.mergeable_state,baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),updatedAt:.updated_at}';
+  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:.mergeable_state,baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),mergeCommitSha:.merge_commit_sha,mergedAt:.merged_at,updatedAt:.updated_at}';
 const repositoryMetadataProjection = "{defaultBranch:.default_branch}";
 const checkProjection =
   '{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),url:.html_url}';
@@ -344,7 +346,21 @@ function snapshotFromProjection(
 ): Result<ChangeRequestSnapshot, DomainError> {
   const updatedAt = providerInstant(value.updatedAt);
   if (!updatedAt.ok) return failure();
-  return ok({ ...value, updatedAt: updatedAt.value });
+  if (value.state === "merged") {
+    if (value.mergeCommitSha == null || value.mergedAt == null) return failure();
+    const mergedAt = providerInstant(value.mergedAt);
+    if (!mergedAt.ok) return failure();
+    return ok({
+      ...value,
+      mergeCommitSha: value.mergeCommitSha,
+      mergedAt: mergedAt.value,
+      updatedAt: updatedAt.value,
+    });
+  }
+  const { mergeCommitSha: _mergeCommitSha, mergedAt: _mergedAt, ...snapshot } = value;
+  void _mergeCommitSha;
+  void _mergedAt;
+  return ok({ ...snapshot, updatedAt: updatedAt.value });
 }
 
 function commentFromProjection(

@@ -195,12 +195,24 @@ export const readyGateTemplateHeadings = Object.freeze({
   changeRegions: "預期變更區域（選填）",
 } as const);
 
+export const humanSummaryTemplate = Object.freeze({
+  heading: "人類摘要（給專案負責人）",
+  objective: "要做什麼",
+  outcome: "完成後會看到／能操作什麼",
+  acceptance: "如何驗收",
+} as const);
+
 /** The literal placeholder text the template asks the human to overwrite. Also a shared constant
  * so the C015b parser can recognize an untouched placeholder as "not actually filled in" rather
  * than treating it as real content. */
 export const readyGateTemplatePlaceholder = "（請填寫）";
 
-const readyGateTemplateDescription = `## ${readyGateTemplateHeadings.goal}
+const readyGateTemplateDescription = `## ${humanSummaryTemplate.heading}
+- ${humanSummaryTemplate.objective}：${readyGateTemplatePlaceholder}
+- ${humanSummaryTemplate.outcome}：${readyGateTemplatePlaceholder}
+- ${humanSummaryTemplate.acceptance}：${readyGateTemplatePlaceholder}
+
+## ${readyGateTemplateHeadings.goal}
 
 ## ${readyGateTemplateHeadings.background}
 
@@ -280,6 +292,8 @@ const labelGroups = [
     ["團隊管理者", "開發工程師", "代碼審查者", "視覺審查者", "整合工程師"],
   ],
   ["review_requirement", "審查需求", ["代碼審查", "視覺審查", "雙重審查"]],
+  ["human_acceptance", "人類驗收", ["需要", "不需要"]],
+  ["verification_level", "驗證強度", ["輕量", "標準", "嚴格"]],
   ["agent_status", "Agent 狀態", ["排隊中", "執行中", "等待中", "已暫停", "已阻塞"]],
   [
     "blocking_reason",
@@ -335,7 +349,7 @@ export const linearProvisionDesiredObjects: readonly LinearProvisionDesiredObjec
       type: "issue",
       description: "Agent Team Ready Gate 中文需求表單。",
       templateData: Object.freeze({
-        title: "[需求] 請填寫簡短標題",
+        title: "請用一句白話描述完成後的結果",
         description: readyGateTemplateDescription,
       }),
     }),

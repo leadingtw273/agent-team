@@ -124,6 +124,8 @@ function pull(
     mergeStateStatus: "clean",
     baseSha: "2".repeat(40),
     autoMergeEnabled: false,
+    mergeCommitSha: "b".repeat(40),
+    mergedAt: "2026-08-08T00:01:00.000Z",
     updatedAt: "2026-08-08T00:00:00.000Z",
     ...overrides,
   };
