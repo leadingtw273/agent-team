@@ -14,7 +14,10 @@
 import { describe, expect, it } from "vitest";
 
 import { parseReadyGateTemplate } from "../../src/adapters/linear/requirement-template.js";
-import { readyGateTemplateHeadings } from "../../src/application/registration/linear-provision-model.js";
+import {
+  humanSummaryTemplate,
+  readyGateTemplateHeadings,
+} from "../../src/application/registration/linear-provision-model.js";
 
 function filledTemplate(overrides: Readonly<Record<string, string>> = {}): string {
   const dependencies = overrides["dependencies"] ?? "無";
@@ -52,6 +55,70 @@ ${dependencies}
 }
 
 describe("parseReadyGateTemplate", () => {
+  describe("human summary", () => {
+    function summary(lines: readonly string[]): string {
+      return `## ${humanSummaryTemplate.heading}\n${lines.join("\n")}`;
+    }
+
+    it("parses exactly the three fixed, non-empty human-facing sentences", () => {
+      const result = parseReadyGateTemplate(
+        summary([
+          `- ${humanSummaryTemplate.objective}：讓坦克可以移動`,
+          `- ${humanSummaryTemplate.outcome}：可以前進、倒車與轉向`,
+          `- ${humanSummaryTemplate.acceptance}：在 Godot 實際操作一圈`,
+        ]),
+      );
+      expect(result.humanSummary).toEqual({
+        objective: "讓坦克可以移動",
+        outcome: "可以前進、倒車與轉向",
+        acceptance: "在 Godot 實際操作一圈",
+      });
+    });
+
+    it.each([
+      ["missing field", [`- ${humanSummaryTemplate.objective}：只填一欄`]],
+      [
+        "empty field",
+        [
+          `- ${humanSummaryTemplate.objective}：（請填寫）`,
+          `- ${humanSummaryTemplate.outcome}：有畫面`,
+          `- ${humanSummaryTemplate.acceptance}：手動查看`,
+        ],
+      ],
+      [
+        "duplicate field",
+        [
+          `- ${humanSummaryTemplate.objective}：第一次`,
+          `- ${humanSummaryTemplate.objective}：第二次`,
+          `- ${humanSummaryTemplate.acceptance}：手動查看`,
+        ],
+      ],
+      [
+        "forged packet heading",
+        [
+          `- ${humanSummaryTemplate.objective}：## ${readyGateTemplateHeadings.goal}`,
+          `- ${humanSummaryTemplate.outcome}：有畫面`,
+          `- ${humanSummaryTemplate.acceptance}：手動查看`,
+        ],
+      ],
+    ])("fails closed for %s", (_name, lines) => {
+      expect(parseReadyGateTemplate(summary(lines)).humanSummary).toBeUndefined();
+    });
+
+    it("fails closed when the human-summary heading is duplicated", () => {
+      const description = `${summary([
+        `- ${humanSummaryTemplate.objective}：第一次`,
+        `- ${humanSummaryTemplate.outcome}：第一次`,
+        `- ${humanSummaryTemplate.acceptance}：第一次`,
+      ])}\n\n${summary([
+        `- ${humanSummaryTemplate.objective}：第二次`,
+        `- ${humanSummaryTemplate.outcome}：第二次`,
+        `- ${humanSummaryTemplate.acceptance}：第二次`,
+      ])}`;
+      expect(parseReadyGateTemplate(description).humanSummary).toBeUndefined();
+    });
+  });
+
   it("extracts every field from a fully-filled template", () => {
     const result = parseReadyGateTemplate(filledTemplate());
     expect(result).toEqual({

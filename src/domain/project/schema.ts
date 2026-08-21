@@ -34,6 +34,21 @@ export const reviewRequirementSchema = z.enum(["code_review", "visual_review", "
 
 export type ReviewRequirement = z.infer<typeof reviewRequirementSchema>;
 
+export const humanAcceptanceRequirementSchema = z.enum(["required", "not_required"]);
+export type HumanAcceptanceRequirement = z.infer<typeof humanAcceptanceRequirementSchema>;
+
+export const verificationLevelSchema = z.enum(["light", "standard", "strict"]);
+export type VerificationLevel = z.infer<typeof verificationLevelSchema>;
+
+export const humanSummarySchema = z
+  .object({
+    objective: nonEmptyTextSchema,
+    outcome: nonEmptyTextSchema,
+    acceptance: nonEmptyTextSchema,
+  })
+  .strict();
+export type HumanSummary = z.infer<typeof humanSummarySchema>;
+
 export const prioritySchema = z.enum(["urgent", "high", "medium", "low"]);
 export type Priority = z.infer<typeof prioritySchema>;
 
@@ -113,6 +128,9 @@ export const issueSchema = z
     priority: prioritySchema.optional(),
     agentRole: agentRoleSchema.optional(),
     reviewRequirement: reviewRequirementSchema.optional(),
+    humanSummary: humanSummarySchema.optional(),
+    humanAcceptanceRequirement: humanAcceptanceRequirementSchema.optional(),
+    verificationLevel: verificationLevelSchema.optional(),
     estimatedMinutes: z
       .number()
       .int()

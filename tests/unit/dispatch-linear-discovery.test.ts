@@ -38,7 +38,10 @@ import {
   type Project,
 } from "../../src/domain/project/index.js";
 import { agentStatuses, blockingReasons } from "../../src/domain/workflow/index.js";
-import { readyGateTemplateHeadings } from "../../src/application/registration/linear-provision-model.js";
+import {
+  humanSummaryTemplate,
+  readyGateTemplateHeadings,
+} from "../../src/application/registration/linear-provision-model.js";
 
 function project(): Project {
   return projectSchema.parse({
@@ -156,7 +159,12 @@ function snapshotWithoutAgentRole(): LinearIssueSnapshot {
  * in, including an explicit "無" (no dependencies) -- the shape a real, fully-compliant Linear
  * issue would carry. */
 function filledTemplateDescription(): string {
-  return `## ${readyGateTemplateHeadings.goal}
+  return `## ${humanSummaryTemplate.heading}
+- ${humanSummaryTemplate.objective}：讓 Linear 新單能被人一眼看懂
+- ${humanSummaryTemplate.outcome}：看得到三句白話摘要
+- ${humanSummaryTemplate.acceptance}：核對三句內容與實際需求一致
+
+## ${readyGateTemplateHeadings.goal}
 讓真實 Linear 候選能通過 eligibility。
 
 ## ${readyGateTemplateHeadings.background}
@@ -225,7 +233,16 @@ describe("discoverReadyDispatchCandidates", () => {
 
   it("C015b: projects every Ready Gate template field when the description genuinely follows it", async () => {
     const readModel = fakeReadModel({
-      readIssue: () => Promise.resolve(ok(snapshot({ description: filledTemplateDescription() }))),
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              description: filledTemplateDescription(),
+              humanAcceptanceRequirement: "required",
+              verificationLevel: "standard",
+            }),
+          ),
+        ),
     });
     const result = await discoverReadyDispatchCandidates({
       project: project(),
@@ -247,6 +264,13 @@ describe("discoverReadyDispatchCandidates", () => {
     expect(candidate?.issue.changeRegions).toEqual([
       { path: "src/adapters/dispatch/linear-discovery.ts", coverage: "exact" },
     ]);
+    expect(candidate?.issue.humanSummary).toEqual({
+      objective: "讓 Linear 新單能被人一眼看懂",
+      outcome: "看得到三句白話摘要",
+      acceptance: "核對三句內容與實際需求一致",
+    });
+    expect(candidate?.issue.humanAcceptanceRequirement).toBe("required");
+    expect(candidate?.issue.verificationLevel).toBe("standard");
   });
 
   it("C015b: skips (visibly, with its own reason) an issue whose dependencies section has unresolvable free text", async () => {

@@ -272,8 +272,8 @@ describe("O003 Linear provision use case", () => {
     ]);
 
     expect([firstResult, secondResult].filter((result) => result.ok)).toHaveLength(1);
-    expect(remote.createCalls).toHaveLength(27);
-    expect(Object.keys(bindings.snapshot().byKey)).toHaveLength(27);
+    expect(remote.createCalls).toHaveLength(34);
+    expect(Object.keys(bindings.snapshot().byKey)).toHaveLength(34);
   });
 
   it("rejects confirmation replay across contexts and config payload changes", async () => {
@@ -332,7 +332,7 @@ describe("O003 Linear provision use case", () => {
     expect(preview.ok).toBe(true);
     if (!preview.ok) return;
     expect(preview.value.actions).toHaveLength(linearProvisionDesiredObjects.length);
-    expect(preview.value.summary).toEqual({ unchanged: 0, create: 27, manual: 7, conflict: 0 });
+    expect(preview.value.summary).toEqual({ unchanged: 0, create: 34, manual: 7, conflict: 0 });
     expect(preview.value.actions.filter((item) => item.kind === "workflow_state")).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "待辦", state: "manual_create" }),
@@ -363,11 +363,11 @@ describe("O003 Linear provision use case", () => {
     expect(provisioned.ok).toBe(true);
     if (!provisioned.ok) return;
     expect(provisioned.value.state).toBe("incomplete");
-    expect(provisioned.value.createdKeys).toHaveLength(27);
-    expect(remote.createCalls).toHaveLength(27);
-    expect(Object.keys(bindings.snapshot().byKey)).toHaveLength(27);
+    expect(provisioned.value.createdKeys).toHaveLength(34);
+    expect(remote.createCalls).toHaveLength(34);
+    expect(Object.keys(bindings.snapshot().byKey)).toHaveLength(34);
     expect(retried).toEqual(err(domainError("conflict")));
-    expect(remote.createCalls).toHaveLength(27);
+    expect(remote.createCalls).toHaveLength(34);
   });
 
   it("keeps manual items incomplete until an exact ID read-back binds all Chinese statuses", async () => {
@@ -394,7 +394,7 @@ describe("O003 Linear provision use case", () => {
     expect(final.ok).toBe(true);
     if (!final.ok) return;
     expect(final.value.state).toBe("ready");
-    expect(final.value.summary).toEqual({ unchanged: 34, create: 0, manual: 0, conflict: 0 });
+    expect(final.value.summary).toEqual({ unchanged: 41, create: 0, manual: 0, conflict: 0 });
   });
 
   it("never adopts by name, renames, or deletes an existing object", async () => {

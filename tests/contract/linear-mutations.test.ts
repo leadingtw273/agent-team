@@ -42,6 +42,37 @@ const fixtureUrl = new URL("../../fixtures/adapters/linear/read-model.json", imp
 let fixture: Fixture;
 let context: LinearProjectContext;
 
+function humanWorkflowLabels(): readonly LinearLabelRecord[] {
+  return [
+    { id: "group-human-acceptance", name: "人類驗收", isGroup: true, parentId: null },
+    {
+      id: "human-required",
+      name: "需要",
+      isGroup: false,
+      parentId: "group-human-acceptance",
+    },
+    {
+      id: "human-not-required",
+      name: "不需要",
+      isGroup: false,
+      parentId: "group-human-acceptance",
+    },
+    { id: "group-verification", name: "驗證強度", isGroup: true, parentId: null },
+    { id: "verify-light", name: "輕量", isGroup: false, parentId: "group-verification" },
+    { id: "verify-standard", name: "標準", isGroup: false, parentId: "group-verification" },
+    { id: "verify-strict", name: "嚴格", isGroup: false, parentId: "group-verification" },
+  ];
+}
+
+function contextWithHumanWorkflow(): LinearProjectContext {
+  const catalog = buildLinearReadCatalog(fixture.states, [
+    ...fixture.labels,
+    ...humanWorkflowLabels(),
+  ]);
+  if (!catalog.ok) throw new Error("human_workflow_catalog_invalid");
+  return Object.freeze({ team: fixture.team, project: fixture.project, catalog: catalog.value });
+}
+
 beforeAll(async () => {
   fixture = JSON.parse(await readFile(fixtureUrl, "utf8")) as Fixture;
   const catalog = buildLinearReadCatalog(fixture.states, fixture.labels);
@@ -218,6 +249,49 @@ describe("Linear mutation contract", () => {
         otherLabelIds: ["label-extra"],
       }),
     );
+  });
+
+  it("creates and preserves human-workflow labels through later controlled-label mutations", async () => {
+    const harness = new MutationHarness();
+    const provisionedContext = contextWithHumanWorkflow();
+    const client = harness.client();
+    const created = await client.createIssue(provisionedContext, {
+      title: "Created human workflow fixture",
+      description: "Created description",
+      priority: "high",
+      workStatus: "ready",
+      agentRole: "implementer",
+      reviewRequirement: "code_review",
+      humanAcceptanceRequirement: "required",
+      verificationLevel: "standard",
+      agentStatus: "queued",
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.value.humanAcceptanceRequirement).toBe("required");
+    expect(created.value.verificationLevel).toBe("standard");
+
+    const executing = await client.setAgentCondition(provisionedContext, harness.issue.id, {
+      status: "executing",
+    });
+    expect(executing.ok).toBe(true);
+    if (!executing.ok) return;
+    expect(executing.value.humanAcceptanceRequirement).toBe("required");
+    expect(executing.value.verificationLevel).toBe("standard");
+  });
+
+  it("fails closed when asked to create new human-workflow labels before provisioning", async () => {
+    const harness = new MutationHarness();
+    const result = await harness.client().createIssue(context, {
+      title: "Unprovisioned human workflow fixture",
+      description: "Created description",
+      priority: "high",
+      workStatus: "ready",
+      humanAcceptanceRequirement: "required",
+      verificationLevel: "standard",
+    });
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
+    expect(harness.fetch).not.toHaveBeenCalled();
   });
 
   it("sets every Agent status and blocking reason with post-mutation read-back", async () => {

@@ -46,6 +46,7 @@ import { workStatuses, type AgentCondition, type WorkStatus } from "../../domain
 import type { LinearIssueSnapshot } from "../../adapters/linear/model.js";
 import type { LinearMutationClient } from "../../adapters/linear/write.js";
 import type { LinearReadModel } from "../../adapters/linear/read.js";
+import { parseReadyGateTemplate } from "../../adapters/linear/requirement-template.js";
 
 /** Same narrowing convention as `LinearDiscoveryReadModel` (linear-discovery.ts): only the
  * methods this adapter actually calls, so callers/tests can fake a plain object instead of a
@@ -78,6 +79,7 @@ function toWorkManagementSnapshot(
 ): Result<WorkManagementIssueSnapshot, DomainError> {
   const issueId = generateDeterministicIdentifier("issue", snapshot.id);
   if (!issueId.ok) return issueId;
+  const template = parseReadyGateTemplate(snapshot.description);
   const issue = issueSchema.safeParse({
     schemaVersion: 1,
     id: issueId.value,
@@ -88,6 +90,13 @@ function toWorkManagementSnapshot(
     ...(snapshot.reviewRequirement === undefined
       ? {}
       : { reviewRequirement: snapshot.reviewRequirement }),
+    ...(template.humanSummary === undefined ? {} : { humanSummary: template.humanSummary }),
+    ...(snapshot.humanAcceptanceRequirement === undefined
+      ? {}
+      : { humanAcceptanceRequirement: snapshot.humanAcceptanceRequirement }),
+    ...(snapshot.verificationLevel === undefined
+      ? {}
+      : { verificationLevel: snapshot.verificationLevel }),
   });
   if (!issue.success) return err(domainError("invariant_violation"));
   return ok(

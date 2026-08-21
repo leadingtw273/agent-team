@@ -47,6 +47,7 @@ import {
   blockingReasons,
   createAgentCondition,
 } from "../../src/domain/workflow/index.js";
+import { humanSummaryTemplate } from "../../src/application/registration/linear-provision-model.js";
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
   const parsed = parseIdentifier(scope, value);
@@ -254,6 +255,38 @@ describe("LinearWorkManagementAdapter", () => {
     expect(result.value.issue.projectId).toBe(project().id);
     expect(result.value.issue.externalId).toBe("linear-issue-1");
     expect(result.value.workStatus).toBe("in_review");
+  });
+
+  it("preserves the human workflow identity needed by later lifecycle read-backs", async () => {
+    const description = `## ${humanSummaryTemplate.heading}
+- ${humanSummaryTemplate.objective}：讓玩家能操作坦克
+- ${humanSummaryTemplate.outcome}：坦克可以前進與轉向
+- ${humanSummaryTemplate.acceptance}：在 Godot 手動繞場一圈`;
+    const readModel = new FakeReadModel(
+      context(),
+      snapshot({
+        description,
+        humanAcceptanceRequirement: "required",
+        verificationLevel: "standard",
+      }),
+    );
+    const adapter = new LinearWorkManagementAdapter({
+      readModel,
+      mutationClient: new FakeMutationClient(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+    });
+
+    const result = await adapter.getIssue(reference());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.issue.humanSummary).toEqual({
+      objective: "讓玩家能操作坦克",
+      outcome: "坦克可以前進與轉向",
+      acceptance: "在 Godot 手動繞場一圈",
+    });
+    expect(result.value.issue.humanAcceptanceRequirement).toBe("required");
+    expect(result.value.issue.verificationLevel).toBe("standard");
   });
 
   it("passes the same AbortSignal through both Linear context and issue multi-read", async () => {

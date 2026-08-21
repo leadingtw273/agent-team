@@ -5,7 +5,10 @@ import {
   LinearGraphqlTransport,
   type LinearFetch,
 } from "../../src/adapters/linear/index.js";
-import { linearProvisionDesiredObjects } from "../../src/application/registration/index.js";
+import {
+  humanSummaryTemplate,
+  linearProvisionDesiredObjects,
+} from "../../src/application/registration/index.js";
 import { domainError, err } from "../../src/domain/foundation/index.js";
 
 const target = Object.freeze({ teamId: "team-contract", projectId: "project-contract" });
@@ -34,6 +37,25 @@ function adapter(fetch: LinearFetch): LinearProvisionGraphqlAdapter {
 }
 
 describe("O003 Linear provision GraphQL contract", () => {
+  it("provisions the human-workflow groups and places the plain-language summary before the Agent Packet", () => {
+    expect(
+      linearProvisionDesiredObjects.find((item) => item.key === "label_group.human_acceptance"),
+    ).toEqual(expect.objectContaining({ kind: "label_group", name: "人類驗收" }));
+    expect(
+      linearProvisionDesiredObjects.find((item) => item.key === "label_group.verification_level"),
+    ).toEqual(expect.objectContaining({ kind: "label_group", name: "驗證強度" }));
+    const template = linearProvisionDesiredObjects.find(
+      (item) => item.key === "form_template.ready_gate",
+    );
+    expect(template).toBeDefined();
+    const serialized = JSON.stringify(template?.payload);
+    expect(serialized).toContain(`## ${humanSummaryTemplate.heading}`);
+    expect(serialized.indexOf(`## ${humanSummaryTemplate.heading}`)).toBeLessThan(
+      serialized.indexOf("## 目標（必填）"),
+    );
+    expect(serialized).toContain("請用一句白話描述完成後的結果");
+  });
+
   it("reads a strict ID inventory and only exposes proven label/template mutations", async () => {
     const operations: string[] = [];
     const fetch: LinearFetch = (_url, init) => {

@@ -4,11 +4,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   agentRoleSchema,
+  humanAcceptanceRequirementSchema,
+  humanSummarySchema,
   issueJsonSchema,
   issueSchema,
   projectJsonSchema,
   projectSchema,
   reviewRequirementSchema,
+  verificationLevelSchema,
 } from "../../src/domain/project/index.js";
 
 async function readJson(relativePath: string): Promise<unknown> {
@@ -53,6 +56,16 @@ describe("project domain schemas", () => {
       "dual_review",
     ]);
     expect(agentRoleSchema.safeParse("producer").success).toBe(false);
+    expect(humanAcceptanceRequirementSchema.options).toEqual(["required", "not_required"]);
+    expect(verificationLevelSchema.options).toEqual(["light", "standard", "strict"]);
+    expect(
+      humanSummarySchema.safeParse({
+        objective: "做什麼",
+        outcome: "看到什麼",
+        acceptance: "如何驗收",
+      }).success,
+    ).toBe(true);
+    expect(humanAcceptanceRequirementSchema.safeParse("maybe").success).toBe(false);
   });
 
   it("rejects every negative fixture without throwing raw input", async () => {

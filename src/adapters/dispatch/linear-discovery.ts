@@ -94,6 +94,7 @@ export function toDomainIssue(
     externalId: snapshot.id,
     title: snapshot.title,
     ...(template.dependencies.kind === "none" ? { dependencies: { kind: "none" as const } } : {}),
+    ...(template.humanSummary === undefined ? {} : { humanSummary: template.humanSummary }),
     ...(template.goal === undefined ? {} : { goal: template.goal }),
     ...(template.background === undefined ? {} : { background: template.background }),
     ...(template.acceptanceCriteria === undefined
@@ -112,6 +113,12 @@ export function toDomainIssue(
     ...(snapshot.reviewRequirement === undefined
       ? {}
       : { reviewRequirement: snapshot.reviewRequirement }),
+    ...(snapshot.humanAcceptanceRequirement === undefined
+      ? {}
+      : { humanAcceptanceRequirement: snapshot.humanAcceptanceRequirement }),
+    ...(snapshot.verificationLevel === undefined
+      ? {}
+      : { verificationLevel: snapshot.verificationLevel }),
   });
   if (!parsed.success) return err(domainError("invariant_violation"));
   return ok(parsed.data);

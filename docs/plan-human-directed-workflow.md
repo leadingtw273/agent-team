@@ -171,6 +171,14 @@ HDW02與HDW03只依賴HDW01，可分開實作；HDW04／05必須等兩者完成�
 - 新 label provisioning preview→confirm→read-back→rerun unchanged。
 - completed／canceled 歷史不在 provisioning mutation scope。
 
+實作證據（2026-08-21）：
+
+- focused unit／contract：8 files、128 tests PASS。
+- Linear provisioning UI：5 tests PASS（先前已於非 sandbox localhost 驗證）。
+- `pnpm run typecheck`、`pnpm run format:check`、`git diff --check` PASS。
+- legacy project 只有兩組新 label 都缺席時可讀；任一群組半套／重名／缺值、多選均 fail closed。
+- 第二模型 code review 因讀取範圍失控，在 4 分半仍未交付結論時依 bounded-review 原則中止；沒有將未完成審查冒稱 PASS。
+
 ### HDW02 — Admission 與驗證政策
 
 範圍：
