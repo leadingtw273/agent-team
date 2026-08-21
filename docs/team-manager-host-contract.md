@@ -28,6 +28,7 @@ Branch、PR、CI 或排障操作轉嫁給使用者。
 | 需求、優先度、依賴、工作狀態、時間軸 | Linear | 查重、建立或更新工單後重新讀取 |
 | Branch、PR、CI、Review、Merge | GitHub | 只翻譯權威狀態，不手動繞過流程 |
 | Job、lease、checkpoint、敏感核可 | 本機狀態／localhost UI | 顯示或轉譯已核准的摘要 |
+| 合併後待產品驗收項目 | `agent-team acceptance list --project <id>` | 在 status／continue／handoff 時主動摘要 |
 | 專案真實摘要 | `agent-team project`／`agent-team health` | 判定可讀狀態與公開 blocker |
 | Ready Gate Description headings | `readyGateTemplateHeadings` | 依既有 SSOT 建立或檢查 Description |
 
@@ -94,6 +95,9 @@ Host 只能引用下表已有命令，不得捏造一般建單命令：
 | `agent-team health` | 唯讀診斷 | 將降級原因翻譯成摘要，不把 unavailable／unknown 說成健康 |
 | `agent-team run --project <id> --dry-run` | 零 lease／零 Job 預覽 | 檢查候選與 eligibility，不能當作實際執行成功 |
 | `agent-team run --project <id>` | Mutation／啟動 pipeline | 只在 Ready Gate 完整且需求核可後執行 |
+| `agent-team acceptance list --project <id>` | 唯讀 | 列出 durable pending，不以一般「審查中」工單猜測 |
+| `agent-team acceptance accept --project <id> --issue <id>` | Mutation／產品裁決 | 只在 leadi 明確接受該單時呼叫；冪等轉 Linear Done |
+| `agent-team acceptance request-adjustment --project <id> --issue <id>` | Mutation／產品裁決 | 只留單一調整通知；修正單沿用既有 Team Lead 建單流程 |
 | `agent-team ui` | 啟動本機前景服務 | 目前是唯讀狀態頁，不是需求聊天或危險核可入口 |
 
 ### 6.1 Q01：歷史 Claude execution canary（ADR-009 後不再是一般入口）
@@ -193,6 +197,11 @@ HTTP `429` 時必須表達為原因未確認的限流。兩者都讓工單維持
 Host 讀取 Controller、CLI、Linear 與 GitHub 已存在的權威摘要，將 blocked、degraded、unknown、失敗與
 可恢復狀態翻譯成使用者可判斷的影響和下一個安全 read-back。它不宣稱 unavailable／unknown 為健康，
 也不以自己的推測取代 Controller 的 eligibility、lease、timeout、retry、pipeline、merge 或狀態轉換。
+
+每次使用者詢問專案狀態、要求繼續工作或進行 handoff 時，Host 對該 project 執行一次
+`agent-team acceptance list --project <id>`，並以工單識別、產品結果與驗收方式摘要；零項時明確說目前
+沒有待產品驗收。只有 leadi 對明確工單表示接受或要求調整，才呼叫相應 mutation 命令；模糊的「看起來
+可以」不得一次套用到多張工單。
 
 Host 不手動建立 Branch／PR、操作 CI 或合併來繞過 Controller。implementer、reviewer、Linear comment、
 checkpoint 或 handoff 都不是授權。
