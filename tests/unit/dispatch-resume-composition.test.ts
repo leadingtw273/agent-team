@@ -3460,6 +3460,57 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
   });
 
+  it("reconciles a merged Job after its required acceptance checkpoint failed", async () => {
+    const workIssue = humanWorkflowIssue("light");
+    const { deps, progress, lifecycleRequests, admission } = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatus: "ready",
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "observe",
+          main: "observed",
+          agent: "observed",
+        }),
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-reconcile-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      progress,
+      {
+        kind: "requires_manual",
+        cause: {
+          stage: "merge",
+          reasonCode: "human_acceptance_checkpoint_failed",
+          attempts: { count: 1 },
+        },
+      },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "observe",
+          capabilityDigest: "5".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle({ ...deps, humanAcceptance: acceptance });
+
+    expect(result).toEqual(ok([{ jobId, outcome: "merge_reconciled" }]));
+    expect(await acceptance.listPending(projectId)).toMatchObject({
+      ok: true,
+      value: [{ state: "pending", externalIssueId }],
+    });
+    expect(lifecycleRequests).toMatchObject([{ humanAcceptance: { state: "pending" } }]);
+    expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
   /**
    * C015v decision 4's composition-matrix requirement: `merge provenance × PR state × policy
    * capability × Linear status × admission state`, covering the exact cell that deadlocked a real
