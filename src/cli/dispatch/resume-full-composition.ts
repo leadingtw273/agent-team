@@ -10,6 +10,10 @@
 import { GhTransport, GitHubAdapter } from "../../adapters/github/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
 import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
+import {
+  FileHumanAcceptanceStore,
+  defaultHumanAcceptanceDirectory,
+} from "../../adapters/dispatch/human-acceptance-store.js";
 import { LinearVisualPublicationCoordinator } from "../../adapters/dispatch/linear-publication.js";
 import {
   FileLinearPublicationStore,
@@ -84,6 +88,7 @@ export type ResumePipelineComposition = Pick<
   | "workManagement"
   | "reviewWaitPublication"
   | "lifecycle"
+  | "humanAcceptance"
   | "visualReviewModel"
 > &
   Required<
@@ -193,6 +198,9 @@ export async function buildResumeComposition(
         statusMerge.value.reviewStatus.ports.sourceControl,
       ),
       lifecycle,
+      humanAcceptance: new FileHumanAcceptanceStore(
+        defaultHumanAcceptanceDirectory(options.agentTeamHome),
+      ),
       visualEvidence,
       linearPublication,
       linearPublicationStore,

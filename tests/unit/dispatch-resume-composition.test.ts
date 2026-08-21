@@ -30,6 +30,7 @@ import {
   FileJobProgressStore,
   type JobProgressRecordMutation,
 } from "../../src/adapters/dispatch/job-progress-store.js";
+import { FileHumanAcceptanceStore } from "../../src/adapters/dispatch/human-acceptance-store.js";
 import type {
   IssueAdmissionPort,
   IssueAdmissionRecord,
@@ -84,6 +85,7 @@ import {
   issueSchema,
   projectSchema,
   reviewRequirementSchema,
+  type Issue,
   type Project,
   type ReviewRequirement,
 } from "../../src/domain/project/index.js";
@@ -109,8 +111,10 @@ import {
   type Job,
 } from "../../src/domain/jobs/index.js";
 import {
+  createRequirementSnapshot,
   createReviewIdentity,
   headShaSchema,
+  sha256Digest,
   type EffectiveTreeChange,
 } from "../../src/domain/review/index.js";
 
@@ -147,6 +151,7 @@ const issueId = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const externalIssueId = "linear-issue-1";
 const headShaValue = "a".repeat(40);
+const mergeCommitSha = "c".repeat(40);
 const headSha = (() => {
   const parsed = headShaSchema.safeParse(headShaValue);
   if (!parsed.success) throw new Error("fixture invariant violated: invalid head sha");
@@ -284,7 +289,44 @@ function acceptanceCriteriaDescription(criteria: readonly string[]): string {
   return `## ${readyGateTemplateHeadings.acceptanceCriteria}\n${criteria.map((criterion) => `- ${criterion}`).join("\n")}\n`;
 }
 
+function humanWorkflowIssue(verificationLevel: "light" | "standard" | "strict"): Issue {
+  return issueSchema.parse({
+    schemaVersion: 1,
+    id: issueId,
+    projectId,
+    externalId: externalIssueId,
+    title: "Ship the thing",
+    humanSummary: {
+      objective: "Deliver the requested result.",
+      outcome: "The requested product result is visible.",
+      acceptance: "Open the result and explicitly accept or request an adjustment.",
+    },
+    humanAcceptanceRequirement: "required",
+    verificationLevel,
+  });
+}
+
+function humanDelivery(issue: Issue): NonNullable<JobProgressRecordMutation["humanDelivery"]> {
+  const requirement = createRequirementSnapshot(issue, now);
+  const summary = issue.humanSummary === undefined ? undefined : sha256Digest(issue.humanSummary);
+  if (
+    !requirement.ok ||
+    summary === undefined ||
+    !summary.ok ||
+    issue.verificationLevel === undefined
+  ) {
+    throw new Error("invalid human workflow fixture");
+  }
+  return {
+    acceptanceRequirement: "required" as const,
+    verificationLevel: issue.verificationLevel,
+    requirementDigest: requirement.value.requirementsDigest,
+    humanSummaryDigest: summary.value,
+  };
+}
+
 function changeRequest(overrides: Readonly<Record<string, unknown>> = {}) {
+  const merged = overrides["state"] === "merged";
   return {
     id: "PR_node_fixture",
     number: 42,
@@ -299,6 +341,7 @@ function changeRequest(overrides: Readonly<Record<string, unknown>> = {}) {
     // fake -- see that constant's own header for why this must agree by default.
     baseSha: baseRevisionValue,
     autoMergeEnabled: false,
+    ...(merged ? { mergeCommitSha, mergedAt: now } : {}),
     updatedAt: now,
     ...overrides,
   };
@@ -491,6 +534,7 @@ async function harness(
     reviewWaitPublish: ReviewerWaitPublicationPort["publish"];
     workStatus: WorkStatus;
     workStatusReadSequence: readonly WorkStatus[];
+    workIssue: Issue;
     prePrRun: NonNullable<ResumeCycleDependencies["prePrImplementation"]>["run"];
     workStatusTransition: NonNullable<ResumeCycleDependencies["workStatusLifecycle"]>["transition"];
   }> = {},
@@ -540,13 +584,15 @@ async function harness(
       getIssue: () =>
         Promise.resolve(
           ok({
-            issue: issueSchema.parse({
-              schemaVersion: 1,
-              id: issueId,
-              projectId,
-              externalId: externalIssueId,
-              title: "Ship the thing",
-            }),
+            issue:
+              overrides.workIssue ??
+              issueSchema.parse({
+                schemaVersion: 1,
+                id: issueId,
+                projectId,
+                externalId: externalIssueId,
+                title: "Ship the thing",
+              }),
             workStatus: workStatusReadSequence.shift() ?? currentWorkStatus,
             updatedAt: now,
             revision: now,
@@ -1323,6 +1369,255 @@ describe("runResumeCycle", () => {
     const reloaded = await progress.load(jobId);
     expect(reloaded.ok).toBe(true);
     if (reloaded.ok) expect(reloaded.value?.stage).toEqual({ kind: "completed" });
+  });
+
+  it("creates a durable acceptance checkpoint, keeps Linear in review, completes the Job, and releases admission", async () => {
+    const workIssue = humanWorkflowIssue("light");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "3".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle({
+      ...fixture.deps,
+      humanAcceptance: {
+        createPending: (input) => {
+          fixture.calls.push("humanAcceptance.createPending");
+          return acceptance.createPending(input);
+        },
+      },
+    });
+
+    expect(result).toEqual(ok([{ jobId, outcome: "completed" }]));
+    expect(fixture.calls).toEqual([
+      "getChangeRequest",
+      "getChangeRequest",
+      "humanAcceptance.createPending",
+      "workStatusLifecycle.transition:complete",
+      "lifecycle.run",
+    ]);
+    expect(fixture.lifecycleRequests).toMatchObject([
+      {
+        humanAcceptance: {
+          state: "pending",
+          mergeCommit: mergeCommitSha,
+          mergedAt: now,
+          headSha,
+        },
+      },
+    ]);
+    const pending = await acceptance.listPending(projectId);
+    expect(pending.ok && pending.value).toHaveLength(1);
+    if (pending.ok) {
+      expect(pending.value[0]).toMatchObject({
+        state: "pending",
+        externalIssueId,
+        identity: { jobId, mergeCommit: mergeCommitSha },
+      });
+    }
+    const progress = await fixture.progress.load(jobId);
+    expect(progress.ok && progress.value?.stage).toEqual({ kind: "completed" });
+    expect(progress.ok && progress.value?.humanDelivery?.acceptanceIdentityDigest).toMatch(
+      /^[0-9a-f]{64}$/u,
+    );
+    expect(fixture.admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("reuses the same acceptance checkpoint after a lifecycle crash without duplicating it", async () => {
+    const workIssue = humanWorkflowIssue("standard");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-restart-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "6".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+    const first = await runResumeCycle({
+      ...fixture.deps,
+      humanAcceptance: acceptance,
+      lifecycle: {
+        run: () =>
+          Promise.resolve({
+            state: "failed",
+            stage: "comment",
+            error: domainError("external_failure"),
+          }),
+      },
+    });
+    expect(first).toMatchObject({
+      ok: true,
+      value: [{ outcome: "requires_manual", reason: "lifecycle_not_completed:failed" }],
+    });
+    expect(await acceptance.listPending(projectId)).toMatchObject({
+      ok: true,
+      value: [{ state: "pending" }],
+    });
+
+    const second = await runResumeCycle({
+      ...fixture.deps,
+      humanAcceptance: acceptance,
+      lifecycle: {
+        run: () =>
+          Promise.resolve({
+            state: "completed",
+            merge: "out_of_process",
+            headSha,
+            autoMergeDisposition: "not_applicable",
+            humanAcceptance: "pending",
+          }),
+      },
+    });
+
+    expect(second).toEqual(ok([{ jobId, outcome: "merge_reconciled" }]));
+    const pending = await acceptance.listPending(projectId);
+    expect(pending.ok && pending.value).toHaveLength(1);
+    expect(fixture.admission.releaseCalls).toHaveLength(1);
+  });
+
+  it("fails closed before Linear or Lifecycle mutation when a required acceptance store is unavailable", async () => {
+    const workIssue = humanWorkflowIssue("strict");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "9".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle(fixture.deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [
+        {
+          outcome: "requires_manual",
+          reason: "human_acceptance_checkpoint_failed:invariant_violation",
+        },
+      ],
+    });
+    expect(fixture.calls).toEqual(["getChangeRequest"]);
+    expect(fixture.lifecycleRequests).toHaveLength(0);
+    expect(fixture.admission.releaseCalls).toHaveLength(0);
+  });
+
+  it("does not create acceptance or complete when the approved requirement identity drifted", async () => {
+    const approvedIssue = humanWorkflowIssue("light");
+    const driftedIssue = humanWorkflowIssue("standard");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue: driftedIssue,
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-drift-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: humanDelivery(approvedIssue),
+      },
+    );
+
+    const result = await runResumeCycle({ ...fixture.deps, humanAcceptance: acceptance });
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [
+        { outcome: "requires_manual", reason: "human_acceptance_checkpoint_failed:conflict" },
+      ],
+    });
+    expect(await acceptance.listPending(projectId)).toEqual(ok([]));
+    expect(fixture.lifecycleRequests).toHaveLength(0);
+    expect(fixture.admission.releaseCalls).toHaveLength(0);
+  });
+
+  it("keeps the existing direct-completion path for an explicit not-required policy", async () => {
+    const fixture = await harness({ changeRequestState: { state: "merged" } });
+    await seedProgressRecord(
+      fixture.progress,
+      { kind: "merging" },
+      {
+        humanDelivery: {
+          acceptanceRequirement: "not_required",
+          verificationLevel: "light",
+          requirementDigest: "a".repeat(64),
+          humanSummaryDigest: "b".repeat(64),
+        },
+      },
+    );
+
+    const result = await runResumeCycle(fixture.deps);
+
+    expect(result).toEqual(ok([{ jobId, outcome: "completed" }]));
+    expect(fixture.calls).toEqual(["getChangeRequest", "lifecycle.run"]);
+    expect(fixture.lifecycleRequests[0]).not.toHaveProperty("humanAcceptance");
+    expect(fixture.admission.releaseCalls).toHaveLength(1);
   });
 
   it("reruns a fresh Reviewer for an existing success status before merge instead of reusing it", async () => {

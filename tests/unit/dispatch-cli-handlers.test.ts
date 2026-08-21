@@ -81,7 +81,7 @@ vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
 // (vi.mock's hoisting makes this safe regardless of import order in source, but writing it below
 // keeps the intent visible -- same convention as
 // tests/unit/registration-cli-probe-composition-poll.test.ts).
-const { bindWorkStatusIssueHistory, createDispatchCliHandlers } =
+const { bindWorkStatusIssueHistory, createDispatchCliHandlers, humanDeliveryForNewJob } =
   await import("../../src/cli/dispatch/handlers.js");
 
 describe("bindWorkStatusIssueHistory", () => {
@@ -106,6 +106,34 @@ describe("bindWorkStatusIssueHistory", () => {
     await history({ project: project(), externalIssueId: "LEA-73" });
 
     expect(adapter.calls).toBe(1);
+  });
+});
+
+describe("humanDeliveryForNewJob", () => {
+  it("captures the approved human workflow and both canonical digests", () => {
+    const value = humanDeliveryForNewJob(
+      issueSchema.parse({
+        ...eligibleIssue(),
+        humanSummary: {
+          objective: "Verify the handler flow.",
+          outcome: "A durable Job records the approved human workflow.",
+          acceptance: "Read back the Job progress checkpoint.",
+        },
+        humanAcceptanceRequirement: "required",
+        verificationLevel: "strict",
+      }),
+      "2026-08-07T00:00:00.000Z" as never,
+    );
+
+    expect(value).toMatchObject({
+      ok: true,
+      value: {
+        acceptanceRequirement: "required",
+        verificationLevel: "strict",
+        requirementDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+        humanSummaryDigest: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+    });
   });
 });
 

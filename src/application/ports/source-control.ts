@@ -72,6 +72,10 @@ export interface ChangeRequestSnapshot {
    */
   readonly baseSha?: string;
   readonly autoMergeEnabled: boolean;
+  /** Exact provider merge receipt. Real adapters populate both fields for `state:"merged"`;
+   * optional only for legacy test fakes and non-merged snapshots. */
+  readonly mergeCommitSha?: string;
+  readonly mergedAt?: Instant;
   readonly updatedAt: Instant;
 }
 

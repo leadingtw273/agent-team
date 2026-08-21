@@ -42,21 +42,29 @@ import type {
   RequiresManualReasonCode,
 } from "../../adapters/dispatch/job-progress-store.js";
 import {
+  FileHumanAcceptanceStore,
   FileIssueScopeLock,
   JobProgressWorkStatusLifecycleLedger,
+  defaultHumanAcceptanceDirectory,
   projectIssueByExternalId,
 } from "../../adapters/dispatch/index.js";
 import { checkpointIdSchema } from "../../domain/checkpoint/index.js";
 import {
   createClock,
+  domainError,
+  err,
   ok,
   type Clock,
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import { headShaSchema, sha256Digest } from "../../domain/review/index.js";
+import {
+  createRequirementSnapshot,
+  headShaSchema,
+  sha256Digest,
+} from "../../domain/review/index.js";
 import { createAgentCondition } from "../../domain/workflow/index.js";
-import type { Project } from "../../domain/project/index.js";
+import type { Issue, Project } from "../../domain/project/index.js";
 import {
   resolveAuthoritativeBaseRevision,
   type AuthoritativeBaseFailure,
@@ -211,7 +219,29 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
     ...(record.workStatusLifecycle === undefined
       ? {}
       : { workStatusLifecycle: record.workStatusLifecycle }),
+    ...(record.humanDelivery === undefined ? {} : { humanDelivery: record.humanDelivery }),
   });
+}
+
+export function humanDeliveryForNewJob(
+  issue: Issue,
+  capturedAt: ReturnType<Clock["now"]>,
+): Result<JobProgressRecordMutation["humanDelivery"] | undefined, DomainError> {
+  const fields = [issue.humanSummary, issue.humanAcceptanceRequirement, issue.verificationLevel];
+  if (fields.every((field) => field === undefined)) return ok(undefined);
+  if (fields.some((field) => field === undefined)) return err(domainError("invariant_violation"));
+  const requirement = createRequirementSnapshot(issue, capturedAt);
+  const humanSummaryDigest = sha256Digest(issue.humanSummary);
+  if (!requirement.ok) return requirement;
+  if (!humanSummaryDigest.ok) return humanSummaryDigest;
+  return ok(
+    Object.freeze({
+      acceptanceRequirement: issue.humanAcceptanceRequirement!,
+      verificationLevel: issue.verificationLevel!,
+      requirementDigest: requirement.value.requirementsDigest,
+      humanSummaryDigest: humanSummaryDigest.value,
+    }),
+  );
 }
 
 async function persistDispatchProgress(
@@ -623,7 +653,19 @@ export function createDispatchCliHandlers(
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
       const durableAdmission = buildIssueAdmissionStore(options.agentTeamHome);
+      const humanAcceptance = new FileHumanAcceptanceStore(
+        defaultHumanAcceptanceDirectory(options.agentTeamHome),
+      );
       const humanOwnedRegions = buildHumanOwnedRegionReservationStore(options.agentTeamHome);
+      const linearWorkManagement = new LinearWorkManagementAdapter({
+        readModel: build.value.discovery.readModel,
+        mutationClient: build.value.discovery.mutationClient,
+        teamId: build.value.discovery.teamId,
+        linearProjectId: build.value.discovery.linearProjectId,
+      });
+      const workManagement = options.protectedRegionWorkManagement ?? linearWorkManagement;
+      const lifecycleWorkManagement =
+        options.workStatusLifecycleWorkManagement ?? linearWorkManagement;
       let bootstrapReconciliation: readonly BootstrapReconciliationOutcome[] = Object.freeze([]);
 
       if (!dryRun) {
@@ -721,12 +763,14 @@ export function createDispatchCliHandlers(
             leases: new LeaseCoordinator(new InMemoryLeaseRepository()),
             jobs: new InMemoryJobRepository(),
             admission: new InMemoryIssueAdmissionStore(),
+            humanAcceptance,
             humanOwnedRegions,
           }
         : {
             leases: new LeaseCoordinator(build.value.leases),
             jobs: build.value.jobs,
             admission: durableAdmission,
+            humanAcceptance,
             humanOwnedRegions,
             locks: new FileIssueScopeLock(
               join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
@@ -738,6 +782,8 @@ export function createDispatchCliHandlers(
                 result.decision.model?.candidate,
                 build.value.routingConfig,
               );
+              const humanDelivery = humanDeliveryForNewJob(candidate.issue, clock.now());
+              if (!humanDelivery.ok) return humanDelivery;
               const written = await progress.compareAndSwap(result.job.id, null, {
                 jobId: result.job.id,
                 projectId: build.value.project.id,
@@ -745,6 +791,9 @@ export function createDispatchCliHandlers(
                 externalIssueId: candidate.issue.externalId,
                 model,
                 ...(providerAssignments === undefined ? {} : { providerAssignments }),
+                ...(humanDelivery.value === undefined
+                  ? {}
+                  : { humanDelivery: humanDelivery.value }),
                 stage: { kind: "work_start_pending" },
                 branch: implementerBranch(result.job.id),
                 worktreePath: implementerWorktreePath(options.agentTeamHome, result.job.id),
@@ -761,15 +810,6 @@ export function createDispatchCliHandlers(
             },
           };
 
-      const linearWorkManagement = new LinearWorkManagementAdapter({
-        readModel: build.value.discovery.readModel,
-        mutationClient: build.value.discovery.mutationClient,
-        teamId: build.value.discovery.teamId,
-        linearProjectId: build.value.discovery.linearProjectId,
-      });
-      const workManagement = options.protectedRegionWorkManagement ?? linearWorkManagement;
-      const lifecycleWorkManagement =
-        options.workStatusLifecycleWorkManagement ?? linearWorkManagement;
       const protectedRegionSyncFailures: Readonly<Record<string, string>>[] = [];
       if (!dryRun) {
         const records = await progress.listForProject(build.value.project.id);

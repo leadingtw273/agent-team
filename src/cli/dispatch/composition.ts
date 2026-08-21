@@ -57,6 +57,7 @@ import {
   createWorkStatusCapabilitySnapshot,
   discoverReadyDispatchCandidates,
   FileWorkStatusCapabilityStore,
+  type HumanAcceptanceStorePort,
   type HumanOwnedRegionReservationPort,
   type IssueAdmissionPort,
   type LinearDiscoverySkippedIssue,
@@ -248,6 +249,7 @@ export interface DispatchOncePorts {
    * `FileIssueAdmissionStore`; `--dry-run` uses the ephemeral `InMemoryIssueAdmissionStore`
    * (ephemeral-ports.ts), the same "throwaway in-memory" convention `leases`/`jobs` already use. */
   readonly admission: IssueAdmissionPort;
+  readonly humanAcceptance?: Pick<HumanAcceptanceStorePort, "listPending">;
   readonly humanOwnedRegions?: Pick<HumanOwnedRegionReservationPort, "checkAdmission">;
   readonly locks?: IssueScopeLockPort;
   /** Durable post-Job bootstrap. It must confirm before the selected claim may attach its Job. */
@@ -279,6 +281,10 @@ export type DispatchBootstrapOutcome =
 export type DispatchOnceAdmissionSkippedIssue =
   | Readonly<{ issueId: string; reason: "issue_claim_active" }>
   | Readonly<{ issueId: string; reason: "issue_scope_lock_unavailable" }>
+  | Readonly<{
+      issueId: string;
+      reason: "human_acceptance_pending" | "human_acceptance_state_unavailable";
+    }>
   | Readonly<{
       issueId: string;
       reason:
@@ -419,11 +425,41 @@ export async function dispatchOnce(
   }
   const admissionSkipped: DispatchOnceAdmissionSkippedIssue[] = [];
   const ownershipClearedCandidates: DispatcherCandidate[] = [];
+  const humanWorkflowCandidates = discovered.value.candidates.filter(
+    (candidate) => candidate.issue.verificationLevel !== undefined,
+  );
+  let pendingHumanAcceptanceIssueIds: ReadonlySet<string> | undefined;
+  if (humanWorkflowCandidates.length > 0 && ports.humanAcceptance !== undefined) {
+    const pending = await ports.humanAcceptance.listPending(ready.project.id);
+    if (pending.ok) {
+      pendingHumanAcceptanceIssueIds = new Set(
+        pending.value.map((record) => record.identity.issueId),
+      );
+    }
+  }
   for (const candidate of discovered.value.candidates) {
     // Absence marks a legacy candidate from a project that has not switched to the new contract.
     // Existing in-flight Jobs never enter this discovery path at all.
     if (candidate.issue.verificationLevel === undefined) {
       ownershipClearedCandidates.push(candidate);
+      continue;
+    }
+    if (pendingHumanAcceptanceIssueIds === undefined) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "human_acceptance_state_unavailable" as const,
+        }),
+      );
+      continue;
+    }
+    if (pendingHumanAcceptanceIssueIds.has(candidate.issue.id)) {
+      admissionSkipped.push(
+        Object.freeze({
+          issueId: candidate.issue.id,
+          reason: "human_acceptance_pending" as const,
+        }),
+      );
       continue;
     }
     if (

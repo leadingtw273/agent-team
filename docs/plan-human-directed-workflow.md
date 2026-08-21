@@ -5,15 +5,27 @@
 規格：`docs/spec-human-directed-workflow.md`  
 決策者：leadi
 
+## 2026-08-21 MVP-first 執行裁決（後出且優先）
+
+本計畫縮回最小可用閉環；若下文舊 Task packet 與本節衝突，以本節為準。已完成 HDW00～03 中可用的 schema、摘要、驗收分類與 durable store 保留，但不再擴建非 MVP 治理能力。
+
+- HDW04：只完成 merge 分流、pending checkpoint、Job／Lease／claim 正常收尾，以及 pending 防重派；不做通用 drift reconciler。
+- HDW05：只做 `list／accept／request-adjustment`。`accept` 冪等轉 Done；`request-adjustment` 記錄決策並交由 Team Lead 使用既有建單流程建立普通修正單，不自動建立／搜尋／復原 adjustment issue。
+- HDW06：只做 Team Lead／CLI pending 摘要；dependency proof 與 production UI 移入 backlog。MVP 沿用 Linear Done 的依賴解除語意。
+- HDW07：聚焦回歸、一次完整專案 Gate，以及 Sandbox 各一條 required／not_required Happy Path；不建立額外 migration 平台。
+- HDW08：套用到 Tank、收束被取代舊單並建立下一批玩法工單，隨即回到遊戲開發。
+
+預估從目前狀態到回到 Tank 為 2.5～4 小時；真實使用發生問題後再開下一個可獨立驗收的小迭代。
+
 ## 1. 交付目標
 
 在所有 Agent Team 專案預設提供：
 
 - 白話工單標題與三句人類摘要。
 - `人類驗收: 需要|不需要` 與 `驗證強度: 輕量|標準|嚴格`。
-- 工程完成後仍可等待產品負責人驗收，不占用 Job、Lease 或下游工程依賴。
-- 可冪等接受或要求多輪 adjustment，不 reopen 原工程 Job。
-- UI／Team Lead 可列出待人類驗收項目。
+- 工程完成後可等待產品負責人驗收，不占用 Job 或 Lease；MVP 仍沿用 Linear Done 才解除下游依賴。
+- 可冪等接受或記錄要求調整，不 reopen 原工程 Job；修正單沿用既有 Team Lead 建單流程。
+- CLI／Team Lead 可列出待人類驗收項目；production UI 延後。
 - 新單立即生效、舊單按需遷移、歷史零批次重寫。
 
 本計畫不修改 Tank Skirmish 程式碼。最後 rollout 只處理 Linear 工單 metadata／狀態；遊戲功能另成下一批工單。

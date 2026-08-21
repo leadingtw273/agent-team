@@ -13,10 +13,12 @@ import type {
 } from "../../src/application/ports/index.js";
 import { domainError, err, ok, parseInstant } from "../../src/domain/foundation/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
+import { createRequirementSnapshot, sha256Digest } from "../../src/domain/review/index.js";
 import type { AgentCondition, WorkStatus } from "../../src/domain/workflow/index.js";
 
 const headSha = "a".repeat(40);
 const otherSha = "b".repeat(40);
+const mergeCommit = "c".repeat(40);
 const nowResult = parseInstant("2026-08-05T02:00:00.000Z");
 if (!nowResult.ok) throw new Error(nowResult.error.code);
 const now = nowResult.value;
@@ -178,6 +180,82 @@ function comments(calls: readonly string[]): readonly string[] {
 }
 
 describe("merged lifecycle", () => {
+  it("keeps Linear in review after an exact durable human-acceptance checkpoint", async () => {
+    const calls: string[] = [];
+    const humanIssue = issueSchema.parse({
+      ...issue,
+      humanSummary: {
+        objective: "Deliver the playable scene.",
+        outcome: "A tank and buildings are visible in Godot.",
+        acceptance: "Open the scene and confirm the camera angle.",
+      },
+      humanAcceptanceRequirement: "required",
+      verificationLevel: "light",
+    });
+    const fixture = ports({
+      changeRequest: changeRequest("merged", { mergeCommitSha: mergeCommit, mergedAt: now }),
+      issue: { ...issueSnapshot("in_review"), issue: humanIssue },
+      calls,
+    });
+    const requirement = createRequirementSnapshot(humanIssue, now);
+    const summaryDigest = sha256Digest(humanIssue.humanSummary);
+    if (!requirement.ok || !summaryDigest.ok) throw new Error("invalid acceptance fixture");
+
+    const outcome = await new LifecyclePipeline(fixture).run(
+      request({
+        mergeAuthorizationHeadSha: headSha,
+        humanAcceptance: {
+          state: "pending",
+          identityDigest: "d".repeat(64),
+          requirementDigest: requirement.value.requirementsDigest,
+          humanSummaryDigest: summaryDigest.value,
+          mergeCommit,
+          mergedAt: now,
+          headSha,
+        },
+      }),
+    );
+
+    expect(outcome).toEqual({
+      state: "completed",
+      merge: "authorized",
+      headSha,
+      autoMergeDisposition: "not_required",
+      humanAcceptance: "pending",
+    });
+    expect(fixture.workManagement.setWorkStatus).not.toHaveBeenCalled();
+    expect(comments(calls)[0]).toContain("工單保留在審查中等待人類驗收");
+    expect(comments(calls)[0]).toContain("A tank and buildings are visible in Godot.");
+    expect(comments(calls)[0]).toContain("Open the scene and confirm the camera angle.");
+  });
+
+  it("fails closed before Linear mutation when the acceptance merge receipt does not match", async () => {
+    const calls: string[] = [];
+    const fixture = ports({
+      changeRequest: changeRequest("merged", { mergeCommitSha: mergeCommit, mergedAt: now }),
+      calls,
+    });
+
+    const outcome = await new LifecyclePipeline(fixture).run(
+      request({
+        mergeAuthorizationHeadSha: headSha,
+        humanAcceptance: {
+          state: "pending",
+          identityDigest: "d".repeat(64),
+          requirementDigest: "e".repeat(64),
+          humanSummaryDigest: "f".repeat(64),
+          mergeCommit: otherSha,
+          mergedAt: now,
+          headSha,
+        },
+      }),
+    );
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "request" });
+    expect(fixture.workManagement.setWorkStatus).not.toHaveBeenCalled();
+    expect(comments(calls)).toHaveLength(0);
+  });
+
   it("marks Linear completed only for an authorized exact-Head GitHub merge", async () => {
     const calls: string[] = [];
     const fixture = ports({ changeRequest: changeRequest("merged"), calls });

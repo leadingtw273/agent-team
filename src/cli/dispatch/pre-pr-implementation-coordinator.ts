@@ -88,6 +88,7 @@ function mutation(record: JobProgressRecord): JobProgressRecordMutation {
     ...(record.workStatusLifecycle === undefined
       ? {}
       : { workStatusLifecycle: record.workStatusLifecycle }),
+    ...(record.humanDelivery === undefined ? {} : { humanDelivery: record.humanDelivery }),
   };
 }
 

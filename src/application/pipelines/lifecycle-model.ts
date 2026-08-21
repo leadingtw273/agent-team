@@ -118,6 +118,17 @@ export interface LifecyclePipelineRequest {
   readonly changeRequestId: string;
   readonly mergeAuthorizationHeadSha?: string;
   readonly idempotencyKeyPrefix: string;
+  /** Durable acceptance checkpoint already created by the Controller. Its exact merge identity is
+   * revalidated against the Lifecycle read-back before Linear is left in review. */
+  readonly humanAcceptance?: Readonly<{
+    state: "pending";
+    identityDigest: string;
+    requirementDigest: string;
+    humanSummaryDigest: string;
+    mergeCommit: string;
+    mergedAt: Instant;
+    headSha: string;
+  }>;
   /** C035: narrow audit metadata for a merged+canceled race; absent on ordinary lifecycle runs. */
   readonly cancellationRaceAudit?: Readonly<{
     /** Local controller time sampled immediately before the authoritative lifecycle read. */
@@ -169,6 +180,7 @@ export type LifecyclePipelineOutcome =
       // `"paused"`, and `"not_applicable"` are now mutually exclusive and each individually
       // meaningful.
       autoMergeDisposition: "not_required" | "paused" | "not_applicable";
+      humanAcceptance?: "pending";
     }>
   | Readonly<{
       state: "canceled";

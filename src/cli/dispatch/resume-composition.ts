@@ -98,6 +98,7 @@ import {
   type IssueAdmissionPort,
 } from "../../adapters/dispatch/issue-admission-store.js";
 import { FileHumanOwnedRegionReservationStore } from "../../adapters/dispatch/human-owned-region-store.js";
+import type { HumanAcceptanceStorePort } from "../../adapters/dispatch/human-acceptance-store.js";
 import {
   FileReviewReportDiagnosticsSidecar,
   defaultReviewReportSidecarDirectory,
@@ -448,6 +449,8 @@ export interface ResumeCycleDependencies {
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
+  /** Required only for new Jobs whose approved policy says human acceptance is required. */
+  readonly humanAcceptance?: Pick<HumanAcceptanceStorePort, "createPending">;
   readonly clock: Clock;
   readonly holderId: string;
   /** Optional project-scoped lazy initialization, invoked only after this job is leased and
@@ -1348,6 +1351,122 @@ async function releaseCompletedAdmission(
   return ok(undefined);
 }
 
+interface PreparedHumanAcceptance {
+  readonly record: JobProgressRecord;
+  readonly lifecycle?: NonNullable<LifecyclePipelineRequest["humanAcceptance"]>;
+}
+
+async function prepareHumanAcceptance(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+  changeRequestId: string,
+  mergedReadback?: ChangeRequestSnapshot,
+): Promise<Result<PreparedHumanAcceptance, DomainError>> {
+  const policy = record.humanDelivery;
+  if (policy?.acceptanceRequirement !== "required") return ok({ record });
+  if (deps.humanAcceptance === undefined) return err(domainError("invariant_violation"));
+
+  const readbackResult =
+    mergedReadback === undefined
+      ? await whileResumeLeaseHeld(deps, () =>
+          deps.sourceControl.getChangeRequest(
+            { project: deps.project, changeRequestId },
+            deps.signal === undefined ? undefined : { signal: deps.signal },
+          ),
+        )
+      : ok(mergedReadback);
+  if (!readbackResult.ok) return readbackResult;
+  const readback = readbackResult.value;
+  if (readback.state !== "merged") return err(domainError("unavailable"));
+  if (
+    readback.baseBranch !== deps.project.defaultBranch ||
+    String(readback.number) !== changeRequestId ||
+    readback.mergeCommitSha === undefined ||
+    readback.mergedAt === undefined ||
+    (record.headSha !== undefined && readback.headSha !== record.headSha)
+  ) {
+    return err(domainError("conflict"));
+  }
+
+  const workItem = await whileResumeLeaseHeld(deps, () =>
+    deps.workManagement.getIssue(
+      { project: deps.project, externalIssueId: record.externalIssueId },
+      deps.signal === undefined ? undefined : { signal: deps.signal },
+    ),
+  );
+  if (!workItem.ok) return workItem;
+  const currentRequirement = createRequirementSnapshot(workItem.value.issue, deps.clock.now());
+  const currentHumanSummaryDigest =
+    workItem.value.issue.humanSummary === undefined
+      ? undefined
+      : sha256Digest(workItem.value.issue.humanSummary);
+  if (
+    workItem.value.issue.projectId !== record.projectId ||
+    workItem.value.issue.externalId !== record.externalIssueId ||
+    (workItem.value.workStatus !== "in_progress" && workItem.value.workStatus !== "in_review") ||
+    !currentRequirement.ok ||
+    currentRequirement.value.requirementsDigest !== policy.requirementDigest ||
+    workItem.value.issue.humanAcceptanceRequirement !== policy.acceptanceRequirement ||
+    workItem.value.issue.verificationLevel !== policy.verificationLevel ||
+    currentHumanSummaryDigest === undefined ||
+    !currentHumanSummaryDigest.ok ||
+    currentHumanSummaryDigest.value !== policy.humanSummaryDigest
+  ) {
+    return err(domainError("conflict"));
+  }
+
+  const created = await whileResumeLeaseHeld(deps, () =>
+    deps.humanAcceptance!.createPending({
+      identity: {
+        projectId: record.projectId,
+        issueId: record.issueId,
+        jobId: record.jobId,
+        requirementDigest: policy.requirementDigest,
+        mergeCommit: readback.mergeCommitSha!,
+      },
+      externalIssueId: record.externalIssueId,
+      changeRequest: {
+        url: readback.url,
+        number: readback.number,
+        headSha: readback.headSha,
+      },
+      humanSummaryDigest: policy.humanSummaryDigest,
+      mergedAt: readback.mergedAt!,
+    }),
+  );
+  if (!created.ok) return created;
+  if (
+    policy.acceptanceIdentityDigest !== undefined &&
+    policy.acceptanceIdentityDigest !== created.value.identityDigest
+  ) {
+    return err(domainError("conflict"));
+  }
+
+  let current = record;
+  if (policy.acceptanceIdentityDigest === undefined) {
+    const persisted = await transition(deps, record, {
+      humanDelivery: {
+        ...policy,
+        acceptanceIdentityDigest: created.value.identityDigest,
+      },
+    });
+    if (!persisted.ok) return persisted;
+    current = persisted.value;
+  }
+  return ok({
+    record: current,
+    lifecycle: {
+      state: "pending",
+      identityDigest: created.value.identityDigest,
+      requirementDigest: policy.requirementDigest,
+      humanSummaryDigest: policy.humanSummaryDigest,
+      mergeCommit: readback.mergeCommitSha,
+      mergedAt: readback.mergedAt,
+      headSha: readback.headSha,
+    },
+  });
+}
+
 async function reconcileMergeStateUnderLease(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
@@ -1387,17 +1506,33 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
+  const acceptance = await prepareHumanAcceptance(record, deps, changeRequestId, current.value);
+  if (!acceptance.ok) {
+    return {
+      jobId: record.jobId,
+      outcome: "merge_reconcile_lifecycle_failed",
+      error: acceptance.error,
+    };
+  }
+  record = acceptance.value.record;
+  const awaitingHumanAcceptance = acceptance.value.lifecycle !== undefined;
+
   const terminalLifecycle = await gateWorkStatusLifecycle(record, deps, {
     step: "complete",
     phase: "terminal",
-    mainTarget: "completed",
-    allowedMainSources: ["in_progress", "in_review", "completed"],
+    mainTarget: awaitingHumanAcceptance ? "in_review" : "completed",
+    allowedMainSources: awaitingHumanAcceptance
+      ? ["in_progress", "in_review"]
+      : ["in_progress", "in_review", "completed"],
     agentTarget: { kind: "clear" },
     causeStage: "merge",
     authority: {
       changeRequestId,
       authorizedHeadSha: "external",
       lifecycleHeadSha: current.value.headSha,
+      ...(acceptance.value.lifecycle === undefined
+        ? {}
+        : { humanAcceptanceIdentityDigest: acceptance.value.lifecycle.identityDigest }),
     },
   });
   if ("outcome" in terminalLifecycle) return terminalLifecycle;
@@ -1413,6 +1548,9 @@ async function reconcileMergeStateUnderLease(
       externalIssueId: record.externalIssueId,
       changeRequestId,
       idempotencyKeyPrefix: lifecyclePrefix,
+      ...(acceptance.value.lifecycle === undefined
+        ? {}
+        : { humanAcceptance: acceptance.value.lifecycle }),
       workStatusLifecycleAudit: lifecycleAudit(
         record,
         record.reviewerReplay?.state === "review_succeeded" ? "reviewer-replay" : "reconcile",
@@ -3327,17 +3465,34 @@ async function finishMerged(
   authorizedHeadSha: string | undefined,
   mergeMutations?: CancellationRaceMergeMutations,
 ): Promise<ResumeJobOutcome> {
+  const acceptance = await prepareHumanAcceptance(record, deps, changeRequestId);
+  if (!acceptance.ok) {
+    return requiresManualUnlessRetryable(
+      record,
+      deps,
+      `human_acceptance_checkpoint_failed:${acceptance.error.code}`,
+      acceptance.error,
+      requiresManualCause("merge", "human_acceptance_checkpoint_failed"),
+    );
+  }
+  record = acceptance.value.record;
+  const awaitingHumanAcceptance = acceptance.value.lifecycle !== undefined;
   const terminalLifecycle = await gateWorkStatusLifecycle(record, deps, {
     step: "complete",
     phase: "terminal",
-    mainTarget: "completed",
-    allowedMainSources: ["in_progress", "in_review", "completed"],
+    mainTarget: awaitingHumanAcceptance ? "in_review" : "completed",
+    allowedMainSources: awaitingHumanAcceptance
+      ? ["in_progress", "in_review"]
+      : ["in_progress", "in_review", "completed"],
     agentTarget: { kind: "clear" },
     causeStage: "merge",
     authority: {
       changeRequestId,
       authorizedHeadSha: authorizedHeadSha ?? "external",
       lifecycleHeadSha: authorizedHeadSha ?? record.headSha ?? "external",
+      ...(acceptance.value.lifecycle === undefined
+        ? {}
+        : { humanAcceptanceIdentityDigest: acceptance.value.lifecycle.identityDigest }),
     },
   });
   if ("outcome" in terminalLifecycle) return terminalLifecycle;
@@ -3354,6 +3509,9 @@ async function finishMerged(
       changeRequestId,
       ...(authorizedHeadSha === undefined ? {} : { mergeAuthorizationHeadSha: authorizedHeadSha }),
       idempotencyKeyPrefix: lifecyclePrefix,
+      ...(acceptance.value.lifecycle === undefined
+        ? {}
+        : { humanAcceptance: acceptance.value.lifecycle }),
       workStatusLifecycleAudit: lifecycleAudit(
         record,
         record.reviewerReplay?.state === "review_succeeded" ? "reviewer-replay" : "dispatch-resume",

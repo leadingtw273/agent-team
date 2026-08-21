@@ -49,6 +49,7 @@ import type { ProjectRegistrySnapshot } from "../../src/application/projects/ind
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
 import {
+  generateDeterministicIdentifier,
   createFixedClock,
   domainError,
   err,
@@ -404,10 +405,102 @@ function buildPorts(stateRoot: string) {
   );
   const jobs = new FileJobRepository(join(stateRoot, "jobs.json"), join(stateRoot, "jobs.lock"));
   const admission = new FileIssueAdmissionStore(join(stateRoot, "admission"));
-  return { leases: new LeaseCoordinator(leases), jobs, admission };
+  return {
+    leases: new LeaseCoordinator(leases),
+    jobs,
+    admission,
+    humanAcceptance: { listPending: () => Promise.resolve(ok([])) },
+  };
 }
 
 describe("dispatchOnce admission-claim wiring (C015o decision 3)", () => {
+  it("已有待人工驗收 checkpoint 時，零 quota、provider、claim、Lease 與 Job", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const externalIssueId = "linear-issue-human-acceptance-pending";
+    const issueId = generateDeterministicIdentifier("issue", externalIssueId);
+    if (!issueId.ok) throw new Error("fixture invariant violated: issue id");
+    const baseReady = readyComposition(stateRoot, externalIssueId);
+    const process = new ReadyClaudeProcessPort();
+    let quotaCalls = 0;
+    const fullDescription = `## ${humanSummaryTemplate.heading}
+- ${humanSummaryTemplate.objective}：加入坦克移動
+- ${humanSummaryTemplate.outcome}：可以操作坦克前進
+- ${humanSummaryTemplate.acceptance}：在 Godot 實機操作
+
+${readyGateDescription()}`;
+    const ready: DispatchCompositionReady = {
+      ...baseReady,
+      projectRevision: baselineRevision,
+      discovery: {
+        ...baseReady.discovery,
+        readModel: {
+          ...readModel(externalIssueId),
+          readContext: () => Promise.resolve(ok(linearProjectContext(true))),
+          readIssue: () =>
+            Promise.resolve(
+              ok({
+                id: externalIssueId,
+                identifier: "SBX-1",
+                title: "加入坦克移動",
+                description: fullDescription,
+                updatedAt: now,
+                teamId: "team-1",
+                projectId: "linear-proj-1",
+                workStatus: "ready" as const,
+                agentRole: "implementer" as const,
+                reviewRequirement: "code_review" as const,
+                humanAcceptanceRequirement: "required" as const,
+                verificationLevel: "standard" as const,
+                priority: "high" as const,
+                otherLabelIds: [],
+                relations: [],
+                comments: [],
+              }),
+            ),
+        } as never,
+      },
+      codex: { ...baseReady.codex, process },
+      quotaAdmission: {
+        resolve: () => {
+          quotaCalls += 1;
+          return Promise.resolve({ state: "ready" as const, reason: "test_fixture" });
+        },
+      },
+    };
+    const ports = {
+      ...buildPorts(stateRoot),
+      humanAcceptance: {
+        listPending: () =>
+          Promise.resolve(
+            ok([
+              {
+                identity: { issueId: issueId.value },
+              } as never,
+            ]),
+          ),
+      },
+      humanOwnedRegions: {
+        checkAdmission: () => Promise.resolve(ok({ state: "allowed" as const })),
+      },
+    };
+
+    const outcome = await dispatchOnce(ready, ports, "holder-human-acceptance-pending");
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.admissionSkipped).toEqual([
+      { issueId: issueId.value, reason: "human_acceptance_pending" },
+    ]);
+    expect(quotaCalls).toBe(0);
+    expect(process.calls).toBe(0);
+    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
+    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
+    await expect(ports.admission.load(ready.project.id, issueId.value)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+  });
+
   it("新工作流工單與人類編輯區域重疊時，零 quota、provider、claim、Lease 與 Job", async () => {
     const stateRoot = await temporaryStateRoot();
     const externalIssueId = "linear-issue-human-overlap";
@@ -468,6 +561,27 @@ ${readyGateDescription()}`;
           ),
       },
     };
+
+    const unavailable = await dispatchOnce(
+      ready,
+      {
+        leases: ports.leases,
+        jobs: ports.jobs,
+        admission: ports.admission,
+        humanOwnedRegions: ports.humanOwnedRegions,
+      },
+      "holder-human-acceptance-unavailable",
+    );
+    expect(unavailable.outcome).toBe("ran");
+    if (unavailable.outcome !== "ran") return;
+    expect(unavailable.admissionSkipped).toEqual([
+      {
+        issueId: unavailable.candidates[0]?.issue.id,
+        reason: "human_acceptance_state_unavailable",
+      },
+    ]);
+    expect(quotaCalls).toBe(0);
+    expect(process.calls).toBe(0);
 
     const outcome = await dispatchOnce(ready, ports, "holder-human-overlap");
 

@@ -5,6 +5,14 @@
 裁決者：leadi  
 適用範圍：所有由 Agent Team 註冊與管理的專案
 
+## 2026-08-21 MVP-first 範圍裁決（後出且優先）
+
+本功能改採敏捷最小閉環；若下文既有段落與本節衝突，以本節為準。第一版只保留既有工程流程並加入：白話摘要、`需要／不需要`人工驗收、合併後分流、durable pending、防重複接單、`list／accept／request-adjustment`與 Team Lead 提醒。
+
+第一版不自動建立 adjustment 子工單、不新增 engineering-complete dependency proof、不新增 production UI、不做通用 cancel／reopen／requirement-drift reconciliation，也不把人類編輯區 reservation 作為本功能發布前置。這些只在真實使用證明必要後另立小型迭代。MVP 中需要驗收的前置工單沿用現有 Linear dependency 語意，直到使用者接受並轉 Done 才解除依賴。
+
+驗收只要求一條 `required` 與一條 `not_required` Happy Path、pending 防重派、接受操作冪等，以及既有 merge／cancel／CI／review 安全 Gate 不退化；不以尚未發生的 recovery class 阻擋 Tank Skirmish 後續工作。
+
 ## 1. 決策摘要
 
 Agent Team 採用「人類主導交付」作為所有專案的預設工作方式：Agent 負責可客觀驗證的工程工作，使用者保留產品判斷與可直接修改產物的權力。系統不把每張工單都推向同樣沉重的驗證，也不把產品驗收誤用成故障處理。

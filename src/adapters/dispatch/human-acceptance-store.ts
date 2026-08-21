@@ -72,6 +72,11 @@ export interface HumanAcceptanceStorePort {
   ): Promise<Result<HumanAcceptanceRecord, DomainError>>;
 }
 
+export function defaultHumanAcceptanceDirectory(agentTeamHome: string): string {
+  if (!isAbsolute(agentTeamHome)) throw new Error("agent_team_home_must_be_absolute");
+  return join(agentTeamHome, "state", "dispatch", "human-acceptance");
+}
+
 type LedgerMutation = (
   ledger: HumanAcceptanceLedger,
 ) => Result<
