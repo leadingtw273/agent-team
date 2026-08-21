@@ -33,6 +33,7 @@ import {
 import { resolveAuthoritativeBaseRevision } from "./authoritative-base.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import {
+  isReviewerReplayCommandEligible,
   ReviewerReplayCoordinator,
   type ReviewerReplayOutcome,
 } from "./reviewer-replay-coordinator.js";
@@ -151,10 +152,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
         ...(!record.ok ? { errorCode: record.error.code } : {}),
       });
     }
-    const ordinaryEligible =
-      record.value.stage.kind === "requires_manual" &&
-      record.value.stage.cause?.stage === "review" &&
-      record.value.stage.cause.reasonCode === "review_report_contract";
+    const ordinaryEligible = isReviewerReplayCommandEligible(record.value);
     if (!finalReviewEpoch && !ordinaryEligible) {
       return outcome("blocked", {
         operation: "reviewer-replay",

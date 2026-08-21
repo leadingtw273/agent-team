@@ -177,6 +177,30 @@ function exactReplayCause(record: JobProgressRecord): boolean {
   );
 }
 
+function lifecycleContinuationCause(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "work_status_lifecycle_failed" &&
+    record.stage.cause.attempts.count === 1 &&
+    record.workStatusLifecycle?.admissionMode === "enforce"
+  );
+}
+
+/**
+ * Dedicated-command admission only. Scheduler/reconcile intentionally keeps using
+ * `isReviewerReplayCheckpointReconcilable`, whose exact `review_report_contract` rule is narrower.
+ * The lifecycle-failure branch can only skip the provider when this same Job already owns a
+ * durable success checkpoint; `resumeUnderLease` still revalidates PR/head, requirements, CI,
+ * current work status and the complete replay identity before any merge mutation.
+ */
+export function isReviewerReplayCommandEligible(record: JobProgressRecord): boolean {
+  return (
+    exactReplayCause(record) ||
+    (lifecycleContinuationCause(record) && record.reviewerReplay?.state === "review_succeeded")
+  );
+}
+
 async function admissionCheck(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
@@ -1444,8 +1468,26 @@ export class ReviewerReplayCoordinator {
       };
     }
     let record = loaded.value;
-    if (!exactReplayCause(record)) {
+    if (!isReviewerReplayCommandEligible(record)) {
       return { state: "blocked", jobId, reason: "job_not_eligible" };
+    }
+    if (lifecycleContinuationCause(record)) {
+      const finalRecovery = this.dependencies.finalReviewRecovery?.store;
+      if (finalRecovery === undefined) {
+        return { state: "blocked", jobId, reason: "runtime_unavailable" };
+      }
+      const finalState = await finalRecovery.load(jobId);
+      if (!finalState.ok) {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "authoritative_read_failed",
+          errorCode: finalState.error.code,
+        };
+      }
+      if (finalState.value !== undefined) {
+        return { state: "blocked", jobId, reason: "final_recovery_state_conflict" };
+      }
     }
     const policy = await deps.reviewerReplayPolicy?.load(record.projectId);
     if (policy === undefined || !policy.ok || policy.value?.enabled !== true) {
@@ -1468,6 +1510,13 @@ export class ReviewerReplayCoordinator {
     if (dryRun) {
       const inspected = await inspectReplay(record, deps);
       if (replayBlocked(inspected)) return inspected;
+      if (
+        lifecycleContinuationCause(record) &&
+        inspected.workStatus !== "in_progress" &&
+        inspected.workStatus !== "in_review"
+      ) {
+        return { state: "blocked", jobId, reason: "job_not_eligible" };
+      }
       if (
         record.reviewerReplay !== undefined &&
         !replayIdentityMatches(record.reviewerReplay, inspected.replayIdentity)
@@ -1567,7 +1616,7 @@ export class ReviewerReplayCoordinator {
         return { state: "blocked", jobId, reason: "contract_epoch_not_allowed" };
       }
       if (
-        isReviewerReplayCheckpointReconcilable(record) &&
+        (isReviewerReplayCheckpointReconcilable(record) || lifecycleContinuationCause(record)) &&
         existingCheckpoint?.state === "review_succeeded"
       ) {
         const continued = await resumeUnderLease(record, guardedDeps);
