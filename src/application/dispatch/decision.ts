@@ -1,9 +1,9 @@
 import { selectModelRoute, type CandidateObservation } from "../routing/index.js";
+import { changeRegionsOverlap } from "../../domain/ownership/index.js";
 import {
   PRIORITY_ORDER,
   dispatchDecisionInputSchema,
   type ActiveDispatch,
-  type ChangeRegion,
   type DispatchBlocker,
   type DispatchCandidate,
   type DispatchDecision,
@@ -72,23 +72,6 @@ function orderCandidates(
   return ordered;
 }
 
-function pathSegments(path: string): readonly string[] {
-  return path.split("/");
-}
-
-function isPrefix(prefix: readonly string[], value: readonly string[]): boolean {
-  return prefix.length <= value.length && prefix.every((part, index) => value[index] === part);
-}
-
-function regionsOverlap(left: ChangeRegion, right: ChangeRegion): boolean {
-  const leftPath = pathSegments(left.path);
-  const rightPath = pathSegments(right.path);
-  if (left.coverage === "exact" && right.coverage === "exact") return left.path === right.path;
-  if (left.coverage === "subtree" && isPrefix(leftPath, rightPath)) return true;
-  if (right.coverage === "subtree" && isPrefix(rightPath, leftPath)) return true;
-  return false;
-}
-
 function hasRepositoryConflict(candidate: DispatchCandidate, active: ActiveDispatch): boolean {
   if (candidate.repositoryId !== active.repositoryId) return false;
   if (
@@ -101,7 +84,9 @@ function hasRepositoryConflict(candidate: DispatchCandidate, active: ActiveDispa
   }
   if (candidate.declaredRegions === undefined || active.declaredRegions === undefined) return true;
   return candidate.declaredRegions.some((candidateRegion) =>
-    active.declaredRegions?.some((activeRegion) => regionsOverlap(candidateRegion, activeRegion)),
+    active.declaredRegions?.some((activeRegion) =>
+      changeRegionsOverlap(candidateRegion, activeRegion),
+    ),
   );
 }
 

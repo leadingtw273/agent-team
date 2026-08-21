@@ -224,6 +224,13 @@ HDW02與HDW03只依賴HDW01，可分開實作；HDW04／05必須等兩者完成�
 - bounded list與跨project隔離。
 - reopen新Job可建立新generation；舊accepted／invalidated record不被覆寫也不阻擋。
 
+實作證據（2026-08-21）：
+
+- 人類驗收 ledger 與人類擁有區域 reservation 均為 project-scoped private atomic JSON、strict schema、CAS revision 與 bounded records。
+- focused stores／dispatch／overlap suite：5 files、61 tests PASS；`pnpm run typecheck`、`pnpm run format:check`、`git diff --check` PASS。
+- 新工作流候選若與有效 reservation 重疊、reservation baseline 漂移、區域無法 canonicalize 或 store 無法讀取，均在 quota／provider／claim／Lease／Job 前 fail closed。
+- legacy 候選未帶新驗證契約時不查 reservation；既有 in-flight resume 不經新單 discovery，因此不被中途遷移。
+
 ### HDW04 — Merge／Job／Linear completion分流
 
 範圍：

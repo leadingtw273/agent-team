@@ -97,6 +97,7 @@ import {
   FileIssueAdmissionStore,
   type IssueAdmissionPort,
 } from "../../adapters/dispatch/issue-admission-store.js";
+import { FileHumanOwnedRegionReservationStore } from "../../adapters/dispatch/human-owned-region-store.js";
 import {
   FileReviewReportDiagnosticsSidecar,
   defaultReviewReportSidecarDirectory,
@@ -3424,6 +3425,16 @@ export function defaultIssueAdmissionDirectory(agentTeamHome: string): string {
 
 export function buildIssueAdmissionStore(agentTeamHome: string): FileIssueAdmissionStore {
   return new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(agentTeamHome));
+}
+
+export function defaultHumanOwnedRegionDirectory(agentTeamHome: string): string {
+  return join(agentTeamHome, "state", "dispatch", "human-owned-regions");
+}
+
+export function buildHumanOwnedRegionReservationStore(
+  agentTeamHome: string,
+): FileHumanOwnedRegionReservationStore {
+  return new FileHumanOwnedRegionReservationStore(defaultHumanOwnedRegionDirectory(agentTeamHome));
 }
 
 /** C015r decision 5: production default -- a fresh `Redactor()` with no seeded secrets, exactly the

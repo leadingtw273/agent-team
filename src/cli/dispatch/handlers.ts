@@ -84,6 +84,7 @@ import {
 } from "./implementer-composition.js";
 import {
   buildAutoMergePauseStore,
+  buildHumanOwnedRegionReservationStore,
   buildIssueAdmissionStore,
   buildJobProgressStore,
   type ResumeJobOutcome,
@@ -622,6 +623,7 @@ export function createDispatchCliHandlers(
       // resume scan below, and the ci_waiting backport further down) is guarded by `!dryRun`.
       const progress = buildJobProgressStore(options.agentTeamHome);
       const durableAdmission = buildIssueAdmissionStore(options.agentTeamHome);
+      const humanOwnedRegions = buildHumanOwnedRegionReservationStore(options.agentTeamHome);
       let bootstrapReconciliation: readonly BootstrapReconciliationOutcome[] = Object.freeze([]);
 
       if (!dryRun) {
@@ -719,11 +721,13 @@ export function createDispatchCliHandlers(
             leases: new LeaseCoordinator(new InMemoryLeaseRepository()),
             jobs: new InMemoryJobRepository(),
             admission: new InMemoryIssueAdmissionStore(),
+            humanOwnedRegions,
           }
         : {
             leases: new LeaseCoordinator(build.value.leases),
             jobs: build.value.jobs,
             admission: durableAdmission,
+            humanOwnedRegions,
             locks: new FileIssueScopeLock(
               join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
             ),

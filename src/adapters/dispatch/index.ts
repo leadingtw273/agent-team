@@ -6,6 +6,8 @@ export * from "./work-status-capability-store.js";
 export * from "./work-status-lifecycle-ledger.js";
 export * from "./issue-admission-store.js";
 export * from "./issue-scope-lock.js";
+export * from "./human-acceptance-store.js";
+export * from "./human-owned-region-store.js";
 export * from "./job-progress-store.js";
 export * from "./linear-discovery.js";
 export * from "./linear-publication.js";
