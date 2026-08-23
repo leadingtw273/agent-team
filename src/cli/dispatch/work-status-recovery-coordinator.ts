@@ -139,9 +139,10 @@ function historyPrefixMatches(
   );
 }
 
-type RecoverySourceShape = "sent_unknown" | "fix_start_intent";
+type RecoverySourceShape = "sent_unknown" | "fix_start_intent" | "confirmed_manual_handoff";
 
 function recoverySourceShape(
+  record: JobProgressRecord,
   transition: WorkStatusLifecycleTransition,
 ): RecoverySourceShape | undefined {
   if (transition.main.state === "sent_unknown") return "sent_unknown";
@@ -153,6 +154,19 @@ function recoverySourceShape(
     transition.mainFailures.lastErrorCode === "conflict"
   ) {
     return "fix_start_intent";
+  }
+  if (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.workStatusLifecycle?.transitions.at(-1)?.instance === transition.instance &&
+    transition.step === "requires_manual" &&
+    transition.mainTarget === "requires_manual" &&
+    transition.allowedMainSources?.length === 1 &&
+    transition.allowedMainSources[0] === "in_review" &&
+    transition.main.state === "confirmed" &&
+    transition.agent.state === "confirmed"
+  ) {
+    return "confirmed_manual_handoff";
   }
   return undefined;
 }
@@ -209,6 +223,11 @@ function classifyRecoveryState(
   const atPreState =
     issue.workStatusStateId === transition.historyEvidence?.preStateId &&
     transition.allowedMainSources?.includes(issue.workStatus) === true;
+  if (sourceShape === "confirmed_manual_handoff") {
+    return atPreState
+      ? { ok: true, disposition: "pre_state_retained" }
+      : { ok: false, reason: "work_status_not_recoverable" };
+  }
   if (sourceShape === "fix_start_intent") {
     return atPreState && preStateSpanIsOpen(transition, history)
       ? { ok: true, disposition: "pre_state_retained" }
@@ -271,7 +290,7 @@ export class WorkStatusRecoveryCoordinator {
       (candidate) => candidate.instance === input.transitionInstance,
     );
     if (transition === undefined) return { state: "blocked", reason: "transition_not_found" };
-    const sourceShape = recoverySourceShape(transition);
+    const sourceShape = recoverySourceShape(record, transition);
     if (
       sourceShape === undefined ||
       transition.mainTarget === undefined ||

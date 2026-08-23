@@ -174,7 +174,7 @@ class FakeWorkManagement {
 async function harness(
   current: WorkStatus,
   onLockAcquire?: (workManagement: FakeWorkManagement) => void,
-  sourceShape: "sent_unknown" | "fix_start_intent" = "sent_unknown",
+  sourceShape: "sent_unknown" | "fix_start_intent" | "confirmed_manual_handoff" = "sent_unknown",
   transitionOverrides: Partial<WorkStatusLifecycleTransition> = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "agent-team-work-status-recovery-"));
@@ -190,7 +190,7 @@ async function harness(
     stage: {
       kind: "requires_manual",
       cause: {
-        stage: "dispatch",
+        stage: sourceShape === "confirmed_manual_handoff" ? "review" : "dispatch",
         reasonCode: "work_status_lifecycle_failed",
         attempts: { count: 1 },
       },
@@ -200,21 +200,44 @@ async function harness(
     workStatusLifecycle: {
       admissionMode: "enforce",
       capabilityDigest,
-      phase: sourceShape === "fix_start_intent" ? "fixing" : "work_start",
+      phase:
+        sourceShape === "fix_start_intent"
+          ? "fixing"
+          : sourceShape === "confirmed_manual_handoff"
+            ? "terminal"
+            : "work_start",
       transitions: [
         {
-          step: sourceShape === "fix_start_intent" ? "fix_start" : "work_start",
+          step:
+            sourceShape === "fix_start_intent"
+              ? "fix_start"
+              : sourceShape === "confirmed_manual_handoff"
+                ? "requires_manual"
+                : "work_start",
           instance: transitionInstance,
-          mainTarget: "in_progress",
+          mainTarget:
+            sourceShape === "confirmed_manual_handoff" ? "requires_manual" : "in_progress",
           allowedMainSources:
             sourceShape === "fix_start_intent"
               ? ["in_review", "in_progress"]
-              : ["ready", "in_progress"],
-          agentTarget: { kind: "set", status: "executing" },
+              : sourceShape === "confirmed_manual_handoff"
+                ? ["in_review"]
+                : ["ready", "in_progress"],
+          agentTarget:
+            sourceShape === "confirmed_manual_handoff"
+              ? { kind: "set", status: "blocked", blockingReason: "unknown_error" }
+              : { kind: "set", status: "executing" },
           main:
             sourceShape === "fix_start_intent"
               ? { state: "intent", idempotencyKey: "old-main" }
-              : { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
+              : sourceShape === "confirmed_manual_handoff"
+                ? {
+                    state: "confirmed",
+                    idempotencyKey: "old-main",
+                    confirmedAt: now,
+                    observedRevision: "revision-0",
+                  }
+                : { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
           agent:
             sourceShape === "fix_start_intent"
               ? { state: "intent", idempotencyKey: "old-agent" }
@@ -231,12 +254,19 @@ async function harness(
           },
           agentFailures: { count: 0 },
           historyEvidence: {
-            preStateId: sourceShape === "fix_start_intent" ? "state-review" : "state-ready",
-            targetStateId: "state-progress",
+            preStateId:
+              sourceShape === "fix_start_intent" || sourceShape === "confirmed_manual_handoff"
+                ? "state-review"
+                : "state-ready",
+            targetStateId:
+              sourceShape === "confirmed_manual_handoff" ? "state-manual" : "state-progress",
             observedRevision: "revision-0",
             historyPrefixDigest: prefixDigest.value,
             historyEntryCount: 0,
-            preStateSpanId: sourceShape === "fix_start_intent" ? "span-review" : "span-ready",
+            preStateSpanId:
+              sourceShape === "fix_start_intent" || sourceShape === "confirmed_manual_handoff"
+                ? "span-review"
+                : "span-ready",
           },
           ...transitionOverrides,
         },
@@ -428,6 +458,55 @@ describe("dispatch work-status recovery", () => {
     expect(record.ok && record.value?.workStatusLifecycle?.transitions[0]?.main.state).toBe(
       "confirmed",
     );
+  });
+
+  it("recovers an exact confirmed review manual handoff after the operator restores Linear to review", async () => {
+    const test = await harness("in_review", undefined, "confirmed_manual_handoff");
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator-dry-run",
+        dryRun: true,
+      }),
+    ).resolves.toMatchObject({
+      state: "ready",
+      disposition: "pre_state_retained",
+      plannedMutation: "operator_receipt_only",
+    });
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: false,
+      }),
+    ).resolves.toMatchObject({ state: "recovered", disposition: "pre_state_retained" });
+
+    const record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.stage.kind).toBe("awaiting_review");
+    expect(record.ok && record.value?.workStatusLifecycle?.recoveries).toMatchObject([
+      { disposition: "pre_state_retained", sourceTransitionInstance: transitionInstance },
+    ]);
+    expect(record.ok && record.value?.workStatusLifecycle?.transitions).toHaveLength(1);
+    expect(test.workManagement.setStatusCalls).toBe(0);
+  });
+
+  it("does not recover a confirmed review manual handoff while Linear is still requires-manual", async () => {
+    const test = await harness("requires_manual", undefined, "confirmed_manual_handoff");
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "work_status_not_recoverable" });
+    const record = await test.progress.load(job.id);
+    expect(record.ok && record.value?.workStatusLifecycle?.recoveries).toBeUndefined();
+    expect(test.workManagement.setStatusCalls).toBe(0);
   });
 
   it("rejects target-observed, non-fix, unattempted, exhausted and evidence-free intent shapes", async () => {
