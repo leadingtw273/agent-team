@@ -374,6 +374,46 @@ describe("dispatch work-status recovery", () => {
     expect(test.workManagement.setStatusCalls).toBe(1);
   });
 
+  it("accepts an unchanged historical snapshot when Linear prepends newer history entries", async () => {
+    const oldEntry = {
+      id: "history-old",
+      createdAt: now,
+      actorKind: "automation" as const,
+      fromStateId: "state-ready",
+      toStateId: "state-progress",
+      fromTeamId: null,
+      toTeamId: null,
+      fromProjectId: null,
+      toProjectId: null,
+      archived: null,
+      trashed: null,
+    };
+    const newerEntry = { ...oldEntry, id: "history-newer" };
+    const oldDigest = sha256Digest({ schemaVersion: 1, entries: [oldEntry] });
+    if (!oldDigest.ok) throw new Error(oldDigest.error.code);
+    const test = await harness("in_progress", undefined, "sent_unknown", {
+      historyEvidence: {
+        preStateId: "state-ready",
+        targetStateId: "state-progress",
+        observedRevision: "revision-0",
+        historyPrefixDigest: oldDigest.value,
+        historyEntryCount: 1,
+        historyTailId: oldEntry.id,
+        preStateSpanId: "span-ready",
+      },
+    });
+    test.workManagement.entries.push(newerEntry, oldEntry);
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: true,
+      }),
+    ).resolves.toMatchObject({ state: "ready", disposition: "target_observed" });
+  });
+
   it("dry-run reports a legal plan without receipt, lease, or Linear mutation", async () => {
     const test = await harness("ready");
     await expect(

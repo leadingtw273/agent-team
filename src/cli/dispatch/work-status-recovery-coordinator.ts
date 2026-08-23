@@ -128,12 +128,19 @@ function historyPrefixMatches(
   const evidence = transition.historyEvidence;
   if (!history.ok || evidence === undefined) return false;
   if (history.value.entries.length < evidence.historyEntryCount) return false;
-  const prefix = history.value.entries.slice(0, evidence.historyEntryCount);
-  const digest = sha256Digest({ schemaVersion: 1, entries: prefix });
-  if (!digest.ok || digest.value !== evidence.historyPrefixDigest) return false;
-  if (evidence.historyTailId !== undefined && prefix.at(-1)?.id !== evidence.historyTailId) {
-    return false;
-  }
+  const candidates = [
+    history.value.entries.slice(0, evidence.historyEntryCount),
+    history.value.entries.slice(-evidence.historyEntryCount),
+  ];
+  const matchingSnapshot = candidates.some((entries) => {
+    const digest = sha256Digest({ schemaVersion: 1, entries });
+    return (
+      digest.ok &&
+      digest.value === evidence.historyPrefixDigest &&
+      (evidence.historyTailId === undefined || entries.at(-1)?.id === evidence.historyTailId)
+    );
+  });
+  if (!matchingSnapshot) return false;
   return history.value.stateSpans.some(
     (span) => span.id === evidence.preStateSpanId && span.stateId === evidence.preStateId,
   );
