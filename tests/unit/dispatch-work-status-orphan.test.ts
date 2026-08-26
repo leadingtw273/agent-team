@@ -16,6 +16,7 @@ import {
   mayProjectRequiresManual,
 } from "../../src/cli/dispatch/requires-manual-projection.js";
 import type { WorkStatusLifecycleRequest } from "../../src/application/pipelines/index.js";
+import type { JobProgressRecord } from "../../src/adapters/dispatch/job-progress-store.js";
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
   const parsed = parseIdentifier(scope, value);
@@ -56,7 +57,196 @@ function snapshot(item: ReturnType<typeof issue>, executing = false) {
   };
 }
 
+function completedRecord(
+  item: ReturnType<typeof issue>,
+  options: Readonly<{
+    acceptanceRequirement?: "required" | "not_required";
+    acceptanceIdentityDigest?: string;
+    confirmedReviewHandoff?: boolean;
+  }> = {},
+): JobProgressRecord {
+  const jobId = "job_018f47d2-77a4-7cc1-8ef2-012345678908";
+  return {
+    projectId: project.id,
+    issueId: item.id,
+    externalIssueId: item.externalId,
+    jobId,
+    revision: 3,
+    stage: { kind: "completed" },
+    workStatusLifecycle: {
+      admissionMode: "enforce",
+      capabilityDigest: "a".repeat(64),
+      transitions: [
+        { step: "work_start", mainTarget: "in_progress", main: { state: "confirmed" } },
+        ...(options.confirmedReviewHandoff === true
+          ? [
+              {
+                step: "complete" as const,
+                instance: "work-status-transition-1",
+                mainTarget: "in_review" as const,
+                allowedMainSources: ["in_progress", "in_review"] as const,
+                agentTarget: { kind: "clear" as const },
+                main: { state: "confirmed" as const },
+                agent: { state: "confirmed" as const },
+              },
+            ]
+          : []),
+      ],
+    },
+    ...(options.acceptanceRequirement === undefined
+      ? {}
+      : {
+          humanDelivery: {
+            acceptanceRequirement: options.acceptanceRequirement,
+            verificationLevel: "strict" as const,
+            requirementDigest: "b".repeat(64),
+            humanSummaryDigest: "c".repeat(64),
+            ...(options.acceptanceIdentityDigest === undefined
+              ? {}
+              : { acceptanceIdentityDigest: options.acceptanceIdentityDigest }),
+          },
+        }),
+    updatedAt: now,
+  } as unknown as JobProgressRecord;
+}
+
+function completedOrphanHarness(
+  item: ReturnType<typeof issue>,
+  record: JobProgressRecord,
+  workStatus: "in_progress" | "in_review",
+) {
+  const candidate = { ...snapshot(item), workStatus };
+  const setWorkStatus = vi.fn();
+  const setAgentCondition = vi.fn();
+  const appendComment = vi.fn();
+  const transitionWhileLockHeld = vi.fn((request: WorkStatusLifecycleRequest, lock: unknown) => {
+    void request;
+    void lock;
+    return Promise.resolve({
+      state: "permitted" as const,
+      mode: "enforce" as const,
+      main: "confirmed" as const,
+      agent: "confirmed" as const,
+    });
+  });
+  const coordinator = new WorkStatusOrphanCoordinator({
+    project,
+    workManagement: {
+      listIssues: () => Promise.resolve(ok([candidate])),
+      getIssue: () => Promise.resolve(ok(candidate)),
+      setWorkStatus,
+      setAgentCondition,
+      appendComment,
+    },
+    progress: {
+      listAll: () => Promise.resolve(ok([record])),
+      load: () => Promise.resolve(ok(record)),
+    },
+    admission: {
+      listForProject: () => Promise.resolve(ok([])),
+      load: () => Promise.resolve(ok(undefined)),
+    } as never,
+    locks: {
+      acquire: (_scope: unknown, holderId: string) =>
+        Promise.resolve(
+          ok({
+            scopeDigest: "d".repeat(64),
+            holderId,
+            release: () => Promise.resolve(ok(undefined)),
+          }),
+        ),
+    },
+    lifecycle: { transitionWhileLockHeld },
+  });
+  return { coordinator, setWorkStatus, setAgentCondition, appendComment, transitionWhileLockHeld };
+}
+
 describe("work-status orphan quarantine", () => {
+  it("keeps a completed Job with pending human acceptance in review without another mutation", async () => {
+    const item = issue(8, true);
+    const record = completedRecord(item, {
+      acceptanceRequirement: "required",
+      acceptanceIdentityDigest: "e".repeat(64),
+      confirmedReviewHandoff: true,
+    });
+    const harness = completedOrphanHarness(item, record, "in_review");
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    expect(harness.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(harness.setWorkStatus).not.toHaveBeenCalled();
+    expect(harness.setAgentCondition).not.toHaveBeenCalled();
+    expect(harness.appendComment).not.toHaveBeenCalled();
+  });
+
+  it("restores a completed Job with pending human acceptance only to in review", async () => {
+    const item = issue(8, true);
+    const record = completedRecord(item, {
+      acceptanceRequirement: "required",
+      acceptanceIdentityDigest: "e".repeat(64),
+      confirmedReviewHandoff: true,
+    });
+    const harness = completedOrphanHarness(item, record, "in_progress");
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    expect(harness.transitionWhileLockHeld).toHaveBeenCalledTimes(2);
+    expect(harness.transitionWhileLockHeld).toHaveBeenCalledWith(
+      expect.objectContaining({
+        step: "complete",
+        mainTarget: "in_review",
+        agentTarget: { kind: "clear" },
+      }),
+      expect.anything(),
+    );
+    const firstTransition = harness.transitionWhileLockHeld.mock.calls[0]?.[0];
+    const secondTransition = harness.transitionWhileLockHeld.mock.calls[1]?.[0];
+    expect(firstTransition?.transitionInstance).not.toBe("work-status-transition-1");
+    expect(firstTransition?.transitionInstance).toBe(secondTransition?.transitionInstance);
+    expect(harness.transitionWhileLockHeld).not.toHaveBeenCalledWith(
+      expect.objectContaining({ mainTarget: "completed" }),
+      expect.anything(),
+    );
+  });
+
+  it("blocks required human acceptance without an identity before any mutation", async () => {
+    const item = issue(8, true);
+    const record = completedRecord(item, { acceptanceRequirement: "required" });
+    const harness = completedOrphanHarness(item, record, "in_progress");
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 0,
+      blocked: 1,
+    });
+    expect(harness.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(harness.setWorkStatus).not.toHaveBeenCalled();
+    expect(harness.setAgentCondition).not.toHaveBeenCalled();
+    expect(harness.appendComment).not.toHaveBeenCalled();
+  });
+
+  it("keeps completed projection for Jobs that do not require human acceptance", async () => {
+    const item = issue(8, true);
+    const record = completedRecord(item, { acceptanceRequirement: "not_required" });
+    const harness = completedOrphanHarness(item, record, "in_progress");
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    expect(harness.transitionWhileLockHeld).toHaveBeenCalledWith(
+      expect.objectContaining({ step: "complete", mainTarget: "completed" }),
+      expect.anything(),
+    );
+  });
+
   it("projects only the exact eligible Job and never enumerates another Linear issue", async () => {
     const item = issue(8, true);
     const jobId = "job_018f47d2-77a4-7cc1-8ef2-012345678908";
