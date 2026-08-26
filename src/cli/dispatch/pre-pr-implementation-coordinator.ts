@@ -71,6 +71,7 @@ function mutation(record: JobProgressRecord): JobProgressRecordMutation {
     ...(record.providerAssignments === undefined
       ? {}
       : { providerAssignments: record.providerAssignments }),
+    ...(record.skillSnapshots === undefined ? {} : { skillSnapshots: record.skillSnapshots }),
     stage: record.stage,
     branch: record.branch,
     worktreePath: record.worktreePath,
@@ -470,6 +471,9 @@ export class PrePrImplementationCoordinator {
       agentTeamHome: this.dependencies.agentTeamHome,
       clock: this.dependencies.clock,
       baseRevision,
+      ...(current.skillSnapshots?.implementer === undefined
+        ? {}
+        : { skillSnapshot: current.skillSnapshots.implementer }),
     };
     const request = buildImplementerPipelineRequest(requestOptions);
     if (!request.ok) {

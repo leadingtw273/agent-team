@@ -161,6 +161,18 @@ describe("LEA-130 Skill routing contract", () => {
     expect(snapshot).not.toHaveProperty("acceptanceCriteria");
     expect(snapshot).not.toHaveProperty("mergeGate");
     expect(snapshot).not.toHaveProperty("lifecycle");
+    expect(
+      jobSkillSnapshotSchema.safeParse({
+        ...snapshot,
+        omitted: [{ name: "godot-testing-patterns", reason: "missing" }],
+        skills: [
+          {
+            ...catalog().skills[0],
+            requirement: "required",
+          },
+        ],
+      }).success,
+    ).toBe(false);
   });
 
   it("computes deterministic tree integrity and rejects symlinks or reference escapes", async () => {

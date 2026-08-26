@@ -22,6 +22,7 @@ import type {
   ProviderRunCompletion,
   ProviderRunHandle,
 } from "../../src/application/ports/index.js";
+import { jobSkillSnapshotSchema, skillRuntimeFailure } from "../../src/application/skills/index.js";
 
 const baseSha = "a".repeat(40);
 const commitSha = "b".repeat(40);
@@ -272,6 +273,56 @@ function fixture(
 }
 
 describe("Implementer Pipeline", () => {
+  it("revalidates Skill content before creating a worktree or starting Provider", async () => {
+    const test = fixture();
+    const skillSnapshot = jobSkillSnapshotSchema.parse({
+      schemaVersion: 1,
+      jobId: job.id,
+      projectId: project.id,
+      skills: [
+        {
+          name: "godot-testing-patterns",
+          displayName: "Godot 測試模式",
+          mode: "knowledge_only",
+          source: {
+            repository: "https://github.com/example/skills",
+            commit: "a".repeat(40),
+            path: "skills/godot-testing-patterns",
+            treeDigest: "1".repeat(64),
+          },
+          installedTreeDigest: "2".repeat(64),
+          fileDigests: { "SKILL.md": "3".repeat(64) },
+          allowedReferences: [],
+          requirement: "required",
+        },
+      ],
+      omitted: [],
+    });
+    const configWithSkills = trustedProjectConfigSchema.parse({
+      ...trustedConfig,
+      skillPolicy: {
+        catalogId: "fixture-catalog",
+        catalogDigest: "4".repeat(64),
+        allowlist: ["godot-testing-patterns"],
+      },
+    });
+    const result = await new ImplementerPipeline({
+      ...test.ports,
+      skillRuntime: {
+        admit: () => Promise.resolve(err(skillRuntimeFailure("content_changed"))),
+        materialize: () =>
+          Promise.resolve(err(skillRuntimeFailure("content_changed", "godot-testing-patterns"))),
+      },
+    }).run(request({ trustedConfig: configWithSkills, skillSnapshot }));
+
+    expect(result).toMatchObject({
+      state: "failed",
+      stage: "request",
+      error: { code: "invariant_violation" },
+    });
+    expect(test.calls).toEqual([]);
+  });
+
   it("creates context-bound work, preflights before Push, opens Draft, and waits for CI", async () => {
     const test = fixture();
     const result = await new ImplementerPipeline(test.ports).run(request());

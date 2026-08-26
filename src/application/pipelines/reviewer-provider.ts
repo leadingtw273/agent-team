@@ -5,6 +5,7 @@ import type {
   ProviderEvent,
   ProviderPort,
   ProviderRunHandle,
+  SkillKnowledgeAttachment,
 } from "../ports/index.js";
 import type { ProviderToolDecisionPort } from "./implementer-model.js";
 import type {
@@ -58,6 +59,7 @@ export interface RunReviewerProviderInput {
   readonly diff: readonly EffectiveTreeChange[];
   readonly checks: CommitChecksSnapshot;
   readonly toolDecisions: ProviderToolDecisionPort;
+  readonly knowledgeAttachments: readonly SkillKnowledgeAttachment[];
 }
 
 async function collectEvents(
@@ -261,6 +263,7 @@ export async function runReviewerProvider(
         ...input.request.trustedConfig.projectRules,
         ...(input.request.trustedConfig.roleInstructions[input.role] ?? []),
       ]),
+      knowledgeAttachments: input.knowledgeAttachments,
       externalData,
       deadlineAt: input.request.deadlineAt,
     },

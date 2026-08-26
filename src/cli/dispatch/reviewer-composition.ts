@@ -31,11 +31,13 @@
  * dispatch -- duplicating it here would only risk the two disagreeing.
  */
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { LocalReviewerEvidenceIntegrity } from "../../adapters/evidence/index.js";
+import { FileSkillRuntime } from "../../adapters/skills/index.js";
 import { ReviewerPipeline } from "../../application/pipelines/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildClaudeRunner } from "./claude-factory.js";
@@ -59,6 +61,7 @@ export interface BuildReviewerPipelineOptions {
   /** Injectable for tests (same convention as `implementer-composition.ts`); production defaults
    * to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+  readonly skillsRoot?: string;
 }
 
 export type BuildReviewerPipelineResult =
@@ -84,6 +87,9 @@ export async function buildReviewerPipeline(
     sourceControl: new GitHubAdapter(githubTransport),
     codeReviewer,
     ...(visualReviewer === undefined ? {} : { visualReviewer }),
+    skillRuntime: new FileSkillRuntime({
+      skillsRoot: options.skillsRoot ?? join(homedir(), ".agent-context", "skills"),
+    }),
     toolDecisions: new FailClosedToolDecisionAdapter(),
     evidenceIntegrity: new LocalReviewerEvidenceIntegrity(),
     jobs: new FileJobUpdateAdapter(options.jobs),

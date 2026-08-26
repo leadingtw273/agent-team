@@ -3,7 +3,11 @@ import { resolve } from "node:path";
 import { domainError, type DomainError } from "../../domain/foundation/index.js";
 import { consumeAttempt, jobSchema, type Job } from "../../domain/jobs/index.js";
 import { createReviewIdentity } from "../../domain/review/index.js";
-import type { CommitChecksSnapshot, MutationOptions } from "../ports/index.js";
+import type {
+  CommitChecksSnapshot,
+  MutationOptions,
+  SkillKnowledgeAttachment,
+} from "../ports/index.js";
 import type {
   ReportContractFailureCategory,
   ReviewEvidenceBlock,
@@ -20,6 +24,7 @@ import {
   requiredReviewerRoles,
   sameReviewSha,
   validReviewerRequest,
+  type RequiredReviewerRole,
 } from "./reviewer-policy.js";
 import { runReviewerProvider, type ReviewerRunResult } from "./reviewer-provider.js";
 
@@ -166,6 +171,27 @@ export class ReviewerPipeline {
       return failed("request", domainError("invariant_violation"), request.job);
     }
     const roles = requiredReviewerRoles(request);
+    const knowledgeByRole = new Map<RequiredReviewerRole, readonly SkillKnowledgeAttachment[]>();
+    if (
+      (request.trustedConfig.skillPolicy === undefined) !==
+      (request.skillSnapshots === undefined)
+    ) {
+      return failed("request", domainError("invariant_violation"), request.job);
+    }
+    if (request.skillSnapshots !== undefined) {
+      if (this.ports.skillRuntime === undefined) {
+        return failed("request", domainError("invariant_violation"), request.job);
+      }
+      for (const role of roles) {
+        const snapshot = request.skillSnapshots[role];
+        if (snapshot?.jobId !== request.job.id || snapshot.projectId !== request.project.id) {
+          return failed("request", domainError("invariant_violation"), request.job);
+        }
+        const materialized = await this.ports.skillRuntime.materialize(snapshot);
+        if (!materialized.ok) return failed("request", materialized.error.error, request.job);
+        knowledgeByRole.set(role, materialized.value);
+      }
+    }
     if (
       (roles.includes("code_reviewer") && this.ports.codeReviewer === undefined) ||
       (roles.includes("visual_reviewer") && this.ports.visualReviewer === undefined)
@@ -294,6 +320,7 @@ export class ReviewerPipeline {
           diff: diff.value,
           checks: checks.value,
           toolDecisions: this.ports.toolDecisions,
+          knowledgeAttachments: knowledgeByRole.get(role) ?? Object.freeze([]),
         });
       }),
     );

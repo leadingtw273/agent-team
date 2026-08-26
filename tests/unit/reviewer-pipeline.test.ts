@@ -24,6 +24,7 @@ import type {
 } from "../../src/application/ports/index.js";
 import {
   domainError,
+  err,
   ok,
   parseInstant,
   type DomainError,
@@ -43,6 +44,11 @@ import {
   type ReviewIdentity,
 } from "../../src/domain/review/index.js";
 import { visualManifestSchema } from "../../src/domain/checkpoint/index.js";
+import {
+  jobSkillSnapshotSchema,
+  skillRuntimeFailure,
+  type SkillRuntimePort,
+} from "../../src/application/skills/index.js";
 
 const headSha = "a".repeat(40);
 const baseSha = "b".repeat(40);
@@ -339,6 +345,7 @@ function handle(
 }
 
 interface FixtureOptions {
+  readonly skillRuntime?: SkillRuntimePort;
   readonly checks?: "pending" | "success" | "failure";
   readonly reports?: Partial<Record<"code_reviewer" | "visual_reviewer", unknown>>;
   readonly postReviewDirty?: boolean;
@@ -415,6 +422,7 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
     },
   });
   const ports: ReviewerPipelinePorts = {
+    ...(options.skillRuntime === undefined ? {} : { skillRuntime: options.skillRuntime }),
     git: {
       inspectWorktree: () => {
         calls.push("git:worktree");
@@ -528,6 +536,42 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
 }
 
 describe("ReviewerPipeline", () => {
+  it("revalidates reviewer Skill content before PR mutation or Provider", async () => {
+    const skillSnapshot = jobSkillSnapshotSchema.parse({
+      schemaVersion: 1,
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      projectId: project.id,
+      skills: [],
+      omitted: [],
+    });
+    const input = request(
+      "code_review",
+      {},
+      {
+        trustedConfig: trustedProjectConfigSchema.parse({
+          ...config,
+          skillPolicy: {
+            catalogId: "fixture-catalog",
+            catalogDigest: "4".repeat(64),
+            allowlist: [],
+          },
+        }),
+        skillSnapshots: { code_reviewer: skillSnapshot },
+      },
+    );
+    const setup = fixture(input, {
+      skillRuntime: {
+        admit: () => Promise.resolve(ok(skillSnapshot)),
+        materialize: () =>
+          Promise.resolve(err(skillRuntimeFailure("content_changed", "fixture-skill"))),
+      },
+    });
+    const outcome = await setup.pipeline.run(input.value);
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "request" });
+    expect(setup.calls).toEqual([]);
+  });
+
   it("reviewer-replay uses its external CAS budget instead of the exhausted historical Job counter", async () => {
     const input = request(
       "code_review",

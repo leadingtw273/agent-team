@@ -23,6 +23,7 @@ import type {
 } from "../ports/index.js";
 import type { AsyncPortResult, MutationOptions, ReadOptions } from "../ports/common.js";
 import type { ProviderToolDecisionPort } from "./implementer-model.js";
+import type { JobSkillSnapshotsByRole, SkillRuntimePort } from "../skills/index.js";
 
 const nonEmptyTextSchema = z.string().trim().min(1).max(65_536);
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
@@ -286,6 +287,7 @@ export interface ReviewerPipelinePorts {
   >;
   readonly codeReviewer?: ProviderPort;
   readonly visualReviewer?: ProviderPort;
+  readonly skillRuntime?: SkillRuntimePort;
   readonly toolDecisions: ProviderToolDecisionPort;
   readonly evidenceIntegrity: ReviewerEvidenceIntegrityPort;
   readonly jobs: ReviewerJobPort;
@@ -317,6 +319,7 @@ export interface ReviewerPipelineRequest {
   /** Dedicated reviewer-replay owns its attempt budget in the Job-progress CAS checkpoint. It
    * must not consume or be blocked by the historical Job.reviewRuns counter. */
   readonly attemptAccounting?: "job" | "reviewer_replay";
+  readonly skillSnapshots?: JobSkillSnapshotsByRole;
 }
 
 export type ReviewerFailureStage =

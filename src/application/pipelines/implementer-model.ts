@@ -18,6 +18,7 @@ import type { Job } from "../../domain/jobs/index.js";
 import type { AgentRole, ChangeRegion, Project } from "../../domain/project/index.js";
 import type { RequirementSnapshot } from "../../domain/review/index.js";
 import type { ExternalDataBlock } from "../ports/provider.js";
+import type { JobSkillSnapshot, SkillRuntimePort } from "../skills/index.js";
 
 export type ImplementerPreflightFinding =
   | Readonly<{ code: "outside_declared_region"; path: string }>
@@ -95,6 +96,7 @@ export interface ImplementerPipelinePorts {
   >;
   readonly preflight: ImplementerPreflightPort;
   readonly provider: ProviderPort;
+  readonly skillRuntime?: SkillRuntimePort;
   readonly sourceControl: Pick<SourceControlPort, "createDraftChangeRequest" | "getCommitChecks">;
   readonly scopeCheckpoint: ScopeOverrunCheckpointPort;
   readonly toolDecisions: ProviderToolDecisionPort;
@@ -116,6 +118,7 @@ export interface ImplementerPipelineRequest {
   readonly pullRequest: Readonly<{ title: string; body: string }>;
   readonly controllerDirective: string;
   readonly externalData: readonly ExternalDataBlock[];
+  readonly skillSnapshot?: JobSkillSnapshot;
   readonly deadlineAt: Instant;
   readonly expectedUntrackedPaths?: readonly string[];
   readonly concurrentJobs?: Parameters<ImplementerPreflightPort["inspect"]>[0]["concurrentJobs"];

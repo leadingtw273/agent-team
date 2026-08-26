@@ -34,6 +34,7 @@ import { watchdogHardStopMs, type Job } from "../../domain/jobs/index.js";
 import type { Issue, Project } from "../../domain/project/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
 import type { ImplementerPipelineRequest } from "../../application/pipelines/index.js";
+import type { JobSkillSnapshot } from "../../application/skills/index.js";
 
 /**
  * Imports `watchdogHardStopMs` (src/domain/jobs/watchdog.ts) directly rather than duplicating the
@@ -107,6 +108,7 @@ export interface BuildImplementerPipelineRequestOptions {
    * the time `createWorktree` actually runs."
    */
   readonly baseRevision: string;
+  readonly skillSnapshot?: JobSkillSnapshot;
 }
 
 /**
@@ -160,6 +162,7 @@ export function buildImplementerPipelineRequest(
       pullRequest: Object.freeze({ title: options.issue.title, body: directive }),
       controllerDirective: directive,
       externalData: Object.freeze([]),
+      ...(options.skillSnapshot === undefined ? {} : { skillSnapshot: options.skillSnapshot }),
       deadlineAt: deadlineAt.value,
       idempotencyKeyPrefix: `cli-dispatch:${options.job.id}`,
       ...(expectedUntrackedPaths === undefined ? {} : { expectedUntrackedPaths }),
