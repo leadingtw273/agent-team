@@ -77,6 +77,16 @@ export interface CliHandlers {
   readonly dispatchResolve: (
     input: Readonly<{ jobId: string; as: "superseded" | "cancelled"; supersededByJobId?: string }>,
   ) => Promise<CliCommandOutcome>;
+  readonly dispatchAcknowledgeExternalMerge: (
+    input: Readonly<{
+      jobId: string;
+      prNumber: number | string;
+      headSha: string;
+      mergeCommitSha: string;
+      allowMissingHumanAcceptance?: boolean;
+      dryRun?: boolean;
+    }>,
+  ) => Promise<CliCommandOutcome>;
   /** C016: the controlled repair path for an admission claim with no job-progress record to
    * resolve against at all -- see src/cli/dispatch/legacy-claim-handlers.ts's own header for the
    * full rationale. Never a substitute for `dispatchResolve` above. */
@@ -190,6 +200,7 @@ export const defaultCliHandlers: CliHandlers = Object.freeze({
   humanAcceptanceAccept: () => blocked("acceptance accept"),
   humanAcceptanceRequestAdjustment: () => blocked("acceptance request-adjustment"),
   dispatchResolve: () => blocked("dispatch resolve"),
+  dispatchAcknowledgeExternalMerge: () => blocked("dispatch acknowledge-external-merge"),
   dispatchResolveLegacyClaim: () => blocked("dispatch resolve-legacy-claim"),
   dispatchAutoMergeResume: () => blocked("dispatch auto-merge-resume"),
   dispatchReviewerResume: () => blocked("dispatch reviewer-resume"),
@@ -394,6 +405,43 @@ export function createProgram(
             ...(options.supersededBy === undefined
               ? {}
               : { supersededByJobId: options.supersededBy }),
+          }),
+        )(),
+    );
+
+  dispatch
+    .command("acknowledge-external-merge")
+    .description(
+      "精確承認一個 legacy Job 的既有流程外合併，補齊 Linear lifecycle、Job、claim 與 Lease；不做 GitHub mutation",
+    )
+    .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
+    .requiredOption("--pr <number>", "已合併的 GitHub PR 編號")
+    .requiredOption("--head <sha>", "GitHub merged PR 的完整 Head SHA")
+    .requiredOption("--merge-commit <sha>", "GitHub merge commit 的完整 SHA")
+    .option(
+      "--allow-missing-human-acceptance",
+      "明確承認既成外部合併尚無已驗證的人工作業驗收；需使用更強確認短語",
+    )
+    .option("--dry-run", "只做 Job、Linear、PR、claim 與公開 recovery marker read-back")
+    .action(
+      (options: {
+        readonly job: string;
+        readonly pr: string;
+        readonly head: string;
+        readonly mergeCommit: string;
+        readonly allowMissingHumanAcceptance?: boolean;
+        readonly dryRun?: boolean;
+      }) =>
+        action(state, io, () =>
+          handlers.dispatchAcknowledgeExternalMerge({
+            jobId: options.job,
+            prNumber: options.pr,
+            headSha: options.head,
+            mergeCommitSha: options.mergeCommit,
+            ...(options.allowMissingHumanAcceptance === true
+              ? { allowMissingHumanAcceptance: true }
+              : {}),
+            ...(options.dryRun === true ? { dryRun: true } : {}),
           }),
         )(),
     );
