@@ -91,6 +91,38 @@ const reference = { project, changeRequestId: "42" } as const;
 const mutation = { idempotencyKey: "attempt-1" } as const;
 
 describe("GitHub source-control adapter", () => {
+  it("finds every open PR by exact head without filtering on base and re-reads full details", async () => {
+    const transport = new ScriptedTransport([
+      {
+        assert: (arguments_) => {
+          expect(arguments_).toContain("state=open");
+          expect(arguments_).toContain("head=owner:task/fixture");
+          expect(arguments_.some((argument) => argument.startsWith("base="))).toBe(false);
+          expect(arguments_.join(" ")).not.toContain(".base.ref");
+        },
+        value: [
+          { number: 42, state: "open" },
+          { number: 43, state: "open" },
+        ],
+      },
+      { value: pull({ number: 42, baseBranch: "release", body: "first" }) },
+      { value: pull({ number: 43, baseBranch: "next", body: "second" }) },
+    ]);
+    const result = await new GitHubAdapter(transport).findOpenChangeRequestsByHead(
+      { project },
+      "task/fixture",
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [
+        { number: 42, baseBranch: "release", body: "first" },
+        { number: 43, baseBranch: "next", body: "second" },
+      ],
+    });
+    transport.expectDone();
+  });
+
   it("maps a pull request and aggregates pending, success, and failed checks", async () => {
     const transport = new ScriptedTransport([
       { value: pull({ mergeability: "conflicting" }) },

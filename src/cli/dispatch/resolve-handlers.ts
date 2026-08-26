@@ -23,6 +23,7 @@ import type {
 } from "../../adapters/dispatch/job-progress-store.js";
 import type { IssueAdmissionPort } from "../../adapters/dispatch/issue-admission-store.js";
 import { jobIdSchema } from "../../domain/jobs/index.js";
+import type { DomainError, Result } from "../../domain/foundation/index.js";
 
 /** O009-style fixed CLI-owned phrase (see confirmation.ts's own header on why this command has no
  * engine-defined phrase to reuse -- there is no engine concept of "resolve a stuck dispatch job"
@@ -38,8 +39,24 @@ export interface DispatchResolveInput {
 export interface CreateDispatchResolveHandlerOptions {
   readonly progress: FileJobProgressStore;
   readonly admission: IssueAdmissionPort;
+  readonly authority: DispatchResolveAuthorityPort;
   /** Injectable for tests; production defaults to `process.stdin`. */
   readonly stdin?: AsyncIterable<Uint8Array | string>;
+}
+
+export interface DispatchResolveAuthorityReceipt {
+  readonly record: JobProgressRecord;
+  readonly release: () => Promise<Result<void, DomainError>>;
+  /** An authoritative external state was preserved, but the requested terminal transition is
+   * unsafe (currently the canceled-after-external-merge race). */
+  readonly blockedReason?: "cancellation_after_merge";
+}
+
+export interface DispatchResolveAuthorityPort {
+  converge(
+    record: JobProgressRecord,
+    input: DispatchResolveInput,
+  ): Promise<Result<DispatchResolveAuthorityReceipt, DomainError>>;
 }
 
 const terminalStageKinds: ReadonlySet<string> = new Set(["completed", "superseded", "cancelled"]);
@@ -148,8 +165,47 @@ export function createDispatchResolveHandler(
     } else {
       nextStage = { kind: "cancelled" };
     }
-    const written = await options.progress.compareAndSwap(input.jobId, record.value.revision, {
-      ...terminalMutationFrom(record.value),
+    const converged = await options.authority.converge(record.value, input);
+    if (!converged.ok) {
+      return outcome(converged.error.code === "permission_denied" ? "blocked" : "failed", {
+        operation: "dispatch_resolve",
+        state: "blocked",
+        reason: "authority_unavailable",
+        errorCode: converged.error.code,
+      });
+    }
+    if (converged.value.blockedReason !== undefined) {
+      const authorityReleased = await converged.value.release();
+      return outcome(authorityReleased.ok ? "blocked" : "failed", {
+        operation: "dispatch_resolve",
+        state: "blocked",
+        reason: converged.value.blockedReason,
+        ...(authorityReleased.ok ? {} : { errorCode: authorityReleased.error.code }),
+      });
+    }
+    const authoritative = await options.progress.load(input.jobId);
+    const authoritativeRecord = authoritative.ok ? authoritative.value : undefined;
+    if (
+      !authoritative.ok ||
+      authoritativeRecord?.revision !== converged.value.record.revision
+    ) {
+      return outcome("failed", {
+        operation: "dispatch_resolve",
+        state: "blocked",
+        reason: "authority_changed_before_terminal",
+        errorCode: authoritative.ok ? "conflict" : authoritative.error.code,
+      });
+    }
+    const written = await options.progress.compareAndSwap(input.jobId, authoritativeRecord.revision, {
+      ...terminalMutationFrom(authoritativeRecord),
+      ...(authoritativeRecord.controlFence === undefined
+        ? {}
+        : {
+            controlFence: {
+              ...authoritativeRecord.controlFence,
+              state: "revoked" as const,
+            },
+          }),
       stage: nextStage,
     });
     if (!written.ok) {
@@ -161,14 +217,14 @@ export function createDispatchResolveHandler(
       });
     }
 
-    const claim = await options.admission.load(record.value.projectId, record.value.issueId);
+    const claim = await options.admission.load(authoritativeRecord.projectId, authoritativeRecord.issueId);
     let admissionReleased: "released" | "not_found" | "owned_by_other_job" | "release_failed" =
       "not_found";
     if (claim.ok && claim.value?.state === "active") {
       if (claim.value.jobId === undefined || claim.value.jobId === input.jobId) {
         const released = await options.admission.release(
-          record.value.projectId,
-          record.value.issueId,
+          authoritativeRecord.projectId,
+          authoritativeRecord.issueId,
           claim.value.revision,
           input.as,
           input.supersededByJobId,
@@ -177,6 +233,17 @@ export function createDispatchResolveHandler(
       } else {
         admissionReleased = "owned_by_other_job";
       }
+    }
+
+    const authorityReleased = await converged.value.release();
+    if (!authorityReleased.ok) {
+      return outcome("failed", {
+        operation: "dispatch_resolve",
+        state: "blocked",
+        reason: "authority_release_failed",
+        errorCode: authorityReleased.error.code,
+        admissionReleased,
+      });
     }
 
     return outcome("success", {
@@ -188,6 +255,7 @@ export function createDispatchResolveHandler(
         ? {}
         : { supersededByJobId: input.supersededByJobId }),
       admissionReleased,
+      authorityReleased: true,
     });
   };
 }

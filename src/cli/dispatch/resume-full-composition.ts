@@ -8,6 +8,7 @@
  * stays free of GitHub-authentication wiring concerns.
  */
 import { GhTransport, GitHubAdapter } from "../../adapters/github/index.js";
+import { LocalGitAdapter } from "../../adapters/git/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/job-progress-store.js";
 import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
 import {
@@ -37,6 +38,15 @@ import { buildLifecyclePipeline } from "./lifecycle-composition.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
 import { ReviewerWaitPublicationCoordinator } from "./reviewer-wait-publication.js";
+import type { Project } from "../../domain/project/index.js";
+import type { Clock } from "../../domain/foundation/index.js";
+import {
+  ProjectManagedMutationAuthority,
+  fenceGitPort,
+  fenceSourceControlPort,
+  fenceWorkManagementLifecyclePort,
+  type WorkManagementLifecyclePort,
+} from "./managed-mutation-authority.js";
 
 export type ResumeCompositionBlockedReason = "github_authentication_unavailable";
 
@@ -75,6 +85,11 @@ export interface BuildResumeCompositionOptions {
    * `lifecycle-composition.ts`'s own header for why this is threaded rather than each composition
    * root constructing its own store from `agentTeamHome`. */
   readonly autoMergePause: Pick<FileAutoMergePauseStore, "load" | "pause">;
+  readonly managedMutation?: Readonly<{
+    project: Project;
+    holderId: string;
+    clock: Clock;
+  }>;
 }
 
 export type ResumePipelineComposition = Pick<
@@ -91,6 +106,7 @@ export type ResumePipelineComposition = Pick<
   | "humanAcceptance"
   | "visualReviewModel"
 > &
+  Readonly<{ workManagement: WorkManagementLifecyclePort }> &
   Required<
     Pick<
       ResumeCycleDependencies,
@@ -105,10 +121,43 @@ export type BuildResumeCompositionResult =
 export async function buildResumeComposition(
   options: BuildResumeCompositionOptions,
 ): Promise<BuildResumeCompositionResult> {
+  const rawWorkManagement = new LinearWorkManagementAdapter({
+    readModel: options.readModel,
+    mutationClient: options.mutationClient,
+    teamId: options.teamId,
+    linearProjectId: options.linearProjectId,
+  });
+  const rawSourceControl = new GitHubAdapter(new GhTransport());
+  const managedGate =
+    options.managedMutation === undefined
+      ? undefined
+      : new ProjectManagedMutationAuthority({
+          progress: options.progress,
+          project: options.managedMutation.project,
+          holderId: options.managedMutation.holderId,
+          workManagement: rawWorkManagement,
+          sourceControl: rawSourceControl,
+          escalationWorkManagement: rawWorkManagement,
+          clock: options.managedMutation.clock,
+        });
+  const sourceControl =
+    managedGate === undefined
+      ? rawSourceControl
+      : fenceSourceControlPort(rawSourceControl, managedGate);
+  const git =
+    managedGate === undefined
+      ? new LocalGitAdapter()
+      : fenceGitPort(new LocalGitAdapter(), managedGate);
+  const workManagement =
+    managedGate === undefined
+      ? rawWorkManagement
+      : fenceWorkManagementLifecyclePort(rawWorkManagement, managedGate);
   const ciRecovery = await buildCiRecoveryPipeline({
     agentTeamHome: options.agentTeamHome,
     codexConfig: options.codexConfig,
     jobs: options.jobs,
+    gitPort: git,
+    sourceControlPort: sourceControl,
   });
   if (ciRecovery.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: ciRecovery.reason });
@@ -117,25 +166,24 @@ export async function buildResumeComposition(
     agentTeamHome: options.agentTeamHome,
     codexConfig: options.codexConfig,
     jobs: options.jobs,
+    gitPort: git,
   });
   const reviewer = await buildReviewerPipeline({
     agentTeamHome: options.agentTeamHome,
     claudeConfig: options.claudeConfig,
     ...(options.geminiConfig === undefined ? {} : { geminiConfig: options.geminiConfig }),
     jobs: options.jobs,
+    gitPort: git,
+    sourceControlPort: sourceControl,
   });
   if (reviewer.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: reviewer.reason });
   }
-  const workManagement = new LinearWorkManagementAdapter({
-    readModel: options.readModel,
-    mutationClient: options.mutationClient,
-    teamId: options.teamId,
-    linearProjectId: options.linearProjectId,
-  });
   const statusMerge = await buildStatusMergePipelines({
     autoMergePauseStore: options.autoMergePause,
     workManagement,
+    sourceControlPort: sourceControl,
+    ...(managedGate === undefined ? {} : { managedMutationGate: managedGate }),
   });
   if (statusMerge.state !== "ready") {
     return Object.freeze({ state: "blocked", reason: statusMerge.reason });
@@ -149,6 +197,8 @@ export async function buildResumeComposition(
     agentTeamHome: options.agentTeamHome,
     leases: options.leases,
     autoMergePause: options.autoMergePause,
+    sourceControlPort: sourceControl,
+    workManagementPort: workManagement,
   });
   // E102-3: zero-arg/no-shared-state construction, the same convention every other adapter in
   // this function's own return value already follows (`new GitHubAdapter(new GhTransport())`
@@ -186,7 +236,7 @@ export async function buildResumeComposition(
   return Object.freeze({
     state: "ready",
     value: Object.freeze({
-      sourceControl: new GitHubAdapter(new GhTransport()),
+      sourceControl,
       ciRecovery: ciRecovery.value,
       reviewerRecovery: reviewerRecovery.value,
       reviewer: reviewer.value,

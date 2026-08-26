@@ -386,6 +386,21 @@ function buildHandlers(
       resolveAuthoritativeBase ?? fakeResolveAuthoritativeBase(repositoryPath),
     ...(buildImplementerPipeline === undefined ? {} : { buildImplementerPipeline }),
     ...(protectedRegionWorkManagement === undefined ? {} : { protectedRegionWorkManagement }),
+    jobMutationRuntimeFactory: () => ({
+      ensureJobStarted: () => Promise.resolve(ok(undefined)),
+      bindPullRequest: (record) => Promise.resolve(ok(record)),
+      buildImplementer: async () =>
+        buildImplementerPipeline === undefined
+          ? { state: "blocked" as const, reason: "github_authentication_unavailable" as const }
+          : buildImplementerPipeline({
+              agentTeamHome: stateRoot,
+              codexConfig: {
+                executable: "codex",
+                models: ["lead", "gpt-5.6-terra", "integrate"],
+                account: "default",
+              },
+            }),
+    }),
   });
 }
 
@@ -412,9 +427,20 @@ async function resolveJob(
   stateRoot: string,
   jobId: string,
 ): Promise<{ resolved: string; admissionReleased: string }> {
+  const progress = new FileJobProgressStore(defaultJobProgressDirectory(stateRoot));
   const resolve = createDispatchResolveHandler({
-    progress: new FileJobProgressStore(defaultJobProgressDirectory(stateRoot)),
+    progress,
     admission: new FileIssueAdmissionStore(defaultIssueAdmissionDirectory(stateRoot)),
+    authority: {
+      converge: async (record) => {
+        const current = await progress.load(record.jobId);
+        return !current.ok
+          ? current
+          : current.value === undefined
+            ? err(domainError("not_found"))
+            : ok({ record: current.value, release: () => Promise.resolve(ok(undefined)) });
+      },
+    },
     stdin: stdinOf(dispatchResolveConfirmationPhrase),
   });
   const outcome = await resolve({ jobId, as: "cancelled" });

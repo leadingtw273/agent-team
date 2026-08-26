@@ -30,13 +30,17 @@ import {
   JobProgressWorkStatusLifecycleLedger,
   projectIssueByExternalId,
 } from "../../adapters/dispatch/index.js";
-import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
+import {
+  JobPrLifecyclePublisher,
+  WorkStatusLifecycleCoordinator,
+} from "../../application/pipelines/index.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import {
   buildImplementerPipeline,
   type BuildImplementerPipelineResult,
 } from "./implementer-composition.js";
 import { PrePrImplementationCoordinator } from "./pre-pr-implementation-coordinator.js";
+import { JobMutationRuntime } from "./job-mutation-runtime.js";
 
 export type ResumeExistingProjectJobsResult =
   | Readonly<{ state: "none" }>
@@ -176,7 +180,20 @@ export async function resumeExistingProjectJobs(
     ),
     clock: options.clock,
   });
-  let implementerComposition: BuildImplementerPipelineResult | undefined;
+  let cachedMutationRuntime: JobMutationRuntime | undefined;
+  const mutationRuntime = (): JobMutationRuntime => {
+    cachedMutationRuntime ??= new JobMutationRuntime({
+      agentTeamHome: options.agentTeamHome,
+      project: options.ready.project,
+      progress,
+      workManagement: lifecycleWorkManagement,
+      escalationWorkManagement: lifecycleWorkManagement,
+      codexConfig: options.ready.codex.config,
+      clock: options.clock,
+      buildPipeline: options.buildImplementerPipeline ?? buildImplementerPipeline,
+    });
+    return cachedMutationRuntime;
+  };
   const prePrImplementation = new PrePrImplementationCoordinator({
     agentTeamHome: options.agentTeamHome,
     project: options.ready.project,
@@ -195,16 +212,27 @@ export async function resumeExistingProjectJobs(
         readOptions,
       ),
     workStatus: workStatusLifecycle,
+    ensureJobStarted: (record) => mutationRuntime().ensureJobStarted(record),
+    bindPullRequest: (record, prNumber, headSha) =>
+      mutationRuntime().bindPullRequest(record, prNumber, headSha),
     clock: options.clock,
     ensureWorktreeDirectory: () => ensureDispatchWorktreesDirectory(options.agentTeamHome),
     buildPipeline: async () => {
-      implementerComposition ??= await (
-        options.buildImplementerPipeline ?? buildImplementerPipeline
-      )({
-        agentTeamHome: options.agentTeamHome,
-        codexConfig: options.ready.codex.config,
-      });
-      return implementerComposition;
+      const records = await progress.listForProject(options.ready.project.id);
+      const active = records.ok
+        ? records.value.filter(
+            (record) =>
+              record.controlFence?.state === "active" &&
+              record.controlFence.holderId === options.holderId &&
+              (record.stage.kind === "work_start_pending" || record.stage.kind === "implementing"),
+          )
+        : [];
+      return active.length === 1 && active[0] !== undefined
+        ? mutationRuntime().buildImplementer(active[0])
+        : Object.freeze({
+            state: "blocked" as const,
+            reason: "github_authentication_unavailable" as const,
+          });
     },
     resolveAuthoritativeBase: (project, resolveOptions) =>
       (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
@@ -231,6 +259,11 @@ export async function resumeExistingProjectJobs(
         leases,
         autoMergePause,
         linearTransport: options.ready.discovery.linearTransport,
+        managedMutation: {
+          project: options.ready.project,
+          holderId: options.holderId,
+          clock: options.clock,
+        },
       });
       if (built.state !== "ready") {
         throw new ResumePreparationBlockedError(
@@ -298,6 +331,11 @@ export async function resumeExistingProjectJobs(
         },
         autoMerge: { enable: (...args) => prepared().autoMerge.enable(...args) },
         lifecycle: { run: (...args) => prepared().lifecycle.run(...args) },
+        jobPrLifecycle: {
+          publish: (...args) =>
+            new JobPrLifecyclePublisher(prepared().workManagement).publish(...args),
+        },
+        repairPublicAuthority: (record) => mutationRuntime().repairPublicAuthority(record),
         humanAcceptance: {
           createPending: (...args) =>
             preparedCapability((composition) => composition.humanAcceptance).createPending(...args),

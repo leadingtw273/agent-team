@@ -28,7 +28,7 @@ import { join } from "node:path";
 
 import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
-import { LifecyclePipeline } from "../../application/pipelines/index.js";
+import { LifecyclePipeline, type LifecyclePipelinePorts } from "../../application/pipelines/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/index.js";
 import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";
@@ -54,19 +54,23 @@ export interface BuildLifecyclePipelineOptions {
   readonly autoMergePause: Pick<FileAutoMergePauseStore, "pause">;
   /** Injectable for tests; production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport;
+  readonly sourceControlPort?: LifecyclePipelinePorts["sourceControl"];
+  readonly workManagementPort?: LifecyclePipelinePorts["workManagement"];
 }
 
 export function buildLifecyclePipeline(options: BuildLifecyclePipelineOptions): LifecyclePipeline {
   const github = new GitHubAdapter(options.githubTransport ?? new GhTransport());
   const checkpointDirectory = join(options.agentTeamHome, "state", "checkpoints");
   return new LifecyclePipeline({
-    sourceControl: github,
-    workManagement: new LinearWorkManagementAdapter({
-      readModel: options.readModel,
-      mutationClient: options.mutationClient,
-      teamId: options.teamId,
-      linearProjectId: options.linearProjectId,
-    }),
+    sourceControl: options.sourceControlPort ?? github,
+    workManagement:
+      options.workManagementPort ??
+      new LinearWorkManagementAdapter({
+        readModel: options.readModel,
+        mutationClient: options.mutationClient,
+        teamId: options.teamId,
+        linearProjectId: options.linearProjectId,
+      }),
     policy: new FileAutoMergePauseAdapter({ store: options.autoMergePause }),
     cancellation: new JobProgressLifecycleCancellationAdapter({
       progress: options.progress,

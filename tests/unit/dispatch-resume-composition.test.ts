@@ -28,6 +28,7 @@ import {
 } from "../../src/cli/dispatch/resume-composition.js";
 import {
   FileJobProgressStore,
+  type JobProgressRecord,
   type JobProgressRecordMutation,
 } from "../../src/adapters/dispatch/job-progress-store.js";
 import { FileHumanAcceptanceStore } from "../../src/adapters/dispatch/human-acceptance-store.js";
@@ -2220,6 +2221,50 @@ describe("runResumeCycle", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value).toEqual([{ jobId, outcome: "completed" }]);
     expect(calls).toEqual(["getChangeRequest", "lifecycle.run"]);
+  });
+
+  it("rotates a legacy Job fence before repairing public authority on resume", async () => {
+    const { deps, progress } = await harness({
+      changeRequestState: { draft: true },
+      ciRecoveryOutcome: {
+        state: "ci_waiting",
+        source: "polling",
+        job: job(),
+        checks: { headSha, aggregate: "pending", checks: [] },
+      },
+    });
+    await seedProgressRecord(progress, { kind: "ci_waiting" });
+    const repairPublicAuthority = vi.fn((record: JobProgressRecord) => {
+      expect(record.controlFence).toMatchObject({
+        holderId: "resume-holder",
+        leaseEpoch: 1,
+        ownershipEpoch: 0,
+        state: "active",
+      });
+      return Promise.resolve(ok(record));
+    });
+    const jobPrLifecycle = {
+      publish: vi.fn(() => Promise.reject(new Error("unexpected lifecycle publication"))),
+    };
+
+    await expect(
+      runResumeCycle({ ...deps, jobPrLifecycle, repairPublicAuthority }),
+    ).resolves.toEqual(ok([{ jobId, outcome: "still_ci_waiting" }]));
+
+    expect(repairPublicAuthority).toHaveBeenCalledTimes(1);
+    expect(jobPrLifecycle.publish).not.toHaveBeenCalled();
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: { kind: "ci_waiting" },
+        controlFence: {
+          holderId: "resume-holder",
+          leaseEpoch: 1,
+          ownershipEpoch: 0,
+          state: "active",
+        },
+      },
+    });
   });
 
   it("still-pending CI leaves the job at ci_waiting, untouched, without ever reaching the reviewer", async () => {

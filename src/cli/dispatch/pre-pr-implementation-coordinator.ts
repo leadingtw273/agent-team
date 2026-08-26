@@ -49,6 +49,13 @@ export interface PrePrImplementationCoordinatorDependencies {
     options?: Readonly<{ signal?: AbortSignal }>,
   ) => Promise<Result<Issue, DomainError>>;
   readonly workStatus: WorkStatusLifecycleCoordinator;
+  /** Publishes and read-backs the public Job seed before any managed provider mutation. */
+  readonly ensureJobStarted?: (record: JobProgressRecord) => Promise<Result<void, DomainError>>;
+  readonly bindPullRequest?: (
+    record: JobProgressRecord,
+    prNumber: number,
+    headSha: string,
+  ) => Promise<Result<JobProgressRecord, DomainError>>;
   readonly clock: Clock;
   readonly ensureWorktreeDirectory: () => Promise<Result<void, DomainError>>;
   readonly buildPipeline: () => Promise<
@@ -90,6 +97,10 @@ function mutation(record: JobProgressRecord): JobProgressRecordMutation {
       ? {}
       : { workStatusLifecycle: record.workStatusLifecycle }),
     ...(record.humanDelivery === undefined ? {} : { humanDelivery: record.humanDelivery }),
+    ...(record.controlFence === undefined ? {} : { controlFence: record.controlFence }),
+    ...(record.mutationAttempts === undefined
+      ? {}
+      : { mutationAttempts: record.mutationAttempts }),
   };
 }
 
@@ -160,6 +171,35 @@ export class PrePrImplementationCoordinator {
           initialRecord.baseRevision !== undefined
         ))
     ) {
+      return requiresManual(
+        this.dependencies.progress,
+        initialRecord,
+        "pre_pr_identity_unrecoverable",
+      );
+    }
+
+    if (this.dependencies.ensureJobStarted !== undefined) {
+      const started = await this.dependencies.ensureJobStarted(initialRecord);
+      if (!started.ok) {
+        return requiresManual(
+          this.dependencies.progress,
+          initialRecord,
+          "pre_pr_identity_unrecoverable",
+        );
+      }
+      const refreshed = await this.dependencies.progress.load(initialRecord.jobId);
+      if (!refreshed.ok || refreshed.value === undefined) {
+        return {
+          jobId: initialRecord.jobId,
+          outcome: "transient_failure",
+          reason: "job_progress_read_failed",
+          error: refreshed.ok ? domainError("not_found") : refreshed.error,
+        };
+      }
+      initialRecord = refreshed.value;
+    }
+    const workStatusLifecycle = initialRecord.workStatusLifecycle;
+    if (workStatusLifecycle === undefined) {
       return requiresManual(
         this.dependencies.progress,
         initialRecord,
@@ -261,10 +301,10 @@ export class PrePrImplementationCoordinator {
         externalIssueId: initialRecord.externalIssueId,
       },
       holderId: options.holderId,
-      mode: initialRecord.workStatusLifecycle.admissionMode,
-      ...(initialRecord.workStatusLifecycle.capabilityDigest === undefined
+      mode: workStatusLifecycle.admissionMode,
+      ...(workStatusLifecycle.capabilityDigest === undefined
         ? {}
-        : { capabilityDigest: initialRecord.workStatusLifecycle.capabilityDigest }),
+        : { capabilityDigest: workStatusLifecycle.capabilityDigest }),
       phase: "work_start",
       step: "work_start",
       transitionInstance: transitionInstance.value,
@@ -433,7 +473,7 @@ export class PrePrImplementationCoordinator {
     const current = providerProgress.value;
     const currentIssue = providerIssue.value;
     const claim = providerClaim.value;
-    const enforce = initialRecord.workStatusLifecycle.admissionMode === "enforce";
+    const enforce = workStatusLifecycle.admissionMode === "enforce";
     const invalidAuthority =
       current.revision !== armed.value.revision ||
       current.projectId !== initialRecord.projectId ||
@@ -548,9 +588,33 @@ export class PrePrImplementationCoordinator {
           baseRevision,
         },
       );
-      return written.ok
-        ? { jobId: record.jobId, outcome: "still_ci_waiting" }
-        : { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
+      if (!written.ok) {
+        return { jobId: record.jobId, outcome: "progress_write_failed", error: written.error };
+      }
+      if (this.dependencies.bindPullRequest !== undefined) {
+        const bound = await this.dependencies.bindPullRequest(
+          written.value,
+          outcome.changeRequest.number,
+          head.data,
+        );
+        if (!bound.ok) {
+          const current = await this.dependencies.progress.load(record.jobId);
+          if (!current.ok || current.value === undefined) {
+            return {
+              jobId: record.jobId,
+              outcome: "transient_failure",
+              reason: "job_progress_read_failed",
+              error: current.ok ? domainError("not_found") : current.error,
+            };
+          }
+          return requiresManual(
+            this.dependencies.progress,
+            current.value,
+            "pre_pr_identity_unrecoverable",
+          );
+        }
+      }
+      return { jobId: record.jobId, outcome: "still_ci_waiting" };
     }
     if (outcome.state === "paused") {
       const checkpoint =

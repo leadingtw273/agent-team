@@ -41,8 +41,10 @@ import type {
   LifecyclePipelineRequest,
   VisualEvidenceBuilder,
   VisualEvidenceBuildSuccess,
+  JobPrLifecyclePublisher,
 } from "../../application/pipelines/index.js";
 import {
+  createJobPrLifecycleEvent,
   createWorkStatusLifecycleTransitionInstance,
   type WorkStatusLifecycleCoordinator,
 } from "../../application/pipelines/index.js";
@@ -98,6 +100,10 @@ import {
   type IssueAdmissionPort,
 } from "../../adapters/dispatch/issue-admission-store.js";
 import type { HumanAcceptanceStorePort } from "../../adapters/dispatch/human-acceptance-store.js";
+import {
+  revokeJobControlFence,
+  rotateJobControlFence,
+} from "./managed-mutation-authority.js";
 import {
   FileReviewReportDiagnosticsSidecar,
   defaultReviewReportSidecarDirectory,
@@ -448,6 +454,12 @@ export interface ResumeCycleDependencies {
   readonly reviewStatus: Pick<ReviewStatusCoordinator, "begin" | "record">;
   readonly autoMerge: Pick<AutoMergeGate, "enable">;
   readonly lifecycle: Pick<LifecyclePipeline, "run">;
+  readonly jobPrLifecycle?: Pick<JobPrLifecyclePublisher, "publish">;
+  /** Production reconciliation for legacy/crash-boundary public Job/PR identity. It may only
+   * publish deterministic `job_started`/`pr_bound` evidence proven by provider read-back. */
+  readonly repairPublicAuthority?: (
+    record: JobProgressRecord,
+  ) => Promise<Result<JobProgressRecord, DomainError>>;
   /** Required only for new Jobs whose approved policy says human acceptance is required. */
   readonly humanAcceptance?: Pick<HumanAcceptanceStorePort, "createPending">;
   readonly clock: Clock;
@@ -1094,6 +1106,53 @@ async function transition(
   );
 }
 
+async function publishJobCompleted(
+  record: JobProgressRecord,
+  deps: ResumeCycleDependencies,
+): Promise<Result<JobProgressRecord, DomainError>> {
+  // Legacy records predate the public authority contract. They remain resumable through the
+  // existing lifecycle, but must not fabricate a terminal public event without a prior fence /
+  // job_started / pr_bound lineage.
+  if (deps.jobPrLifecycle === undefined || record.controlFence === undefined) return ok(record);
+  if (record.changeRequestId === undefined) return err(domainError("unavailable"));
+  const changeRequestId = record.changeRequestId;
+  const changeRequest = await whileResumeLeaseHeld(deps, () =>
+    deps.sourceControl.getChangeRequest(
+      { project: deps.project, changeRequestId },
+      deps.signal === undefined ? undefined : { signal: deps.signal },
+    ),
+  );
+  if (
+    !changeRequest.ok ||
+    changeRequest.value.state !== "merged" ||
+    changeRequest.value.mergeCommitSha === undefined
+  ) {
+    return changeRequest.ok ? err(domainError("conflict")) : changeRequest;
+  }
+  const event = createJobPrLifecycleEvent({
+    schemaVersion: 1,
+    kind: "job_completed",
+    projectId: record.projectId,
+    issueId: record.issueId,
+    jobId: record.jobId,
+    prNumber: changeRequest.value.number,
+    mergeCommitSha: changeRequest.value.mergeCommitSha,
+  });
+  if (!event.ok) return event;
+  const published = await deps.jobPrLifecycle.publish({
+    issue: { project: deps.project, externalIssueId: record.externalIssueId },
+    humanSummary: `Agent Team 已完成 Job ${record.jobId}，PR #${String(changeRequest.value.number)} 已合併。`,
+    event: event.value,
+  });
+  if (!published.ok) return published;
+  const refreshed = await deps.progress.load(record.jobId);
+  return !refreshed.ok
+    ? refreshed
+    : refreshed.value === undefined
+      ? err(domainError("not_found"))
+      : ok(refreshed.value);
+}
+
 type PersistedMergeMutation = NonNullable<JobProgressRecord["mergeMutations"]>[number];
 
 function mergedMutationHistory(
@@ -1150,24 +1209,52 @@ async function resumeOneJob(
   try {
     const current = await revalidateRecordUnderLease(record, guardedDeps, isPipelineResumable);
     if ("outcome" in current) return current;
-    if (current.record.providerAssignments === undefined) {
+    if (guardedDeps.prepare !== undefined && !isPrePrResumeCandidate(current.record)) {
+      await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
+    }
+    const fenced =
+      guardedDeps.jobPrLifecycle === undefined
+        ? ok(current.record)
+        : await rotateJobControlFence(
+            guardedDeps.progress,
+            current.record,
+            lease.value.value,
+            heartbeat.signal,
+          );
+    if (!fenced.ok) return { jobId: record.jobId, outcome: "lease_conflict" };
+    const repairPublicAuthority = guardedDeps.repairPublicAuthority;
+    const repaired =
+      repairPublicAuthority === undefined
+        ? ok(fenced.value)
+        : await whileResumeLeaseHeld(guardedDeps, () =>
+            repairPublicAuthority(fenced.value),
+          );
+    if (!repaired.ok) {
       return await requiresManual(
-        current.record,
+        fenced.value,
+        guardedDeps,
+        "provider_authority_mismatch",
+        requiresManualCause("setup", "work_status_lifecycle_failed"),
+      );
+    }
+    if (repaired.value.providerAssignments === undefined) {
+      return await requiresManual(
+        repaired.value,
         guardedDeps,
         "legacy_provider_assignment_unavailable",
         requiresManualCause("setup", "legacy_provider_assignment_unavailable"),
       );
     }
-    if (isPrePrResumeCandidate(current.record)) {
+    if (isPrePrResumeCandidate(repaired.value)) {
       if (guardedDeps.prePrImplementation === undefined) {
         return await requiresManual(
-          current.record,
+          repaired.value,
           guardedDeps,
           "pre_pr_resume_unavailable",
           requiresManualCause("setup", "bootstrap_incomplete"),
         );
       }
-      const resumed = await guardedDeps.prePrImplementation.run(current.record, {
+      const resumed = await guardedDeps.prePrImplementation.run(repaired.value, {
         signal: heartbeat.signal,
       });
       await heartbeat.stop();
@@ -1175,10 +1262,7 @@ async function resumeOneJob(
         ? { jobId: record.jobId, outcome: "lease_conflict" }
         : resumed;
     }
-    if (guardedDeps.prepare !== undefined) {
-      await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
-    }
-    const resumed = await resumeUnderLease(current.record, guardedDeps);
+    const resumed = await resumeUnderLease(repaired.value, guardedDeps);
     await heartbeat.stop();
     return heartbeat.signal.aborted ? { jobId: record.jobId, outcome: "lease_conflict" } : resumed;
   } catch (error) {
@@ -1213,7 +1297,17 @@ async function reconcileMergeStateOneJob(
     if (guardedDeps.prepare !== undefined) {
       await whileResumeLeaseHeld(guardedDeps, guardedDeps.prepare);
     }
-    const reconciled = await reconcileMergeStateUnderLease(current.record, guardedDeps);
+    const fenced =
+      guardedDeps.jobPrLifecycle === undefined || current.record.controlFence === undefined
+        ? ok(current.record)
+        : await rotateJobControlFence(
+            guardedDeps.progress,
+            current.record,
+            lease.value.value,
+            heartbeat.signal,
+          );
+    if (!fenced.ok) return { jobId: record.jobId, outcome: "lease_conflict" };
+    const reconciled = await reconcileMergeStateUnderLease(fenced.value, guardedDeps);
     await heartbeat.stop();
     return heartbeat.signal.aborted
       ? { jobId: record.jobId, outcome: "lease_conflict" }
@@ -1591,7 +1685,19 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
-  const completed = await transition(deps, record, { stage: { kind: "completed" } });
+  const publiclyCompleted = await publishJobCompleted(record, deps);
+  if (!publiclyCompleted.ok) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "job_completed_publication_failed",
+      error: publiclyCompleted.error,
+    };
+  }
+  const completed = await transition(deps, publiclyCompleted.value, {
+    ...revokeJobControlFence(publiclyCompleted.value),
+    stage: { kind: "completed" },
+  });
   if (!completed.ok) {
     return { jobId: record.jobId, outcome: "progress_write_failed", error: completed.error };
   }
@@ -3558,10 +3664,22 @@ async function finishMerged(
           requiresManualCause("merge", "lifecycle_not_completed"),
         );
   }
+  const publiclyCompleted = await publishJobCompleted(record, deps);
+  if (!publiclyCompleted.ok) {
+    return {
+      jobId: record.jobId,
+      outcome: "transient_failure",
+      reason: "job_completed_publication_failed",
+      error: publiclyCompleted.error,
+    };
+  }
   const completedOutcome = await transitionOrReport(
     deps,
-    record,
-    { stage: { kind: "completed" } },
+    publiclyCompleted.value,
+    {
+      ...revokeJobControlFence(publiclyCompleted.value),
+      stage: { kind: "completed" },
+    },
     () => ({ jobId: record.jobId, outcome: "completed" as const }),
   );
   if (completedOutcome.outcome !== "completed") return completedOutcome;

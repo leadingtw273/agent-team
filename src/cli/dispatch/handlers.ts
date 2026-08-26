@@ -78,6 +78,7 @@ import {
   type BuildDispatchCompositionResult,
   type DispatchBootstrapInput,
   type DispatchCompositionBlockedReason,
+  type DispatchOncePorts,
 } from "./composition.js";
 import {
   InMemoryIssueAdmissionStore,
@@ -122,6 +123,10 @@ import { resumeExistingProjectJobs } from "./resume-existing.js";
 import { createQuotaProbeStatusHandler } from "../quota/index.js";
 import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import { PrePrImplementationCoordinator } from "./pre-pr-implementation-coordinator.js";
+import { JobMutationRuntime } from "./job-mutation-runtime.js";
+import { DispatchResolveAuthority } from "./resolve-authority.js";
+import { checkPublicIssueAdmissionAuthority } from "./public-admission-authority.js";
+import { buildLifecyclePipeline } from "./lifecycle-composition.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -166,6 +171,12 @@ export interface CreateDispatchCliHandlersOptions {
     Partial<Pick<LinearWorkManagementAdapter, "getIssueHistory">>;
   /** Test seam; production reads only the pinned common Skill catalog and sanitized files. */
   readonly skillRuntime?: SkillRuntimePort;
+  /** Test seam for the provider-authority shell; production always uses JobMutationRuntime. */
+  readonly jobMutationRuntimeFactory?: (
+    runtime: JobMutationRuntime,
+  ) => Pick<JobMutationRuntime, "ensureJobStarted" | "bindPullRequest" | "buildImplementer">;
+  /** Narrow test seam. Production derives the guard from the real Linear/GitHub adapters. */
+  readonly publicAdmissionAuthority?: DispatchOncePorts["publicAdmissionAuthority"];
 }
 
 /** Preserve the adapter receiver when exposing its optional history method through the
@@ -226,6 +237,10 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
       ? {}
       : { workStatusLifecycle: record.workStatusLifecycle }),
     ...(record.humanDelivery === undefined ? {} : { humanDelivery: record.humanDelivery }),
+    ...(record.controlFence === undefined ? {} : { controlFence: record.controlFence }),
+    ...(record.mutationAttempts === undefined
+      ? {}
+      : { mutationAttempts: record.mutationAttempts }),
   });
 }
 
@@ -577,6 +592,8 @@ export function createDispatchCliHandlers(
       codex: createCodexQuotaCollector({ clock }),
     }),
   });
+  // Shared by resolve's external-merge convergence and the normal resume/auto-merge paths.
+  const autoMergePause = buildAutoMergePauseStore(options.agentTeamHome);
 
   // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/
   // admission stores -- there is no `--dry-run` concept for it (it is itself the manual escape
@@ -584,6 +601,46 @@ export function createDispatchCliHandlers(
   const dispatchResolve = createDispatchResolveHandler({
     progress: buildJobProgressStore(options.agentTeamHome),
     admission: buildIssueAdmissionStore(options.agentTeamHome),
+    authority: {
+      converge: async (record, input) => {
+        const build = await (options.buildComposition ?? buildDispatchComposition)({
+          agentTeamHome: options.agentTeamHome,
+          projectId: record.projectId,
+          ...(options.environment === undefined ? {} : { environment: options.environment }),
+        });
+        if (build.state !== "ready") return err(domainError("unavailable"));
+        const workManagement = new LinearWorkManagementAdapter({
+          readModel: build.value.discovery.readModel,
+          mutationClient: build.value.discovery.mutationClient,
+          teamId: build.value.discovery.teamId,
+          linearProjectId: build.value.discovery.linearProjectId,
+        });
+        return new DispatchResolveAuthority({
+          project: build.value.project,
+          progress: buildJobProgressStore(options.agentTeamHome),
+          jobs: build.value.jobs,
+          leases: new LeaseCoordinator(build.value.leases),
+          workManagement,
+          lifecycleWorkManagement: workManagement,
+          sourceControl: new GitHubAdapter(),
+          buildLifecycle: ({ sourceControl, workManagement: lifecycleWorkManagement }) =>
+            buildLifecyclePipeline({
+              readModel: build.value.discovery.readModel,
+              mutationClient: build.value.discovery.mutationClient,
+              teamId: build.value.discovery.teamId,
+              linearProjectId: build.value.discovery.linearProjectId,
+              progress: buildJobProgressStore(options.agentTeamHome),
+              agentTeamHome: options.agentTeamHome,
+              leases: new LeaseCoordinator(build.value.leases),
+              autoMergePause,
+              sourceControlPort: sourceControl,
+              workManagementPort: lifecycleWorkManagement,
+            }),
+          clock,
+          generateHolderId,
+        }).converge(record, input);
+      },
+    },
   });
 
   // C016: same "no --dry-run concept" rationale as `dispatchResolve` right above -- this is
@@ -598,7 +655,6 @@ export function createDispatchCliHandlers(
   // resolving a pause) and the `run` handler's resume cycle below (the read side, threaded into
   // `buildResumeComposition` -> `AutoMergeGate`'s gate check) -- exactly one store instance per
   // process, mirroring `progress`'s own single-instance-per-process convention just above.
-  const autoMergePause = buildAutoMergePauseStore(options.agentTeamHome);
   const dispatchAutoMergeResume = createDispatchAutoMergeResumeHandler({
     store: autoMergePause,
     progress: buildJobProgressStore(options.agentTeamHome),
@@ -705,6 +761,21 @@ export function createDispatchCliHandlers(
       const workManagement = options.protectedRegionWorkManagement ?? linearWorkManagement;
       const lifecycleWorkManagement =
         options.workStatusLifecycleWorkManagement ?? linearWorkManagement;
+      const publicAdmissionAuthority =
+        options.publicAdmissionAuthority ??
+        (options.buildComposition === undefined
+          ? {
+              check: (issue: Issue) =>
+                checkPublicIssueAdmissionAuthority(
+                  {
+                    project: build.value.project,
+                    workManagement: linearWorkManagement,
+                    sourceControl: new GitHubAdapter(),
+                  },
+                  issue,
+                ),
+            }
+          : undefined);
       let bootstrapReconciliation: readonly BootstrapReconciliationOutcome[] = Object.freeze([]);
 
       if (!dryRun) {
@@ -809,6 +880,7 @@ export function createDispatchCliHandlers(
             jobs: build.value.jobs,
             admission: durableAdmission,
             humanAcceptance,
+            ...(publicAdmissionAuthority === undefined ? {} : { publicAdmissionAuthority }),
             locks: new FileIssueScopeLock(
               join(options.agentTeamHome, "state", "dispatch", "issue-scope-locks"),
             ),
@@ -844,7 +916,11 @@ export function createDispatchCliHandlers(
                   ? {}
                   : { humanDelivery: humanDelivery.value }),
                 stage: { kind: "work_start_pending" },
-                branch: implementerBranch(result.job.id),
+                branch: implementerBranch(
+                  build.value.project.id,
+                  result.job.issueId,
+                  result.job.id,
+                ),
                 worktreePath: implementerWorktreePath(options.agentTeamHome, result.job.id),
                 workStatusLifecycle: {
                   admissionMode: lifecycle.mode,
@@ -853,6 +929,13 @@ export function createDispatchCliHandlers(
                     : { capabilityDigest: lifecycle.capabilityDigest }),
                   phase: "work_start",
                   transitions: [],
+                },
+                controlFence: {
+                  leaseId: result.lease.id,
+                  holderId,
+                  leaseEpoch: 1,
+                  ownershipEpoch: 0,
+                  state: "active",
                 },
               });
               return written.ok ? ok(undefined) : written;
@@ -1010,7 +1093,11 @@ export function createDispatchCliHandlers(
           // same `branch`/`worktreePath`/`issue`/`model` derivation for its own fallback write, and
           // reusing this one computation keeps both paths' fallback records byte-for-byte
           // consistent with whatever a real implementer dispatch for this same job id would use.
-          const branch = implementerBranch(result.job.id);
+          const branch = implementerBranch(
+            build.value.project.id,
+            result.job.issueId,
+            result.job.id,
+          );
           const worktreePath = implementerWorktreePath(options.agentTeamHome, result.job.id);
 
           const issue = candidates.find(
@@ -1187,6 +1274,19 @@ export function createDispatchCliHandlers(
           ) {
             let observedPipelineOutcome: ImplementerPipelineOutcome | undefined;
             const lifecycleHistory = bindWorkStatusIssueHistory(lifecycleWorkManagement);
+            const productionMutationRuntime = new JobMutationRuntime({
+              agentTeamHome: options.agentTeamHome,
+              project: build.value.project,
+              progress,
+              workManagement: linearWorkManagement,
+              escalationWorkManagement: linearWorkManagement,
+              codexConfig: build.value.codex.config,
+              clock,
+              buildPipeline: buildPipelineComposition,
+            });
+            const mutationRuntime =
+              options.jobMutationRuntimeFactory?.(productionMutationRuntime) ??
+              productionMutationRuntime;
             const prePr = new PrePrImplementationCoordinator({
               agentTeamHome: options.agentTeamHome,
               project: build.value.project,
@@ -1219,14 +1319,21 @@ export function createDispatchCliHandlers(
                 ),
                 clock,
               }),
+              ensureJobStarted: (record) => mutationRuntime.ensureJobStarted(record),
+              bindPullRequest: (record, prNumber, headSha) =>
+                mutationRuntime.bindPullRequest(record, prNumber, headSha),
               clock,
               ensureWorktreeDirectory: () =>
                 ensureDispatchWorktreesDirectory(options.agentTeamHome),
-              buildPipeline: () =>
-                buildPipelineComposition({
-                  agentTeamHome: options.agentTeamHome,
-                  codexConfig: build.value.codex.config,
-                }),
+              buildPipeline: async () => {
+                const current = await progress.load(result.job.id);
+                return current.ok && current.value !== undefined
+                  ? mutationRuntime.buildImplementer(current.value)
+                  : Object.freeze({
+                      state: "blocked" as const,
+                      reason: "github_authentication_unavailable" as const,
+                    });
+              },
               resolveAuthoritativeBase: (project, resolveOptions) =>
                 (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
                   project,

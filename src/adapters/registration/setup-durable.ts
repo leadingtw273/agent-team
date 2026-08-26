@@ -125,6 +125,9 @@ const changeRequestSchema = z
     baseBranch: z.string().min(1),
     headBranch: z.string().min(1),
     headSha: shaSchema,
+    // New provider snapshots expose the PR body for immutable authority back-pointers. Optional
+    // keeps pre-LEA-136 setup sessions readable without migration.
+    body: z.string().optional(),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]),
     // C015x decision 2: mirrors `ChangeRequestSnapshot.mergeStateStatus`/`baseSha`
     // (application/ports/source-control.ts) -- optional here for the exact same reason that port

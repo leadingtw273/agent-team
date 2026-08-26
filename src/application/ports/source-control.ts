@@ -33,6 +33,9 @@ export interface ChangeRequestSnapshot {
   readonly baseBranch: string;
   readonly headBranch: string;
   readonly headSha: string;
+  /** Real provider adapters populate the full PR body so Agent Team can validate its immutable
+   * `agent-team-pr:v1` back-pointer. Optional only for legacy test doubles. */
+  readonly body?: string;
   readonly mergeability: "mergeable" | "conflicting" | "unknown";
   /**
    * C015x decision 2: GitHub's own `mergeable_state` (REST) -- before this ticket, `mergeability`
@@ -137,6 +140,11 @@ export interface SourceControlPort {
     reference: ChangeRequestRef,
     options?: ReadOptions,
   ): AsyncPortResult<ChangeRequestSnapshot>;
+  findOpenChangeRequestsByHead(
+    repository: SourceControlRepositoryRef,
+    headBranch: string,
+    options?: ReadOptions,
+  ): AsyncPortResult<readonly ChangeRequestSnapshot[]>;
   createDraftChangeRequest(
     command: CreateDraftChangeRequestCommand,
     options: MutationOptions,

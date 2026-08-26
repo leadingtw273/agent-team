@@ -64,6 +64,7 @@ import {
   reportContractFailureCategorySchema,
   reviewerReportSchema,
 } from "../../application/pipelines/reviewer-model.js";
+import { managedMutationIntentSchema } from "../../application/pipelines/job-pr-authority-model.js";
 import { currentReviewerReportContractBinding } from "../../application/pipelines/reviewer-policy.js";
 import { jobSkillSnapshotsByRoleSchema } from "../../application/skills/index.js";
 import {
@@ -729,6 +730,64 @@ export const reviewerReplayCheckpointSchema = z
   });
 export type ReviewerReplayCheckpoint = z.infer<typeof reviewerReplayCheckpointSchema>;
 
+export const jobControlFenceSchema = z
+  .object({
+    leaseId: leaseIdSchema,
+    holderId: z.string().trim().min(1).max(255),
+    leaseEpoch: z.number().int().positive(),
+    /** Zero means the Job has not published `pr_bound` yet. Public PR ownership starts at one. */
+    ownershipEpoch: z.number().int().nonnegative(),
+    state: z.enum(["active", "revoked"]),
+  })
+  .strict();
+export type JobControlFence = z.infer<typeof jobControlFenceSchema>;
+
+const providerMutationAttemptSchema = z
+  .object({
+    ordinal: z.number().int().min(1).max(2),
+    preparedAt: instantSchema,
+    outcome: z.enum(["prepared", "confirmed", "sent_unknown", "rejected"]),
+  })
+  .strict();
+
+export const providerMutationLedgerEntrySchema = z
+  .object({
+    operationKey: z.string().trim().min(1).max(512),
+    intent: managedMutationIntentSchema,
+    identityDigest: digestSchema,
+    attempts: z.array(providerMutationAttemptSchema).min(1).max(2),
+  })
+  .strict()
+  .superRefine((entry, context) => {
+    entry.attempts.forEach((attempt, index) => {
+      if (attempt.ordinal !== index + 1) {
+        context.addIssue({
+          code: "custom",
+          path: ["attempts", index, "ordinal"],
+          message: "Attempt ordinals must be contiguous and one-based.",
+        });
+      }
+    });
+  });
+export type ProviderMutationLedgerEntry = z.infer<typeof providerMutationLedgerEntrySchema>;
+
+const providerMutationLedgerSchema = z
+  .array(providerMutationLedgerEntrySchema)
+  .max(128)
+  .superRefine((entries, context) => {
+    const seen = new Set<string>();
+    entries.forEach((entry, index) => {
+      if (seen.has(entry.operationKey)) {
+        context.addIssue({
+          code: "custom",
+          path: [index, "operationKey"],
+          message: "Mutation operation keys must be unique per Job.",
+        });
+      }
+      seen.add(entry.operationKey);
+    });
+  });
+
 export const jobProgressRecordSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -809,6 +868,12 @@ export const jobProgressRecordSchema = z
     previousReviewerReplay: reviewerReplayCheckpointSchema.optional(),
     /** Optional for every legacy record. New work-status-aware Jobs persist it before Provider. */
     workStatusLifecycle: workStatusLifecycleCheckpointSchema.optional(),
+    /** LEA-136: local execution authority. Optional only for legacy records; any new managed
+     * provider mutation must establish and CAS-check this fence before sending. */
+    controlFence: jobControlFenceSchema.optional(),
+    /** LEA-136: persist-before-send provider budget. Entries and attempts are append-only; a
+     * prepared attempt counts even if the process crashes before recording its outcome. */
+    mutationAttempts: providerMutationLedgerSchema.optional(),
     /** Optional only for legacy Jobs. New human-directed Jobs persist this approved policy before
      * Provider execution; merge completion may attach one immutable acceptance identity digest. */
     humanDelivery: humanDeliveryCheckpointSchema.optional(),
@@ -837,6 +902,23 @@ export const jobProgressRecordSchema = z
         code: "custom",
         path: ["protectedRegionHandoff"],
         message: "protected-region handoff receipts must match the protected dispatch reason",
+      });
+    }
+    if ((record.mutationAttempts?.length ?? 0) > 0 && record.controlFence === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["mutationAttempts"],
+        message: "Provider attempts require a Job control fence.",
+      });
+    }
+    if (
+      record.controlFence?.state === "active" &&
+      ["completed", "superseded", "cancelled"].includes(record.stage.kind)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["controlFence", "state"],
+        message: "A terminal Job cannot retain an active control fence.",
       });
     }
   });
@@ -984,6 +1066,71 @@ function humanDeliveryCanAdvance(
   );
 }
 
+function controlFenceCanAdvance(
+  current: JobControlFence | undefined,
+  next: JobControlFence | undefined,
+): boolean {
+  if (current === undefined) {
+    return next === undefined || (next.leaseEpoch === 1 && next.state === "active");
+  }
+  if (next === undefined || next.ownershipEpoch < current.ownershipEpoch) return false;
+  if (next.leaseEpoch === current.leaseEpoch) {
+    return (
+      next.leaseId === current.leaseId &&
+      next.holderId === current.holderId &&
+      (next.state === current.state ||
+        (current.state === "active" && next.state === "revoked"))
+    );
+  }
+  return (
+    current.state === "active" &&
+    next.leaseEpoch === current.leaseEpoch + 1 &&
+    next.state === "active"
+  );
+}
+
+function mutationAttemptCanAdvance(
+  current: ProviderMutationLedgerEntry["attempts"][number],
+  next: ProviderMutationLedgerEntry["attempts"][number],
+): boolean {
+  if (current.ordinal !== next.ordinal || current.preparedAt !== next.preparedAt) return false;
+  return current.outcome === "prepared" || current.outcome === next.outcome;
+}
+
+function mutationLedgerCanAdvance(
+  current: readonly ProviderMutationLedgerEntry[] | undefined,
+  next: readonly ProviderMutationLedgerEntry[] | undefined,
+): boolean {
+  const prior = current ?? [];
+  const candidate = next ?? [];
+  if (candidate.length < prior.length) return false;
+  for (const [index, entry] of candidate.entries()) {
+    const previous = prior[index];
+    if (previous === undefined) {
+      if (entry.attempts.length !== 1 || entry.attempts[0]?.outcome !== "prepared") return false;
+      continue;
+    }
+    if (
+      entry.operationKey !== previous.operationKey ||
+      entry.intent !== previous.intent ||
+      entry.identityDigest !== previous.identityDigest ||
+      entry.attempts.length < previous.attempts.length ||
+      entry.attempts.length > previous.attempts.length + 1
+    ) {
+      return false;
+    }
+    for (const [attemptIndex, attempt] of entry.attempts.entries()) {
+      const priorAttempt = previous.attempts[attemptIndex];
+      if (priorAttempt === undefined) {
+        if (attempt.outcome !== "prepared") return false;
+      } else if (!mutationAttemptCanAdvance(priorAttempt, attempt)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 function isNotFound(error: DomainError): boolean {
   return error.code === "not_found";
 }
@@ -1100,6 +1247,15 @@ export class FileJobProgressStore {
     if (
       normalizedCurrent.value !== undefined &&
       !humanDeliveryCanAdvance(normalizedCurrent.value.humanDelivery, next.humanDelivery)
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      !controlFenceCanAdvance(normalizedCurrent.value?.controlFence, next.controlFence) ||
+      !mutationLedgerCanAdvance(
+        normalizedCurrent.value?.mutationAttempts,
+        next.mutationAttempts,
+      )
     ) {
       return err(domainError("invariant_violation"));
     }

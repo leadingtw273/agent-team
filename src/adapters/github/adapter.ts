@@ -64,6 +64,7 @@ const projectedChangeRequestSchema = z
     baseBranch: z.string().min(1),
     headBranch: z.string().min(1),
     headSha: z.string().regex(shaPattern),
+    body: z.string().default(""),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]),
     // C015x decision 2: GitHub's own `mergeable_state` -- see `ChangeRequestSnapshot.mergeStateStatus`'s
     // own header (application/ports/source-control.ts) for why this is required here (the real
@@ -138,6 +139,16 @@ const draftCandidateSchema = z
       .strict(),
   )
   .max(2);
+const openHeadCandidateSchema = z
+  .array(
+    z
+      .object({
+        number: z.number().int().positive(),
+        state: z.literal("open"),
+      })
+      .strict(),
+  )
+  .max(100);
 const projectedChecksPageSchema = z
   .object({
     totalCount: z.number().int().nonnegative(),
@@ -215,7 +226,7 @@ const squashMergeResultSchema = z.object({ merged: z.boolean() }).strict();
 // 2-valued-boolean-to-3-state map (GitHub's `.mergeable` is `true`/`false`/`null`), not a
 // many-values-collapsed-into-one-catch-all like the one this ticket removes.
 const changeRequestProjection =
-  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:.mergeable_state,baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),mergeCommitSha:.merge_commit_sha,mergedAt:.merged_at,updatedAt:.updated_at}';
+  '{id:.node_id,number,url:.html_url,state:(if .merged_at != null then "merged" else .state end),draft,baseBranch:.base.ref,headBranch:.head.ref,headSha:.head.sha,body:(.body // ""),mergeability:(if .mergeable == true then "mergeable" elif .mergeable == false then "conflicting" else "unknown" end),mergeStateStatus:.mergeable_state,baseSha:.base.sha,autoMergeEnabled:(.auto_merge != null),mergeCommitSha:.merge_commit_sha,mergedAt:.merged_at,updatedAt:.updated_at}';
 const repositoryMetadataProjection = "{defaultBranch:.default_branch}";
 const checkProjection =
   '{name,status:(if .status == "completed" then "completed" elif .status == "in_progress" then "in_progress" else "queued" end),conclusion:(if .conclusion == null then null elif (.conclusion == "success" or .conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "skipped") then .conclusion else "failure" end),url:.html_url}';
@@ -397,6 +408,10 @@ function draftCandidateProjection(baseBranch: string, headBranch: string): strin
   return `[.[] | select(.base.ref == ${JSON.stringify(baseBranch)} and .head.ref == ${JSON.stringify(headBranch)}) | {number,title,body:(.body // ""),draft}][:2]`;
 }
 
+function openHeadCandidateProjection(headBranch: string): string {
+  return `[.[] | select(.head.ref == ${JSON.stringify(headBranch)} and .state == "open") | {number,state}]`;
+}
+
 function commentsProjection(marker: string): string {
   return `{count:length,matches:[.[] | select(.body | contains(${JSON.stringify(marker)})) | ${commentProjection}]}`;
 }
@@ -421,6 +436,53 @@ export class GitHubAdapter implements SourceControlPort {
       options,
     );
     return result.ok ? snapshotFromProjection(result.value) : result;
+  }
+
+  async findOpenChangeRequestsByHead(
+    repository: SourceControlRepositoryRef,
+    headBranch: string,
+    options: ReadOptions = {},
+  ): Promise<Result<readonly ChangeRequestSnapshot[], DomainError>> {
+    if (!validRepository(repository) || !validBranch(headBranch)) return failure();
+    const owner = repository.project.sourceControl.repository.split("/")[0];
+    if (owner === undefined || owner.length === 0) return failure();
+    const candidates: { readonly number: number; readonly state: "open" }[] = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const listed = await this.transport.requestJson(
+        [
+          "api",
+          `repos/${repositoryPath(repository)}/pulls`,
+          "--method",
+          "GET",
+          ...rawField("state", "open"),
+          ...rawField("head", `${owner}:${headBranch}`),
+          ...rawField("per_page", "100"),
+          ...rawField("page", String(page)),
+          "--jq",
+          openHeadCandidateProjection(headBranch),
+        ],
+        openHeadCandidateSchema,
+        options,
+      );
+      if (!listed.ok) return listed;
+      candidates.push(...listed.value);
+      if (listed.value.length < 100) break;
+      if (page === 100) return failure("conflict");
+    }
+
+    const snapshots: ChangeRequestSnapshot[] = [];
+    for (const candidate of candidates) {
+      const detail = await this.getChangeRequest(
+        { project: repository.project, changeRequestId: String(candidate.number) },
+        options,
+      );
+      if (!detail.ok) return detail;
+      if (detail.value.state !== "open" || detail.value.headBranch !== headBranch) {
+        return failure("conflict");
+      }
+      snapshots.push(detail.value);
+    }
+    return ok(Object.freeze(snapshots));
   }
 
   async createDraftChangeRequest(

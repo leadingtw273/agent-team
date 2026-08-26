@@ -43,8 +43,10 @@ import {
 import type {
   AutoMergePauseQueryPort,
   ChangeRequestRef,
+  SourceControlPort,
   WorkManagementPort,
 } from "../../application/ports/index.js";
+import type { ManagedMutationGate } from "./managed-mutation-authority.js";
 
 export type StatusMergeCompositionBlockedReason = "github_authentication_unavailable";
 
@@ -54,6 +56,8 @@ export interface BuildStatusMergePipelinesOptions {
   readonly clock?: Clock;
   /** Injectable for tests; production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+  readonly sourceControlPort?: SourceControlPort;
+  readonly managedMutationGate?: ManagedMutationGate;
 }
 
 /** E116cap: read-only `AutoMergePauseQueryPort` adapter over a `FileAutoMergePauseStore` -- see
@@ -115,6 +119,7 @@ export function buildMergeGateSourceControl(
   github: GitHubAdapter,
   workManagement: Pick<WorkManagementPort, "getIssue">,
   clock: Clock = createClock(),
+  managedMutationGate?: ManagedMutationGate,
 ): MergeGatePorts["sourceControl"] {
   return Object.freeze({
     getChangeRequest: github.getChangeRequest.bind(github),
@@ -202,7 +207,21 @@ export function buildMergeGateSourceControl(
         }
       }
 
-      const enabled = await github.enableAutoMerge(reference, expectedHeadSha, options, observer);
+      const enabled = await (managedMutationGate === undefined
+        ? github.enableAutoMerge(reference, expectedHeadSha, options, observer)
+        : managedMutationGate.execute(
+            {
+              intent: "auto_merge",
+              idempotencyKey: options.idempotencyKey,
+              identity: {
+                projectId: reference.project.id,
+                changeRequestId: reference.changeRequestId,
+                expectedHeadSha,
+              },
+              ...(options.signal === undefined ? {} : { signal: options.signal }),
+            },
+            (stable) => github.enableAutoMerge(reference, expectedHeadSha, stable, observer),
+          ));
       if (enabled.ok) {
         // GitHub's own mutation can itself return an already-merged snapshot (idempotently
         // reporting reality rather than actually enabling anything) -- this call did not cause
@@ -263,12 +282,21 @@ export function buildMergeGateSourceControl(
       ) {
         return mutationFailed("authorization", domainError("conflict"));
       }
-      const merged = await github.squashMergeChangeRequest(
-        reference,
-        expectedHeadSha,
-        options,
-        observer,
-      );
+      const merged = await (managedMutationGate === undefined
+        ? github.squashMergeChangeRequest(reference, expectedHeadSha, options, observer)
+        : managedMutationGate.execute(
+            {
+              intent: "merge",
+              idempotencyKey: options.idempotencyKey,
+              identity: {
+                projectId: reference.project.id,
+                changeRequestId: reference.changeRequestId,
+                expectedHeadSha,
+              },
+              ...(options.signal === undefined ? {} : { signal: options.signal }),
+            },
+            (stable) => github.squashMergeChangeRequest(reference, expectedHeadSha, stable, observer),
+          ));
       if (merged.ok) return controllerMerged(merged.value.headSha);
       const directReceipt = attempts.findLast((attempt) => attempt.kind === "direct_squash");
       return directReceipt?.outcome === "merged_directly"
@@ -288,13 +316,14 @@ export async function buildStatusMergePipelines(
   }
 
   const github = new GitHubAdapter(githubTransport);
+  const reviewSource = options.sourceControlPort ?? github;
   const reviewStatus = new ReviewStatusCoordinator({
     sourceControl: {
-      getChangeRequest: github.getChangeRequest.bind(github),
-      getCommitChecks: github.getCommitChecks.bind(github),
-      getCommitStatuses: github.getCommitStatuses.bind(github),
-      setCommitStatus: github.setCommitStatus.bind(github),
-      appendChangeRequestComment: github.appendChangeRequestComment.bind(github),
+      getChangeRequest: reviewSource.getChangeRequest.bind(reviewSource),
+      getCommitChecks: reviewSource.getCommitChecks.bind(reviewSource),
+      getCommitStatuses: reviewSource.getCommitStatuses.bind(reviewSource),
+      setCommitStatus: reviewSource.setCommitStatus.bind(reviewSource),
+      appendChangeRequestComment: reviewSource.appendChangeRequestComment.bind(reviewSource),
     },
   });
   const autoMergeGate = new AutoMergeGate({
@@ -303,6 +332,7 @@ export async function buildStatusMergePipelines(
       github,
       options.workManagement,
       options.clock ?? createClock(),
+      options.managedMutationGate,
     ),
     workManagement: options.workManagement,
     autoMergePause: buildAutoMergePauseQuery(options.autoMergePauseStore),
