@@ -37,6 +37,7 @@ function handlers(outcome: CliCommandOutcome = { state: "success" }) {
     humanAcceptanceAccept: vi.fn(() => Promise.resolve(outcome)),
     humanAcceptanceRequestAdjustment: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
+    dispatchAcknowledgeExternalMerge: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
@@ -171,6 +172,35 @@ describe("agent-team CLI contract", () => {
     ).resolves.toBe(0);
     expect(commands.dispatchCiResume).toHaveBeenCalledWith({
       jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      dryRun: true,
+    });
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
+          "acknowledge-external-merge",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--pr",
+          "57",
+          "--head",
+          "a".repeat(40),
+          "--merge-commit",
+          "b".repeat(40),
+          "--allow-missing-human-acceptance",
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchAcknowledgeExternalMerge).toHaveBeenCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      prNumber: "57",
+      headSha: "a".repeat(40),
+      mergeCommitSha: "b".repeat(40),
+      allowMissingHumanAcceptance: true,
       dryRun: true,
     });
     await expect(
@@ -321,7 +351,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(24));
+    expect(sink.stdout()).toBe("完成\n".repeat(25));
   });
 
   it("maps a blocked work-status recovery to exit 3", async () => {

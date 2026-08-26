@@ -125,6 +125,8 @@ import { LinearWorkManagementAdapter } from "./work-management-adapter.js";
 import { PrePrImplementationCoordinator } from "./pre-pr-implementation-coordinator.js";
 import { JobMutationRuntime } from "./job-mutation-runtime.js";
 import { DispatchResolveAuthority } from "./resolve-authority.js";
+import { ExternalMergeRecoveryAuthority } from "./external-merge-recovery-authority.js";
+import { createAcknowledgeExternalMergeHandler } from "./external-merge-recovery-handlers.js";
 import { checkPublicIssueAdmissionAuthority } from "./public-admission-authority.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
 
@@ -643,6 +645,66 @@ export function createDispatchCliHandlers(
     },
   });
 
+  const externalMergeRecoveryProgress = buildJobProgressStore(options.agentTeamHome);
+  const externalMergeRecoveryAdmission = buildIssueAdmissionStore(options.agentTeamHome);
+  const buildExternalMergeRecoveryAuthority = async (record: JobProgressRecord) => {
+    const build = await (options.buildComposition ?? buildDispatchComposition)({
+      agentTeamHome: options.agentTeamHome,
+      projectId: record.projectId,
+      ...(options.environment === undefined ? {} : { environment: options.environment }),
+    });
+    if (build.state !== "ready") return err(domainError("unavailable"));
+    const workManagement = new LinearWorkManagementAdapter({
+      readModel: build.value.discovery.readModel,
+      mutationClient: build.value.discovery.mutationClient,
+      teamId: build.value.discovery.teamId,
+      linearProjectId: build.value.discovery.linearProjectId,
+    });
+    const leases = new LeaseCoordinator(build.value.leases);
+    const github = new GitHubAdapter();
+    return ok(
+      new ExternalMergeRecoveryAuthority({
+        project: build.value.project,
+        progress: externalMergeRecoveryProgress,
+        admission: externalMergeRecoveryAdmission,
+        leases,
+        workManagement,
+        sourceControl: {
+          getChangeRequest: (reference, requestOptions) =>
+            github.getChangeRequest(reference, requestOptions),
+        },
+        buildLifecycle: ({ sourceControl, workManagement: lifecycleWorkManagement }) =>
+          buildLifecyclePipeline({
+            readModel: build.value.discovery.readModel,
+            mutationClient: build.value.discovery.mutationClient,
+            teamId: build.value.discovery.teamId,
+            linearProjectId: build.value.discovery.linearProjectId,
+            progress: externalMergeRecoveryProgress,
+            agentTeamHome: options.agentTeamHome,
+            leases,
+            autoMergePause,
+            sourceControlPort: sourceControl,
+            workManagementPort: lifecycleWorkManagement,
+          }),
+        clock,
+        generateHolderId,
+      }),
+    );
+  };
+  const dispatchAcknowledgeExternalMerge = createAcknowledgeExternalMergeHandler({
+    progress: externalMergeRecoveryProgress,
+    authority: {
+      inspect: async (record, input) => {
+        const authority = await buildExternalMergeRecoveryAuthority(record);
+        return authority.ok ? authority.value.inspect(record, input) : authority;
+      },
+      recover: async (record, input) => {
+        const authority = await buildExternalMergeRecoveryAuthority(record);
+        return authority.ok ? authority.value.recover(record, input) : authority;
+      },
+    },
+  });
+
   // C016: same "no --dry-run concept" rationale as `dispatchResolve` right above -- this is
   // itself a manual, human-confirmed repair of a real durable claim; a dry-run version would have
   // nothing meaningful to predict.
@@ -713,6 +775,7 @@ export function createDispatchCliHandlers(
 
   return Object.freeze({
     dispatchResolve,
+    dispatchAcknowledgeExternalMerge,
     dispatchResolveLegacyClaim,
     dispatchAutoMergeResume,
     dispatchReviewerResume,

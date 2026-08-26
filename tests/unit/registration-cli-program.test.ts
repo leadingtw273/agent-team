@@ -42,6 +42,7 @@ function baseHandlers(outcome: CliCommandOutcome = { state: "success" }): CliHan
     humanAcceptanceAccept: vi.fn(() => Promise.resolve(outcome)),
     humanAcceptanceRequestAdjustment: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolve: vi.fn(() => Promise.resolve(outcome)),
+    dispatchAcknowledgeExternalMerge: vi.fn(() => Promise.resolve(outcome)),
     dispatchResolveLegacyClaim: vi.fn(() => Promise.resolve(outcome)),
     dispatchAutoMergeResume: vi.fn(() => Promise.resolve(outcome)),
     dispatchReviewerResume: vi.fn(() => Promise.resolve(outcome)),
