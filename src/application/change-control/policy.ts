@@ -17,6 +17,7 @@ const hardFields = [
   "constraints",
   "risks",
   "changeRegions",
+  "skillSelections",
 ] as const satisfies readonly (keyof Issue)[];
 
 const allFields = [
@@ -34,6 +35,7 @@ const allFields = [
   "constraints",
   "risks",
   "changeRegions",
+  "skillSelections",
 ] as const satisfies readonly (keyof Issue)[];
 
 function canonical(value: unknown): string | undefined {
@@ -62,6 +64,13 @@ function normalizedField(issue: Issue, field: (typeof allFields)[number]): unkno
     return [...issue.changeRegions].sort((left, right) => {
       const leftKey = `${left.path}:${left.coverage}`;
       const rightKey = `${right.path}:${right.coverage}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+  }
+  if (field === "skillSelections" && issue.skillSelections !== undefined) {
+    return [...issue.skillSelections].sort((left, right) => {
+      const leftKey = `${left.name}:${left.requirement}`;
+      const rightKey = `${right.name}:${right.requirement}`;
       return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
     });
   }
@@ -112,6 +121,7 @@ export function classifyRequirementChange(
   if (fields.includes("constraints")) reasons.push("constraints_changed");
   if (fields.includes("risks")) reasons.push("risks_changed");
   if (fields.includes("changeRegions")) reasons.push("change_regions_changed");
+  if (fields.includes("skillSelections")) reasons.push("skill_selection_changed");
 
   const narrativeFieldsChanged = fields.some((field) =>
     ["title", "goal", "background"].includes(field),

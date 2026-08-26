@@ -264,6 +264,26 @@
               "type": "string",
               "enum": ["light", "standard", "strict"]
             },
+            "skillSelections": {
+              "maxItems": 50,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "maxLength": 64,
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+                  },
+                  "requirement": {
+                    "type": "string",
+                    "enum": ["required", "optional"]
+                  }
+                },
+                "required": ["name", "requirement"],
+                "additionalProperties": false
+              }
+            },
             "estimatedMinutes": {
               "type": "integer",
               "exclusiveMinimum": 0,
