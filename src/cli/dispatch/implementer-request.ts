@@ -33,7 +33,11 @@ import { createRequirementSnapshot } from "../../domain/review/index.js";
 import { watchdogHardStopMs, type Job } from "../../domain/jobs/index.js";
 import type { Issue, Project } from "../../domain/project/index.js";
 import type { TrustedProjectConfig } from "../../application/projects/index.js";
-import type { ImplementerPipelineRequest } from "../../application/pipelines/index.js";
+import {
+  appendPullRequestBackPointer,
+  createPullRequestBackPointer,
+  type ImplementerPipelineRequest,
+} from "../../application/pipelines/index.js";
 import type { JobSkillSnapshot } from "../../application/skills/index.js";
 
 /**
@@ -119,8 +123,8 @@ export interface BuildImplementerPipelineRequestOptions {
  * schema-valid, non-empty `branch` field, and re-deriving a *different* formula there would risk
  * silently drifting from whatever a later successful dispatch for the same job id would have used.
  */
-export function implementerBranch(jobId: string): string {
-  return `agent-team/${jobId}`;
+export function implementerBranch(projectId: string, issueId: string, jobId: string): string {
+  return `agent-team/${projectId}/${issueId}/${jobId}`;
 }
 
 /** C018 fix: see `implementerBranch`'s own comment right above -- same rationale, same
@@ -140,9 +144,19 @@ export function buildImplementerPipelineRequest(
   );
   if (!deadlineAt.ok) return err(domainError("invariant_violation"));
 
-  const branch = implementerBranch(options.job.id);
+  const branch = implementerBranch(options.project.id, options.issue.id, options.job.id);
   const worktreePath = implementerWorktreePath(options.agentTeamHome, options.job.id);
   const directive = buildDirective(options.issue);
+  const pointer = createPullRequestBackPointer({
+    schemaVersion: 1,
+    projectId: options.project.id,
+    issueId: options.issue.id,
+    jobId: options.job.id,
+    branch,
+  });
+  if (!pointer.ok) return pointer;
+  const pullRequestBody = appendPullRequestBackPointer(directive, pointer.value);
+  if (!pullRequestBody.ok) return pullRequestBody;
   const expectedUntrackedPaths = expectedUntrackedPathsFrom(options.issue);
 
   return ok(
@@ -159,7 +173,7 @@ export function buildImplementerPipelineRequest(
       branch,
       remote: "origin",
       commitMessage: `${options.issue.title} (${options.issue.externalId})`,
-      pullRequest: Object.freeze({ title: options.issue.title, body: directive }),
+      pullRequest: Object.freeze({ title: options.issue.title, body: pullRequestBody.value }),
       controllerDirective: directive,
       externalData: Object.freeze([]),
       ...(options.skillSnapshot === undefined ? {} : { skillSnapshot: options.skillSnapshot }),

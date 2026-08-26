@@ -7,6 +7,7 @@ import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import { buildCodexRunner } from "./codex-factory.js";
 import { FileJobUpdateAdapter } from "./pipeline-job-adapter.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
+import type { GitPort } from "../../application/ports/index.js";
 import { ReviewerRecoveryCheckpointAdapter } from "./reviewer-recovery-checkpoint.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
 
@@ -14,6 +15,7 @@ export interface BuildReviewerRecoveryPipelineOptions {
   readonly agentTeamHome: string;
   readonly codexConfig: DispatchProviderConfig["codex"];
   readonly jobs: Pick<FileJobRepository, "update">;
+  readonly gitPort?: GitPort;
 }
 
 export type BuildReviewerRecoveryPipelineResult = Readonly<{
@@ -30,7 +32,7 @@ export type BuildReviewerRecoveryPipelineResult = Readonly<{
 export function buildReviewerRecoveryPipeline(
   options: BuildReviewerRecoveryPipelineOptions,
 ): Promise<BuildReviewerRecoveryPipelineResult> {
-  const git = new LocalGitAdapter();
+  const git = options.gitPort ?? new LocalGitAdapter();
   const pipeline = new ReviewerRecoveryPipeline({
     git,
     preflight: new GitPreflight(git),

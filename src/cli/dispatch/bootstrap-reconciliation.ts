@@ -75,7 +75,7 @@ export async function reconcileBootstrapClaims(options: {
             attempts: { count: 1 },
           },
         },
-        branch: implementerBranch(job.id),
+        branch: implementerBranch(options.project.id, claim.issueId, job.id),
         worktreePath: implementerWorktreePath(options.agentTeamHome, job.id),
       });
       if (!quarantined.ok) {

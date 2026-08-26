@@ -46,6 +46,7 @@ import { FileJobUpdateAdapter } from "./pipeline-job-adapter.js";
 import { ReviewerCheckpointAdapter } from "./reviewer-checkpoint.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
+import type { GitPort, SourceControlPort } from "../../application/ports/index.js";
 
 export type ReviewerCompositionBlockedReason = "github_authentication_unavailable";
 
@@ -62,6 +63,8 @@ export interface BuildReviewerPipelineOptions {
    * to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
   readonly skillsRoot?: string;
+  readonly gitPort?: GitPort;
+  readonly sourceControlPort?: SourceControlPort;
 }
 
 export type BuildReviewerPipelineResult =
@@ -83,8 +86,8 @@ export async function buildReviewerPipeline(
     options.geminiConfig === undefined ? undefined : buildGeminiRunner(options.geminiConfig);
 
   const pipeline = new ReviewerPipeline({
-    git: new LocalGitAdapter(),
-    sourceControl: new GitHubAdapter(githubTransport),
+    git: options.gitPort ?? new LocalGitAdapter(),
+    sourceControl: options.sourceControlPort ?? new GitHubAdapter(githubTransport),
     codeReviewer,
     ...(visualReviewer === undefined ? {} : { visualReviewer }),
     skillRuntime: new FileSkillRuntime({

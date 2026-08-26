@@ -134,7 +134,7 @@ describe("buildImplementerPipelineRequest", () => {
     expect(request.repositoryRoot).toBe("/tmp/sandbox");
     expect(request.baseRevision).toBe("a".repeat(40));
     expect(request.worktreePath).toBe(`/tmp/agent-team-home/state/dispatch/worktrees/${jobId}`);
-    expect(request.branch).toBe(`agent-team/${jobId}`);
+    expect(request.branch).toBe(`agent-team/${projectId}/${issueId}/${jobId}`);
     expect(request.remote).toBe("origin");
     expect(request.idempotencyKeyPrefix).toBe(`cli-dispatch:${jobId}`);
   });
@@ -219,7 +219,10 @@ describe("buildImplementerPipelineRequest", () => {
     expect(result.value.controllerDirective).toContain("讓真實候選能跑到 CI waiting。");
     expect(result.value.controllerDirective).toContain("candidate reaches ci_waiting");
     expect(result.value.pullRequest.title).toBe("Ship the thing");
-    expect(result.value.pullRequest.body).toBe(result.value.controllerDirective);
+    expect(result.value.pullRequest.body).toContain(result.value.controllerDirective);
+    expect(result.value.pullRequest.body).toContain("<!-- agent-team-pr:v1");
+    expect(result.value.pullRequest.body).toContain(`\"branch\":\"${result.value.branch}\"`);
+    expect(result.value.pullRequest.body).not.toContain("ownershipEpoch");
     expect(result.value.commitMessage).toBe("Ship the thing (linear-issue-1)");
   });
 

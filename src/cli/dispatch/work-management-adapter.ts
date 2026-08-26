@@ -98,6 +98,7 @@ export class LinearWorkManagementAdapter implements Pick<
   WorkManagementPort,
   | "getIssue"
   | "listIssues"
+  | "listComments"
   | "setWorkStatus"
   | "setAgentCondition"
   | "clearAgentCondition"
@@ -223,6 +224,23 @@ export class LinearWorkManagementAdapter implements Pick<
       snapshots.push(snapshot.value);
     }
     return ok(Object.freeze(snapshots));
+  }
+
+  async listComments(
+    reference: WorkManagementIssueRef,
+    options: ReadOptions = {},
+  ): Promise<Result<readonly WorkManagementComment[], DomainError>> {
+    const context = await this.#context(options);
+    if (!context.ok) return context;
+    const read = await this.#readModel.readIssue(context.value, reference.externalIssueId, options);
+    if (!read.ok) return read;
+    return ok(
+      Object.freeze(
+        read.value.comments.map((comment) =>
+          Object.freeze({ id: comment.id, body: comment.body, createdAt: comment.createdAt }),
+        ),
+      ),
+    );
   }
 
   async setWorkStatus(

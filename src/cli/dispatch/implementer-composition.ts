@@ -22,6 +22,7 @@ import { GitPreflight, LocalGitAdapter } from "../../adapters/git/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
 import { FileSkillRuntime } from "../../adapters/skills/index.js";
 import { ImplementerPipeline } from "../../application/pipelines/index.js";
+import type { GitPort, SourceControlPort } from "../../application/ports/index.js";
 import { buildCodexRunner } from "./codex-factory.js";
 import { ScopeOverrunCheckpointAdapter } from "./scope-checkpoint.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
@@ -35,6 +36,9 @@ export interface BuildImplementerPipelineOptions {
   /** Injectable for tests (same convention as `probe-composition.ts`'s `githubTransport`);
    * production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+  /** Composition-root seams for the shared managed-mutation fence. Reads remain pass-through. */
+  readonly gitPort?: GitPort;
+  readonly sourceControlPort?: SourceControlPort;
   readonly skillsRoot?: string;
 }
 
@@ -51,7 +55,7 @@ export async function buildImplementerPipeline(
     return Object.freeze({ state: "blocked", reason: "github_authentication_unavailable" });
   }
 
-  const git = new LocalGitAdapter();
+  const git = options.gitPort ?? new LocalGitAdapter();
   const checkpointDirectory = join(options.agentTeamHome, "state", "checkpoints");
 
   const pipeline = new ImplementerPipeline({
@@ -61,7 +65,7 @@ export async function buildImplementerPipeline(
     skillRuntime: new FileSkillRuntime({
       skillsRoot: options.skillsRoot ?? join(homedir(), ".agent-context", "skills"),
     }),
-    sourceControl: new GitHubAdapter(githubTransport),
+    sourceControl: options.sourceControlPort ?? new GitHubAdapter(githubTransport),
     scopeCheckpoint: new ScopeOverrunCheckpointAdapter({
       store: new LocalYamlCheckpointStore(checkpointDirectory),
     }),

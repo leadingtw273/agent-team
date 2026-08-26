@@ -63,6 +63,8 @@ const now = instant("2026-08-07T12:00:00.000Z");
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const projectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const issueId = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+const leaseId = id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+const nextLeaseId = id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ac");
 
 const skillSnapshots = {
   implementer: {
@@ -109,6 +111,178 @@ function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProg
 }
 
 describe("FileJobProgressStore", () => {
+  describe("LEA-136 control fence and durable provider-attempt ledger", () => {
+    const firstFence = {
+      leaseId,
+      holderId: "controller-a",
+      leaseEpoch: 1,
+      ownershipEpoch: 0,
+      state: "active" as const,
+    };
+    const identityDigest = "a".repeat(64);
+    const operationKey = `authority:${jobId}:pr_close:${identityDigest}`;
+
+    it("keeps legacy records readable but requires a fence before an attempt ledger can exist", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const legacy = await store.compareAndSwap(jobId, null, baseRecord());
+      expect(legacy.ok).toBe(true);
+      if (!legacy.ok) return;
+      expect(legacy.value).not.toHaveProperty("controlFence");
+
+      const withoutFence = await store.compareAndSwap(
+        jobId,
+        0,
+        baseRecord({
+          mutationAttempts: [
+            {
+              operationKey,
+              intent: "pr_close",
+              identityDigest,
+              attempts: [{ ordinal: 1, preparedAt: now, outcome: "prepared" }],
+            },
+          ],
+        }),
+      );
+      expect(withoutFence).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+    });
+
+    it("allows only monotonic lease epochs and never reactivates a revoked same-epoch fence", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const created = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ controlFence: firstFence }),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+
+      const rotatedFence = {
+        leaseId: nextLeaseId,
+        holderId: "controller-b",
+        leaseEpoch: 2,
+        ownershipEpoch: 1,
+        state: "active" as const,
+      };
+      const rotated = await store.compareAndSwap(
+        jobId,
+        created.value.revision,
+        baseRecord({ controlFence: rotatedFence }),
+      );
+      expect(rotated.ok).toBe(true);
+      if (!rotated.ok) return;
+
+      const substitutedSameEpoch = await store.compareAndSwap(
+        jobId,
+        rotated.value.revision,
+        baseRecord({
+          controlFence: { ...rotatedFence, holderId: "controller-c" },
+        }),
+      );
+      expect(substitutedSameEpoch).toMatchObject({
+        ok: false,
+        error: { code: "invariant_violation" },
+      });
+
+      const revoked = await store.compareAndSwap(
+        jobId,
+        rotated.value.revision,
+        baseRecord({ controlFence: { ...rotatedFence, state: "revoked" } }),
+      );
+      expect(revoked.ok).toBe(true);
+      if (!revoked.ok) return;
+      const reactivated = await store.compareAndSwap(
+        jobId,
+        revoked.value.revision,
+        baseRecord({ controlFence: rotatedFence }),
+      );
+      expect(reactivated).toMatchObject({
+        ok: false,
+        error: { code: "invariant_violation" },
+      });
+    });
+
+    it("persists before send, counts crash/sent-unknown, and caps one identity at two calls", async () => {
+      const directory = await temporaryDirectory();
+      const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+      const created = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({ controlFence: firstFence }),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const firstPrepared = {
+        operationKey,
+        intent: "pr_close" as const,
+        identityDigest,
+        attempts: [{ ordinal: 1 as const, preparedAt: now, outcome: "prepared" as const }],
+      };
+      const prepared = await store.compareAndSwap(
+        jobId,
+        created.value.revision,
+        baseRecord({ controlFence: firstFence, mutationAttempts: [firstPrepared] }),
+      );
+      expect(prepared.ok).toBe(true);
+      if (!prepared.ok) return;
+
+      const sentUnknownAttempt = {
+        ...firstPrepared,
+        attempts: [
+          { ordinal: 1 as const, preparedAt: now, outcome: "sent_unknown" as const },
+        ],
+      };
+      const sentUnknown = await store.compareAndSwap(
+        jobId,
+        prepared.value.revision,
+        baseRecord({ controlFence: firstFence, mutationAttempts: [sentUnknownAttempt] }),
+      );
+      expect(sentUnknown.ok).toBe(true);
+      if (!sentUnknown.ok) return;
+
+      const secondPrepared = {
+        ...sentUnknownAttempt,
+        attempts: [
+          ...sentUnknownAttempt.attempts,
+          { ordinal: 2 as const, preparedAt: now, outcome: "prepared" as const },
+        ],
+      };
+      const retried = await store.compareAndSwap(
+        jobId,
+        sentUnknown.value.revision,
+        baseRecord({ controlFence: firstFence, mutationAttempts: [secondPrepared] }),
+      );
+      expect(retried.ok).toBe(true);
+      if (!retried.ok) return;
+
+      const third = await store.compareAndSwap(
+        jobId,
+        retried.value.revision,
+        baseRecord({
+          controlFence: firstFence,
+          mutationAttempts: [
+            {
+              ...secondPrepared,
+              attempts: [
+                ...secondPrepared.attempts,
+                { ordinal: 3, preparedAt: now, outcome: "prepared" as const },
+              ],
+            },
+          ],
+        }),
+      );
+      expect(third).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+      const removed = await store.compareAndSwap(
+        jobId,
+        retried.value.revision,
+        baseRecord({ controlFence: firstFence, mutationAttempts: [] }),
+      );
+      expect(removed).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+    });
+  });
+
   it("reserves a brand-new record with expectedRevision:null, revision starts at 0, and stamps updatedAt from the injected clock", async () => {
     const directory = await temporaryDirectory();
     const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));

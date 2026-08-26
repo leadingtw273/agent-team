@@ -25,6 +25,7 @@ import { CiRecoveryCheckpointAdapter } from "./ci-recovery-checkpoint.js";
 import { FileJobUpdateAdapter } from "./pipeline-job-adapter.js";
 import { FailClosedToolDecisionAdapter } from "./tool-decision.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
+import type { GitPort, SourceControlPort } from "../../application/ports/index.js";
 
 export type CiRecoveryCompositionBlockedReason = "github_authentication_unavailable";
 
@@ -47,6 +48,8 @@ export interface BuildCiRecoveryPipelineOptions {
   readonly githubTransport?: GhJsonTransport &
     GhTextTransport &
     Pick<GhTransport, "inspectAuthentication">;
+  readonly gitPort?: GitPort;
+  readonly sourceControlPort?: SourceControlPort;
 }
 
 export type BuildCiRecoveryPipelineResult =
@@ -62,7 +65,7 @@ export async function buildCiRecoveryPipeline(
     return Object.freeze({ state: "blocked", reason: "github_authentication_unavailable" });
   }
 
-  const git = new LocalGitAdapter();
+  const git = options.gitPort ?? new LocalGitAdapter();
   const checkpointDirectory = join(options.agentTeamHome, "state", "checkpoints");
   // C017: one GitHubAdapter instance serves both `sourceControl` (the pre-existing
   // `getCommitChecks`) and `ciLog` (the new `getFailedCheckLogExcerpts`) -- both are read-only
@@ -73,7 +76,7 @@ export async function buildCiRecoveryPipeline(
     git,
     preflight: new GitPreflight(git),
     provider: buildCodexRunner(options.codexConfig),
-    sourceControl: github,
+    sourceControl: options.sourceControlPort ?? github,
     ciLog: github,
     jobs: new FileJobUpdateAdapter(options.jobs),
     checkpoint: new CiRecoveryCheckpointAdapter({

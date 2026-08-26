@@ -650,6 +650,67 @@ ${readyGateDescription()}`;
     if (allJobs.ok) expect(allJobs.value).toHaveLength(0);
   });
 
+  it("public authority blocks a fresh claim and Job before local admission", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-public-owner");
+    const ports = buildPorts(stateRoot);
+    let authorityReads = 0;
+
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...ports,
+        publicAdmissionAuthority: {
+          check: () => {
+            authorityReads += 1;
+            return Promise.resolve(ok("existing_job_or_pr" as const));
+          },
+        },
+      },
+      "holder-public-owner",
+    );
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(authorityReads).toBe(1);
+    expect(outcome.admissionSkipped).toEqual([
+      { issueId: outcome.candidates[0]?.issue.id, reason: "public_authority_active" },
+    ]);
+    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
+    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
+    const issueId = outcome.candidates[0]?.issue.id;
+    if (issueId === undefined) throw new Error("fixture invariant violated: missing issue id");
+    await expect(ports.admission.load(ready.project.id, issueId)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    });
+  });
+
+  it("fails admission closed when public authority cannot be read", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const ready = readyComposition(stateRoot, "linear-issue-public-unavailable");
+    const ports = buildPorts(stateRoot);
+
+    const outcome = await dispatchOnce(
+      ready,
+      {
+        ...ports,
+        publicAdmissionAuthority: {
+          check: () => Promise.resolve(err(domainError("unavailable"))),
+        },
+      },
+      "holder-public-unavailable",
+    );
+
+    expect(outcome.outcome).toBe("ran");
+    if (outcome.outcome !== "ran") return;
+    expect(outcome.admissionSkipped).toEqual([
+      { issueId: outcome.candidates[0]?.issue.id, reason: "public_authority_unavailable" },
+    ]);
+    expect(await ports.jobs.readAll()).toEqual({ ok: true, value: [] });
+    expect(await ports.leases.repository.readAll()).toEqual({ ok: true, value: [] });
+  });
+
   it("serializes admission on the shared Issue lock and creates zero claim or Job on contention", async () => {
     const stateRoot = await temporaryStateRoot();
     const ready = readyComposition(stateRoot, "linear-issue-admission-lock");

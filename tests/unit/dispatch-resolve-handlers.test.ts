@@ -25,7 +25,8 @@ import {
   type JobProgressRecordMutation,
 } from "../../src/adapters/dispatch/job-progress-store.js";
 import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
-import { parseIdentifier, type Identifier } from "../../src/domain/foundation/index.js";
+import { domainError, ok, parseIdentifier, type Identifier } from "../../src/domain/foundation/index.js";
+import type { CreateDispatchResolveHandlerOptions } from "../../src/cli/dispatch/resolve-handlers.js";
 
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
@@ -107,6 +108,24 @@ async function setup(): Promise<{
   return { progress, admission, progressDirectory };
 }
 
+function createTestDispatchResolveHandler(
+  options: Omit<CreateDispatchResolveHandlerOptions, "authority">,
+) {
+  return createDispatchResolveHandler({
+    ...options,
+    authority: {
+      converge: async (record) => {
+        const current = await options.progress.load(record.jobId);
+        return !current.ok
+          ? current
+          : current.value === undefined
+            ? { ok: false as const, error: domainError("not_found") }
+            : ok({ record: current.value, release: () => Promise.resolve(ok(undefined)) });
+      },
+    },
+  });
+}
+
 describe("createDispatchResolveHandler", () => {
   it("rejects a wrong confirmation phrase with zero side effects -- no progress write, no admission release", async () => {
     const { progress, admission } = await setup();
@@ -115,7 +134,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf("wrong phrase"),
@@ -140,7 +159,7 @@ describe("createDispatchResolveHandler", () => {
       await Promise.resolve();
       yield dispatchResolveConfirmationPhrase;
     }
-    const handler = createDispatchResolveHandler({ progress, admission, stdin: trackedStdin() });
+    const handler = createTestDispatchResolveHandler({ progress, admission, stdin: trackedStdin() });
     const result = await handler({ jobId: jobA, as: "superseded" });
     expect(result.state).toBe("rejected");
     expect(JSON.parse(result.message ?? "{}")).toMatchObject({
@@ -151,7 +170,7 @@ describe("createDispatchResolveHandler", () => {
 
   it("rejects --as cancelled carrying --superseded-by", async () => {
     const { progress, admission } = await setup();
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -165,7 +184,7 @@ describe("createDispatchResolveHandler", () => {
 
   it("blocks resolving a job id that has no progress record", async () => {
     const { progress, admission } = await setup();
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -181,7 +200,7 @@ describe("createDispatchResolveHandler", () => {
   it("blocks resolving a job whose stage is already terminal (e.g. completed)", async () => {
     const { progress, admission } = await setup();
     await progress.compareAndSwap(jobA, null, baseRecord({ stage: { kind: "completed" } }));
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -201,7 +220,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -235,7 +254,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -279,7 +298,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -313,7 +332,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -350,7 +369,7 @@ describe("createDispatchResolveHandler", () => {
     if (!claimed.ok) throw new Error(claimed.error.code);
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobA);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -385,7 +404,7 @@ describe("createDispatchResolveHandler", () => {
     // by a newer job by the time an operator gets around to resolving the old, stuck one).
     await admission.attachJob(projectId, issueId, claimed.value.revision, jobB);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf(dispatchResolveConfirmationPhrase),
@@ -405,7 +424,7 @@ describe("createDispatchResolveHandler", () => {
     await progress.compareAndSwap(jobA, null, baseRecord());
     const before = await readdir(progressDirectory);
 
-    const handler = createDispatchResolveHandler({
+    const handler = createTestDispatchResolveHandler({
       progress,
       admission,
       stdin: stdinOf("nope"),

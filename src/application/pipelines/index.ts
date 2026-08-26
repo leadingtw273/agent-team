@@ -5,6 +5,8 @@ export * from "./conflict-policy.js";
 export * from "./conflict.js";
 export * from "./implementer-model.js";
 export * from "./implementer.js";
+export * from "./job-pr-authority-model.js";
+export * from "./job-pr-authority.js";
 export * from "./lifecycle-model.js";
 export * from "./lifecycle.js";
 export * from "./merge-gate-model.js";

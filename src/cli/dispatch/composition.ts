@@ -103,6 +103,7 @@ import {
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
+import type { Issue } from "../../domain/project/index.js";
 import { FileLeaseRepository } from "../../infrastructure/leases/index.js";
 import { FileJobRepository } from "../../infrastructure/jobs/index.js";
 import {
@@ -250,6 +251,9 @@ export interface DispatchOncePorts {
   readonly locks?: IssueScopeLockPort;
   /** Durable post-Job bootstrap. It must confirm before the selected claim may attach its Job. */
   readonly bootstrap?: (input: DispatchBootstrapInput) => Promise<Result<void, DomainError>>;
+  readonly publicAdmissionAuthority?: Readonly<{
+    check(issue: Issue): Promise<Result<"allowed" | "existing_job_or_pr", DomainError>>;
+  }>;
 }
 
 export interface DispatchBootstrapInput {
@@ -284,6 +288,10 @@ export type DispatchOnceAdmissionSkippedIssue =
   | Readonly<{
       issueId: string;
       reason: "quota_unknown" | "quota_blocked" | "provider_route_unavailable";
+    }>
+  | Readonly<{
+      issueId: string;
+      reason: "public_authority_active" | "public_authority_unavailable";
     }>;
 
 function routeAdmissionSkipReason(
@@ -518,6 +526,20 @@ export async function dispatchOnce(
           Object.freeze({
             issueId: candidate.issue.id,
             reason: routeAdmissionSkipReason(route),
+          }),
+        );
+        continue;
+      }
+    }
+    if (ports.publicAdmissionAuthority !== undefined) {
+      const authority = await ports.publicAdmissionAuthority.check(candidate.issue);
+      if (!authority.ok || authority.value !== "allowed") {
+        admissionSkipped.push(
+          Object.freeze({
+            issueId: candidate.issue.id,
+            reason: authority.ok
+              ? ("public_authority_active" as const)
+              : ("public_authority_unavailable" as const),
           }),
         );
         continue;

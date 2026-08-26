@@ -36,6 +36,7 @@ const workManagement = {
 
 const sourceControl = {
   getChangeRequest: unavailable,
+  findOpenChangeRequestsByHead: unavailable,
   createDraftChangeRequest: unavailable,
   getCommitChecks: unavailable,
   getCommitStatuses: unavailable,
@@ -94,6 +95,7 @@ const requiredMethods = {
   ],
   sourceControl: [
     "getChangeRequest",
+    "findOpenChangeRequestsByHead",
     "createDraftChangeRequest",
     "getCommitChecks",
     "getCommitStatuses",

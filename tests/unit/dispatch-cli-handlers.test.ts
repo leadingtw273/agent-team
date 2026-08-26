@@ -45,6 +45,7 @@ import type { ProjectRegistrySnapshot } from "../../src/application/projects/ind
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
 import type { Job, Lease } from "../../src/domain/jobs/index.js";
+import { headShaSchema } from "../../src/domain/review/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
 import { FileLeaseRepository } from "../../src/infrastructure/leases/index.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
@@ -502,6 +503,14 @@ async function seedResumableProgressRecord(stateRoot: string): Promise<Identifie
     branch: `agent-team/${jobId}`,
     worktreePath: "/tmp/does-not-need-to-exist-for-this-fake",
     changeRequestId: "42",
+    headSha: headShaSchema.parse("a".repeat(40)),
+    controlFence: {
+      leaseId: id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab"),
+      holderId: "prior-controller",
+      leaseEpoch: 1,
+      ownershipEpoch: 1,
+      state: "active",
+    },
   });
   return jobId;
 }
