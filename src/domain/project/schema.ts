@@ -30,6 +30,17 @@ export const agentRoleSchema = z.enum([
 
 export type AgentRole = z.infer<typeof agentRoleSchema>;
 
+export const skillNameSchema = z
+  .string()
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u)
+  .max(64);
+export const skillRequirementSchema = z.enum(["required", "optional"]);
+export const issueSkillSelectionSchema = z
+  .object({ name: skillNameSchema, requirement: skillRequirementSchema })
+  .strict();
+export const issueSkillSelectionsSchema = z.array(issueSkillSelectionSchema).max(50);
+export type IssueSkillSelection = z.infer<typeof issueSkillSelectionSchema>;
+
 export const reviewRequirementSchema = z.enum(["code_review", "visual_review", "dual_review"]);
 
 export type ReviewRequirement = z.infer<typeof reviewRequirementSchema>;
@@ -131,6 +142,7 @@ export const issueSchema = z
     humanSummary: humanSummarySchema.optional(),
     humanAcceptanceRequirement: humanAcceptanceRequirementSchema.optional(),
     verificationLevel: verificationLevelSchema.optional(),
+    skillSelections: issueSkillSelectionsSchema.optional(),
     estimatedMinutes: z
       .number()
       .int()
@@ -143,14 +155,24 @@ export const issueSchema = z
   })
   .strict()
   .superRefine((issue, context) => {
-    if (issue.dependencies?.kind !== "issues") return;
-    if (!issue.dependencies.issueIds.includes(issue.id)) return;
-
-    context.addIssue({
-      code: "custom",
-      message: "An issue cannot depend on itself.",
-      path: ["dependencies", "issueIds"],
-    });
+    if (issue.dependencies?.kind === "issues" && issue.dependencies.issueIds.includes(issue.id)) {
+      context.addIssue({
+        code: "custom",
+        message: "An issue cannot depend on itself.",
+        path: ["dependencies", "issueIds"],
+      });
+    }
+    const seenSkills = new Set<string>();
+    for (const [index, skill] of (issue.skillSelections ?? []).entries()) {
+      if (seenSkills.has(skill.name)) {
+        context.addIssue({
+          code: "custom",
+          message: "Issue Skill selections must be unique.",
+          path: ["skillSelections", index, "name"],
+        });
+      }
+      seenSkills.add(skill.name);
+    }
   });
 
 export type Issue = z.infer<typeof issueSchema>;

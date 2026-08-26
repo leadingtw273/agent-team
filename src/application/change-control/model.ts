@@ -33,6 +33,7 @@ export type RequirementChangeReason =
   | "constraints_changed"
   | "risks_changed"
   | "change_regions_changed"
+  | "skill_selection_changed"
   | "observable_outcome_changed"
   | "external_service_added"
   | "dangerous_operation_added"

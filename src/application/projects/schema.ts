@@ -12,6 +12,7 @@ import {
 import { agentRoleSchema, projectIdSchema } from "../../domain/project/index.js";
 import { canonicalSerialize } from "../../domain/review/index.js";
 import { Redactor } from "../../infrastructure/redaction/index.js";
+import { projectSkillPolicySchema } from "../skills/index.js";
 
 const boundedText = z.string().trim().min(1).max(10_000);
 const platformKey = z
@@ -79,6 +80,7 @@ export const trustedProjectConfigSchema = z
     projectRules: z.array(boundedText).max(1_000),
     workStatusLifecycleMode: workStatusLifecycleModeSchema.optional(),
     roleInstructions: roleInstructionsSchema,
+    skillPolicy: projectSkillPolicySchema.optional(),
     commands: z
       .object({
         quality: z.array(projectCommandSchema).min(1).max(50),
