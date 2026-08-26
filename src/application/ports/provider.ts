@@ -23,6 +23,20 @@ export interface ExternalFileDataBlock extends ExternalDataBase {
 
 export type ExternalDataBlock = ExternalTextDataBlock | ExternalFileDataBlock;
 
+/**
+ * Pinned, integrity-checked Skill knowledge. It is intentionally a separate provider field and is
+ * rendered inside untrusted context; it can never become project rules or controller authority.
+ */
+export interface SkillKnowledgeAttachment {
+  readonly skillName: string;
+  readonly displayName: string;
+  readonly mode: "knowledge_only" | "rubric_only";
+  readonly source: string;
+  readonly mediaType: "text/markdown";
+  readonly content: string;
+  readonly sha256: string;
+}
+
 export interface ProviderCapabilities {
   readonly provider: string;
   readonly cliVersion: string;
@@ -41,6 +55,7 @@ export interface ProviderRunRequest {
   readonly requirementSnapshot: RequirementSnapshot;
   readonly controllerDirective: string;
   readonly projectRules: readonly string[];
+  readonly knowledgeAttachments?: readonly SkillKnowledgeAttachment[];
   readonly externalData: readonly ExternalDataBlock[];
   readonly checkpoint?: Checkpoint;
   readonly deadlineAt: Instant;

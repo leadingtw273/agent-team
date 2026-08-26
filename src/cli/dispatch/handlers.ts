@@ -15,6 +15,7 @@
  * `pipeline: "not_applicable_role"`, exactly like before this ticket existed.
  */
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type { CliHandlers } from "../program.js";
@@ -26,6 +27,8 @@ import { createCodexQuotaCollector } from "../../adapters/providers/codex/index.
 import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter } from "../../adapters/github/index.js";
+import { FileSkillRuntime } from "../../adapters/skills/index.js";
+import { admitJobSkillSnapshots, type SkillRuntimePort } from "../../application/skills/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import {
   WorkStatusLifecycleCoordinator,
@@ -161,6 +164,8 @@ export interface CreateDispatchCliHandlersOptions {
     "getIssue" | "setWorkStatus" | "setAgentCondition" | "clearAgentCondition"
   > &
     Partial<Pick<LinearWorkManagementAdapter, "getIssueHistory">>;
+  /** Test seam; production reads only the pinned common Skill catalog and sanitized files. */
+  readonly skillRuntime?: SkillRuntimePort;
 }
 
 /** Preserve the adapter receiver when exposing its optional history method through the
@@ -202,6 +207,7 @@ function progressMutation(record: JobProgressRecord): JobProgressRecordMutation 
     ...(record.providerAssignments === undefined
       ? {}
       : { providerAssignments: record.providerAssignments }),
+    ...(record.skillSnapshots === undefined ? {} : { skillSnapshots: record.skillSnapshots }),
     stage: record.stage,
     branch: record.branch,
     worktreePath: record.worktreePath,
@@ -550,6 +556,9 @@ export function createDispatchCliHandlers(
 ): DispatchHandlers {
   const generateHolderId = options.generateHolderId ?? (() => `cli-dispatch:${randomUUID()}`);
   const clock = options.clock ?? createClock();
+  const skillRuntime =
+    options.skillRuntime ??
+    new FileSkillRuntime({ skillsRoot: join(homedir(), ".agent-context", "skills") });
   const buildPipelineComposition = options.buildImplementerPipeline ?? buildImplementerPipeline;
   const operatorCanary = createOperatorCanaryCliHandlers({
     agentTeamHome: options.agentTeamHome,
@@ -812,6 +821,17 @@ export function createDispatchCliHandlers(
               );
               const humanDelivery = humanDeliveryForNewJob(candidate.issue, clock.now());
               if (!humanDelivery.ok) return humanDelivery;
+              const skillSnapshots =
+                build.value.trustedConfig.skillPolicy === undefined
+                  ? undefined
+                  : await admitJobSkillSnapshots(skillRuntime, {
+                      job: result.job,
+                      issue: candidate.issue,
+                      policy: build.value.trustedConfig.skillPolicy,
+                    });
+              if (skillSnapshots !== undefined && !skillSnapshots.ok) {
+                return err(skillSnapshots.error.error);
+              }
               const written = await progress.compareAndSwap(result.job.id, null, {
                 jobId: result.job.id,
                 projectId: build.value.project.id,
@@ -819,6 +839,7 @@ export function createDispatchCliHandlers(
                 externalIssueId: candidate.issue.externalId,
                 model,
                 ...(providerAssignments === undefined ? {} : { providerAssignments }),
+                ...(skillSnapshots === undefined ? {} : { skillSnapshots: skillSnapshots.value }),
                 ...(humanDelivery.value === undefined
                   ? {}
                   : { humanDelivery: humanDelivery.value }),
@@ -1387,6 +1408,16 @@ export function createDispatchCliHandlers(
             });
           }
 
+          const bootstrapRecord = await progress.load(result.job.id);
+          if (!bootstrapRecord.ok || bootstrapRecord.value?.workStatusLifecycle === undefined) {
+            return outcome("failed", {
+              ...dispatchedPayload,
+              pipeline: "not_started",
+              pipelineReason: "job_progress_read_failed",
+              errorCode: bootstrapRecord.ok ? "not_found" : bootstrapRecord.error.code,
+            });
+          }
+
           const request = buildImplementerPipelineRequest({
             job: result.job,
             issue,
@@ -1396,6 +1427,9 @@ export function createDispatchCliHandlers(
             agentTeamHome: options.agentTeamHome,
             clock,
             baseRevision: authoritativeBase.value.baseRevision,
+            ...(bootstrapRecord.value.skillSnapshots?.implementer === undefined
+              ? {}
+              : { skillSnapshot: bootstrapRecord.value.skillSnapshots.implementer }),
           });
           if (!request.ok) {
             // C018 fix: `implementer_request_invalid` -- this file's grep-verified sixth exit
@@ -1434,15 +1468,6 @@ export function createDispatchCliHandlers(
             });
           }
 
-          const bootstrapRecord = await progress.load(result.job.id);
-          if (!bootstrapRecord.ok || bootstrapRecord.value?.workStatusLifecycle === undefined) {
-            return outcome("failed", {
-              ...dispatchedPayload,
-              pipeline: "not_started",
-              pipelineReason: "job_progress_read_failed",
-              errorCode: bootstrapRecord.ok ? "not_found" : bootstrapRecord.error.code,
-            });
-          }
           const authorityDigest = sha256Digest({
             schemaVersion: 1,
             jobId: result.job.id,

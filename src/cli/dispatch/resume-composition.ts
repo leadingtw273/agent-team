@@ -2820,6 +2820,7 @@ async function resumeReview(
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
     ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
+    ...(record.skillSnapshots === undefined ? {} : { skillSnapshots: record.skillSnapshots }),
   };
 
   let reviewOutcome: ReviewerPipelineOutcome;

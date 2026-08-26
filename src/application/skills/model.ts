@@ -116,11 +116,24 @@ const roleDefaultsSchema = z
 
 export const projectSkillPolicySchema = z
   .object({
+    catalogId: z
+      .string()
+      .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u)
+      .max(120)
+      .optional(),
+    catalogDigest: digestSchema.optional(),
     allowlist: z.array(skillNameSchema).max(200),
     roleDefaults: roleDefaultsSchema.optional(),
   })
   .strict()
   .superRefine((policy, context) => {
+    if ((policy.catalogId === undefined) !== (policy.catalogDigest === undefined)) {
+      context.addIssue({
+        code: "custom",
+        path: ["catalogDigest"],
+        message: "Catalog id and digest must be supplied together.",
+      });
+    }
     const allowed = new Set<string>();
     for (const [index, name] of policy.allowlist.entries()) {
       if (allowed.has(name)) {
@@ -174,9 +187,45 @@ export const jobSkillSnapshotSchema = z
       .array(z.object({ name: skillNameSchema, reason: skillPublicReasonSchema }).strict())
       .max(50),
   })
-  .strict();
+  .strict()
+  .superRefine((snapshot, context) => {
+    const seen = new Set<string>();
+    for (const [index, skill] of snapshot.skills.entries()) {
+      if (seen.has(skill.name)) {
+        context.addIssue({
+          code: "custom",
+          path: ["skills", index, "name"],
+          message: "Snapshot Skill names must be unique.",
+        });
+      }
+      seen.add(skill.name);
+    }
+    for (const [index, omission] of snapshot.omitted.entries()) {
+      if (seen.has(omission.name)) {
+        context.addIssue({
+          code: "custom",
+          path: ["omitted", index, "name"],
+          message: "Selected and omitted Skill names must be disjoint and unique.",
+        });
+      }
+      seen.add(omission.name);
+    }
+  });
 
 export type JobSkillSnapshot = z.infer<typeof jobSkillSnapshotSchema>;
+
+export const jobSkillSnapshotsByRoleSchema = z
+  .object(
+    Object.fromEntries(
+      agentRoleSchema.options.map((role) => [role, jobSkillSnapshotSchema.optional()]),
+    ) as Record<
+      (typeof agentRoleSchema.options)[number],
+      z.ZodOptional<typeof jobSkillSnapshotSchema>
+    >,
+  )
+  .strict();
+
+export type JobSkillSnapshotsByRole = z.infer<typeof jobSkillSnapshotsByRoleSchema>;
 
 export const firstGodotSkillAllowlist = Object.freeze([
   "godot-project-foundations",
@@ -192,6 +241,8 @@ export const firstGodotSkillAllowlist = Object.freeze([
 
 export const tankSkirmishGodotSkillPolicy = Object.freeze(
   projectSkillPolicySchema.parse({
+    catalogId: "gd-agentic-skills-6a36f189",
+    catalogDigest: "b4e467676e9494363325bc23a57978dd81e6ff9867d1ba164f23687e569b4ed0",
     allowlist: firstGodotSkillAllowlist,
     roleDefaults: {
       team_lead: [],

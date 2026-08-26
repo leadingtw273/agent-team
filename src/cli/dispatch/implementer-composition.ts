@@ -15,10 +15,12 @@
  * make.
  */
 import { join } from "node:path";
+import { homedir } from "node:os";
 
 import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
 import { GitPreflight, LocalGitAdapter } from "../../adapters/git/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
+import { FileSkillRuntime } from "../../adapters/skills/index.js";
 import { ImplementerPipeline } from "../../application/pipelines/index.js";
 import { buildCodexRunner } from "./codex-factory.js";
 import { ScopeOverrunCheckpointAdapter } from "./scope-checkpoint.js";
@@ -33,6 +35,7 @@ export interface BuildImplementerPipelineOptions {
   /** Injectable for tests (same convention as `probe-composition.ts`'s `githubTransport`);
    * production defaults to a real `GhTransport`. */
   readonly githubTransport?: GhJsonTransport & Pick<GhTransport, "inspectAuthentication">;
+  readonly skillsRoot?: string;
 }
 
 export type BuildImplementerPipelineResult =
@@ -55,6 +58,9 @@ export async function buildImplementerPipeline(
     git,
     preflight: new GitPreflight(git),
     provider: buildCodexRunner(options.codexConfig),
+    skillRuntime: new FileSkillRuntime({
+      skillsRoot: options.skillsRoot ?? join(homedir(), ".agent-context", "skills"),
+    }),
     sourceControl: new GitHubAdapter(githubTransport),
     scopeCheckpoint: new ScopeOverrunCheckpointAdapter({
       store: new LocalYamlCheckpointStore(checkpointDirectory),

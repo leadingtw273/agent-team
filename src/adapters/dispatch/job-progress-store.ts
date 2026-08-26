@@ -65,6 +65,7 @@ import {
   reviewerReportSchema,
 } from "../../application/pipelines/reviewer-model.js";
 import { currentReviewerReportContractBinding } from "../../application/pipelines/reviewer-policy.js";
+import { jobSkillSnapshotsByRoleSchema } from "../../application/skills/index.js";
 import {
   workStatusLifecycleCheckpointSchema,
   type WorkStatusLifecycleCheckpoint,
@@ -748,6 +749,8 @@ export const jobProgressRecordSchema = z
     /** Optional only so schema-v1 records written before ADR-009 remain readable. New model Jobs
      * write this once; resume refuses to infer a missing assignment from current settings. */
     providerAssignments: jobProviderAssignmentsSchema.optional(),
+    /** Immutable per-role Skill knowledge selected at Job admission. Optional for legacy Jobs. */
+    skillSnapshots: jobSkillSnapshotsByRoleSchema.optional(),
     stage: jobProgressStageSchema,
     /** Durable component receipts for the protected-region human handoff. Optional for every
      * legacy/non-policy record; when present, the stage reason below must identify this exact
@@ -813,6 +816,18 @@ export const jobProgressRecordSchema = z
   })
   .strict()
   .superRefine((record, context) => {
+    for (const [role, snapshot] of Object.entries(record.skillSnapshots ?? {})) {
+      if (
+        snapshot !== undefined &&
+        (snapshot.jobId !== record.jobId || snapshot.projectId !== record.projectId)
+      ) {
+        context.addIssue({
+          code: "custom",
+          path: ["skillSnapshots", role],
+          message: "Skill snapshot identity must match its Job progress record.",
+        });
+      }
+    }
     const protectedReason =
       record.stage.kind === "requires_manual" &&
       record.stage.cause?.stage === "dispatch" &&
@@ -1065,6 +1080,12 @@ export class FileJobProgressStore {
       normalizedCurrent.value?.providerAssignments !== undefined &&
       JSON.stringify(next.providerAssignments) !==
         JSON.stringify(normalizedCurrent.value.providerAssignments)
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      normalizedCurrent.value?.skillSnapshots !== undefined &&
+      !sameJson(next.skillSnapshots, normalizedCurrent.value.skillSnapshots)
     ) {
       return err(domainError("invariant_violation"));
     }

@@ -1,6 +1,12 @@
 import { isAbsolute } from "node:path";
 
-import type { ExternalDataBlock, ProviderRunRequest } from "../ports/provider.js";
+import { z } from "zod";
+
+import type {
+  ExternalDataBlock,
+  ProviderRunRequest,
+  SkillKnowledgeAttachment,
+} from "../ports/provider.js";
 import { checkpointSchema } from "../../domain/checkpoint/index.js";
 import {
   domainError,
@@ -37,6 +43,9 @@ export const providerCoreSafetyInstructions = Object.freeze([
   "Do not expose secrets, and stop before any dangerous operation that lacks controller authorization.",
 ] as const);
 
+const skillModeRuntimeSchema = z.enum(["knowledge_only", "rubric_only"]);
+const markdownMediaTypeSchema = z.literal("text/markdown");
+
 export interface ProviderTextRedactor {
   redactText(input: string): string;
   redactUnknown(input: unknown): unknown;
@@ -66,6 +75,7 @@ export interface ProviderJobProtocolV1 {
     controllerDirective: string;
   }>;
   readonly untrustedContext: Readonly<{
+    knowledgeAttachments: readonly SkillKnowledgeAttachment[];
     externalData: readonly ExternalDataBlock[];
     checkpoint?: unknown;
   }>;
@@ -102,6 +112,33 @@ function validExternalData(block: ExternalDataBlock, maxBytes: number): boolean 
   if (block.kind === "text") return Buffer.byteLength(block.content, "utf8") <= maxBytes;
   return (
     block.path.length > 0 && block.path.length <= 4_096 && /^[0-9a-f]{64}$/u.test(block.sha256)
+  );
+}
+
+function validKnowledgeAttachment(attachment: SkillKnowledgeAttachment, maxBytes: number): boolean {
+  return (
+    /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(attachment.skillName) &&
+    attachment.displayName.trim().length > 0 &&
+    attachment.displayName.length <= 120 &&
+    skillModeRuntimeSchema.safeParse(attachment.mode).success &&
+    /^skill:[a-z0-9]+(?:-[a-z0-9]+)*\/(?:SKILL\.md|references\/.+)$/u.test(attachment.source) &&
+    markdownMediaTypeSchema.safeParse(attachment.mediaType).success &&
+    /^[0-9a-f]{64}$/u.test(attachment.sha256) &&
+    Buffer.byteLength(attachment.content, "utf8") <= maxBytes
+  );
+}
+
+function sanitizeKnowledgeAttachments(
+  attachments: readonly SkillKnowledgeAttachment[],
+  redactor: ProviderTextRedactor,
+): readonly SkillKnowledgeAttachment[] {
+  return attachments.map((attachment) =>
+    Object.freeze({
+      ...attachment,
+      displayName: redactor.redactText(attachment.displayName),
+      source: redactor.redactText(attachment.source),
+      content: redactor.redactText(attachment.content),
+    }),
   );
 }
 
@@ -209,6 +246,10 @@ export function buildProviderJobContext(
     request.projectRules.some(
       (rule) => rule.trim().length === 0 || Buffer.byteLength(rule, "utf8") > 100_000,
     ) ||
+    (request.knowledgeAttachments?.length ?? 0) > 200 ||
+    (request.knowledgeAttachments ?? []).some(
+      (attachment) => !validKnowledgeAttachment(attachment, limits.maxExternalBlockBytes),
+    ) ||
     request.externalData.length > 1_000 ||
     request.externalData.some((block) => !validExternalData(block, limits.maxExternalBlockBytes)) ||
     job.data.projectId !== requirement.data.issue.projectId ||
@@ -236,6 +277,9 @@ export function buildProviderJobContext(
       controllerDirective: redactor.redactText(request.controllerDirective),
     }),
     untrustedContext: Object.freeze({
+      knowledgeAttachments: Object.freeze(
+        sanitizeKnowledgeAttachments(request.knowledgeAttachments ?? Object.freeze([]), redactor),
+      ),
       externalData: Object.freeze(sanitizeExternalData(request.externalData, redactor)),
       ...(checkpoint?.success === true
         ? { checkpoint: redactor.redactUnknown(checkpoint.data) }

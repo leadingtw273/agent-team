@@ -64,6 +64,32 @@ const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const projectId = id("project", "project_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const issueId = id("issue", "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 
+const skillSnapshots = {
+  implementer: {
+    schemaVersion: 1 as const,
+    jobId,
+    projectId,
+    skills: [
+      {
+        name: "godot-testing-patterns",
+        displayName: "Godot 測試模式",
+        mode: "knowledge_only" as const,
+        source: {
+          repository: "https://github.com/example/skills",
+          commit: "a".repeat(40),
+          path: "skills/godot-testing-patterns",
+          treeDigest: "1".repeat(64),
+        },
+        installedTreeDigest: "2".repeat(64),
+        fileDigests: { "SKILL.md": "3".repeat(64) },
+        allowedReferences: [],
+        requirement: "optional" as const,
+      },
+    ],
+    omitted: [],
+  },
+};
+
 function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProgressRecordMutation {
   return {
     jobId,
@@ -192,6 +218,58 @@ describe("FileJobProgressStore", () => {
     const removed = await reader.compareAndSwap(jobId, first.value.revision, withoutAssignments);
     expect(removed.ok).toBe(false);
     if (!removed.ok) expect(removed.error.code).toBe("invariant_violation");
+  });
+
+  it("persists the per-role Skill snapshot once and rejects later change or removal", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const first = await store.compareAndSwap(jobId, null, baseRecord({ skillSnapshots }));
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const originalSkill = skillSnapshots.implementer.skills[0];
+    if (originalSkill === undefined) throw new Error("missing Skill fixture");
+
+    const changed = await store.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        skillSnapshots: {
+          implementer: {
+            ...skillSnapshots.implementer,
+            skills: [
+              {
+                ...originalSkill,
+                installedTreeDigest: "4".repeat(64),
+              },
+            ],
+          },
+        },
+      }),
+    );
+    expect(changed.ok).toBe(false);
+    if (!changed.ok) expect(changed.error.code).toBe("invariant_violation");
+
+    const removed = await store.compareAndSwap(jobId, first.value.revision, baseRecord());
+    expect(removed.ok).toBe(false);
+    if (!removed.ok) expect(removed.error.code).toBe("invariant_violation");
+  });
+
+  it("rejects a Skill snapshot bound to another Job identity", () => {
+    expect(
+      jobProgressRecordSchema.safeParse({
+        schemaVersion: 1,
+        revision: 0,
+        updatedAt: now,
+        ...baseRecord({
+          skillSnapshots: {
+            implementer: {
+              ...skillSnapshots.implementer,
+              jobId: id("job", "job_018f47d2-77a4-7cc1-8ef2-1123456789ab"),
+            },
+          },
+        }),
+      }).success,
+    ).toBe(false);
   });
 
   it("keeps the approved human-delivery snapshot immutable and attaches one acceptance identity", async () => {

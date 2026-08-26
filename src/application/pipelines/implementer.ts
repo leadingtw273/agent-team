@@ -5,7 +5,12 @@ import { jobSchema } from "../../domain/jobs/index.js";
 import { projectSchema } from "../../domain/project/index.js";
 import { requirementSnapshotSchema } from "../../domain/review/index.js";
 import { trustedProjectConfigSchema } from "../projects/index.js";
-import type { GitWorktree, MutationOptions, ProviderRunHandle } from "../ports/index.js";
+import type {
+  GitWorktree,
+  MutationOptions,
+  ProviderRunHandle,
+  SkillKnowledgeAttachment,
+} from "../ports/index.js";
 import type {
   ImplementerFailureStage,
   ImplementerPipelineOutcome,
@@ -55,7 +60,8 @@ function validRequest(request: ImplementerPipelineRequest): boolean {
     config.data.platforms.workManagement.containerId === project.data.workManagement.containerId &&
     config.data.platforms.workManagement.projectId === project.data.workManagement.projectId &&
     config.data.platforms.sourceControl.provider === project.data.sourceControl.provider &&
-    config.data.platforms.sourceControl.repository === project.data.sourceControl.repository
+    config.data.platforms.sourceControl.repository === project.data.sourceControl.repository &&
+    (config.data.skillPolicy === undefined) === (request.skillSnapshot === undefined)
   );
 }
 
@@ -106,6 +112,19 @@ export class ImplementerPipeline {
     if (declaredRegions === undefined) {
       return failed("request", domainError("invariant_violation"));
     }
+    let knowledgeAttachments: readonly SkillKnowledgeAttachment[] = Object.freeze([]);
+    if (request.skillSnapshot !== undefined) {
+      if (
+        this.ports.skillRuntime === undefined ||
+        request.skillSnapshot.jobId !== request.job.id ||
+        request.skillSnapshot.projectId !== request.project.id
+      ) {
+        return failed("request", domainError("invariant_violation"));
+      }
+      const materialized = await this.ports.skillRuntime.materialize(request.skillSnapshot);
+      if (!materialized.ok) return failed("request", materialized.error.error);
+      knowledgeAttachments = materialized.value;
+    }
     const created = await this.ports.git.createWorktree(
       {
         rootPath: request.repositoryRoot,
@@ -137,6 +156,7 @@ export class ImplementerPipeline {
           ...request.trustedConfig.projectRules,
           ...(request.trustedConfig.roleInstructions.implementer ?? []),
         ]),
+        knowledgeAttachments,
         externalData: request.externalData,
         deadlineAt: request.deadlineAt,
       },
