@@ -296,9 +296,17 @@ export class WorkStatusOrphanCoordinator {
     if (checkpoint?.admissionMode !== "enforce" || checkpoint.capabilityDigest === undefined) {
       return "blocked";
     }
+    const pendingHumanAcceptance =
+      record.stage.kind === "completed" &&
+      record.humanDelivery?.acceptanceRequirement === "required";
+    if (pendingHumanAcceptance && record.humanDelivery?.acceptanceIdentityDigest === undefined) {
+      return "blocked";
+    }
     const target =
       record.stage.kind === "completed"
-        ? "completed"
+        ? pendingHumanAcceptance
+          ? "in_review"
+          : "completed"
         : record.stage.kind === "cancelled"
           ? "canceled"
           : "requires_manual";
@@ -340,12 +348,7 @@ export class WorkStatusOrphanCoordinator {
       this.dependencies.progress.listAll(),
     ]);
     if (!latest.ok || !claim.ok || !latestInventory.ok) return "blocked";
-    const expectedStage =
-      target === "requires_manual"
-        ? "requires_manual"
-        : target === "completed"
-          ? "completed"
-          : "cancelled";
+    const expectedStage = record.stage.kind;
     const competingLiveRecord = latestInventory.value.some(
       (candidateRecord) =>
         candidateRecord.projectId === record.projectId &&
@@ -380,22 +383,43 @@ export class WorkStatusOrphanCoordinator {
     ) {
       return "blocked";
     }
+    const confirmedHumanAcceptanceHandoff =
+      pendingHumanAcceptance &&
+      current.value.workStatus === "in_review" &&
+      current.value.agentCondition === undefined &&
+      latestConfirmedTransition === prior &&
+      prior?.main.state === "confirmed" &&
+      prior.agent.state === "confirmed";
+    if (confirmedHumanAcceptanceHandoff) return "completed";
     if (prior?.main.state === "sent_unknown") return "blocked";
+    const confirmedReceiptNeedsRecovery =
+      pendingHumanAcceptance &&
+      prior?.main.state === "confirmed" &&
+      (current.value.workStatus !== "in_review" || current.value.agentCondition !== undefined);
+    const reusablePrior = confirmedReceiptNeedsRecovery ? undefined : prior;
+    const transitionAllowedMainSources =
+      confirmedReceiptNeedsRecovery && prior.allowedMainSources !== undefined
+        ? prior.allowedMainSources
+        : allowedMainSources;
     const authority = sha256Digest({
       schemaVersion: 1,
       operation: "work-status-orphan-terminal-projection",
       jobId: record.jobId,
       target,
+      ...(pendingHumanAcceptance
+        ? { humanAcceptanceIdentityDigest: record.humanDelivery?.acceptanceIdentityDigest }
+        : {}),
+      ...(confirmedReceiptNeedsRecovery ? { recoveryOfTransitionInstance: prior.instance } : {}),
       ...(record.stage.kind === "requires_manual" ? { cause: record.stage.cause } : {}),
     });
     if (!authority.ok) return "blocked";
     const instance =
-      prior?.instance ??
+      reusablePrior?.instance ??
       createWorkStatusLifecycleTransitionInstance({
         jobId: record.jobId,
         step,
         mainTarget: target,
-        allowedMainSources,
+        allowedMainSources: transitionAllowedMainSources,
         agentTarget,
         authorityDigest: authority.value,
       });
@@ -421,8 +445,8 @@ export class WorkStatusOrphanCoordinator {
         transitionInstance,
         invocationDigest: invocation.value,
         mainTarget: target,
-        allowedMainSources: prior?.allowedMainSources ?? allowedMainSources,
-        agentTarget: prior?.agentTarget ?? agentTarget,
+        allowedMainSources: reusablePrior?.allowedMainSources ?? transitionAllowedMainSources,
+        agentTarget: reusablePrior?.agentTarget ?? agentTarget,
       },
       lock,
     );
