@@ -67,6 +67,34 @@ describe("registration setup start/approve: confirmation gate", () => {
 });
 
 describe("registration setup status/resume: fail-closed on missing configuration", () => {
+  it("passes the same explicit draft path through every mid-session composition rebuild", async () => {
+    const buildComposition = vi.fn<typeof buildRegistrationSetupComposition>(() =>
+      Promise.resolve({ state: "blocked", reason: "linear_api_key_missing" }),
+    );
+    const handlers = createRegistrationSetupHandlers({
+      agentTeamHome: "/nonexistent",
+      buildComposition,
+    });
+    const input = { projectId: "proj-1", draftPath: "/tmp/isolated-draft.json" } as const;
+
+    await handlers.setupStatus(input);
+    await handlers.setupResume(input);
+    await handlers.setupRefresh(input);
+
+    expect(buildComposition).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ draftPath: input.draftPath, ensureWorktreeDirectories: false }),
+    );
+    expect(buildComposition).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ draftPath: input.draftPath, ensureWorktreeDirectories: true }),
+    );
+    expect(buildComposition).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ draftPath: input.draftPath, ensureWorktreeDirectories: true }),
+    );
+  });
+
   it("reports blocked (exit 3) with a fixed reason when the composition is not ready", async () => {
     const buildComposition = vi.fn<typeof buildRegistrationSetupComposition>(() =>
       Promise.resolve({ state: "blocked", reason: "linear_api_key_missing" }),

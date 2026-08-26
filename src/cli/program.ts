@@ -32,9 +32,15 @@ export interface RegistrationCliHandlers {
   readonly setupStart: (
     input: Readonly<{ projectId: string; draftPath?: string }>,
   ) => Promise<CliCommandOutcome>;
-  readonly setupStatus: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
-  readonly setupResume: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
-  readonly setupRefresh: (input: Readonly<{ projectId: string }>) => Promise<CliCommandOutcome>;
+  readonly setupStatus: (
+    input: Readonly<{ projectId: string; draftPath?: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly setupResume: (
+    input: Readonly<{ projectId: string; draftPath?: string }>,
+  ) => Promise<CliCommandOutcome>;
+  readonly setupRefresh: (
+    input: Readonly<{ projectId: string; draftPath?: string }>,
+  ) => Promise<CliCommandOutcome>;
   readonly setupApprove: (
     input: Readonly<{ projectId: string; draftPath?: string }>,
   ) => Promise<CliCommandOutcome>;
@@ -662,15 +668,27 @@ export function createProgram(
     .command("status")
     .description("讀取目前 Setup 狀態（唯讀）")
     .requiredOption("--project <project-id>", "專案識別碼")
-    .action((options: { readonly project: string }) =>
-      action(state, io, () => handlers.registration.setupStatus({ projectId: options.project }))(),
+    .option("--draft <path>", "覆寫預設 host draft 檔路徑")
+    .action((options: { readonly project: string; readonly draft?: string }) =>
+      action(state, io, () =>
+        handlers.registration.setupStatus({
+          projectId: options.project,
+          ...(options.draft === undefined ? {} : { draftPath: options.draft }),
+        }),
+      )(),
     );
   setup
     .command("resume")
     .description("重新整理／恢復進行中的 Setup 流程")
     .requiredOption("--project <project-id>", "專案識別碼")
-    .action((options: { readonly project: string }) =>
-      action(state, io, () => handlers.registration.setupResume({ projectId: options.project }))(),
+    .option("--draft <path>", "覆寫預設 host draft 檔路徑")
+    .action((options: { readonly project: string; readonly draft?: string }) =>
+      action(state, io, () =>
+        handlers.registration.setupResume({
+          projectId: options.project,
+          ...(options.draft === undefined ? {} : { draftPath: options.draft }),
+        }),
+      )(),
     );
   setup
     .command("refresh")
@@ -679,8 +697,14 @@ export function createProgram(
         "（唯一能離開 ci_waiting 的命令；不合併、不啟用可信設定，合併仍須 approve 的 stdin 確認字串把關）",
     )
     .requiredOption("--project <project-id>", "專案識別碼")
-    .action((options: { readonly project: string }) =>
-      action(state, io, () => handlers.registration.setupRefresh({ projectId: options.project }))(),
+    .option("--draft <path>", "覆寫預設 host draft 檔路徑")
+    .action((options: { readonly project: string; readonly draft?: string }) =>
+      action(state, io, () =>
+        handlers.registration.setupRefresh({
+          projectId: options.project,
+          ...(options.draft === undefined ? {} : { draftPath: options.draft }),
+        }),
+      )(),
     );
   setup
     .command("approve")

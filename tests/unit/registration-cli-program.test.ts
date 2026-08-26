@@ -87,7 +87,7 @@ describe("O009 registration CLI command parsing", () => {
     await expect(
       runCli(
         metadata,
-        ["registration", "setup", "status", "--project", "proj-1"],
+        ["registration", "setup", "status", "--project", "proj-1", "--draft", "/tmp/d.json"],
         commands,
         sink.io,
       ),
@@ -95,7 +95,7 @@ describe("O009 registration CLI command parsing", () => {
     await expect(
       runCli(
         metadata,
-        ["registration", "setup", "resume", "--project", "proj-1"],
+        ["registration", "setup", "resume", "--project", "proj-1", "--draft", "/tmp/d.json"],
         commands,
         sink.io,
       ),
@@ -103,7 +103,7 @@ describe("O009 registration CLI command parsing", () => {
     await expect(
       runCli(
         metadata,
-        ["registration", "setup", "refresh", "--project", "proj-1"],
+        ["registration", "setup", "refresh", "--project", "proj-1", "--draft", "/tmp/d.json"],
         commands,
         sink.io,
       ),
@@ -132,9 +132,18 @@ describe("O009 registration CLI command parsing", () => {
       projectId: "proj-1",
       draftPath: "/tmp/d.json",
     });
-    expect(commands.registration.setupStatus).toHaveBeenCalledWith({ projectId: "proj-1" });
-    expect(commands.registration.setupResume).toHaveBeenCalledWith({ projectId: "proj-1" });
-    expect(commands.registration.setupRefresh).toHaveBeenCalledWith({ projectId: "proj-1" });
+    expect(commands.registration.setupStatus).toHaveBeenCalledWith({
+      projectId: "proj-1",
+      draftPath: "/tmp/d.json",
+    });
+    expect(commands.registration.setupResume).toHaveBeenCalledWith({
+      projectId: "proj-1",
+      draftPath: "/tmp/d.json",
+    });
+    expect(commands.registration.setupRefresh).toHaveBeenCalledWith({
+      projectId: "proj-1",
+      draftPath: "/tmp/d.json",
+    });
     expect(commands.registration.setupApprove).toHaveBeenCalledWith({
       projectId: "proj-1",
       draftPath: undefined,
