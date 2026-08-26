@@ -242,7 +242,7 @@ export const firstGodotSkillAllowlist = Object.freeze([
 export const tankSkirmishGodotSkillPolicy = Object.freeze(
   projectSkillPolicySchema.parse({
     catalogId: "gd-agentic-skills-6a36f189",
-    catalogDigest: "b4e467676e9494363325bc23a57978dd81e6ff9867d1ba164f23687e569b4ed0",
+    catalogDigest: "a957ba2615456637c7886f186d437d2259dd7b6bac1b5cbc3bc5c3546d103ece",
     allowlist: firstGodotSkillAllowlist,
     roleDefaults: {
       team_lead: [],
