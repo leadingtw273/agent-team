@@ -63,9 +63,11 @@ function completedRecord(
     acceptanceRequirement?: "required" | "not_required";
     acceptanceIdentityDigest?: string;
     confirmedReviewHandoff?: boolean;
+    jobId?: string;
+    updatedAt?: typeof now;
   }> = {},
 ): JobProgressRecord {
-  const jobId = "job_018f47d2-77a4-7cc1-8ef2-012345678908";
+  const jobId = options.jobId ?? "job_018f47d2-77a4-7cc1-8ef2-012345678908";
   return {
     projectId: project.id,
     issueId: item.id,
@@ -106,17 +108,61 @@ function completedRecord(
               : { acceptanceIdentityDigest: options.acceptanceIdentityDigest }),
           },
         }),
-    updatedAt: now,
+    updatedAt: options.updatedAt ?? now,
   } as unknown as JobProgressRecord;
+}
+
+function cancelledRecord(
+  item: ReturnType<typeof issue>,
+  jobId: string,
+  updatedAt: typeof now,
+): JobProgressRecord {
+  return {
+    projectId: project.id,
+    issueId: item.id,
+    externalIssueId: item.externalId,
+    jobId,
+    revision: 2,
+    stage: { kind: "cancelled" },
+    workStatusLifecycle: {
+      admissionMode: "enforce",
+      capabilityDigest: "a".repeat(64),
+      transitions: [
+        { step: "work_start", mainTarget: "in_progress", main: { state: "confirmed" } },
+      ],
+    },
+    updatedAt,
+  } as JobProgressRecord;
+}
+
+function releasedClaim(
+  item: ReturnType<typeof issue>,
+  jobId: string,
+  releaseReason: "completed" | "cancelled",
+) {
+  return {
+    schemaVersion: 1 as const,
+    revision: 2,
+    projectId: project.id,
+    issueId: item.id,
+    externalIssueId: item.externalId,
+    jobId,
+    state: "released" as const,
+    releaseReason,
+    claimedAt: now,
+    updatedAt: now,
+  };
 }
 
 function completedOrphanHarness(
   item: ReturnType<typeof issue>,
   record: JobProgressRecord,
   workStatus: "in_progress" | "in_review",
+  records: readonly JobProgressRecord[] = [record],
+  claim?: Readonly<Record<string, unknown>>,
 ) {
   const candidate = { ...snapshot(item), workStatus };
-  const setWorkStatus = vi.fn();
+  const setWorkStatus = vi.fn(() => Promise.resolve(err(domainError("invariant_violation"))));
   const setAgentCondition = vi.fn();
   const appendComment = vi.fn();
   const transitionWhileLockHeld = vi.fn((request: WorkStatusLifecycleRequest, lock: unknown) => {
@@ -139,11 +185,12 @@ function completedOrphanHarness(
       appendComment,
     },
     progress: {
-      listAll: () => Promise.resolve(ok([record])),
-      load: () => Promise.resolve(ok(record)),
+      listAll: () => Promise.resolve(ok(records)),
+      load: (jobId: string) =>
+        Promise.resolve(ok(records.find((candidateRecord) => candidateRecord.jobId === jobId))),
     },
     admission: {
-      listForProject: () => Promise.resolve(ok([])),
+      listForProject: () => Promise.resolve(ok(claim === undefined ? [] : [claim])),
       load: () => Promise.resolve(ok(undefined)),
     } as never,
     locks: {
@@ -179,6 +226,97 @@ describe("work-status orphan quarantine", () => {
     expect(harness.setWorkStatus).not.toHaveBeenCalled();
     expect(harness.setAgentCondition).not.toHaveBeenCalled();
     expect(harness.appendComment).not.toHaveBeenCalled();
+  });
+
+  it("uses the admission claim's completed Job instead of an older cancelled retry", async () => {
+    const item = issue(8, true);
+    const olderAt = parseInstant("2026-08-18T00:00:00.000Z");
+    const newerAt = parseInstant("2026-08-18T02:00:00.000Z");
+    if (!olderAt.ok || !newerAt.ok) throw new Error("invalid_test_instant");
+    const completed = completedRecord(item, {
+      acceptanceRequirement: "required",
+      acceptanceIdentityDigest: "e".repeat(64),
+      confirmedReviewHandoff: true,
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-012345678920",
+      updatedAt: newerAt.value,
+    });
+    const cancelled = cancelledRecord(
+      item,
+      "job_018f47d2-77a4-7cc1-8ef2-012345678910",
+      olderAt.value,
+    );
+    const claim = releasedClaim(item, completed.jobId, "completed");
+    const harness = completedOrphanHarness(
+      item,
+      completed,
+      "in_review",
+      [cancelled, completed],
+      claim,
+    );
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    expect(harness.transitionWhileLockHeld).not.toHaveBeenCalled();
+  });
+
+  it("lets a cancellation claim supersede an older completed Job", async () => {
+    const item = issue(8, true);
+    const olderAt = parseInstant("2026-08-18T00:00:00.000Z");
+    const newerAt = parseInstant("2026-08-18T02:00:00.000Z");
+    if (!olderAt.ok || !newerAt.ok) throw new Error("invalid_test_instant");
+    const completed = completedRecord(item, {
+      acceptanceRequirement: "required",
+      acceptanceIdentityDigest: "e".repeat(64),
+      confirmedReviewHandoff: true,
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-012345678910",
+      updatedAt: olderAt.value,
+    });
+    const cancelled = cancelledRecord(
+      item,
+      "job_018f47d2-77a4-7cc1-8ef2-012345678920",
+      newerAt.value,
+    );
+    const claim = releasedClaim(item, cancelled.jobId, "cancelled");
+    const harness = completedOrphanHarness(
+      item,
+      cancelled,
+      "in_progress",
+      [completed, cancelled],
+      claim,
+    );
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 1,
+      blocked: 0,
+    });
+    expect(harness.transitionWhileLockHeld).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: cancelled.jobId, mainTarget: "canceled" }),
+      expect.anything(),
+    );
+  });
+
+  it("does not guess between multiple terminal Jobs without an admission claim", async () => {
+    const item = issue(8, true);
+    const completed = completedRecord(item, {
+      acceptanceRequirement: "required",
+      acceptanceIdentityDigest: "e".repeat(64),
+      confirmedReviewHandoff: true,
+    });
+    const cancelled = cancelledRecord(item, "job_018f47d2-77a4-7cc1-8ef2-012345678920", now);
+    const harness = completedOrphanHarness(item, completed, "in_review", [cancelled, completed]);
+
+    await expect(harness.coordinator.scan()).resolves.toMatchObject({
+      terminalResidue: 0,
+      blocked: 1,
+    });
+    expect(harness.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(harness.setWorkStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ externalIssueId: item.externalId }),
+      "requires_manual",
+      expect.anything(),
+    );
   });
 
   it("restores a completed Job with pending human acceptance only to in review", async () => {

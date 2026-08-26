@@ -2,7 +2,10 @@ import type {
   FileJobProgressStore,
   JobProgressRecord,
 } from "../../adapters/dispatch/job-progress-store.js";
-import type { IssueAdmissionInventoryPort } from "../../adapters/dispatch/issue-admission-store.js";
+import type {
+  IssueAdmissionInventoryPort,
+  IssueAdmissionRecord,
+} from "../../adapters/dispatch/issue-admission-store.js";
 import {
   createWorkStatusLifecycleTransitionInstance,
   type IssueScopeLockHandle,
@@ -58,6 +61,20 @@ export type WorkStatusJobReconcileOutcome = Readonly<
 >;
 
 type TerminalProjectionOutcome = "completed" | "stale" | "blocked";
+
+function attributableTerminalRecord(
+  records: readonly JobProgressRecord[],
+  claim: IssueAdmissionRecord | undefined,
+): JobProgressRecord | undefined {
+  const terminal = records.filter(
+    (record) =>
+      ["completed", "cancelled"].includes(record.stage.kind) && hasConfirmedWorkStart(record),
+  );
+  if (terminal.length === 1) return terminal[0];
+  const authoritativeJobId = claim?.supersededByJobId ?? claim?.jobId;
+  if (authoritativeJobId === undefined) return undefined;
+  return terminal.find((record) => record.jobId === authoritativeJobId);
+}
 
 export class WorkStatusOrphanCoordinator {
   constructor(
@@ -142,6 +159,7 @@ export class WorkStatusOrphanCoordinator {
       const activeClaims = claims.value.filter(
         (claim) => claim.state === "active" && claim.externalIssueId === candidate.issue.externalId,
       );
+      const issueClaim = claims.value.find((claim) => claim.issueId === candidate.issue.id);
       const live = records.filter(
         (record) =>
           !["completed", "failed", "superseded", "cancelled", "requires_manual"].includes(
@@ -170,11 +188,7 @@ export class WorkStatusOrphanCoordinator {
       const attributableTerminal =
         manualHandoff ??
         (activeManagedJobId === undefined
-          ? records.find(
-              (record) =>
-                ["completed", "cancelled"].includes(record.stage.kind) &&
-                hasConfirmedWorkStart(record),
-            )
+          ? attributableTerminalRecord(records, issueClaim)
           : undefined);
       if (attributableTerminal !== undefined) {
         const holderId = `work-status-orphan:${attributableTerminal.jobId}`;
