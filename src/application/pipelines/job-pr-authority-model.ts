@@ -7,11 +7,7 @@ import {
   type DomainError,
   type Result,
 } from "../../domain/foundation/index.js";
-import {
-  issueIdSchema,
-  jobIdSchema,
-  projectIdSchema,
-} from "../../domain/jobs/index.js";
+import { issueIdSchema, jobIdSchema, projectIdSchema } from "../../domain/jobs/index.js";
 import { canonicalSerialize, sha256Digest } from "../../domain/review/index.js";
 
 const branchSchema = z
@@ -165,7 +161,9 @@ const eventVariants = [
   z.object({ ...externalMergeObservedShape, eventId: eventIdSchema }).strict(),
 ] as const;
 
-function canonicalEventIdentity(event: JobPrLifecycleEventInput): Readonly<Record<string, unknown>> {
+function canonicalEventIdentity(
+  event: JobPrLifecycleEventInput,
+): Readonly<Record<string, unknown>> {
   switch (event.kind) {
     case "job_started":
     case "job_cancelled":
@@ -278,10 +276,7 @@ export function projectPullRequestAuthority(
   }
   const terminalJobs = new Set<string>();
   for (const event of unique) {
-    if (
-      event.kind === "job_cancelled" ||
-      event.kind === "job_completed"
-    ) {
+    if (event.kind === "job_cancelled" || event.kind === "job_completed") {
       terminalJobs.add(event.jobId);
     } else if (event.kind === "job_superseded") {
       terminalJobs.add(event.oldJobId);

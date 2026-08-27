@@ -43,7 +43,9 @@ import {
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
   );
 });
 
@@ -111,7 +113,13 @@ describe("managed mutation fenced port decorators", () => {
       mutation,
     );
     await source.setCommitStatus(
-      { project, headSha: "a".repeat(40), context: "agent-team/review", state: "success", description: "ok" },
+      {
+        project,
+        headSha: "a".repeat(40),
+        context: "agent-team/review",
+        state: "success",
+        description: "ok",
+      },
       mutation,
     );
     await source.appendChangeRequestComment(
@@ -123,14 +131,23 @@ describe("managed mutation fenced port decorators", () => {
       },
       mutation,
     );
-    await source.markChangeRequestReady({ project, changeRequestId: "42" }, "a".repeat(40), mutation);
+    await source.markChangeRequestReady(
+      { project, changeRequestId: "42" },
+      "a".repeat(40),
+      mutation,
+    );
     await source.enableAutoMerge({ project, changeRequestId: "42" }, "a".repeat(40), mutation);
     await source.closeChangeRequest({ project, changeRequestId: "42" }, mutation);
 
     const gitPush = vi.fn(() => Promise.resolve(ok(undefined)));
     const git = fenceGitPort({ push: gitPush } as unknown as GitPort, gate);
     await git.push(
-      { repositoryRoot: "/tmp/fixture", path: "/tmp/worktree", branch: "task", headSha: "a".repeat(40) },
+      {
+        repositoryRoot: "/tmp/fixture",
+        path: "/tmp/worktree",
+        branch: "task",
+        headSha: "a".repeat(40),
+      },
       "origin",
       mutation,
     );
@@ -153,7 +170,12 @@ describe("managed mutation fenced port decorators", () => {
     await work.appendComment(issue, "audit", mutation);
     await work.uploadArtifact(
       issue,
-      { filename: "evidence.txt", mediaType: "text/plain", sha256: "b".repeat(64), content: new Uint8Array() },
+      {
+        filename: "evidence.txt",
+        mediaType: "text/plain",
+        sha256: "b".repeat(64),
+        content: new Uint8Array(),
+      },
       mutation,
     );
 
@@ -190,7 +212,13 @@ describe("FileManagedMutationAuthority", () => {
       stage: { kind: "ci_waiting" },
       branch: "agent-team/project/issue/job",
       worktreePath: "/tmp/worktree",
-      controlFence: { leaseId, holderId: "controller", leaseEpoch: 1, ownershipEpoch: 1, state: "active" },
+      controlFence: {
+        leaseId,
+        holderId: "controller",
+        leaseEpoch: 1,
+        ownershipEpoch: 1,
+        state: "active",
+      },
     });
     const makeAuthority = () =>
       new FileManagedMutationAuthority({
@@ -253,7 +281,13 @@ describe("FileManagedMutationAuthority", () => {
       stage: { kind: "ci_waiting" },
       branch: "agent-team/project/issue/job",
       worktreePath: "/tmp/worktree",
-      controlFence: { leaseId, holderId: "current", leaseEpoch: 2, ownershipEpoch: 1, state: "active" },
+      controlFence: {
+        leaseId,
+        holderId: "current",
+        leaseEpoch: 2,
+        ownershipEpoch: 1,
+        state: "active",
+      },
     } as never);
     const provider = vi.fn(() => Promise.resolve(ok("must-not-run")));
     const authority = new FileManagedMutationAuthority({

@@ -98,9 +98,7 @@ function mutation(record: JobProgressRecord): JobProgressRecordMutation {
       : { workStatusLifecycle: record.workStatusLifecycle }),
     ...(record.humanDelivery === undefined ? {} : { humanDelivery: record.humanDelivery }),
     ...(record.controlFence === undefined ? {} : { controlFence: record.controlFence }),
-    ...(record.mutationAttempts === undefined
-      ? {}
-      : { mutationAttempts: record.mutationAttempts }),
+    ...(record.mutationAttempts === undefined ? {} : { mutationAttempts: record.mutationAttempts }),
   };
 }
 

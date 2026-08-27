@@ -1,6 +1,12 @@
 import type { SourceControlPort, WorkManagementPort } from "../../application/ports/index.js";
 import { parseJobPrLifecycleComment } from "../../application/pipelines/index.js";
-import { domainError, err, ok, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import type { Issue, Project } from "../../domain/project/index.js";
 import { implementerBranch } from "./implementer-request.js";
 
@@ -28,9 +34,7 @@ export async function checkPublicIssueAdmissionAuthority(
     return event === undefined ? [] : [event];
   });
   if (
-    events.some(
-      (event) => event.projectId !== options.project.id || event.issueId !== issue.id,
-    )
+    events.some((event) => event.projectId !== options.project.id || event.issueId !== issue.id)
   ) {
     return err(domainError("conflict"));
   }

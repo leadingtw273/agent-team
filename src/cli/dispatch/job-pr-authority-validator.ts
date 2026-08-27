@@ -1,14 +1,17 @@
 import type { JobProgressRecord } from "../../adapters/dispatch/job-progress-store.js";
-import type {
-  SourceControlPort,
-  WorkManagementPort,
-} from "../../application/ports/index.js";
+import type { SourceControlPort, WorkManagementPort } from "../../application/ports/index.js";
 import {
   parseJobPrLifecycleComment,
   parsePullRequestBackPointer,
   projectPullRequestAuthority,
 } from "../../application/pipelines/index.js";
-import { domainError, err, ok, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import type { ManagedMutationRequest } from "./managed-mutation-authority.js";
 
@@ -24,15 +27,26 @@ export interface JobPrAuthorityValidatorOptions {
 }
 
 function requestedLifecycleEvent(request: ManagedMutationRequest) {
-  if (request.intent !== "linear_lifecycle" || typeof request.identity !== "object" || request.identity === null) {
+  if (
+    request.intent !== "linear_lifecycle" ||
+    typeof request.identity !== "object" ||
+    request.identity === null
+  ) {
     return undefined;
   }
   const body = (request.identity as Readonly<Record<string, unknown>>)["body"];
   return typeof body === "string" ? parseJobPrLifecycleComment(body) : undefined;
 }
 
-function isSafeConflictCondition(request: ManagedMutationRequest, record: JobProgressRecord): boolean {
-  if (request.intent !== "linear_agent_condition" || typeof request.identity !== "object" || request.identity === null) {
+function isSafeConflictCondition(
+  request: ManagedMutationRequest,
+  record: JobProgressRecord,
+): boolean {
+  if (
+    request.intent !== "linear_agent_condition" ||
+    typeof request.identity !== "object" ||
+    request.identity === null
+  ) {
     return false;
   }
   const identity = request.identity as Readonly<Record<string, unknown>>;

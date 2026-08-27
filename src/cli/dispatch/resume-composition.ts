@@ -100,10 +100,7 @@ import {
   type IssueAdmissionPort,
 } from "../../adapters/dispatch/issue-admission-store.js";
 import type { HumanAcceptanceStorePort } from "../../adapters/dispatch/human-acceptance-store.js";
-import {
-  revokeJobControlFence,
-  rotateJobControlFence,
-} from "./managed-mutation-authority.js";
+import { revokeJobControlFence, rotateJobControlFence } from "./managed-mutation-authority.js";
 import {
   FileReviewReportDiagnosticsSidecar,
   defaultReviewReportSidecarDirectory,
@@ -1226,9 +1223,7 @@ async function resumeOneJob(
     const repaired =
       repairPublicAuthority === undefined
         ? ok(fenced.value)
-        : await whileResumeLeaseHeld(guardedDeps, () =>
-            repairPublicAuthority(fenced.value),
-          );
+        : await whileResumeLeaseHeld(guardedDeps, () => repairPublicAuthority(fenced.value));
     if (!repaired.ok) {
       return await requiresManual(
         fenced.value,

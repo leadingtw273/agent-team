@@ -10,7 +10,14 @@ import {
   parsePullRequestBackPointer,
   projectPullRequestAuthority,
 } from "../../application/pipelines/index.js";
-import { domainError, err, ok, type Clock, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  type Clock,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import { jobIdSchema } from "../../domain/jobs/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
@@ -43,17 +50,23 @@ export interface DispatchResolveAuthorityOptions {
   >;
   readonly lifecycleWorkManagement?: WorkManagementLifecyclePort;
   readonly sourceControl: SourceControlPort;
-  readonly buildLifecycle?: (ports: Readonly<{
-    sourceControl: SourceControlPort;
-    workManagement: WorkManagementLifecyclePort;
-  }>) => Pick<LifecyclePipeline, "run">;
+  readonly buildLifecycle?: (
+    ports: Readonly<{
+      sourceControl: SourceControlPort;
+      workManagement: WorkManagementLifecyclePort;
+    }>,
+  ) => Pick<LifecyclePipeline, "run">;
   readonly clock: Clock;
   readonly generateHolderId?: () => string;
 }
 
 function mutationFrom(record: JobProgressRecord) {
-  const { schemaVersion: _schemaVersion, revision: _revision, updatedAt: _updatedAt, ...mutation } =
-    record;
+  const {
+    schemaVersion: _schemaVersion,
+    revision: _revision,
+    updatedAt: _updatedAt,
+    ...mutation
+  } = record;
   void _schemaVersion;
   void _revision;
   void _updatedAt;
@@ -68,8 +81,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     input: DispatchResolveInput,
   ): Promise<Result<DispatchResolveAuthorityReceipt, DomainError>> {
     if (record.projectId !== this.options.project.id) return err(domainError("conflict"));
-    const holderId =
-      this.options.generateHolderId?.() ?? `dispatch-resolve:${randomUUID()}`;
+    const holderId = this.options.generateHolderId?.() ?? `dispatch-resolve:${randomUUID()}`;
     const acquired = await this.options.leases.acquire({
       jobId: record.jobId,
       issueId: record.issueId,
@@ -106,10 +118,11 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     input: DispatchResolveInput,
   ): Promise<
     Result<
-      JobProgressRecord | Readonly<{
-        record: JobProgressRecord;
-        blockedReason: "cancellation_after_merge";
-      }>,
+      | JobProgressRecord
+      | Readonly<{
+          record: JobProgressRecord;
+          blockedReason: "cancellation_after_merge";
+        }>,
       DomainError
     >
   > {
@@ -502,25 +515,25 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
           ownershipEpoch: fence.ownershipEpoch,
         },
         clock: this.options.clock,
-      validateAuthority: createJobPrAuthorityValidator({
+        validateAuthority: createJobPrAuthorityValidator({
           project: this.options.project,
           workManagement: this.options.workManagement,
           sourceControl: this.options.sourceControl,
           mode,
-        ...(supersededByJobId === undefined ? {} : { supersededByJobId }),
+          ...(supersededByJobId === undefined ? {} : { supersededByJobId }),
+        }),
+        ...(this.options.lifecycleWorkManagement === undefined
+          ? {}
+          : {
+              escalation: {
+                project: this.options.project,
+                workManagement: this.options.lifecycleWorkManagement,
+                sourceControl: this.options.sourceControl,
+                mode,
+                ...(supersededByJobId === undefined ? {} : { supersededByJobId }),
+              },
+            }),
       }),
-      ...(this.options.lifecycleWorkManagement === undefined
-        ? {}
-        : {
-            escalation: {
-              project: this.options.project,
-              workManagement: this.options.lifecycleWorkManagement,
-              sourceControl: this.options.sourceControl,
-              mode,
-              ...(supersededByJobId === undefined ? {} : { supersededByJobId }),
-            },
-          }),
-    }),
     );
   }
 

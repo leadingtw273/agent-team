@@ -33,7 +33,9 @@ import {
 
 const directories: string[] = [];
 afterEach(async () => {
-  await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await Promise.all(
+    directories.splice(0).map((path) => rm(path, { recursive: true, force: true })),
+  );
 });
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
@@ -86,7 +88,11 @@ describe("DispatchResolveAuthority", () => {
     if (!pointer.ok) throw new Error(pointer.error.code);
     const prBody = appendPullRequestBackPointer("legacy work", pointer.value);
     if (!prBody.ok) throw new Error(prBody.error.code);
-    const progress = new FileJobProgressStore(join(root, "progress"), undefined, createFixedClock(now.value));
+    const progress = new FileJobProgressStore(
+      join(root, "progress"),
+      undefined,
+      createFixedClock(now.value),
+    );
     await progress.compareAndSwap(jobId, null, {
       jobId,
       projectId,
@@ -99,7 +105,11 @@ describe("DispatchResolveAuthority", () => {
     });
     const comments: { id: string; body: string; createdAt: typeof now.value }[] = [];
     const workManagement = {
-      getIssue: vi.fn(() => Promise.resolve(ok({ issue, workStatus: "canceled" as const, updatedAt: now.value, revision: "r1" }))),
+      getIssue: vi.fn(() =>
+        Promise.resolve(
+          ok({ issue, workStatus: "canceled" as const, updatedAt: now.value, revision: "r1" }),
+        ),
+      ),
       listComments: vi.fn(() => Promise.resolve(ok([...comments]))),
       appendComment: vi.fn((_reference, body: string) => {
         const receipt = { id: `c${String(comments.length + 1)}`, body, createdAt: now.value };
@@ -158,9 +168,11 @@ describe("DispatchResolveAuthority", () => {
 
     expect(resolved.state).toBe("success");
     expect(close).toHaveBeenCalledTimes(1);
-    expect(
-      comments.map((comment) => parseJobPrLifecycleComment(comment.body)?.kind),
-    ).toEqual(["job_started", "pr_bound", "job_cancelled"]);
+    expect(comments.map((comment) => parseJobPrLifecycleComment(comment.body)?.kind)).toEqual([
+      "job_started",
+      "pr_bound",
+      "job_cancelled",
+    ]);
     await expect(progress.load(jobId)).resolves.toMatchObject({
       ok: true,
       value: {
@@ -201,8 +213,20 @@ describe("DispatchResolveAuthority", () => {
     });
     const branch = `agent-team/${projectId}/${issueId}/${jobId}`;
     const headSha = headShaSchema.parse("f".repeat(40));
-    const pointer = createPullRequestBackPointer({ schemaVersion: 1, projectId, issueId, jobId, branch });
-    const started = createJobPrLifecycleEvent({ schemaVersion: 1, kind: "job_started", projectId, issueId, jobId });
+    const pointer = createPullRequestBackPointer({
+      schemaVersion: 1,
+      projectId,
+      issueId,
+      jobId,
+      branch,
+    });
+    const started = createJobPrLifecycleEvent({
+      schemaVersion: 1,
+      kind: "job_started",
+      projectId,
+      issueId,
+      jobId,
+    });
     const bound = createJobPrLifecycleEvent({
       schemaVersion: 1,
       kind: "pr_bound",
@@ -219,7 +243,11 @@ describe("DispatchResolveAuthority", () => {
     const startedBody = formatJobPrLifecycleComment("started", started.value);
     const boundBody = formatJobPrLifecycleComment("bound", bound.value);
     if (!prBody.ok || !startedBody.ok || !boundBody.ok) throw new Error("format fixture failed");
-    const progress = new FileJobProgressStore(join(root, "progress"), undefined, createFixedClock(now.value));
+    const progress = new FileJobProgressStore(
+      join(root, "progress"),
+      undefined,
+      createFixedClock(now.value),
+    );
     await progress.compareAndSwap(jobId, null, {
       jobId,
       projectId,
@@ -251,7 +279,10 @@ describe("DispatchResolveAuthority", () => {
     };
     const blockedIssueSnapshot = {
       ...baseIssueSnapshot,
-      agentCondition: { status: "blocked" as const, blockingReasons: ["integration_failure"] as const },
+      agentCondition: {
+        status: "blocked" as const,
+        blockingReasons: ["integration_failure"] as const,
+      },
     };
     const setAgentCondition = vi.fn(() => Promise.resolve(ok(blockedIssueSnapshot)));
     const workManagement = {
@@ -319,7 +350,10 @@ describe("DispatchResolveAuthority", () => {
     expect(kinds).not.toContain("job_superseded");
     await expect(progress.load(jobId)).resolves.toMatchObject({
       ok: true,
-      value: { stage: { kind: "requires_manual" }, controlFence: { state: "active", ownershipEpoch: 1 } },
+      value: {
+        stage: { kind: "requires_manual" },
+        controlFence: { state: "active", ownershipEpoch: 1 },
+      },
     });
   });
 
@@ -383,7 +417,11 @@ describe("DispatchResolveAuthority", () => {
     const boundBody = formatJobPrLifecycleComment("bound", bound.value);
     if (!prBody.ok || !startedBody.ok || !boundBody.ok) throw new Error("format fixture failed");
 
-    const progress = new FileJobProgressStore(join(root, "progress"), undefined, createFixedClock(now.value));
+    const progress = new FileJobProgressStore(
+      join(root, "progress"),
+      undefined,
+      createFixedClock(now.value),
+    );
     await progress.compareAndSwap(jobId, null, {
       jobId,
       projectId,
@@ -409,7 +447,9 @@ describe("DispatchResolveAuthority", () => {
     ];
     const workManagement = {
       getIssue: vi.fn(() =>
-        Promise.resolve(ok({ issue, workStatus: "canceled" as const, updatedAt: now.value, revision: "r1" })),
+        Promise.resolve(
+          ok({ issue, workStatus: "canceled" as const, updatedAt: now.value, revision: "r1" }),
+        ),
       ),
       listComments: vi.fn(() => Promise.resolve(ok([...comments]))),
       appendComment: vi.fn((_reference, body: string) => {
@@ -449,8 +489,7 @@ describe("DispatchResolveAuthority", () => {
     await admission.attachJob(projectId, issueId, claim.value.revision, jobId);
     const leases = new LeaseCoordinator(new InMemoryLeaseRepository(), {
       clock: createFixedClock(now.value),
-      generateLeaseId: () =>
-        ok(id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab")),
+      generateLeaseId: () => ok(id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab")),
     });
     const authority = new DispatchResolveAuthority({
       project,
@@ -474,7 +513,9 @@ describe("DispatchResolveAuthority", () => {
     expect(close).toHaveBeenCalledTimes(1);
     expect(prState).toBe("closed");
     expect(
-      comments.some((comment) => parseJobPrLifecycleComment(comment.body)?.kind === "job_cancelled"),
+      comments.some(
+        (comment) => parseJobPrLifecycleComment(comment.body)?.kind === "job_cancelled",
+      ),
     ).toBe(true);
     await expect(progress.load(jobId)).resolves.toMatchObject({
       ok: true,
@@ -623,8 +664,7 @@ describe("DispatchResolveAuthority", () => {
     await admission.attachJob(projectId, issueId, claim.value.revision, jobId);
     const leases = new LeaseCoordinator(new InMemoryLeaseRepository(), {
       clock: createFixedClock(now.value),
-      generateLeaseId: () =>
-        ok(id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab")),
+      generateLeaseId: () => ok(id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab")),
     });
     let lifecycleCalls = 0;
     const authority = new DispatchResolveAuthority({
@@ -666,8 +706,7 @@ describe("DispatchResolveAuthority", () => {
     expect(lifecycleCalls).toBe(1);
     expect(
       comments.some(
-        (comment) =>
-          parseJobPrLifecycleComment(comment.body)?.kind === "external_merge_observed",
+        (comment) => parseJobPrLifecycleComment(comment.body)?.kind === "external_merge_observed",
       ),
     ).toBe(true);
     await expect(progress.load(jobId)).resolves.toMatchObject({
