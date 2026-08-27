@@ -20,7 +20,11 @@ import {
   type ReviewStatusFailureStage,
   type ReviewStatusPorts,
 } from "./merge-gate-model.js";
-import { canonicalVisualManifestInput, reviewerReportSchema } from "./reviewer-model.js";
+import {
+  aggregateReviewerDecisionState,
+  canonicalVisualManifestInput,
+  reviewerReportSchema,
+} from "./reviewer-model.js";
 
 function sameSha(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
@@ -71,15 +75,15 @@ function decisionMatchesRequest(request: RecordReviewRequest): boolean {
   const reportsValid = decision.reports.every(
     (report) => reviewerReportSchema.safeParse(report).success,
   );
-  const verdictMatches =
-    decision.state === "approved"
-      ? decision.reports.every((report) => report.verdict === "passed")
-      : decision.state === "changes_requested"
-        ? decision.reports.some((report) => report.verdict === "changes_requested")
-        : decision.reports.some((report) => report.verdict === "clarification_required");
+  // ReviewerPipeline and this publication boundary must share one aggregation rule.
+  // In particular, clarification findings take precedence over blocking findings even when the
+  // report's top-level verdict is changes_requested.
+  const aggregateState = reportsValid
+    ? aggregateReviewerDecisionState(decision.reports)
+    : undefined;
   return (
     reportsValid &&
-    verdictMatches &&
+    decision.state === aggregateState &&
     sameSha(decision.identity.headSha, request.expectedHeadSha) &&
     sameSha(decision.changeRequest.headSha, request.expectedHeadSha) &&
     sameSha(decision.checks.headSha, request.expectedHeadSha) &&

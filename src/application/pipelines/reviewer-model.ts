@@ -175,6 +175,33 @@ export const reviewerReportSchema = z
   });
 export type ReviewerReport = z.infer<typeof reviewerReportSchema>;
 
+export type ReviewerDecisionState = "approved" | "changes_requested" | "clarification_required";
+
+export function aggregateReviewerDecisionState(
+  reports: readonly ReviewerReport[],
+): ReviewerDecisionState | undefined {
+  if (reports.length === 0) return undefined;
+  if (
+    reports.some(
+      (report) =>
+        report.verdict === "clarification_required" ||
+        report.findings.some((finding) => finding.severity === "clarification"),
+    )
+  ) {
+    return "clarification_required";
+  }
+  if (
+    reports.some(
+      (report) =>
+        report.verdict === "changes_requested" ||
+        report.findings.some((finding) => finding.severity === "blocking"),
+    )
+  ) {
+    return "changes_requested";
+  }
+  return reports.every((report) => report.verdict === "passed") ? "approved" : undefined;
+}
+
 export function canonicalVisualManifestInput(
   manifest: VisualManifest,
 ): CanonicalVisualManifestInput {
