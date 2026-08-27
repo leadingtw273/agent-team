@@ -786,7 +786,7 @@ async function harness(
         calls.push("reviewStatus.begin");
         return Promise.resolve({ state: "pending", changeRequest: changeRequest() } as never);
       },
-      record: async () => {
+      record: async (request) => {
         reviewRecordCalls += 1;
         if (overrides.crashOnFirstReviewRecord === true && reviewRecordCalls === 1) {
           throw new Error("simulated_crash_after_checkpoint");
@@ -796,8 +796,17 @@ async function harness(
           throw new Error("simulated_crash_after_status_success");
         }
         const checkpoint = await progress.load(jobId);
-        expect(checkpoint.ok && checkpoint.value?.reviewerReplay?.state).toBe("review_succeeded");
+        expect(checkpoint.ok && checkpoint.value?.reviewerReplay?.state).toBe(
+          request.decision.state === "approved" ? "review_succeeded" : "attempting",
+        );
         calls.push("reviewStatus.record");
+        if (request.decision.state !== "approved") {
+          return {
+            state: "rejected",
+            reason: request.decision.state,
+            evidenceComment: {},
+          } as never;
+        }
         if (
           overrides.reviewRecordMismatch === true ||
           (overrides.reviewRecordMismatchOnce === true && reviewRecordCalls === 1)
@@ -1491,6 +1500,83 @@ describe("ReviewerReplayCoordinator", () => {
       formatFailures: 1,
       transportFailures: 0,
     });
+  });
+
+  it("publishes a valid negative replay decision and remains fail-closed without merge", async () => {
+    const value = await harness(["changes"]);
+    const loaded = await value.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) throw new Error("missing progress");
+    const {
+      schemaVersion: _schemaVersion,
+      revision: _revision,
+      updatedAt: _updatedAt,
+      ...record
+    } = loaded.value;
+    void _schemaVersion;
+    void _revision;
+    void _updatedAt;
+    const changed = await value.progress.compareAndSwap(jobId, loaded.value.revision, {
+      ...record,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_record_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    expect(changed.ok).toBe(true);
+    const result = await value.coordinator.run(jobId, false);
+
+    expect(result).toMatchObject({
+      state: "blocked",
+      reason: "review_not_approved",
+      providerAttempts: 1,
+    });
+    expect(value.calls).toContain("reviewStatus.record");
+    expect(value.calls).not.toContain("autoMerge.enable");
+    expect(value.calls).not.toContain("lifecycle.run");
+    expect(value.admission.record.state).toBe("active");
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: {
+        stage: "review",
+        reasonCode: "review_not_approved",
+        attempts: { count: 1 },
+      },
+    });
+    expect(stored.ok && stored.value?.reviewerReplay).toMatchObject({
+      state: "attempting",
+      counters: { providerAttempts: 1, formatFailures: 0, transportFailures: 0 },
+    });
+    expect(value.requests[0]?.job.attempts.reviewRuns).toBe(3);
+  });
+
+  it("publishes and closes a valid negative decision from the ordinary replay cause", async () => {
+    const value = await harness(["changes"]);
+    const result = await value.coordinator.run(jobId, false);
+
+    expect(result).toMatchObject({
+      state: "blocked",
+      reason: "review_not_approved",
+      providerAttempts: 1,
+    });
+    expect(value.calls).toContain("reviewStatus.record");
+    expect(value.calls).not.toContain("autoMerge.enable");
+    expect(value.calls).not.toContain("lifecycle.run");
+    expect(value.admission.record.state).toBe("active");
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value?.stage).toMatchObject({
+      kind: "requires_manual",
+      cause: {
+        stage: "review",
+        reasonCode: "review_not_approved",
+        attempts: { count: 1 },
+      },
+    });
+    expect(value.requests[0]?.job.attempts.reviewRuns).toBe(3);
   });
 
   it("AC4 two format failures remain requires_manual, publish one safe summary, and never record or merge", async () => {
