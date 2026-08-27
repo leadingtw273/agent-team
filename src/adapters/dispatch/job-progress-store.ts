@@ -65,7 +65,10 @@ import {
   reviewerReportSchema,
 } from "../../application/pipelines/reviewer-model.js";
 import { managedMutationIntentSchema } from "../../application/pipelines/job-pr-authority-model.js";
-import { currentReviewerReportContractBinding } from "../../application/pipelines/reviewer-policy.js";
+import {
+  currentReviewerReportContractBinding,
+  reviewerReportContractV2Binding,
+} from "../../application/pipelines/reviewer-policy.js";
 import { jobSkillSnapshotsByRoleSchema } from "../../application/skills/index.js";
 import {
   workStatusLifecycleCheckpointSchema,
@@ -1301,8 +1304,18 @@ export class FileJobProgressStore {
           currentPrevious === undefined &&
           currentReplay.state === "attempting" &&
           currentReplay.counters.providerAttempts === 2 &&
-          currentReplay.counters.formatFailures === currentReplay.counters.providerAttempts &&
-          currentReplay.counters.transportFailures === 0 &&
+          ((currentReplay.counters.formatFailures === currentReplay.counters.providerAttempts &&
+            currentReplay.counters.transportFailures === 0) ||
+            (currentReplay.identity.schemaVersion === 2 &&
+              sameJson(currentReplay.reviewContractBinding, reviewerReportContractV2Binding) &&
+              currentReplay.counters.formatFailures + currentReplay.counters.transportFailures <
+                currentReplay.counters.providerAttempts &&
+              normalizedCurrent.value?.stage.kind === "requires_manual" &&
+              normalizedCurrent.value.stage.cause?.stage === "review" &&
+              normalizedCurrent.value.stage.cause.reasonCode === "review_record_failed" &&
+              normalizedCurrent.value.mutationAttempts?.some(
+                (entry) => entry.intent === "pr_comment",
+              ) !== true)) &&
           next.reviewerReplay.state === "attempting" &&
           zeroReplayCounters(next.reviewerReplay) &&
           sameJson(next.previousReviewerReplay, currentReplay) &&

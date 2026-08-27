@@ -7,6 +7,7 @@ import {
 import {
   computeReviewerReportContractDigest,
   currentReviewerReportContractBinding,
+  reviewerReportContractV2Binding,
   requiredReviewerRoles,
 } from "../../application/pipelines/reviewer-policy.js";
 import { defaultLeaseDurationMs } from "../../application/leases/index.js";
@@ -37,6 +38,7 @@ import type {
   ReviewerReplayIdentity,
 } from "../../adapters/dispatch/job-progress-store.js";
 import type { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
+import type { ReviewerReplayDiagnosticEntry } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import type {
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
@@ -82,6 +84,10 @@ export type ReviewerReplayBlockedReason =
   | "contract_digest_mismatch"
   | "attempts_exhausted"
   | "review_not_approved"
+  | "reviewer_not_ready"
+  | "reviewer_paused"
+  | "reviewer_waiting"
+  | "reviewer_failed"
   | "checkpoint_write_failed"
   | "diagnostic_write_failed"
   | "public_summary_failed"
@@ -441,13 +447,89 @@ function currentContractGoldenIsValid(): boolean {
   return computeReviewerReportContractDigest() === currentReviewerReportContractBinding.digest;
 }
 
-function canCreateContractEpoch(checkpoint: ReviewerReplayCheckpoint): boolean {
-  return (
+function canCreateContractEpoch(
+  record: JobProgressRecord,
+  checkpoint: ReviewerReplayCheckpoint,
+): boolean {
+  const exhausted =
     checkpoint.state === "attempting" &&
-    checkpoint.counters.providerAttempts === maximumReplayAttempts &&
+    checkpoint.counters.providerAttempts === maximumReplayAttempts;
+  const formatContractExhausted =
+    exhausted &&
     checkpoint.counters.formatFailures === checkpoint.counters.providerAttempts &&
-    checkpoint.counters.transportFailures === 0
-  );
+    checkpoint.counters.transportFailures === 0;
+  const replayOutcomeContractExhausted =
+    exhausted &&
+    checkpoint.identity.schemaVersion === 2 &&
+    checkpoint.reviewContractBinding?.version === reviewerReportContractV2Binding.version &&
+    checkpoint.reviewContractBinding.digest === reviewerReportContractV2Binding.digest &&
+    checkpoint.counters.formatFailures + checkpoint.counters.transportFailures <
+      checkpoint.counters.providerAttempts &&
+    isReviewRecordPrepublicationFailure(record);
+  return formatContractExhausted || replayOutcomeContractExhausted;
+}
+
+function unhandledReplayDiagnostic(
+  outcome: ReviewerPipelineOutcome,
+  attempt: number,
+): Readonly<{
+  entry: ReviewerReplayDiagnosticEntry;
+  reason: Extract<
+    ReviewerReplayBlockedReason,
+    "reviewer_not_ready" | "reviewer_paused" | "reviewer_waiting" | "reviewer_failed"
+  >;
+}> {
+  if (outcome.state === "not_ready") {
+    return {
+      reason: "reviewer_not_ready",
+      entry: {
+        attempt,
+        kind: "outcome",
+        outcomeCategory: `not_ready_${outcome.reason}`,
+      },
+    };
+  }
+  if (outcome.state === "checkpointed") {
+    return {
+      reason: "reviewer_failed",
+      entry: {
+        attempt,
+        kind: "outcome",
+        outcomeCategory: "checkpointed_attempt_limit_reached",
+      },
+    };
+  }
+  if (outcome.state === "paused") {
+    return {
+      reason: "reviewer_paused",
+      entry: {
+        attempt,
+        kind: "outcome",
+        outcomeCategory: `paused_${outcome.reason}`,
+      },
+    };
+  }
+  if (outcome.state === "failed") {
+    const wait = outcome.reviewWait;
+    return {
+      reason: wait === undefined ? "reviewer_failed" : "reviewer_waiting",
+      entry: {
+        attempt,
+        kind: "outcome",
+        outcomeCategory:
+          wait === undefined
+            ? outcome.error.retryable
+              ? "failed_retryable_unclassified"
+              : "failed_non_retryable"
+            : wait.confidence === "confirmed"
+              ? "review_wait_confirmed"
+              : "review_wait_unconfirmed",
+        failureStage: outcome.stage,
+        errorCode: outcome.error.code,
+      },
+    };
+  }
+  throw new Error("reviewer_replay_outcome_already_handled");
 }
 
 type ContractEpochCheckpointResult =
@@ -475,7 +557,7 @@ function contractEpochCheckpoint(
   if (
     current === undefined ||
     record.previousReviewerReplay !== undefined ||
-    !canCreateContractEpoch(current)
+    !canCreateContractEpoch(record, current)
   ) {
     return { ok: false, reason: "contract_epoch_not_allowed" };
   }
@@ -1947,6 +2029,7 @@ export class ReviewerReplayCoordinator {
           }
         } else if (
           reviewOutcome.state === "failed" &&
+          reviewOutcome.reviewWait === undefined &&
           reviewOutcome.error.retryable &&
           (reviewOutcome.stage === "provider_start" || reviewOutcome.stage === "provider_run")
         ) {
@@ -1978,10 +2061,25 @@ export class ReviewerReplayCoordinator {
             };
           }
         } else {
+          const classified = unhandledReplayDiagnostic(reviewOutcome, attempt);
+          const diagnostic = await this.dependencies.diagnostics.append(
+            jobId,
+            currentReplay.identityDigest,
+            classified.entry,
+            { epochScoped: currentReplay.identity.schemaVersion === 2 },
+          );
+          if (!diagnostic.ok) {
+            return {
+              state: "blocked",
+              jobId,
+              reason: "diagnostic_write_failed",
+              errorCode: diagnostic.error.code,
+            };
+          }
           return {
             state: "blocked",
             jobId,
-            reason: "review_not_approved",
+            reason: classified.reason,
             providerAttempts: currentReplay.counters.providerAttempts,
           };
         }

@@ -5,7 +5,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { safeReviewReportDiagnostics } from "../../src/application/pipelines/index.js";
-import { currentReviewerReportContractBinding } from "../../src/application/pipelines/reviewer-policy.js";
+import {
+  currentReviewerReportContractBinding,
+  reviewerReportContractV2Binding,
+} from "../../src/application/pipelines/reviewer-policy.js";
 import { FileReviewerReplayPolicyStore } from "../../src/adapters/dispatch/reviewer-replay-policy-store.js";
 import { FileReviewerReplayDiagnosticStore } from "../../src/adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import { FileJobProgressStore } from "../../src/adapters/dispatch/job-progress-store.js";
@@ -168,6 +171,46 @@ describe("reviewer-replay safe diagnostics", () => {
     expect(epoch.ok && epoch.value.identityDigest).toBe(epochDigest);
     expect(legacy.ok && legacy.value.entries).toHaveLength(1);
     expect(epoch.ok && epoch.value.entries).toHaveLength(1);
+  });
+
+  it("persists only a closed category for non-report replay outcomes", async () => {
+    const directory = await temporaryDirectory("reviewer-replay-outcome-diagnostics-");
+    const store = new FileReviewerReplayDiagnosticStore(directory);
+    const jobId = identifier("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+    const digest = "c".repeat(64);
+
+    await expect(
+      store.append(
+        jobId,
+        digest,
+        {
+          attempt: 1,
+          kind: "outcome",
+          outcomeCategory: "review_wait_confirmed",
+          failureStage: "provider_run",
+          errorCode: "rate_limited",
+        },
+        { epochScoped: true },
+      ),
+    ).resolves.toEqual({ ok: true, value: undefined });
+
+    const loaded = await readJsonWithSchema(
+      join(directory, `${jobId}.${digest}.json`),
+      reviewerReplayDiagnosticRecordSchema,
+    );
+    expect(loaded).toMatchObject({
+      ok: true,
+      value: {
+        entries: [
+          {
+            kind: "outcome",
+            outcomeCategory: "review_wait_confirmed",
+            failureStage: "provider_run",
+            errorCode: "rate_limited",
+          },
+        ],
+      },
+    });
   });
 });
 
@@ -561,7 +604,7 @@ describe("reviewer-replay progress invariants", () => {
     expect(rolledBack).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
   });
 
-  it("archives one exhausted legacy epoch and atomically installs the committed ordinal-2 epoch", async () => {
+  it("archives one exhausted v2 epoch and atomically installs the committed v3 ordinal-2 epoch", async () => {
     const directory = await temporaryDirectory("reviewer-replay-epoch-transition-");
     const store = new FileJobProgressStore(directory);
     const identityV1 = {
@@ -576,10 +619,14 @@ describe("reviewer-replay progress invariants", () => {
       headSha: "a".repeat(40) as never,
       diffDigest: "d".repeat(64),
     };
+    const legacyIdentity = { ...identityV1, schemaVersion: 2 as const, epochOrdinal: 1 };
+    const legacyIdentityDigest = sha256Digest(legacyIdentity);
+    if (!legacyIdentityDigest.ok) throw new Error(legacyIdentityDigest.error.code);
     const legacy = {
       state: "attempting" as const,
-      identity: identityV1,
-      identityDigest: "e".repeat(64),
+      identity: legacyIdentity,
+      identityDigest: legacyIdentityDigest.value,
+      reviewContractBinding: reviewerReportContractV2Binding,
       counters: { providerAttempts: 2, formatFailures: 2, transportFailures: 0 },
       lastFormatCategory: "missing_field" as const,
     };

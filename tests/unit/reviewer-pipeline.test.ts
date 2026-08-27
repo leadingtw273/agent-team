@@ -942,8 +942,8 @@ describe("ReviewerPipeline", () => {
  * through the real, public `ReviewerPipeline.run()`, exactly as production does.
  */
 describe("ReviewerPipeline report contract (C015r decisions 2/3/4/5)", () => {
-  it("pins reviewer report contract v2 to its committed canonical digest", () => {
-    expect(reviewerReportContractVersion).toBe(2);
+  it("pins reviewer/replay contract v3 to its committed canonical digest", () => {
+    expect(reviewerReportContractVersion).toBe(3);
     expect(computeReviewerReportContractDigest()).toBe(reviewerReportContractDigest);
   });
 
