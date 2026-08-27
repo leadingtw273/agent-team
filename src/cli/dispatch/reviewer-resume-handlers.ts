@@ -19,6 +19,7 @@ export interface CreateReviewerResumeHandlerOptions {
 export interface ReviewerResumeInput {
   readonly jobId: string;
   readonly recoverReadyIdempotency?: boolean;
+  readonly recoverRecordPrepublication?: boolean;
 }
 
 function outcome(
@@ -87,7 +88,26 @@ export function createReviewerResumeHandler(
       confirmedReadyMutation === true &&
       loaded.value.changeRequestId !== undefined &&
       loaded.value.headSha !== undefined;
-    if (stage.kind !== "reviewer_waiting" && !recoverableBeginFailure && !recoverableReadyFailure) {
+    // The ordinary review-begin pending status is also recorded as `review_status`, so it cannot
+    // distinguish pre-publication from a partial record attempt. `record()` always writes the PR
+    // evidence comment first; therefore any `pr_comment` ledger entry is the fail-closed boundary.
+    const hasReviewEvidenceCommentAttempt = loaded.value.mutationAttempts?.some(
+      (entry) => entry.intent === "pr_comment",
+    );
+    const recoverableRecordFailure =
+      input.recoverRecordPrepublication === true &&
+      stage.kind === "requires_manual" &&
+      stage.cause?.stage === "review" &&
+      stage.cause.reasonCode === "review_record_failed" &&
+      hasReviewEvidenceCommentAttempt !== true &&
+      loaded.value.changeRequestId !== undefined &&
+      loaded.value.headSha !== undefined;
+    if (
+      stage.kind !== "reviewer_waiting" &&
+      !recoverableBeginFailure &&
+      !recoverableReadyFailure &&
+      !recoverableRecordFailure
+    ) {
       return outcome("failed", {
         operation: "dispatch_reviewer_resume",
         state: "blocked",
@@ -119,11 +139,13 @@ export function createReviewerResumeHandler(
         errorCode: written.error.code,
       });
     }
-    const recovery = recoverableReadyFailure
-      ? "review_ready_idempotency"
-      : recoverableBeginFailure
-        ? "review_begin_failed"
-        : "reviewer_waiting";
+    const recovery = recoverableRecordFailure
+      ? "review_record_prepublication"
+      : recoverableReadyFailure
+        ? "review_ready_idempotency"
+        : recoverableBeginFailure
+          ? "review_begin_failed"
+          : "reviewer_waiting";
     return outcome("success", {
       operation: "dispatch_reviewer_resume",
       state: "resumed",

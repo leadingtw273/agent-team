@@ -3108,7 +3108,7 @@ async function resumeReview(
         return requiresManualUnlessRetryable(
           record,
           deps,
-          "review_record_failed",
+          `review_record_failed:${record$.stage}:${record$.error.code}`,
           record$.error,
           requiresManualCause("review", "review_record_failed"),
         );
@@ -3134,7 +3134,7 @@ async function resumeReview(
         return requiresManualUnlessRetryable(
           record,
           deps,
-          "review_record_failed",
+          `review_record_failed:${record$.stage}:${record$.error.code}`,
           record$.error,
           requiresManualCause("review", "review_record_failed"),
         );
@@ -3266,7 +3266,7 @@ async function resumeReview(
       ? requiresManualUnlessRetryable(
           record,
           deps,
-          "review_record_did_not_approve",
+          `review_record_did_not_approve:${recorded.stage}:${recorded.error.code}`,
           recorded.error,
           requiresManualCause("review", "review_not_approved"),
         )
