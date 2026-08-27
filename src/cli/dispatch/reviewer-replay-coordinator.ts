@@ -1828,6 +1828,88 @@ export class ReviewerReplayCoordinator {
           };
         }
 
+        if (
+          reviewOutcome.state === "changes_requested" ||
+          reviewOutcome.state === "clarification_required"
+        ) {
+          const reservedReplay = record.reviewerReplay;
+          const admittedReasonCode =
+            record.stage.kind === "requires_manual" && record.stage.cause?.stage === "review"
+              ? record.stage.cause.reasonCode
+              : undefined;
+          if (reservedReplay?.state !== "attempting" || admittedReasonCode === undefined) {
+            return { state: "blocked", jobId, reason: "checkpoint_write_failed" };
+          }
+          const recorded = await guardedDeps.reviewStatus.record({
+            project: guardedDeps.project,
+            changeRequestId: inspected.request.changeRequestId,
+            expectedHeadSha: inspected.request.expectedHeadSha,
+            idempotencyKeyPrefix: `${inspected.request.idempotencyKeyPrefix}:review-record`,
+            decision: reviewOutcome,
+            signal: beat.signal,
+          });
+          if (recorded.state !== "rejected" || recorded.reason !== reviewOutcome.state) {
+            return {
+              state: "blocked",
+              jobId,
+              reason: "review_not_approved",
+              ...(recorded.state === "failed" ? { errorCode: recorded.error.code } : {}),
+              ...(record.reviewerReplay?.state === "attempting"
+                ? { providerAttempts: record.reviewerReplay.counters.providerAttempts }
+                : {}),
+            };
+          }
+          // `record()` may advance the managed-mutation ledger (and therefore the progress
+          // revision) while publishing the evidence comment/status. Reload before the final CAS;
+          // any concurrent stage or replay-identity change fails closed instead of overwriting it.
+          const afterPublication = await guardedDeps.progress.load(jobId, {
+            signal: beat.signal,
+          });
+          const publishedReplay = afterPublication.ok
+            ? afterPublication.value?.reviewerReplay
+            : undefined;
+          if (
+            !afterPublication.ok ||
+            afterPublication.value?.stage.kind !== "requires_manual" ||
+            afterPublication.value.stage.cause?.stage !== "review" ||
+            afterPublication.value.stage.cause.reasonCode !== admittedReasonCode ||
+            publishedReplay?.state !== "attempting" ||
+            publishedReplay.identityDigest !== reservedReplay.identityDigest ||
+            publishedReplay.counters.providerAttempts !== reservedReplay.counters.providerAttempts
+          ) {
+            return { state: "blocked", jobId, reason: "candidate_changed" };
+          }
+          const marked = await guardedDeps.progress.compareAndSwap(
+            jobId,
+            afterPublication.value.revision,
+            {
+              ...mutationFrom(afterPublication.value),
+              stage: {
+                kind: "requires_manual",
+                cause: {
+                  stage: "review",
+                  reasonCode: "review_not_approved",
+                  attempts: { count: publishedReplay.counters.providerAttempts },
+                },
+              },
+            },
+            { signal: beat.signal },
+          );
+          return marked.ok
+            ? {
+                state: "blocked",
+                jobId,
+                reason: "review_not_approved",
+                providerAttempts: publishedReplay.counters.providerAttempts,
+              }
+            : {
+                state: "blocked",
+                jobId,
+                reason: "checkpoint_write_failed",
+                errorCode: marked.error.code,
+              };
+        }
+
         const currentReplay = record.reviewerReplay;
         if (currentReplay?.state !== "attempting") {
           return { state: "blocked", jobId, reason: "checkpoint_write_failed" };
