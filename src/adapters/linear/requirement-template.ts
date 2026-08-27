@@ -71,7 +71,11 @@ import {
   readyGateTemplateHeadings,
   readyGateTemplatePlaceholder,
 } from "../../application/registration/linear-provision-model.js";
-import type { HumanSummary } from "../../domain/project/index.js";
+import {
+  issueSkillSelectionsSchema,
+  type HumanSummary,
+  type IssueSkillSelection,
+} from "../../domain/project/index.js";
 
 export type ReadyGateDependenciesField =
   Readonly<{ kind: "none" }> | Readonly<{ kind: "unparsed" }> | Readonly<{ kind: "absent" }>;
@@ -80,6 +84,13 @@ export interface ReadyGateChangeRegion {
   readonly path: string;
   readonly coverage: "exact";
 }
+
+export type ReadyGateSkillSelectionsField =
+  | Readonly<{
+      kind: "selected";
+      selections: readonly IssueSkillSelection[];
+    }>
+  | Readonly<{ kind: "unparsed" }>;
 
 export interface ReadyGateTemplateFields {
   readonly humanSummary?: HumanSummary;
@@ -92,6 +103,8 @@ export interface ReadyGateTemplateFields {
   readonly constraints?: readonly string[];
   readonly risks?: readonly string[];
   readonly changeRegions?: readonly ReadyGateChangeRegion[];
+  /** Omitted for both a legacy missing heading and an explicit `無`. */
+  readonly skillSelections?: ReadyGateSkillSelectionsField;
   readonly dependencies: ReadyGateDependenciesField;
 }
 
@@ -287,6 +300,39 @@ function parseDependencies(
   return Object.freeze({ kind: "unparsed" as const });
 }
 
+function parseSkillSelections(
+  body: string | undefined,
+  duplicated: boolean,
+): ReadyGateSkillSelectionsField | undefined {
+  if (duplicated) return Object.freeze({ kind: "unparsed" as const });
+  if (body === undefined) return undefined;
+  const trimmed = body.trim();
+  if (trimmed === "無") return undefined;
+  if (trimmed.length === 0 || trimmed === readyGateTemplatePlaceholder) {
+    return Object.freeze({ kind: "unparsed" as const });
+  }
+
+  const selections: IssueSkillSelection[] = [];
+  const seen = new Set<string>();
+  for (const line of body.split(/\r\n|\r|\n/u)) {
+    const entry = line.trim();
+    if (entry.length === 0) continue;
+    if (!bulletMarkerPattern.test(entry)) {
+      return Object.freeze({ kind: "unparsed" as const });
+    }
+    const name = entry.slice(2).trim();
+    if (seen.has(name)) return Object.freeze({ kind: "unparsed" as const });
+    seen.add(name);
+    selections.push(Object.freeze({ name, requirement: "required" as const }));
+  }
+
+  const parsed = issueSkillSelectionsSchema.safeParse(selections);
+  if (!parsed.success || parsed.data.length === 0) {
+    return Object.freeze({ kind: "unparsed" as const });
+  }
+  return Object.freeze({ kind: "selected" as const, selections: Object.freeze(parsed.data) });
+}
+
 export function parseReadyGateTemplate(description: string | undefined): ReadyGateTemplateFields {
   if (description === undefined) {
     return Object.freeze({ dependencies: Object.freeze({ kind: "absent" as const }) });
@@ -315,6 +361,10 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
     sections.bodies.get(readyGateTemplateHeadings.dependencies),
     sections.duplicated.has(readyGateTemplateHeadings.dependencies),
   );
+  const skillSelections = parseSkillSelections(
+    sections.bodies.get(readyGateTemplateHeadings.skillSelections),
+    sections.duplicated.has(readyGateTemplateHeadings.skillSelections),
+  );
 
   return Object.freeze({
     ...(humanSummary === undefined ? {} : { humanSummary }),
@@ -327,6 +377,7 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
     ...(constraints === undefined ? {} : { constraints }),
     ...(risks === undefined ? {} : { risks }),
     ...(changeRegions === undefined ? {} : { changeRegions }),
+    ...(skillSelections === undefined ? {} : { skillSelections }),
     dependencies,
   });
 }

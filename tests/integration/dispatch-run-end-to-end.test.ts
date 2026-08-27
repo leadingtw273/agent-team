@@ -16,6 +16,7 @@
  * fakes that would throw if ever called, as a tripwire.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { GitPreflight, LocalGitAdapter } from "../../src/adapters/git/index.js";
+import { FileSkillRuntime } from "../../src/adapters/skills/index.js";
 import type { LinearDiscoveryReadModel } from "../../src/adapters/dispatch/linear-discovery.js";
 import {
   buildLinearReadCatalog,
@@ -43,12 +45,17 @@ import { dispatchOnce, type DispatchCompositionReady } from "../../src/cli/dispa
 import { buildImplementerPipelineRequest } from "../../src/cli/dispatch/implementer-request.js";
 import { LeaseCoordinator } from "../../src/application/leases/index.js";
 import {
+  admitJobSkillSnapshots,
+  computeSkillTreeIntegrity,
+  type JobSkillSnapshotsByRole,
+} from "../../src/application/skills/index.js";
+import {
   ImplementerPipeline,
   type ImplementerPipelinePorts,
 } from "../../src/application/pipelines/index.js";
 import type { ProcessPort, ProviderRunHandle } from "../../src/application/ports/index.js";
 import type { ModelRoutingConfig } from "../../src/application/routing/index.js";
-import { ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
+import { err, ok, parseInstant, type Instant } from "../../src/domain/foundation/index.js";
 import { projectSchema } from "../../src/domain/project/index.js";
 import { trustedProjectConfigSchema } from "../../src/application/projects/index.js";
 import { FileJobRepository } from "../../src/infrastructure/jobs/index.js";
@@ -114,6 +121,9 @@ C015b 決策層 Q3 要求至少一條端到端測試走真解析器。
 ## ${readyGateTemplateHeadings.constraints}
 
 ## ${readyGateTemplateHeadings.risks}
+
+## ${readyGateTemplateHeadings.skillSelections}
+- godot-camera-systems
 
 ## ${readyGateTemplateHeadings.changeRegions}
 - src/feature/index.ts
@@ -232,6 +242,36 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     await git(repository, ["remote", "add", "origin", remote]);
     await git(repository, ["push", "-u", "origin", "main"]);
 
+    const skillsRoot = join(root, "skills");
+    const skillRoot = join(skillsRoot, "godot-camera-systems");
+    await mkdir(join(skillsRoot, ".provenance"), { recursive: true });
+    await mkdir(skillRoot, { recursive: true });
+    await writeFile(join(skillRoot, "SKILL.md"), "# Camera systems\n", "utf8");
+    const skillIntegrity = await computeSkillTreeIntegrity(skillRoot);
+    if (!skillIntegrity.ok) throw new Error(skillIntegrity.error.code);
+    const skillCatalog = {
+      schemaVersion: 1,
+      digestAlgorithm: "sha256-v1-posix-path-nul-size-nul-bytes",
+      skills: [
+        {
+          name: "godot-camera-systems",
+          displayName: "Godot Camera Systems",
+          mode: "knowledge_only",
+          source: {
+            repository: "https://example.invalid/godot-skills",
+            commit: "b".repeat(40),
+            path: "godot-camera-systems",
+            treeDigest: "c".repeat(64),
+          },
+          installedTreeDigest: skillIntegrity.value.treeDigest,
+          fileDigests: skillIntegrity.value.fileDigests,
+          allowedReferences: [],
+        },
+      ],
+    } as const;
+    const skillCatalogBytes = Buffer.from(JSON.stringify(skillCatalog), "utf8");
+    await writeFile(join(skillsRoot, ".provenance", "e2e-catalog.json"), skillCatalogBytes);
+
     const projectId = "project_018f47d2-77a4-7cc1-8ef2-0123456789ab";
     const project = projectSchema.parse({
       schemaVersion: 1,
@@ -250,7 +290,15 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
       projectRules: [],
       roleInstructions: {},
       commands: { quality: [{ executable: "pnpm", arguments: ["test"] }], visualReview: [] },
+      skillPolicy: {
+        catalogId: "e2e-catalog",
+        catalogDigest: createHash("sha256").update(skillCatalogBytes).digest("hex"),
+        allowlist: ["godot-camera-systems"],
+        roleDefaults: { implementer: ["godot-camera-systems"] },
+      },
     });
+    const skillPolicy = trustedConfig.skillPolicy;
+    if (skillPolicy === undefined) throw new Error("Skill policy fixture is missing");
 
     const readModel: LinearDiscoveryReadModel = {
       readContext: () => Promise.resolve(ok(linearProjectContext())),
@@ -325,9 +373,25 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     // this fixture already uses), never the ephemeral in-memory one -- this is the genuine-run
     // path, not `--dry-run`.
     const admission = new FileIssueAdmissionStore(join(root, "state", "dispatch", "admission"));
+    let bootstrappedSkillSnapshots: JobSkillSnapshotsByRole | undefined;
+    const skillRuntime = new FileSkillRuntime({ skillsRoot });
     const dispatched = await dispatchOnce(
       ready,
-      { leases: new LeaseCoordinator(leases), jobs, admission },
+      {
+        leases: new LeaseCoordinator(leases),
+        jobs,
+        admission,
+        bootstrap: async ({ result, candidate }) => {
+          const admitted = await admitJobSkillSnapshots(skillRuntime, {
+            job: result.job,
+            issue: candidate.issue,
+            policy: skillPolicy,
+          });
+          if (!admitted.ok) return err(admitted.error.error);
+          bootstrappedSkillSnapshots = admitted.value;
+          return ok(undefined);
+        },
+      },
       "holder-e2e",
     );
     if (dispatched.outcome !== "ran") {
@@ -352,6 +416,20 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
     expect(issue.goal).toBe("證明從 Linear 描述到 CI waiting 全鏈無縫。");
     expect(issue.changeRegions).toEqual([{ path: "src/feature/index.ts", coverage: "exact" }]);
     expect(issue.dependencies).toEqual({ kind: "none" });
+    expect(issue.skillSelections).toEqual([
+      { name: "godot-camera-systems", requirement: "required" },
+    ]);
+    expect(dispatched.bootstrap).toEqual({ state: "confirmed" });
+    expect(bootstrappedSkillSnapshots?.implementer?.skills).toEqual([
+      expect.objectContaining({ name: "godot-camera-systems", requirement: "required" }),
+    ]);
+    if (bootstrappedSkillSnapshots === undefined) {
+      throw new Error("Skill snapshots were not bootstrapped");
+    }
+    const implementerSkillSnapshot = bootstrappedSkillSnapshots.implementer;
+    if (implementerSkillSnapshot === undefined) {
+      throw new Error("Implementer Skill snapshot was not bootstrapped");
+    }
 
     // === Real baseRevision resolution + real request construction ===
     const localGit = new LocalGitAdapter();
@@ -370,6 +448,7 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
       agentTeamHome: root,
       clock: { now: () => instant("2026-08-07T00:05:00.000Z") },
       baseRevision: repositorySnapshot.value.headSha,
+      skillSnapshot: implementerSkillSnapshot,
     });
     if (!request.ok) throw new Error(`expected a valid request: ${JSON.stringify(request.error)}`);
     // Override the worktree path/branch to this test's own layout (buildImplementerPipelineRequest
@@ -409,6 +488,7 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
           return ok(providerHandle);
         },
       },
+      skillRuntime,
       sourceControl: {
         createDraftChangeRequest: async () => {
           const headSha = await git(root, [
@@ -480,6 +560,7 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
       worktreePath: pipelineRequest.worktreePath,
       changeRequestId: String(outcome.changeRequest.number),
       headSha,
+      skillSnapshots: bootstrappedSkillSnapshots,
     });
     expect(recorded.ok).toBe(true);
     const reloaded = await progress.load(dispatchResult.job.id);
@@ -488,6 +569,9 @@ describe("C015b end to end: Ready Gate description -> dispatch -> ImplementerPip
       expect(reloaded.value?.stage).toEqual({ kind: "ci_waiting" });
       expect(reloaded.value?.changeRequestId).toBe("1");
       expect(reloaded.value?.headSha).toBe(outcome.commit.sha);
+      expect(reloaded.value?.skillSnapshots?.implementer?.skills).toEqual([
+        expect.objectContaining({ name: "godot-camera-systems", requirement: "required" }),
+      ]);
     }
   });
 });
