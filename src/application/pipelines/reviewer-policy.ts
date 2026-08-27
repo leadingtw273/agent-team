@@ -55,7 +55,7 @@ const visualQualityDimensions = Object.freeze([
   "visual_regression",
 ] as const satisfies readonly ReviewQualityDimension[]);
 
-export const reviewerReportContractVersion = 2 as const;
+export const reviewerReportContractVersion = 3 as const;
 
 const reportDirectiveStaticRules = Object.freeze({
   copySkeleton:
@@ -102,6 +102,10 @@ const reviewerReportContractDescriptor = Object.freeze({
   schemaVersion: reviewerReportContractVersion,
   reportSchemaVersion: 1,
   normalizedRenderedDirectives: normalizedReviewerDirectiveVariants(),
+  /** The binding also versions the dedicated replay controller's closed outcome mapping. A
+   * replay epoch may therefore be renewed only when both the report directive and the controller
+   * that interprets its Provider outcome are the committed version represented by this digest. */
+  replayOutcomeClassificationVersion: 1,
 });
 
 export function computeReviewerReportContractDigest(): string {
@@ -112,7 +116,13 @@ export function computeReviewerReportContractDigest(): string {
 
 /** Committed golden pair. CI tests require a version bump whenever the descriptor digest changes. */
 export const reviewerReportContractDigest =
-  "3d90b3b4db7e422d1561bdfe4b74c45984abf508d913b50a9d1f09e79c7d4e44" as const;
+  "abbd201a4d469bd37aeeb6e0b699165107af9d5aa09d352cb6b0af3a2c3f2221" as const;
+
+/** Immutable predecessor accepted only when authorizing the single v2 -> v3 recovery epoch. */
+export const reviewerReportContractV2Binding = Object.freeze({
+  version: 2,
+  digest: "3d90b3b4db7e422d1561bdfe4b74c45984abf508d913b50a9d1f09e79c7d4e44",
+});
 
 export const currentReviewerReportContractBinding = Object.freeze({
   version: reviewerReportContractVersion,

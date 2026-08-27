@@ -33,16 +33,64 @@ const instantSchema = z
   .refine((value) => parseInstant(value).ok) as unknown as z.ZodType<Instant>;
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 
-const diagnosticEntrySchema = z
-  .object({
-    attempt: z.number().int().min(1).max(2),
-    kind: z.enum(["format", "transport"]),
-    category: reportContractFailureCategorySchema.optional(),
-    errorCode: z.string().trim().min(1).max(64).optional(),
-    diagnostics: z.array(safeReviewReportDiagnosticSchema).max(100),
-    recordedAt: instantSchema,
-  })
-  .strict();
+export const reviewerReplayOutcomeCategorySchema = z.enum([
+  "not_ready_ci_pending",
+  "not_ready_ci_failed",
+  "checkpointed_attempt_limit_reached",
+  "paused_safety_approval_required",
+  "paused_provider_interrupted",
+  "review_wait_confirmed",
+  "review_wait_unconfirmed",
+  "failed_non_retryable",
+  "failed_retryable_unclassified",
+]);
+
+const diagnosticEntryBaseSchema = z.object({
+  attempt: z.number().int().min(1).max(2),
+  recordedAt: instantSchema,
+});
+
+const diagnosticEntrySchema = z.discriminatedUnion("kind", [
+  diagnosticEntryBaseSchema
+    .extend({
+      kind: z.literal("format"),
+      category: reportContractFailureCategorySchema,
+      diagnostics: z.array(safeReviewReportDiagnosticSchema).max(100),
+    })
+    .strict(),
+  diagnosticEntryBaseSchema
+    .extend({
+      kind: z.literal("transport"),
+      errorCode: z.string().trim().min(1).max(64),
+      diagnostics: z.array(safeReviewReportDiagnosticSchema).max(0),
+    })
+    .strict(),
+  diagnosticEntryBaseSchema
+    .extend({
+      kind: z.literal("outcome"),
+      outcomeCategory: reviewerReplayOutcomeCategorySchema,
+      failureStage: z
+        .enum([
+          "request",
+          "change_request",
+          "checks",
+          "worktree",
+          "diff",
+          "evidence",
+          "checkpoint",
+          "ready",
+          "provider_start",
+          "provider_run",
+          "tool_decision",
+          "report",
+          "post_review_worktree",
+          "attempt_persistence",
+        ])
+        .optional(),
+      errorCode: z.string().trim().min(1).max(64).optional(),
+    })
+    .strict(),
+]);
 
 export const reviewerReplayDiagnosticRecordSchema = z
   .object({
@@ -53,7 +101,10 @@ export const reviewerReplayDiagnosticRecordSchema = z
     updatedAt: instantSchema,
   })
   .strict();
-export type ReviewerReplayDiagnosticEntry = z.input<typeof diagnosticEntrySchema>;
+type WithoutRecordedAt<T> = T extends unknown ? Omit<T, "recordedAt"> : never;
+export type ReviewerReplayDiagnosticEntry = WithoutRecordedAt<
+  z.input<typeof diagnosticEntrySchema>
+>;
 
 export class FileReviewerReplayDiagnosticStore {
   readonly #directory: string;
@@ -78,7 +129,7 @@ export class FileReviewerReplayDiagnosticStore {
   async append(
     jobId: string,
     identityDigest: string,
-    entry: Omit<ReviewerReplayDiagnosticEntry, "recordedAt">,
+    entry: ReviewerReplayDiagnosticEntry,
     options: Readonly<{ epochScoped?: boolean }> = {},
   ): Promise<Result<void, DomainError>> {
     if (!jobIdSchema.safeParse(jobId).success || !digestSchema.safeParse(identityDigest).success) {
