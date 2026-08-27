@@ -1078,8 +1078,7 @@ function controlFenceCanAdvance(
     return (
       next.leaseId === current.leaseId &&
       next.holderId === current.holderId &&
-      (next.state === current.state ||
-        (current.state === "active" && next.state === "revoked"))
+      (next.state === current.state || (current.state === "active" && next.state === "revoked"))
     );
   }
   return (
@@ -1252,10 +1251,7 @@ export class FileJobProgressStore {
     }
     if (
       !controlFenceCanAdvance(normalizedCurrent.value?.controlFence, next.controlFence) ||
-      !mutationLedgerCanAdvance(
-        normalizedCurrent.value?.mutationAttempts,
-        next.mutationAttempts,
-      )
+      !mutationLedgerCanAdvance(normalizedCurrent.value?.mutationAttempts, next.mutationAttempts)
     ) {
       return err(domainError("invariant_violation"));
     }

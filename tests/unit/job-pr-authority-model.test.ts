@@ -174,12 +174,13 @@ describe("job/PR public authority contracts", () => {
       state: "unsettled",
       ownerJobId: jobId,
     });
-    expect(
-      projectPullRequestAuthority([bound.value, handoff.value, superseded.value], 42),
-    ).toEqual({ state: "owned", prNumber: 42, ownerJobId: nextJobId, ownershipEpoch: 2 });
-    expect(
-      projectPullRequestAuthority([bound.value, wrongEpochHandoff.value], 42),
-    ).toEqual({ state: "conflict", prNumber: 42 });
+    expect(projectPullRequestAuthority([bound.value, handoff.value, superseded.value], 42)).toEqual(
+      { state: "owned", prNumber: 42, ownerJobId: nextJobId, ownershipEpoch: 2 },
+    );
+    expect(projectPullRequestAuthority([bound.value, wrongEpochHandoff.value], 42)).toEqual({
+      state: "conflict",
+      prNumber: 42,
+    });
   });
 
   it("publishes once and recovers a sent-unknown append by provider read-back", async () => {

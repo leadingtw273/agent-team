@@ -6,11 +6,21 @@ import {
   createJobPrLifecycleEvent,
   parsePullRequestBackPointer,
 } from "../../application/pipelines/index.js";
-import { domainError, err, ok, type Clock, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  type Clock,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
 import { headShaSchema } from "../../domain/review/index.js";
 import type { WorkManagementPort } from "../../application/ports/index.js";
-import { buildImplementerPipeline, type BuildImplementerPipelineResult } from "./implementer-composition.js";
+import {
+  buildImplementerPipeline,
+  type BuildImplementerPipelineResult,
+} from "./implementer-composition.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
 import { createJobPrAuthorityValidator } from "./job-pr-authority-validator.js";
 import {
@@ -24,10 +34,7 @@ export interface JobMutationRuntimeOptions {
   readonly agentTeamHome: string;
   readonly project: Project;
   readonly progress: FileJobProgressStore;
-  readonly workManagement: Pick<
-    WorkManagementPort,
-    "getIssue" | "listComments" | "appendComment"
-  >;
+  readonly workManagement: Pick<WorkManagementPort, "getIssue" | "listComments" | "appendComment">;
   readonly escalationWorkManagement?: WorkManagementLifecyclePort;
   readonly codexConfig: DispatchProviderConfig["codex"];
   readonly clock: Clock;

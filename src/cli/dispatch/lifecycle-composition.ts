@@ -28,7 +28,10 @@ import { join } from "node:path";
 
 import { GhTransport, GitHubAdapter, type GhJsonTransport } from "../../adapters/github/index.js";
 import { LocalYamlCheckpointStore } from "../../adapters/checkpoint/index.js";
-import { LifecyclePipeline, type LifecyclePipelinePorts } from "../../application/pipelines/index.js";
+import {
+  LifecyclePipeline,
+  type LifecyclePipelinePorts,
+} from "../../application/pipelines/index.js";
 import type { LeaseCoordinator } from "../../application/leases/index.js";
 import type { FileJobProgressStore } from "../../adapters/dispatch/index.js";
 import type { FileAutoMergePauseStore } from "../../adapters/dispatch/auto-merge-pause-store.js";

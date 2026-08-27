@@ -295,7 +295,8 @@ export function buildMergeGateSourceControl(
               },
               ...(options.signal === undefined ? {} : { signal: options.signal }),
             },
-            (stable) => github.squashMergeChangeRequest(reference, expectedHeadSha, stable, observer),
+            (stable) =>
+              github.squashMergeChangeRequest(reference, expectedHeadSha, stable, observer),
           ));
       if (merged.ok) return controllerMerged(merged.value.headSha);
       const directReceipt = attempts.findLast((attempt) => attempt.kind === "direct_squash");

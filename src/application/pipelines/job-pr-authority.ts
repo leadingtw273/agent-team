@@ -3,7 +3,13 @@ import type {
   WorkManagementIssueRef,
   WorkManagementPort,
 } from "../ports/index.js";
-import { domainError, err, ok, type DomainError, type Result } from "../../domain/foundation/index.js";
+import {
+  domainError,
+  err,
+  ok,
+  type DomainError,
+  type Result,
+} from "../../domain/foundation/index.js";
 import {
   formatJobPrLifecycleComment,
   parseJobPrLifecycleComment,

@@ -25,7 +25,12 @@ import {
   type JobProgressRecordMutation,
 } from "../../src/adapters/dispatch/job-progress-store.js";
 import { FileIssueAdmissionStore } from "../../src/adapters/dispatch/issue-admission-store.js";
-import { domainError, ok, parseIdentifier, type Identifier } from "../../src/domain/foundation/index.js";
+import {
+  domainError,
+  ok,
+  parseIdentifier,
+  type Identifier,
+} from "../../src/domain/foundation/index.js";
 import type { CreateDispatchResolveHandlerOptions } from "../../src/cli/dispatch/resolve-handlers.js";
 
 const temporaryDirectories: string[] = [];
@@ -159,7 +164,11 @@ describe("createDispatchResolveHandler", () => {
       await Promise.resolve();
       yield dispatchResolveConfirmationPhrase;
     }
-    const handler = createTestDispatchResolveHandler({ progress, admission, stdin: trackedStdin() });
+    const handler = createTestDispatchResolveHandler({
+      progress,
+      admission,
+      stdin: trackedStdin(),
+    });
     const result = await handler({ jobId: jobA, as: "superseded" });
     expect(result.state).toBe("rejected");
     expect(JSON.parse(result.message ?? "{}")).toMatchObject({
