@@ -135,6 +135,12 @@ export interface ChangeRequestCommentReceipt {
   readonly createdAt: Instant;
 }
 
+/** Exact provider read-back used by narrow recovery commands. Deliberately not part of the
+ * mutation-focused SourceControlPort contract. */
+export interface ChangeRequestCommentSnapshot extends ChangeRequestCommentReceipt {
+  readonly body: string;
+}
+
 export interface SourceControlPort {
   getChangeRequest(
     reference: ChangeRequestRef,

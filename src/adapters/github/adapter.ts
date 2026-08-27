@@ -5,6 +5,7 @@ import { z } from "zod";
 import type {
   ChangeRequestCommentCommand,
   ChangeRequestCommentReceipt,
+  ChangeRequestCommentSnapshot,
   ChangeRequestRef,
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
@@ -383,6 +384,13 @@ function commentFromProjection(
     : failure();
 }
 
+function commentSnapshotFromProjection(
+  value: z.infer<typeof projectedCommentSchema>,
+): Result<ChangeRequestCommentSnapshot, DomainError> {
+  const receipt = commentFromProjection(value);
+  return receipt.ok ? ok({ ...receipt.value, body: value.body }) : receipt;
+}
+
 function rawField(name: string, value: string): readonly string[] {
   return ["-f", `${name}=${value}`];
 }
@@ -436,6 +444,27 @@ export class GitHubAdapter implements SourceControlPort {
       options,
     );
     return result.ok ? snapshotFromProjection(result.value) : result;
+  }
+
+  async getChangeRequestComment(
+    repository: SourceControlRepositoryRef,
+    commentId: string,
+    options: ReadOptions = {},
+  ): Promise<Result<ChangeRequestCommentSnapshot, DomainError>> {
+    if (!validRepository(repository) || !/^[1-9][0-9]{0,19}$/u.test(commentId)) {
+      return failure();
+    }
+    const result = await this.transport.requestJson(
+      [
+        "api",
+        `repos/${repositoryPath(repository)}/issues/comments/${commentId}`,
+        "--jq",
+        commentProjection,
+      ],
+      projectedCommentSchema,
+      options,
+    );
+    return result.ok ? commentSnapshotFromProjection(result.value) : result;
   }
 
   async findOpenChangeRequestsByHead(

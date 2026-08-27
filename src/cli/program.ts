@@ -113,6 +113,7 @@ export interface CliHandlers {
       expectContractVersion?: number;
       finalReviewEpoch?: boolean;
       expectCheckpoint?: string;
+      fixRejectedReview?: boolean;
     }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplayPolicy: (
@@ -485,8 +486,8 @@ export function createProgram(
   dispatch
     .command("reviewer-replay")
     .description(
-      "只針對既有 requires_manual(review_report_contract) Job 重做有界 Reviewer 審查，" +
-        "成功 checkpoint 後接回既有 merge/lifecycle",
+      "針對既有 Reviewer 格式失敗重做審查，或顯式修正一次已發布的 changes_requested；" +
+        "成功後接回既有 merge/lifecycle",
     )
     .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
     .option("--dry-run", "只做 admission、權威 read-back、identity 與預計 mutation 檢查")
@@ -497,6 +498,7 @@ export function createProgram(
     )
     .option("--final-review-epoch", "只救回 exact paused(retry_exhausted) 最終代碼審查")
     .option("--expect-checkpoint <checkpoint-id>", "final-review epoch 綁定的既有 checkpoint id")
+    .option("--fix-rejected-review", "同一 Job／PR 修正一次已發布的 changes_requested 並重新審查")
     .action(
       (options: {
         readonly job: string;
@@ -505,6 +507,7 @@ export function createProgram(
         readonly expectContractVersion?: string;
         readonly finalReviewEpoch?: boolean;
         readonly expectCheckpoint?: string;
+        readonly fixRejectedReview?: boolean;
       }) =>
         action(state, io, () =>
           handlers.dispatchReviewerReplay({
@@ -518,6 +521,7 @@ export function createProgram(
             ...(options.expectCheckpoint === undefined
               ? {}
               : { expectCheckpoint: options.expectCheckpoint }),
+            ...(options.fixRejectedReview === true ? { fixRejectedReview: true } : {}),
           }),
         )(),
     );

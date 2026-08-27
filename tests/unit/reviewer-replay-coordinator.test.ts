@@ -32,6 +32,7 @@ import type {
   ReviewerPipelineRequest,
   ReviewerReport,
 } from "../../src/application/pipelines/index.js";
+import { renderReviewComment } from "../../src/application/pipelines/review-evidence.js";
 import {
   currentReviewerReportContractBinding,
   reviewerReportContractV2Binding,
@@ -114,6 +115,7 @@ const issueId = generatedIssueId.value;
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const controlLeaseId = id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const headSha = headShaSchema.parse("a".repeat(40));
+const repairedHeadSha = headShaSchema.parse("e".repeat(40));
 const baseRevision = headShaSchema.parse("b".repeat(40));
 const requirementsDigest = "c".repeat(64);
 const diffDigest = "d".repeat(64);
@@ -221,7 +223,7 @@ function readModel(
   };
 }
 
-function changeRequest(state: "open" | "merged" = "open") {
+function changeRequest(state: "open" | "merged" = "open", currentHeadSha = headSha) {
   return {
     id: "PR_node",
     number: 42,
@@ -230,13 +232,60 @@ function changeRequest(state: "open" | "merged" = "open") {
     draft: false,
     baseBranch: "main",
     headBranch: "agent-team/replay",
-    headSha,
+    headSha: currentHeadSha,
     mergeability: "mergeable" as const,
     mergeStateStatus: "clean" as const,
     baseSha: baseRevision,
     autoMergeEnabled: false,
     updatedAt: now,
   };
+}
+
+function rejectedReviewBody(requirements = requirementsDigest): string {
+  const finding = {
+    severity: "blocking" as const,
+    title: "Smoke test is not registered",
+    description: "The quality runner never executes the smoke test.",
+    acceptanceCriteria: ["Review passes"],
+    evidenceSources: ["agent-team:diff"],
+    path: "tests/combat_boundary_smoke.gd",
+  };
+  const report = {
+    schemaVersion: 1 as const,
+    role: "code_reviewer" as const,
+    verdict: "changes_requested" as const,
+    requirementsDigest: requirements as never,
+    headSha,
+    diffDigest: diffDigest as never,
+    summary: "One blocking finding remains.",
+    acceptanceCriteria: [
+      {
+        criterion: "Review passes",
+        status: "failed" as const,
+        summary: "The smoke test is not registered.",
+        evidenceSources: ["agent-team:diff"],
+      },
+    ],
+    qualityChecks: [
+      {
+        dimension: "test_effectiveness" as const,
+        status: "failed" as const,
+        summary: "The test is dead code.",
+        evidenceSources: ["agent-team:diff"],
+      },
+    ],
+    findings: [finding],
+  };
+  const body = renderReviewComment({
+    state: "changes_requested",
+    identity: identity(requirements),
+    reports: [report],
+    findings: [finding],
+    job: job(),
+    changeRequest: changeRequest(),
+    checks: { headSha, aggregate: "success", checks: [] },
+  });
+  return `${body}\n\n<!-- agent-team:review_evidence:${"f".repeat(64)} -->`;
 }
 
 function identity(requirements = requirementsDigest): ReviewIdentity {
@@ -370,6 +419,8 @@ async function harness(
     throwOnProvider?: boolean;
     prCommentAttempt?: boolean;
     reviewerSkills?: boolean;
+    rejectedFix?: boolean;
+    rejectionEvidenceMismatch?: boolean;
   }> = {},
 ): Promise<Harness> {
   const progressRoot = await temporaryDirectory("reviewer-replay-progress-");
@@ -463,8 +514,12 @@ async function harness(
       kind: "requires_manual",
       cause: {
         stage: "review",
-        reasonCode: "review_report_contract",
-        attempts: { count: 2, lastCategory: "missing_field" },
+        ...(overrides.rejectedFix === true
+          ? { reasonCode: "review_not_approved" as const, attempts: { count: 2 } }
+          : {
+              reasonCode: "review_report_contract" as const,
+              attempts: { count: 2, lastCategory: "missing_field" as const },
+            }),
       },
     },
     branch: "agent-team/replay",
@@ -490,6 +545,7 @@ async function harness(
     overrides.seedReplay === undefined
       ? {
           ...baseProgress,
+          ...(overrides.rejectedFix === true ? { reviewerReplay: legacyReplay } : {}),
           ...(overrides.finalReview === true
             ? { stage: { kind: "paused" as const, checkpointId: finalCheckpointId } }
             : {}),
@@ -606,6 +662,7 @@ async function harness(
   let inspectIndex = 0;
   let reviewRecordCalls = 0;
   let reviewStatusState: "pending" | "success" = "pending";
+  let liveHeadSha = headSha;
   const jobs = [job(overrides.finalReview === true)];
   const reviewer = {
     inspect: (request: ReviewerPipelineRequest) => {
@@ -764,12 +821,23 @@ async function harness(
     },
     leases: leaseCoordinator,
     sourceControl: {
-      getChangeRequest: () => Promise.resolve(ok(changeRequest())),
+      getChangeRequest: () => Promise.resolve(ok(changeRequest("open", liveHeadSha))),
       getCommitStatuses: () =>
         Promise.resolve(
           ok({
-            headSha,
-            statuses: [{ context: "agent-team/review", state: reviewStatusState }],
+            headSha: liveHeadSha,
+            statuses: [
+              {
+                context: "agent-team/review",
+                state: overrides.rejectedFix === true ? "failure" : reviewStatusState,
+                ...(overrides.rejectedFix === true
+                  ? {
+                      targetUrl:
+                        "https://github.com/owner/replay-test/pull/42#issuecomment-5435569980",
+                    }
+                  : {}),
+              },
+            ],
           }),
         ),
     },
@@ -850,7 +918,26 @@ async function harness(
         }
       : {}),
     ciRecovery: { run: () => Promise.reject(new Error("must not run")) },
-    reviewerRecovery: { run: () => Promise.reject(new Error("must not run")) },
+    reviewerRecovery: {
+      run: (request) => {
+        if (overrides.rejectedFix !== true) {
+          return Promise.reject(new Error("must not run"));
+        }
+        const repaired = jobSchema.parse({
+          ...request.job,
+          attempts: { ...request.job.attempts, reviewerFixRounds: 1 },
+        });
+        jobs[0] = repaired;
+        liveHeadSha = repairedHeadSha;
+        calls.push("reviewerRecovery.run");
+        return Promise.resolve({
+          state: "repair_pushed" as const,
+          job: repaired,
+          commit: { sha: repairedHeadSha, branch: "agent-team/replay" },
+          push: { sha: repairedHeadSha, branch: "agent-team/replay", remote: "origin" },
+        });
+      },
+    },
     reviewer,
     reviewerReplayPolicy: {
       load: () =>
@@ -881,6 +968,18 @@ async function harness(
     reviewStatus: {
       begin: () => {
         calls.push("reviewStatus.begin");
+        if (overrides.rejectedFix === true) {
+          return Promise.resolve({
+            state: "not_ready" as const,
+            reason: "ci_pending" as const,
+            changeRequest: changeRequest("open", repairedHeadSha),
+            checks: {
+              headSha: repairedHeadSha,
+              aggregate: "pending" as const,
+              checks: [],
+            },
+          });
+        }
         return Promise.resolve({ state: "pending", changeRequest: changeRequest() } as never);
       },
       record: async (request) => {
@@ -1003,6 +1102,18 @@ async function harness(
           calls.push("pr-summary");
           return Promise.resolve(ok({ id: "comment", url: "url", createdAt: now }));
         },
+        getChangeRequestComment: () =>
+          Promise.resolve(
+            ok({
+              id: "5435569980",
+              url: "https://github.com/owner/replay-test/pull/42#issuecomment-5435569980",
+              createdAt: now,
+              body:
+                overrides.rejectionEvidenceMismatch === true
+                  ? "invalid evidence"
+                  : rejectedReviewBody(snapshot.value.requirementsDigest),
+            }),
+          ),
       },
       workManagement: {
         appendComment: (_ref, body) => {
@@ -1031,6 +1142,52 @@ async function harness(
 }
 
 describe("ReviewerReplayCoordinator", () => {
+  it("dry-runs one exact rejected-review fixer without provider or mutation", async () => {
+    const value = await harness([], { rejectedFix: true });
+    const result = await value.coordinator.run(jobId, true, { fixRejectedReview: true });
+
+    expect(result).toMatchObject({
+      state: "ready",
+      providerAttemptsRemaining: 1,
+      plannedMutations: [
+        "one-reviewer-fix",
+        "push-repair",
+        "fresh-review",
+        "existing-merge-lifecycle",
+      ],
+    });
+    expect(value.calls).not.toContain("reviewerRecovery.run");
+  });
+
+  it("uses one existing fixer round on the same Job and resumes at CI waiting", async () => {
+    const value = await harness([], { rejectedFix: true });
+    const result = await value.coordinator.run(jobId, false, { fixRejectedReview: true });
+
+    expect(result).toMatchObject({
+      state: "repaired",
+      sourceHeadSha: headSha,
+      repairedHeadSha,
+      outcome: { outcome: "still_ci_waiting" },
+    });
+    expect(value.calls.filter((call) => call === "reviewerRecovery.run")).toHaveLength(1);
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value).toMatchObject({
+      stage: { kind: "ci_waiting" },
+      headSha: repairedHeadSha,
+    });
+  });
+
+  it("blocks mismatched published evidence before invoking the fixer", async () => {
+    const value = await harness([], {
+      rejectedFix: true,
+      rejectionEvidenceMismatch: true,
+    });
+    const result = await value.coordinator.run(jobId, false, { fixRejectedReview: true });
+
+    expect(result).toMatchObject({ state: "blocked", reason: "review_evidence_mismatch" });
+    expect(value.calls).not.toContain("reviewerRecovery.run");
+  });
+
   it("final-review dry-run validates the exact paused checkpoint with zero mutation", async () => {
     const value = await harness(["approved"], { finalReview: true });
     const before = await value.progress.load(jobId);

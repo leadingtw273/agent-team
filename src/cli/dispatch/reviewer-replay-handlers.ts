@@ -48,6 +48,7 @@ export interface ReviewerReplayHandlerInput {
   readonly expectContractVersion?: number;
   readonly finalReviewEpoch?: boolean;
   readonly expectCheckpoint?: string;
+  readonly fixRejectedReview?: boolean;
 }
 
 export interface ReviewerReplayPolicyHandlerInput {
@@ -101,7 +102,10 @@ export function reviewerReplayCliOutcome(
       ...result,
     });
   }
-  const state = result.state === "continued" ? resumeOutcomeCliState(result.outcome) : "success";
+  const state =
+    result.state === "continued" || result.state === "repaired"
+      ? resumeOutcomeCliState(result.outcome)
+      : "success";
   return outcome(state, {
     operation: "reviewer-replay",
     dryRun,
@@ -141,6 +145,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
   const buildCoordinator = async (
     jobId: string,
     finalReviewEpoch = false,
+    fixRejectedReview = false,
   ): Promise<ReviewerReplayCoordinator | CliCommandOutcome> => {
     if (options.coordinatorFactory !== undefined) return options.coordinatorFactory(jobId);
     const record = await progress.load(jobId);
@@ -153,7 +158,11 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       });
     }
     const ordinaryEligible = isReviewerReplayCommandEligible(record.value);
-    if (!finalReviewEpoch && !ordinaryEligible) {
+    const rejectedFixEligible =
+      record.value.stage.kind === "requires_manual" &&
+      record.value.stage.cause?.stage === "review" &&
+      record.value.stage.cause.reasonCode === "review_not_approved";
+    if (!finalReviewEpoch && !ordinaryEligible && !(fixRejectedReview && rejectedFixEligible)) {
       return outcome("blocked", {
         operation: "reviewer-replay",
         state: "blocked",
@@ -314,10 +323,11 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
       const hasExpectedVersion = input.expectContractVersion !== undefined;
       const hasFinalEpoch = input.finalReviewEpoch === true;
       const hasExpectedCheckpoint = input.expectCheckpoint !== undefined;
+      const hasRejectedFix = input.fixRejectedReview === true;
       if (
         hasNewEpoch !== hasExpectedVersion ||
         hasFinalEpoch !== hasExpectedCheckpoint ||
-        (hasNewEpoch && hasFinalEpoch) ||
+        Number(hasNewEpoch) + Number(hasFinalEpoch) + Number(hasRejectedFix) > 1 ||
         (hasExpectedVersion &&
           (!Number.isSafeInteger(input.expectContractVersion) ||
             (input.expectContractVersion ?? 0) < 2)) ||
@@ -330,7 +340,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
           reason: "contract_epoch_options_invalid",
         });
       }
-      const coordinator = await buildCoordinator(input.jobId, hasFinalEpoch);
+      const coordinator = await buildCoordinator(input.jobId, hasFinalEpoch, hasRejectedFix);
       if (!(coordinator instanceof ReviewerReplayCoordinator)) return coordinator;
       const dryRun = input.dryRun === true;
       return reviewerReplayCliOutcome(
@@ -339,6 +349,7 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
           ...(hasExpectedVersion ? { expectContractVersion: input.expectContractVersion } : {}),
           ...(hasFinalEpoch ? { finalReviewEpoch: true } : {}),
           ...(hasExpectedCheckpoint ? { expectCheckpoint: input.expectCheckpoint } : {}),
+          ...(hasRejectedFix ? { fixRejectedReview: true } : {}),
         }),
         dryRun,
       );

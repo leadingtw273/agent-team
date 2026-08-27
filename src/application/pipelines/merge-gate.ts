@@ -16,7 +16,6 @@ import {
   type RecordReviewOutcome,
   type RecordReviewRequest,
   type RecordedReviewApproval,
-  type ReviewDecision,
   type ReviewStatusFailureStage,
   type ReviewStatusPorts,
 } from "./merge-gate-model.js";
@@ -25,6 +24,7 @@ import {
   canonicalVisualManifestInput,
   reviewerReportSchema,
 } from "./reviewer-model.js";
+import { renderReviewComment } from "./review-evidence.js";
 
 function sameSha(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
@@ -133,32 +133,6 @@ function validApproval(request: EnableAutoMergeRequest): boolean {
             report.publicationDigest === request.approval.identity.publicationDigest,
         )))
   );
-}
-
-function reviewComment(decision: ReviewDecision): string {
-  const findings = "findings" in decision ? decision.findings : [];
-  const evidence = {
-    schemaVersion: 1,
-    kind: "agent_team_review",
-    verdict: decision.state,
-    identity: decision.identity,
-    reports: decision.reports.map((report) => ({
-      role: report.role,
-      verdict: report.verdict,
-      summary: report.summary,
-      acceptanceCriteria: report.acceptanceCriteria,
-      qualityChecks: report.qualityChecks,
-      findings: report.findings,
-    })),
-    findings,
-  };
-  return [
-    `Agent Team review: **${decision.state}**`,
-    "",
-    "```json",
-    JSON.stringify(evidence, null, 2),
-    "```",
-  ].join("\n");
 }
 
 function reuseComment(approved: ReviewIdentity, current: ReviewIdentity): string {
@@ -409,7 +383,7 @@ export class ReviewStatusCoordinator {
         changeRequest: reference,
         expectedHeadSha: request.expectedHeadSha,
         kind: "review_evidence",
-        body: reviewComment(request.decision),
+        body: renderReviewComment(request.decision),
       },
       mutation(request, `review-${request.decision.state}-comment`),
     );

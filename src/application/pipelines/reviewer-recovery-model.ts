@@ -66,6 +66,10 @@ export interface ReviewerRecoveryPipelineRequest {
   readonly externalData: readonly ExternalDataBlock[];
   readonly deadlineAt: Instant;
   readonly idempotencyKeyPrefix: string;
+  /** Narrow operator recovery for a published `changes_requested` result. It still consumes the
+   * ordinary one-round fixer budget; it only prevents an already-full review counter from
+   * suppressing that fixer. */
+  readonly allowExhaustedReviewRuns?: boolean;
   readonly signal?: AbortSignal;
 }
 
