@@ -185,10 +185,7 @@ export function createDispatchResolveHandler(
     }
     const authoritative = await options.progress.load(input.jobId);
     const authoritativeRecord = authoritative.ok ? authoritative.value : undefined;
-    if (
-      !authoritative.ok ||
-      authoritativeRecord?.revision !== converged.value.record.revision
-    ) {
+    if (!authoritative.ok || authoritativeRecord?.revision !== converged.value.record.revision) {
       return outcome("failed", {
         operation: "dispatch_resolve",
         state: "blocked",
@@ -196,18 +193,22 @@ export function createDispatchResolveHandler(
         errorCode: authoritative.ok ? "conflict" : authoritative.error.code,
       });
     }
-    const written = await options.progress.compareAndSwap(input.jobId, authoritativeRecord.revision, {
-      ...terminalMutationFrom(authoritativeRecord),
-      ...(authoritativeRecord.controlFence === undefined
-        ? {}
-        : {
-            controlFence: {
-              ...authoritativeRecord.controlFence,
-              state: "revoked" as const,
-            },
-          }),
-      stage: nextStage,
-    });
+    const written = await options.progress.compareAndSwap(
+      input.jobId,
+      authoritativeRecord.revision,
+      {
+        ...terminalMutationFrom(authoritativeRecord),
+        ...(authoritativeRecord.controlFence === undefined
+          ? {}
+          : {
+              controlFence: {
+                ...authoritativeRecord.controlFence,
+                state: "revoked" as const,
+              },
+            }),
+        stage: nextStage,
+      },
+    );
     if (!written.ok) {
       return outcome("failed", {
         operation: "dispatch_resolve",
@@ -217,7 +218,10 @@ export function createDispatchResolveHandler(
       });
     }
 
-    const claim = await options.admission.load(authoritativeRecord.projectId, authoritativeRecord.issueId);
+    const claim = await options.admission.load(
+      authoritativeRecord.projectId,
+      authoritativeRecord.issueId,
+    );
     let admissionReleased: "released" | "not_found" | "owned_by_other_job" | "release_failed" =
       "not_found";
     if (claim.ok && claim.value?.state === "active") {

@@ -60,10 +60,7 @@ export interface FileManagedMutationAuthorityOptions {
   readonly escalation?: Readonly<{
     project: Project;
     workManagement: WorkManagementLifecyclePort;
-    sourceControl: Pick<
-      SourceControlPort,
-      "getChangeRequest" | "findOpenChangeRequestsByHead"
-    >;
+    sourceControl: Pick<SourceControlPort, "getChangeRequest" | "findOpenChangeRequestsByHead">;
     mode?: "active" | "cancellation" | "completion" | "supersede";
     supersededByJobId?: string;
   }>;
@@ -108,8 +105,12 @@ export function revokeJobControlFence(record: JobProgressRecord): JobProgressRec
 const terminalStages = new Set(["completed", "superseded", "cancelled"]);
 
 function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
-  const { schemaVersion: _schemaVersion, revision: _revision, updatedAt: _updatedAt, ...mutation } =
-    record;
+  const {
+    schemaVersion: _schemaVersion,
+    revision: _revision,
+    updatedAt: _updatedAt,
+    ...mutation
+  } = record;
   void _schemaVersion;
   void _revision;
   void _updatedAt;
@@ -198,9 +199,7 @@ export class FileManagedMutationAuthority implements ManagedMutationGate {
     const currentEntry = entryIndex < 0 ? undefined : ledger[entryIndex];
     const exhaustedUnknown =
       (currentEntry?.attempts.length ?? 0) >= 2 &&
-      ["prepared", "sent_unknown"].includes(
-        currentEntry?.attempts.at(-1)?.outcome ?? "confirmed",
-      );
+      ["prepared", "sent_unknown"].includes(currentEntry?.attempts.at(-1)?.outcome ?? "confirmed");
     if (exhaustedUnknown) {
       const escalated = await this.#escalate(
         loaded.value,
@@ -381,21 +380,23 @@ export class FileManagedMutationAuthority implements ManagedMutationGate {
   }
 }
 
-export async function publishAuthorityConflict(options: Readonly<{
-  authority: ManagedMutationGate;
-  project: Project;
-  workManagement: WorkManagementLifecyclePort;
-  record: JobProgressRecord;
-  conflictClass:
-    | "multiple_pr_candidates"
-    | "pr_identity_mismatch"
-    | "owner_conflict"
-    | "unsettled_pr"
-    | "linear_github_mismatch";
-  observedIdentity: unknown;
-  prNumber?: number;
-  signal?: AbortSignal;
-}>): Promise<Result<void, DomainError>> {
+export async function publishAuthorityConflict(
+  options: Readonly<{
+    authority: ManagedMutationGate;
+    project: Project;
+    workManagement: WorkManagementLifecyclePort;
+    record: JobProgressRecord;
+    conflictClass:
+      | "multiple_pr_candidates"
+      | "pr_identity_mismatch"
+      | "owner_conflict"
+      | "unsettled_pr"
+      | "linear_github_mismatch";
+    observedIdentity: unknown;
+    prNumber?: number;
+    signal?: AbortSignal;
+  }>,
+): Promise<Result<void, DomainError>> {
   const observedIdentityDigest = sha256Digest(options.observedIdentity);
   if (!observedIdentityDigest.ok) return observedIdentityDigest;
   const event = createJobPrLifecycleEvent({
@@ -570,14 +571,18 @@ export function fenceSourceControlPort(
       ),
     setCommitStatus: (command, options) =>
       gate.execute(
-        request(command.context === "agent-team/review" ? "review_status" : "commit_status", options, {
-          projectId: command.project.id,
-          headSha: command.headSha,
-          context: command.context,
-          state: command.state,
-          description: command.description,
-          targetUrl: command.targetUrl ?? null,
-        }),
+        request(
+          command.context === "agent-team/review" ? "review_status" : "commit_status",
+          options,
+          {
+            projectId: command.project.id,
+            headSha: command.headSha,
+            context: command.context,
+            state: command.state,
+            description: command.description,
+            targetUrl: command.targetUrl ?? null,
+          },
+        ),
         (stable) => inner.setCommitStatus(command, stable),
       ),
     appendChangeRequestComment: (command, options) =>

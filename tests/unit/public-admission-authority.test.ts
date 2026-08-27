@@ -124,12 +124,7 @@ describe("public issue admission authority", () => {
         workManagement: {
           listComments: () =>
             Promise.resolve(
-              ok(
-                comments(
-                  lifecycleComment("job_started"),
-                  lifecycleComment("job_completed"),
-                ),
-              ),
+              ok(comments(lifecycleComment("job_started"), lifecycleComment("job_completed"))),
             ),
         },
         sourceControl: {
@@ -153,12 +148,7 @@ describe("public issue admission authority", () => {
         workManagement: {
           listComments: () =>
             Promise.resolve(
-              ok(
-                comments(
-                  lifecycleComment("job_started"),
-                  lifecycleComment("job_completed"),
-                ),
-              ),
+              ok(comments(lifecycleComment("job_started"), lifecycleComment("job_completed"))),
             ),
         },
         sourceControl: {

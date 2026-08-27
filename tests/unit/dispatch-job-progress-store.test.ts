@@ -229,9 +229,7 @@ describe("FileJobProgressStore", () => {
 
       const sentUnknownAttempt = {
         ...firstPrepared,
-        attempts: [
-          { ordinal: 1 as const, preparedAt: now, outcome: "sent_unknown" as const },
-        ],
+        attempts: [{ ordinal: 1 as const, preparedAt: now, outcome: "sent_unknown" as const }],
       };
       const sentUnknown = await store.compareAndSwap(
         jobId,
