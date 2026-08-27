@@ -16,7 +16,6 @@ import {
   type RecordReviewOutcome,
   type RecordReviewRequest,
   type RecordedReviewApproval,
-  type ReviewDecision,
   type ReviewStatusFailureStage,
   type ReviewStatusPorts,
 } from "./merge-gate-model.js";

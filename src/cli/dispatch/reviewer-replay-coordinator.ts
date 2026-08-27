@@ -1198,7 +1198,7 @@ export class ReviewerReplayCoordinator {
         findings: currentAdmission.findings,
         externalData: Object.freeze([]),
         deadlineAt: deadline.value,
-        idempotencyKeyPrefix: `reviewer-rejection-fix:${jobId}:${record.headSha}`,
+        idempotencyKeyPrefix: `reviewer-rejection-fix:${jobId}:${currentAdmission.inspection.request.expectedHeadSha}`,
         allowExhaustedReviewRuns: true,
         signal: beat.signal,
       });

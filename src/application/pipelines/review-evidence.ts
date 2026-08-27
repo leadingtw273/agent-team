@@ -129,7 +129,7 @@ export function parsePublishedReviewEvidence(
   body: string,
 ): Result<ParsedPublishedReviewEvidence, DomainError> {
   const match = publishedBodyPattern.exec(body);
-  if (match === null || match[1] === undefined || match[2] === undefined || match[3] === undefined) {
+  if (match?.[1] === undefined || match[2] === undefined || match[3] === undefined) {
     return err(domainError("external_failure"));
   }
   let decoded: unknown;
