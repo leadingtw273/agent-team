@@ -22,6 +22,21 @@ export interface ReviewerResumeInput {
   readonly recoverRecordPrepublication?: boolean;
 }
 
+/** Exact fail-closed boundary shared by the ordinary resume repair and dedicated replay.
+ * `ReviewStatusCoordinator.record()` writes the PR evidence comment before every later review
+ * mutation, so any `pr_comment` ledger entry means the outcome may already be externally visible
+ * and must never be replayed as a prepublication failure. */
+export function isReviewRecordPrepublicationFailure(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "review_record_failed" &&
+    record.mutationAttempts?.some((entry) => entry.intent === "pr_comment") !== true &&
+    record.changeRequestId !== undefined &&
+    record.headSha !== undefined
+  );
+}
+
 function outcome(
   state: "success" | "failed" | "blocked" | "rejected",
   payload: unknown,
@@ -88,20 +103,9 @@ export function createReviewerResumeHandler(
       confirmedReadyMutation === true &&
       loaded.value.changeRequestId !== undefined &&
       loaded.value.headSha !== undefined;
-    // The ordinary review-begin pending status is also recorded as `review_status`, so it cannot
-    // distinguish pre-publication from a partial record attempt. `record()` always writes the PR
-    // evidence comment first; therefore any `pr_comment` ledger entry is the fail-closed boundary.
-    const hasReviewEvidenceCommentAttempt = loaded.value.mutationAttempts?.some(
-      (entry) => entry.intent === "pr_comment",
-    );
     const recoverableRecordFailure =
       input.recoverRecordPrepublication === true &&
-      stage.kind === "requires_manual" &&
-      stage.cause?.stage === "review" &&
-      stage.cause.reasonCode === "review_record_failed" &&
-      hasReviewEvidenceCommentAttempt !== true &&
-      loaded.value.changeRequestId !== undefined &&
-      loaded.value.headSha !== undefined;
+      isReviewRecordPrepublicationFailure(loaded.value);
     if (
       stage.kind !== "reviewer_waiting" &&
       !recoverableBeginFailure &&

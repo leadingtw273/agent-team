@@ -544,6 +544,113 @@ describe("review commit status coordination", () => {
     );
   });
 
+  it("records a mixed blocking and clarification report using reviewer-pipeline precedence", async () => {
+    const calls: string[] = [];
+    const ports = reviewPorts({ calls });
+    const mixedReport: ReviewerReport = {
+      ...report,
+      verdict: "changes_requested",
+      acceptanceCriteria: [
+        {
+          criterion: acceptanceCriterion,
+          status: "failed",
+          summary: "A blocking issue remains.",
+          evidenceSources: ["agent-team:diff"],
+        },
+      ],
+      findings: [
+        {
+          severity: "blocking",
+          title: "Blocking requirement violation",
+          description: "The implementation violates the requirement.",
+          acceptanceCriteria: [acceptanceCriterion],
+          evidenceSources: ["agent-team:diff"],
+        },
+        {
+          severity: "clarification",
+          title: "Requirement clarification needed",
+          description: "The requirement also needs clarification.",
+          acceptanceCriteria: [acceptanceCriterion],
+          evidenceSources: ["agent-team:diff"],
+        },
+      ],
+    };
+    const decision: RecordReviewRequest["decision"] = {
+      ...approvedDecision(),
+      state: "clarification_required",
+      reports: [mixedReport],
+      findings: mixedReport.findings.filter((finding) => finding.severity === "clarification"),
+    };
+
+    const outcome = await new ReviewStatusCoordinator(ports).record(recordRequest(decision));
+
+    expect(outcome).toMatchObject({ state: "rejected", reason: "clarification_required" });
+    expect(calls).toEqual(["comment", "status"]);
+    expect(ports.sourceControl.setCommitStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ headSha, state: "failure" }),
+      expect.anything(),
+    );
+  });
+
+  it("rejects a changes-requested decision when clarification findings require precedence", async () => {
+    const ports = reviewPorts();
+    const mixedReport: ReviewerReport = {
+      ...report,
+      verdict: "changes_requested",
+      acceptanceCriteria: [
+        {
+          criterion: acceptanceCriterion,
+          status: "failed",
+          summary: "A blocking issue remains.",
+          evidenceSources: ["agent-team:diff"],
+        },
+      ],
+      findings: [
+        {
+          severity: "blocking",
+          title: "Blocking requirement violation",
+          description: "The implementation violates the requirement.",
+          acceptanceCriteria: [acceptanceCriterion],
+          evidenceSources: ["agent-team:diff"],
+        },
+        {
+          severity: "clarification",
+          title: "Requirement clarification needed",
+          description: "The requirement also needs clarification.",
+          acceptanceCriteria: [acceptanceCriterion],
+          evidenceSources: ["agent-team:diff"],
+        },
+      ],
+    };
+    const decision: RecordReviewRequest["decision"] = {
+      ...approvedDecision(),
+      state: "changes_requested",
+      reports: [mixedReport],
+      findings: mixedReport.findings.filter((finding) => finding.severity === "blocking"),
+    };
+
+    const outcome = await new ReviewStatusCoordinator(ports).record(recordRequest(decision));
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "request" });
+    expect(ports.sourceControl.appendChangeRequestComment).not.toHaveBeenCalled();
+    expect(ports.sourceControl.setCommitStatus).not.toHaveBeenCalled();
+  });
+
+  it("fails closed without throwing when an untrusted report is missing findings", async () => {
+    const ports = reviewPorts();
+    const malformedReport = { ...report, findings: undefined };
+    const decision = {
+      ...approvedDecision(),
+      reports: [malformedReport],
+    } as unknown as RecordReviewRequest["decision"];
+
+    const outcome = await new ReviewStatusCoordinator(ports).record(recordRequest(decision));
+
+    expect(outcome).toMatchObject({ state: "failed", stage: "request" });
+    expect(ports.sourceControl.appendChangeRequestComment).not.toHaveBeenCalled();
+    expect(ports.sourceControl.setCommitStatus).not.toHaveBeenCalled();
+  });
+
   it("rejects stale reviewer evidence before any mutation", async () => {
     const ports = reviewPorts();
     const staleIdentity = createReviewIdentity(snapshot, rebasedHeadSha, diff);

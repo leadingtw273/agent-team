@@ -18,7 +18,7 @@ import type {
   ReviewerPipelineRequest,
   SafeReviewReportDiagnostic,
 } from "./reviewer-model.js";
-import { canonicalVisualManifestInput } from "./reviewer-model.js";
+import { aggregateReviewerDecisionState, canonicalVisualManifestInput } from "./reviewer-model.js";
 import {
   anyReviewerAttemptLimitReached,
   requiredReviewerRoles,
@@ -429,13 +429,11 @@ export class ReviewerPipeline {
       identity: identity.value,
       reports,
     });
+    const decisionState = aggregateReviewerDecisionState(reports);
     const clarificationFindings = reports.flatMap((report) =>
       report.findings.filter((finding) => finding.severity === "clarification"),
     );
-    if (
-      reports.some((report) => report.verdict === "clarification_required") ||
-      clarificationFindings.length > 0
-    ) {
+    if (decisionState === "clarification_required") {
       return Object.freeze({
         state: "clarification_required",
         ...common,
@@ -445,17 +443,16 @@ export class ReviewerPipeline {
     const blockingFindings = reports.flatMap((report) =>
       report.findings.filter((finding) => finding.severity === "blocking"),
     );
-    if (
-      reports.some((report) => report.verdict === "changes_requested") ||
-      blockingFindings.length > 0
-    ) {
+    if (decisionState === "changes_requested") {
       return Object.freeze({
         state: "changes_requested",
         ...common,
         findings: Object.freeze(blockingFindings),
       });
     }
-    return Object.freeze({ state: "approved", ...common });
+    return decisionState === "approved"
+      ? Object.freeze({ state: "approved", ...common })
+      : failed("report", domainError("invariant_violation"), reviewedJob);
   }
 
   async #verifyEvidence(

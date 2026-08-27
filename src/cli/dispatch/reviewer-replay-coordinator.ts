@@ -56,6 +56,7 @@ import {
   type ResumeCycleDependencies,
   type ResumeJobOutcome,
 } from "./resume-composition.js";
+import { isReviewRecordPrepublicationFailure } from "./reviewer-resume-handlers.js";
 
 const maximumReplayAttempts = 2;
 const transportRetryBackoffMs = 1_000;
@@ -197,6 +198,7 @@ function lifecycleContinuationCause(record: JobProgressRecord): boolean {
 export function isReviewerReplayCommandEligible(record: JobProgressRecord): boolean {
   return (
     exactReplayCause(record) ||
+    isReviewRecordPrepublicationFailure(record) ||
     (lifecycleContinuationCause(record) && record.reviewerReplay?.state === "review_succeeded")
   );
 }

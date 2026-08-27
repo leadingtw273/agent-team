@@ -111,6 +111,7 @@ const generatedIssueId = generateDeterministicIdentifier("issue", externalIssueI
 if (!generatedIssueId.ok) throw new Error(generatedIssueId.error.code);
 const issueId = generatedIssueId.value;
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
+const controlLeaseId = id("lease", "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const headSha = headShaSchema.parse("a".repeat(40));
 const baseRevision = headShaSchema.parse("b".repeat(40));
 const requirementsDigest = "c".repeat(64);
@@ -352,6 +353,7 @@ async function harness(
     lifecycleEnforce?: boolean;
     workStatusLifecycleUnavailable?: boolean;
     throwOnProvider?: boolean;
+    prCommentAttempt?: boolean;
   }> = {},
 ): Promise<Harness> {
   const progressRoot = await temporaryDirectory("reviewer-replay-progress-");
@@ -506,7 +508,29 @@ async function harness(
                 ? v2ExhaustedReplay
                 : legacyReplay,
         };
-  const seeded = await progress.compareAndSwap(jobId, null, initialProgress);
+  const initialProgressWithMutationLedger: JobProgressRecordMutation = {
+    ...initialProgress,
+    ...(overrides.prCommentAttempt !== true
+      ? {}
+      : {
+          controlFence: {
+            leaseId: controlLeaseId,
+            holderId: "reviewer-replay-test",
+            leaseEpoch: 1,
+            ownershipEpoch: 1,
+            state: "active" as const,
+          },
+          mutationAttempts: [
+            {
+              operationKey: `review-record:${jobId}:pr-comment`,
+              intent: "pr_comment" as const,
+              identityDigest: "e".repeat(64),
+              attempts: [{ ordinal: 1, preparedAt: now, outcome: "prepared" as const }],
+            },
+          ],
+        }),
+  };
+  const seeded = await progress.compareAndSwap(jobId, null, initialProgressWithMutationLedger);
   expect(seeded.ok).toBe(true);
   if (!seeded.ok) throw new Error("test setup could not seed job progress");
   if (overrides.seedReplay === "v2_zero") {
@@ -1373,6 +1397,86 @@ describe("ReviewerReplayCoordinator", () => {
     });
     expect(value.admission.record.state).toBe("released");
     expect(value.requests[0]?.attemptAccounting).toBe("reviewer_replay");
+  });
+
+  it("recovers an exact prepublication review-record failure without resetting Job reviewRuns", async () => {
+    const value = await harness(["approved"]);
+    const loaded = await value.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) throw new Error("missing progress");
+    const {
+      schemaVersion: _schemaVersion,
+      revision: _revision,
+      updatedAt: _updatedAt,
+      ...record
+    } = loaded.value;
+    void _schemaVersion;
+    void _revision;
+    void _updatedAt;
+    const changed = await value.progress.compareAndSwap(jobId, loaded.value.revision, {
+      ...record,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_record_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.error.code);
+
+    expect(isReviewerReplayCommandEligible(changed.value)).toBe(true);
+    expect(isReviewerReplayCheckpointReconcilable(changed.value)).toBe(false);
+    const dryRun = await value.coordinator.run(jobId, true);
+    expect(dryRun).toMatchObject({
+      state: "ready",
+      providerAttemptsUsed: 0,
+      providerAttemptsRemaining: 2,
+    });
+    expect(value.calls).toEqual(["inspect"]);
+
+    const recovered = await value.coordinator.run(jobId, false);
+    expect(recovered).toMatchObject({ state: "continued", outcome: { outcome: "completed" } });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.requests[0]?.job.attempts.reviewRuns).toBe(3);
+    expect(value.requests[0]?.attemptAccounting).toBe("reviewer_replay");
+    expect(value.admission.record.state).toBe("released");
+  });
+
+  it("rejects review-record replay after any PR evidence-comment attempt", async () => {
+    const value = await harness(["approved"], { prCommentAttempt: true });
+    const loaded = await value.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) throw new Error("missing progress");
+    const {
+      schemaVersion: _schemaVersion,
+      revision: _revision,
+      updatedAt: _updatedAt,
+      ...record
+    } = loaded.value;
+    void _schemaVersion;
+    void _revision;
+    void _updatedAt;
+    const changed = await value.progress.compareAndSwap(jobId, loaded.value.revision, {
+      ...record,
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_record_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) throw new Error(changed.error.code);
+
+    expect(isReviewerReplayCommandEligible(changed.value)).toBe(false);
+    await expect(value.coordinator.run(jobId, true)).resolves.toMatchObject({
+      state: "blocked",
+      reason: "job_not_eligible",
+    });
+    expect(value.calls).toEqual([]);
   });
 
   it("AC3 retries one safe format failure once, then succeeds", async () => {
