@@ -358,6 +358,7 @@ interface FixtureOptions {
    * `evidenceVerified` (or its own default of `true`), unaffected. */
   readonly evidenceVerifiedSequenceBySource?: Readonly<Record<string, readonly boolean[]>>;
   readonly persistence?: "confirmed" | "unknown";
+  readonly changeRequestDraft?: boolean;
   readonly providerFailure?: Readonly<{
     role: "code_reviewer" | "visual_reviewer";
     error: DomainError;
@@ -463,7 +464,7 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
     sourceControl: {
       getChangeRequest: () => {
         calls.push("pr:get");
-        return Promise.resolve(ok(draft));
+        return Promise.resolve(ok(options.changeRequestDraft === false ? ready : draft));
       },
       getCommitChecks: () => {
         calls.push("ci:get");
@@ -663,6 +664,19 @@ describe("ReviewerPipeline", () => {
       "git:changes",
       "job:update",
     ]);
+  });
+
+  it("reuses an already non-draft exact-Head PR without repeating the ready mutation", async () => {
+    const input = request("code_review", { reviewRuns: 1 });
+    const setup = fixture(input, { changeRequestDraft: false });
+
+    await expect(setup.pipeline.run(input.value)).resolves.toMatchObject({
+      state: "approved",
+      job: { attempts: { reviewRuns: 2 } },
+      changeRequest: { draft: false, headSha },
+    });
+    expect(setup.calls).not.toContain("pr:ready");
+    expect(setup.calls).toContain("provider:code_reviewer");
   });
 
   it("requires both code and visual reviewers to pass in a dual review", async () => {

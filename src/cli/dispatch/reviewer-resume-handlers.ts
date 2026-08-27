@@ -16,6 +16,11 @@ export interface CreateReviewerResumeHandlerOptions {
   readonly stdin?: AsyncIterable<Uint8Array | string>;
 }
 
+export interface ReviewerResumeInput {
+  readonly jobId: string;
+  readonly recoverReadyIdempotency?: boolean;
+}
+
 function outcome(
   state: "success" | "failed" | "blocked" | "rejected",
   payload: unknown,
@@ -38,7 +43,7 @@ function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
 
 export function createReviewerResumeHandler(
   options: CreateReviewerResumeHandlerOptions,
-): (input: Readonly<{ jobId: string }>) => Promise<CliCommandOutcome> {
+): (input: ReviewerResumeInput) => Promise<CliCommandOutcome> {
   const stdin = options.stdin ?? process.stdin;
   const clock = options.clock ?? createClock();
   return async (input) => {
@@ -71,7 +76,18 @@ export function createReviewerResumeHandler(
       stage.kind === "requires_manual" &&
       stage.cause?.stage === "review" &&
       stage.cause.reasonCode === "review_begin_failed";
-    if (stage.kind !== "reviewer_waiting" && !recoverableBeginFailure) {
+    const confirmedReadyMutation = loaded.value.mutationAttempts?.some(
+      (entry) => entry.intent === "pr_ready" && entry.attempts.at(-1)?.outcome === "confirmed",
+    );
+    const recoverableReadyFailure =
+      input.recoverReadyIdempotency === true &&
+      stage.kind === "requires_manual" &&
+      stage.cause?.stage === "review" &&
+      stage.cause.reasonCode === "review_provider_failed" &&
+      confirmedReadyMutation === true &&
+      loaded.value.changeRequestId !== undefined &&
+      loaded.value.headSha !== undefined;
+    if (stage.kind !== "reviewer_waiting" && !recoverableBeginFailure && !recoverableReadyFailure) {
       return outcome("failed", {
         operation: "dispatch_reviewer_resume",
         state: "blocked",
@@ -103,6 +119,11 @@ export function createReviewerResumeHandler(
         errorCode: written.error.code,
       });
     }
+    const recovery = recoverableReadyFailure
+      ? "review_ready_idempotency"
+      : recoverableBeginFailure
+        ? "review_begin_failed"
+        : "reviewer_waiting";
     return outcome("success", {
       operation: "dispatch_reviewer_resume",
       state: "resumed",
@@ -110,7 +131,7 @@ export function createReviewerResumeHandler(
       nextStage: "awaiting_review",
       admissionReleased: false,
       implementerRerun: false,
-      recovery: recoverableBeginFailure ? "review_begin_failed" : "reviewer_waiting",
+      recovery,
     });
   };
 }

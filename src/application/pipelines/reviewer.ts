@@ -285,18 +285,22 @@ export class ReviewerPipeline {
 
     const evidence = await this.#verifyEvidence(request);
     if (!evidence.ok) return failed("evidence", evidence.error, request.job);
-    const ready = await this.ports.sourceControl.markChangeRequestReady(
-      reference,
-      request.expectedHeadSha,
-      mutation(request, "ready-for-review"),
-    );
-    if (!ready.ok) return failed("ready", ready.error, request.job);
-    if (
-      ready.value.state !== "open" ||
-      ready.value.draft ||
-      !sameReviewSha(ready.value.headSha, request.expectedHeadSha)
-    ) {
-      return failed("ready", domainError("conflict"), request.job);
+    let readyChangeRequest = changeRequest.value;
+    if (changeRequest.value.draft) {
+      const ready = await this.ports.sourceControl.markChangeRequestReady(
+        reference,
+        request.expectedHeadSha,
+        mutation(request, "ready-for-review"),
+      );
+      if (!ready.ok) return failed("ready", ready.error, request.job);
+      if (
+        ready.value.state !== "open" ||
+        ready.value.draft ||
+        !sameReviewSha(ready.value.headSha, request.expectedHeadSha)
+      ) {
+        return failed("ready", domainError("conflict"), request.job);
+      }
+      readyChangeRequest = ready.value;
     }
 
     const runs = await Promise.all(
@@ -420,7 +424,7 @@ export class ReviewerPipeline {
 
     const common = Object.freeze({
       job: reviewedJob,
-      changeRequest: ready.value,
+      changeRequest: readyChangeRequest,
       checks: checks.value,
       identity: identity.value,
       reports,
