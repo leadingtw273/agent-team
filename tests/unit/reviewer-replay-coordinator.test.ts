@@ -327,6 +327,7 @@ class AdmissionFake implements IssueAdmissionPort {
     revision: 0,
     projectId,
     issueId,
+    externalIssueId,
     jobId,
     state: "active",
     claimedAt: now,
@@ -421,6 +422,7 @@ async function harness(
     reviewerSkills?: boolean;
     rejectedFix?: boolean;
     postFixContinuation?: boolean;
+    postFixClarification?: boolean;
     rejectionEvidenceMismatch?: boolean;
   }> = {},
 ): Promise<Harness> {
@@ -536,7 +538,10 @@ async function harness(
     branch: "agent-team/replay",
     worktreePath: "/tmp/reviewer-replay-project",
     changeRequestId: "42",
-    headSha: overrides.postFixContinuation === true ? repairedHeadSha : headSha,
+    headSha:
+      overrides.postFixContinuation === true || overrides.postFixClarification === true
+        ? repairedHeadSha
+        : headSha,
     baseRevision,
     ...(overrides.reviewerSkills !== true
       ? {}
@@ -556,8 +561,13 @@ async function harness(
     overrides.seedReplay === undefined
       ? {
           ...baseProgress,
-          ...(overrides.rejectedFix === true || overrides.postFixContinuation === true
+          ...(overrides.rejectedFix === true ||
+          overrides.postFixContinuation === true ||
+          overrides.postFixClarification === true
             ? { reviewerReplay: legacyReplay }
+            : {}),
+          ...(overrides.postFixClarification === true
+            ? { stage: { kind: "paused" as const, checkpointId: finalCheckpointId } }
             : {}),
           ...(overrides.finalReview === true
             ? { stage: { kind: "paused" as const, checkpointId: finalCheckpointId } }
@@ -675,9 +685,12 @@ async function harness(
   let inspectIndex = 0;
   let reviewRecordCalls = 0;
   let reviewStatusState: "pending" | "success" = "pending";
-  let liveHeadSha = overrides.postFixContinuation === true ? repairedHeadSha : headSha;
+  let liveHeadSha =
+    overrides.postFixContinuation === true || overrides.postFixClarification === true
+      ? repairedHeadSha
+      : headSha;
   const jobs = [
-    overrides.postFixContinuation === true
+    overrides.postFixContinuation === true || overrides.postFixClarification === true
       ? jobSchema.parse({
           ...job(),
           attempts: { ...emptyAttemptCounters(), reviewerFixRounds: 1, reviewRuns: 3 },
@@ -687,16 +700,18 @@ async function harness(
   const reviewer = {
     inspect: (request: ReviewerPipelineRequest) => {
       calls.push("inspect");
-      const selected =
-        overrides.inspectIdentities?.[inspectIndex] ??
-        identity(request.requirementSnapshot.requirementsDigest);
+      const requestHeadSha = headShaSchema.parse(request.expectedHeadSha);
+      const selected = overrides.inspectIdentities?.[inspectIndex] ?? {
+        ...identity(request.requirementSnapshot.requirementsDigest),
+        headSha: requestHeadSha,
+      };
       inspectIndex += 1;
       return Promise.resolve({
         state: "ready" as const,
         job: request.job,
-        changeRequest: changeRequest(),
+        changeRequest: changeRequest("open", requestHeadSha),
         checks: {
-          headSha,
+          headSha: requestHeadSha,
           aggregate: "success" as const,
           checks: [
             { name: "quality", status: "completed" as const, conclusion: "success" as const },
@@ -708,6 +723,7 @@ async function harness(
     },
     run: (request: ReviewerPipelineRequest): Promise<ReviewerPipelineOutcome> => {
       calls.push("provider");
+      const requestHeadSha = headShaSchema.parse(request.expectedHeadSha);
       providerStarts.push(...requiredReviewerRoles(request));
       requests.push(request);
       if (overrides.throwOnProvider === true) throw new Error("simulated_provider_process_crash");
@@ -750,9 +766,9 @@ async function harness(
           state: "not_ready",
           reason: "ci_pending",
           job: request.job,
-          changeRequest: changeRequest(),
+          changeRequest: changeRequest("open", requestHeadSha),
           checks: {
-            headSha,
+            headSha: requestHeadSha,
             aggregate: "pending",
             checks: [{ name: "quality", status: "queued", conclusion: null }],
           },
@@ -799,25 +815,30 @@ async function harness(
         return Promise.resolve({
           state: "changes_requested",
           job: request.job,
-          changeRequest: changeRequest(),
+          changeRequest: changeRequest("open", requestHeadSha),
           checks: {
-            headSha,
+            headSha: requestHeadSha,
             aggregate: "success",
             checks: [{ name: "quality", status: "completed", conclusion: "success" }],
           },
-          identity: identity(request.requirementSnapshot.requirementsDigest),
+          identity: {
+            ...identity(request.requirementSnapshot.requirementsDigest),
+            headSha: requestHeadSha,
+          },
           reports: [blocking],
           findings: blocking.findings,
         });
       }
-      const approvedIdentity =
-        overrides.approvedIdentity ?? identity(request.requirementSnapshot.requirementsDigest);
+      const approvedIdentity = overrides.approvedIdentity ?? {
+        ...identity(request.requirementSnapshot.requirementsDigest),
+        headSha: requestHeadSha,
+      };
       return Promise.resolve({
         state: "approved",
         job: request.job,
-        changeRequest: changeRequest(),
+        changeRequest: changeRequest("open", requestHeadSha),
         checks: {
-          headSha,
+          headSha: requestHeadSha,
           aggregate: "success",
           checks: [{ name: "quality", status: "completed", conclusion: "success" }],
         },
@@ -1012,9 +1033,11 @@ async function harness(
           throw new Error("simulated_crash_after_status_success");
         }
         const checkpoint = await progress.load(jobId);
-        expect(checkpoint.ok && checkpoint.value?.reviewerReplay?.state).toBe(
-          request.decision.state === "approved" ? "review_succeeded" : "attempting",
-        );
+        if (overrides.postFixClarification !== true) {
+          expect(checkpoint.ok && checkpoint.value?.reviewerReplay?.state).toBe(
+            request.decision.state === "approved" ? "review_succeeded" : "attempting",
+          );
+        }
         calls.push("reviewStatus.record");
         if (request.decision.state !== "approved") {
           return {
@@ -1227,6 +1250,32 @@ describe("ReviewerReplayCoordinator", () => {
       outcome: { outcome: "still_ci_waiting" },
     });
     expect(value.calls).not.toContain("reviewerRecovery.run");
+  });
+
+  it("re-reviews an exact post-fix clarification checkpoint without invoking another fixer", async () => {
+    const value = await harness(["approved"], { postFixClarification: true });
+    const preview = await value.coordinator.run(jobId, true, { fixRejectedReview: true });
+
+    expect(preview).toMatchObject({
+      state: "ready",
+      providerAttemptsRemaining: 1,
+      plannedMutations: ["resume-repaired-head", "fresh-review", "existing-merge-lifecycle"],
+    });
+    const result = await value.coordinator.run(jobId, false, { fixRejectedReview: true });
+
+    expect(result).toMatchObject({
+      state: "repaired",
+      sourceHeadSha: headSha,
+      repairedHeadSha,
+      outcome: { outcome: "completed" },
+    });
+    expect(value.calls.filter((call) => call === "provider")).toHaveLength(1);
+    expect(value.calls).not.toContain("reviewerRecovery.run");
+    const stored = await value.progress.load(jobId);
+    expect(stored.ok && stored.value).toMatchObject({
+      stage: { kind: "completed" },
+      headSha: repairedHeadSha,
+    });
   });
 
   it("final-review dry-run validates the exact paused checkpoint with zero mutation", async () => {

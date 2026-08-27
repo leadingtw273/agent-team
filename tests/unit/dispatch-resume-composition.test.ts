@@ -2013,7 +2013,8 @@ describe("runResumeCycle", () => {
     });
   });
 
-  it("re-reviews a repaired replay rejection once without consuming another Job review run or fixer", async () => {
+  it("re-reviews a repaired clarification once without consuming another Job review run or fixer", async () => {
+    const verdict = "clarification_required" as const;
     const recoveryJob = job({
       attempts: { ...emptyAttemptCounters(), reviewerFixRounds: 1, reviewRuns: 3 },
     });
@@ -2025,7 +2026,7 @@ describe("runResumeCycle", () => {
     const { deps, progress, jobRepository, calls, reviewerRequests } = await harness({
       changeRequestState: { headSha: repairedIdentity.headSha },
       reviewerOutcome: {
-        state: "changes_requested",
+        state: verdict,
         job: recoveryJob,
         changeRequest: changeRequest({ headSha: repairedIdentity.headSha }),
         checks: {} as never,
@@ -2035,7 +2036,7 @@ describe("runResumeCycle", () => {
       },
       recordOutcome: {
         state: "rejected",
-        reason: "changes_requested",
+        reason: verdict,
         evidenceComment: {} as never,
       },
     });
