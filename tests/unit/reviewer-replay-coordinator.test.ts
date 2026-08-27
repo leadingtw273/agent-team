@@ -369,6 +369,7 @@ async function harness(
     workStatusLifecycleUnavailable?: boolean;
     throwOnProvider?: boolean;
     prCommentAttempt?: boolean;
+    reviewerSkills?: boolean;
   }> = {},
 ): Promise<Harness> {
   const progressRoot = await temporaryDirectory("reviewer-replay-progress-");
@@ -471,6 +472,19 @@ async function harness(
     changeRequestId: "42",
     headSha,
     baseRevision,
+    ...(overrides.reviewerSkills !== true
+      ? {}
+      : {
+          skillSnapshots: {
+            code_reviewer: {
+              schemaVersion: 1 as const,
+              jobId,
+              projectId,
+              skills: [],
+              omitted: [],
+            },
+          },
+        }),
   };
   const initialProgress =
     overrides.seedReplay === undefined
@@ -784,6 +798,7 @@ async function harness(
       },
       projectRules: [],
       roleInstructions: {},
+      ...(overrides.reviewerSkills !== true ? {} : { skillPolicy: { allowlist: [] } }),
       commands: { quality: [], visualReview: [] },
     },
     ...(overrides.reviewRequirement === "dual_review"
@@ -1489,6 +1504,20 @@ describe("ReviewerReplayCoordinator", () => {
     });
     expect(value.admission.record.state).toBe("released");
     expect(value.requests[0]?.attemptAccounting).toBe("reviewer_replay");
+  });
+
+  it("reuses the Job-pinned reviewer SkillSnapshot for live replay", async () => {
+    const value = await harness(["approved"], { reviewerSkills: true });
+    const result = await value.coordinator.run(jobId, false);
+
+    expect(result.state).toBe("continued");
+    expect(value.requests).toHaveLength(1);
+    expect(value.requests[0]?.skillSnapshots?.code_reviewer).toMatchObject({
+      jobId,
+      projectId,
+      skills: [],
+      omitted: [],
+    });
   });
 
   it("recovers an exact prepublication review-record failure without resetting Job reviewRuns", async () => {
