@@ -300,6 +300,61 @@ describe("discoverReadyDispatchCandidates", () => {
     expect(candidate?.issue.verificationLevel).toBe("standard");
   });
 
+  it("projects parsed explicit Skills as required Issue selections", async () => {
+    const description = `${minimalChangeRegionsDescription()}
+## ${readyGateTemplateHeadings.skillSelections}
+- godot-camera-systems
+- godot-raycasting-queries`;
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel: fakeReadModel({
+        readIssue: () => Promise.resolve(ok(snapshot({ description }))),
+      }),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.skipped).toEqual([]);
+    expect(result.value.candidates[0]?.issue.skillSelections).toEqual([
+      { name: "godot-camera-systems", requirement: "required" },
+      { name: "godot-raycasting-queries", requirement: "required" },
+    ]);
+  });
+
+  it("isolates an unparsed Skill field without blocking a valid issue in the same batch", async () => {
+    const malformed = `${minimalChangeRegionsDescription()}
+## ${readyGateTemplateHeadings.skillSelections}
+- godot-camera-systems：需要鏡頭功能`;
+    const readModel = fakeReadModel({
+      listIssueIdsInState: () => Promise.resolve(ok(["linear-issue-1", "linear-issue-2"])),
+      readIssue: (_context, issueId) =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              id: issueId,
+              description:
+                issueId === "linear-issue-1" ? malformed : minimalChangeRegionsDescription(),
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates.map((candidate) => candidate.issue.externalId)).toEqual([
+      "linear-issue-2",
+    ]);
+    expect(result.value.skipped).toEqual([
+      { externalIssueId: "linear-issue-1", reason: { code: "skills_unparsed" } },
+    ]);
+  });
+
   it.each([
     {
       name: "人類摘要",

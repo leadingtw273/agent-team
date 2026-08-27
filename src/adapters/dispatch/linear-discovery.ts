@@ -42,6 +42,7 @@ export type LinearDiscoverySkipReason =
   | Readonly<{ code: "not_ready" }>
   | Readonly<{ code: "no_agent_role" }>
   | Readonly<{ code: "dependencies_unparsed" }>
+  | Readonly<{ code: "skills_unparsed" }>
   | Readonly<{ code: "missing_human_summary" }>
   | Readonly<{ code: "missing_human_acceptance_requirement" }>
   | Readonly<{ code: "missing_verification_level" }>
@@ -84,10 +85,11 @@ export interface DiscoverReadyDispatchCandidatesOptions {
 export function toDomainIssue(
   project: Project,
   snapshot: LinearIssueSnapshot,
-  template: Omit<ReadyGateTemplateFields, "dependencies"> & {
-    readonly dependencies: Exclude<ReadyGateTemplateFields["dependencies"], { kind: "unparsed" }>;
-  },
+  template: ReadyGateTemplateFields,
 ): Result<Issue, DomainError> {
+  if (template.dependencies.kind === "unparsed" || template.skillSelections?.kind === "unparsed") {
+    return err(domainError("conflict"));
+  }
   const issueId = generateDeterministicIdentifier("issue", snapshot.id);
   if (!issueId.ok) return err(domainError("invariant_violation"));
   const parsed = issueSchema.safeParse({
@@ -110,6 +112,9 @@ export function toDomainIssue(
       : { estimatedMinutes: template.estimatedMinutes }),
     ...(template.constraints === undefined ? {} : { constraints: template.constraints }),
     ...(template.risks === undefined ? {} : { risks: template.risks }),
+    ...(template.skillSelections === undefined
+      ? {}
+      : { skillSelections: template.skillSelections.selections }),
     ...(template.changeRegions === undefined ? {} : { changeRegions: template.changeRegions }),
     ...(snapshot.priority === undefined ? {} : { priority: snapshot.priority }),
     ...(snapshot.agentRole === undefined ? {} : { agentRole: snapshot.agentRole }),
@@ -191,6 +196,15 @@ export async function discoverReadyDispatchCandidates(
         Object.freeze({
           externalIssueId,
           reason: Object.freeze({ code: "dependencies_unparsed" as const }),
+        }),
+      );
+      continue;
+    }
+    if (template.skillSelections?.kind === "unparsed") {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "skills_unparsed" as const }),
         }),
       );
       continue;
@@ -301,6 +315,7 @@ export async function projectIssueByExternalId(
   if (!snapshot.ok) return snapshot;
   const template = parseReadyGateTemplate(snapshot.value.description);
   if (template.dependencies.kind === "unparsed") return err(domainError("conflict"));
+  if (template.skillSelections?.kind === "unparsed") return err(domainError("conflict"));
   return toDomainIssue(project, snapshot.value, {
     ...template,
     dependencies: template.dependencies,

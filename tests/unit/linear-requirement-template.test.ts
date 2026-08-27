@@ -484,4 +484,71 @@ describe("parseReadyGateTemplate", () => {
       expect(parseReadyGateTemplate(description).inScope).toBeUndefined();
     });
   });
+
+  describe("explicit Skill selections", () => {
+    it("parses exact CommonMark bullets as required selections in source order", () => {
+      const description = `## ${readyGateTemplateHeadings.skillSelections}
+- godot-camera-systems
+* godot-physics-3d
++ godot-raycasting-queries`;
+
+      expect(parseReadyGateTemplate(description).skillSelections).toEqual({
+        kind: "selected",
+        selections: [
+          { name: "godot-camera-systems", requirement: "required" },
+          { name: "godot-physics-3d", requirement: "required" },
+          { name: "godot-raycasting-queries", requirement: "required" },
+        ],
+      });
+    });
+
+    it("accepts a syntactically valid unknown name and leaves catalog membership to admission", () => {
+      const description = `## ${readyGateTemplateHeadings.skillSelections}\n- future-project-skill`;
+      expect(parseReadyGateTemplate(description).skillSelections).toEqual({
+        kind: "selected",
+        selections: [{ name: "future-project-skill", requirement: "required" }],
+      });
+    });
+
+    it.each([
+      ["missing heading", `## ${readyGateTemplateHeadings.goal}\n目標`],
+      ["explicit none", `## ${readyGateTemplateHeadings.skillSelections}\n無`],
+    ])("omits skillSelections for %s", (_name, description) => {
+      expect(parseReadyGateTemplate(description).skillSelections).toBeUndefined();
+    });
+
+    it.each([
+      ["empty body", ""],
+      ["placeholder", "（請填寫）"],
+      ["free text", "godot-camera-systems"],
+      ["ordered list", "1. godot-camera-systems"],
+      ["inline reason", "- godot-camera-systems：需要鏡頭跟隨"],
+      ["invalid uppercase", "- Godot-Camera-Systems"],
+      ["bulleted none", "- 無"],
+      ["duplicate", "- godot-camera-systems\n- godot-camera-systems"],
+    ])("fails closed for %s", (_name, body) => {
+      const description = `## ${readyGateTemplateHeadings.skillSelections}\n${body}`;
+      expect(parseReadyGateTemplate(description).skillSelections).toEqual({ kind: "unparsed" });
+    });
+
+    it("fails closed when the Skill heading is duplicated", () => {
+      const description = `## ${readyGateTemplateHeadings.skillSelections}
+- godot-camera-systems
+
+## ${readyGateTemplateHeadings.skillSelections}
+- godot-physics-3d`;
+      expect(parseReadyGateTemplate(description).skillSelections).toEqual({ kind: "unparsed" });
+    });
+
+    it("ignores heading-looking text inside fences and block quotes", () => {
+      const description = `## ${readyGateTemplateHeadings.risks}
+\`\`\`
+## ${readyGateTemplateHeadings.skillSelections}
+- forged-skill
+\`\`\`
+> ## ${readyGateTemplateHeadings.skillSelections}
+> - quoted-skill`;
+      expect(parseReadyGateTemplate(description).skillSelections).toBeUndefined();
+    });
+  });
 });

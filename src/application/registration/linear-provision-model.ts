@@ -193,6 +193,7 @@ export const readyGateTemplateHeadings = Object.freeze({
   constraints: "補充限制（選填）",
   risks: "預期風險（選填）",
   changeRegions: "預期變更區域（選填）",
+  skillSelections: "使用 Skills（選填）",
 } as const);
 
 export const humanSummaryTemplate = Object.freeze({
@@ -232,6 +233,9 @@ const readyGateTemplateDescription = `## ${humanSummaryTemplate.heading}
 ## ${readyGateTemplateHeadings.constraints}
 
 ## ${readyGateTemplateHeadings.risks}
+
+## ${readyGateTemplateHeadings.skillSelections}
+無
 
 ## ${readyGateTemplateHeadings.changeRegions}`;
 

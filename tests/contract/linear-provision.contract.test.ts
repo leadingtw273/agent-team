@@ -8,6 +8,7 @@ import {
 import {
   humanSummaryTemplate,
   linearProvisionDesiredObjects,
+  readyGateTemplateHeadings,
 } from "../../src/application/registration/index.js";
 import { domainError, err } from "../../src/domain/foundation/index.js";
 
@@ -54,6 +55,8 @@ describe("O003 Linear provision GraphQL contract", () => {
       serialized.indexOf("## 目標（必填）"),
     );
     expect(serialized).toContain("請用一句白話描述完成後的結果");
+    expect(serialized).toContain(`## ${readyGateTemplateHeadings.skillSelections}`);
+    expect(serialized).toContain(`## ${readyGateTemplateHeadings.skillSelections}\\n無`);
   });
 
   it("reads a strict ID inventory and only exposes proven label/template mutations", async () => {
