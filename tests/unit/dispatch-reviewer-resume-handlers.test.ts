@@ -139,4 +139,71 @@ describe("dispatch reviewer-resume", () => {
       },
     });
   });
+
+  it("narrowly recovers requires_manual(review_begin_failed) without accepting other manual causes", async () => {
+    const progress = await store();
+    await progress.compareAndSwap(jobId, null, {
+      ...record(),
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_begin_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    const handler = createReviewerResumeHandler({
+      progress,
+      stdin: stdin(reviewerResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ jobId });
+    expect(result.state).toBe("success");
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      nextStage: "awaiting_review",
+      recovery: "review_begin_failed",
+      admissionReleased: false,
+      implementerRerun: false,
+    });
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { stage: { kind: "awaiting_review" } },
+    });
+  });
+
+  it("does not recover a different requires_manual review cause", async () => {
+    const progress = await store();
+    await progress.compareAndSwap(jobId, null, {
+      ...record(),
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_provider_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+    const handler = createReviewerResumeHandler({
+      progress,
+      stdin: stdin(reviewerResumeConfirmationPhrase),
+    });
+
+    const result = await handler({ jobId });
+    expect(result.state).toBe("failed");
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      reason: "job_not_waiting_for_reviewer",
+      currentStage: "requires_manual",
+    });
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: {
+        stage: {
+          kind: "requires_manual",
+          cause: { reasonCode: "review_provider_failed" },
+        },
+      },
+    });
+  });
 });

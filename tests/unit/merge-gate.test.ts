@@ -500,6 +500,31 @@ describe("review commit status coordination", () => {
     expect(complete.sourceControl.setCommitStatus).not.toHaveBeenCalled();
   });
 
+  it("reuses Agent Team's exact pending status on reviewer retry without a duplicate mutation", async () => {
+    const pending = reviewPorts({
+      statuses: {
+        headSha,
+        statuses: [
+          {
+            context: REVIEW_STATUS_CONTEXT,
+            state: "pending",
+            description: "Agent Team reviewer is evaluating this exact commit",
+          },
+        ],
+      },
+    });
+
+    expect(
+      await new ReviewStatusCoordinator(pending).begin({
+        project,
+        changeRequestId: "42",
+        expectedHeadSha: headSha,
+        idempotencyKeyPrefix: "review:retry",
+      }),
+    ).toMatchObject({ state: "pending" });
+    expect(pending.sourceControl.setCommitStatus).not.toHaveBeenCalled();
+  });
+
   it("records structured evidence before publishing exact-SHA success", async () => {
     const calls: string[] = [];
     const ports = reviewPorts({ calls });

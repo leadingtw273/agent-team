@@ -66,7 +66,12 @@ export function createReviewerResumeHandler(
         ...(!loaded.ok ? { errorCode: loaded.error.code } : {}),
       });
     }
-    if (loaded.value.stage.kind !== "reviewer_waiting") {
+    const stage = loaded.value.stage;
+    const recoverableBeginFailure =
+      stage.kind === "requires_manual" &&
+      stage.cause?.stage === "review" &&
+      stage.cause.reasonCode === "review_begin_failed";
+    if (stage.kind !== "reviewer_waiting" && !recoverableBeginFailure) {
       return outcome("failed", {
         operation: "dispatch_reviewer_resume",
         state: "blocked",
@@ -75,14 +80,15 @@ export function createReviewerResumeHandler(
       });
     }
     if (
-      loaded.value.stage.retryNotBefore !== undefined &&
-      Date.parse(clock.now()) < Date.parse(loaded.value.stage.retryNotBefore)
+      stage.kind === "reviewer_waiting" &&
+      stage.retryNotBefore !== undefined &&
+      Date.parse(clock.now()) < Date.parse(stage.retryNotBefore)
     ) {
       return outcome("failed", {
         operation: "dispatch_reviewer_resume",
         state: "blocked",
         reason: "reset_not_reached",
-        retryNotBefore: loaded.value.stage.retryNotBefore,
+        retryNotBefore: stage.retryNotBefore,
       });
     }
     const written = await options.progress.compareAndSwap(input.jobId, loaded.value.revision, {
@@ -104,6 +110,7 @@ export function createReviewerResumeHandler(
       nextStage: "awaiting_review",
       admissionReleased: false,
       implementerRerun: false,
+      recovery: recoverableBeginFailure ? "review_begin_failed" : "reviewer_waiting",
     });
   };
 }
