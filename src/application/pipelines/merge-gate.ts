@@ -324,13 +324,28 @@ export class ReviewStatusCoordinator {
     if (!sameSha(statuses.value.headSha, request.expectedHeadSha)) {
       return reviewFailure("status", domainError("conflict"));
     }
-    if (
-      statuses.value.statuses.some(
-        (status) => status.context === REVIEW_STATUS_CONTEXT && status.state === "success",
-      )
-    ) {
+    const currentReviewStatus = statuses.value.statuses.find(
+      (status) => status.context === REVIEW_STATUS_CONTEXT,
+    );
+    if (currentReviewStatus?.state === "success") {
       return Object.freeze({
         state: "already_approved",
+        changeRequest: changeRequest.value,
+        checks: checks.value,
+      });
+    }
+
+    // A reviewer provider retry re-enters this coordinator for the same exact Head. The managed
+    // mutation fence correctly refuses to send an already-confirmed provider mutation twice, so
+    // recognize our own pending status from the authoritative read-back before asking the fence to
+    // write it again. A foreign/differently-described pending status is still overwritten below;
+    // only the exact status Agent Team owns is reusable.
+    if (
+      currentReviewStatus?.state === "pending" &&
+      currentReviewStatus.description === "Agent Team reviewer is evaluating this exact commit"
+    ) {
+      return Object.freeze({
+        state: "pending",
         changeRequest: changeRequest.value,
         checks: checks.value,
       });

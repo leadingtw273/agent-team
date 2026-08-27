@@ -450,7 +450,7 @@ export function createProgram(
     .command("reviewer-resume")
     .description(
       "在確認 Claude 可用後，將無可信 reset 的 reviewer_waiting job 受控移回 awaiting_review；" +
-        "不釋放 admission，也不重跑 implementer",
+        "也可窄恢復 requires_manual(review_begin_failed)；不釋放 admission，也不重跑 implementer",
     )
     .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
     .action((options: { readonly job: string }) =>
