@@ -222,10 +222,14 @@ function exactRejectedReviewCause(record: JobProgressRecord): boolean {
 }
 
 function exactRejectedReviewPostFixCause(record: JobProgressRecord): boolean {
-  return (
+  const stoppedAfterPostFixReview =
+    record.stage.kind === "paused" && record.stage.checkpointId !== undefined;
+  const waitingForPostPushReadback =
     record.stage.kind === "requires_manual" &&
     record.stage.cause?.stage === "setup" &&
-    record.stage.cause.reasonCode === "change_request_unavailable" &&
+    record.stage.cause.reasonCode === "change_request_unavailable";
+  return (
+    (waitingForPostPushReadback || stoppedAfterPostFixReview) &&
     record.reviewerReplay?.state === "attempting" &&
     record.headSha !== undefined &&
     record.headSha !== record.reviewerReplay.identity.headSha

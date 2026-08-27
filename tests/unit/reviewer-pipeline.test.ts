@@ -537,6 +537,92 @@ function fixture(input: ReturnType<typeof request>, options: FixtureOptions = {}
 }
 
 describe("ReviewerPipeline", () => {
+  it("gives the reviewer a safe role-scoped SkillSnapshot read-back", async () => {
+    const base = request("code_review");
+    const issueWithSkills = issueSchema.parse({
+      ...base.review.issue,
+      skillSelections: [
+        { name: "godot-project-foundations", requirement: "required" },
+        { name: "godot-gdscript-mastery", requirement: "required" },
+      ],
+    });
+    const requirement = createRequirementSnapshot(issueWithSkills, now);
+    if (!requirement.ok) throw new Error(requirement.error.code);
+    const skill = (name: string, requirementLevel: "required" | "optional") => ({
+      name,
+      displayName: name,
+      mode: "knowledge_only" as const,
+      source: {
+        repository: "https://example.invalid/skills.git",
+        commit: "1".repeat(40),
+        path: `skills/${name}`,
+        treeDigest: "2".repeat(64),
+      },
+      installedTreeDigest: "3".repeat(64),
+      fileDigests: { "SKILL.md": "4".repeat(64) },
+      allowedReferences: [],
+      requirement: requirementLevel,
+    });
+    const skillSnapshot = jobSkillSnapshotSchema.parse({
+      schemaVersion: 1,
+      jobId: base.value.job.id,
+      projectId: project.id,
+      skills: [
+        skill("godot-project-foundations", "required"),
+        skill("godot-testing-patterns", "optional"),
+      ],
+      omitted: [],
+    });
+    const input: ReviewerPipelineRequest = {
+      ...base.value,
+      job: job(requirement.value),
+      requirementSnapshot: requirement.value,
+      trustedConfig: trustedProjectConfigSchema.parse({
+        ...config,
+        skillPolicy: {
+          catalogId: "fixture-catalog",
+          catalogDigest: "5".repeat(64),
+          allowlist: ["godot-project-foundations", "godot-testing-patterns"],
+        },
+      }),
+      skillSnapshots: { code_reviewer: skillSnapshot },
+    };
+    const setup = fixture(
+      { review: base.review, value: input },
+      {
+        skillRuntime: {
+          admit: () => Promise.resolve(ok(skillSnapshot)),
+          materialize: () => Promise.resolve(ok([])),
+        },
+      },
+    );
+
+    await expect(setup.pipeline.run(input)).resolves.toMatchObject({ state: "approved" });
+    const evidence = setup.providerRequests[0]?.externalData.find(
+      (block) => block.kind === "text" && block.source === "agent-team:skill-snapshot",
+    );
+    expect(evidence?.kind).toBe("text");
+    if (evidence?.kind !== "text") return;
+    expect(JSON.parse(evidence.content)).toEqual({
+      schemaVersion: 1,
+      role: "code_reviewer",
+      selectionSemantics:
+        "explicitSelections are required by this Job; selected optional entries are project role defaults and do not alter the explicit declaration",
+      explicitSelections: [
+        { name: "godot-project-foundations", requirement: "required" },
+        { name: "godot-gdscript-mastery", requirement: "required" },
+      ],
+      selected: [
+        { name: "godot-project-foundations", requirement: "required" },
+        { name: "godot-testing-patterns", requirement: "optional" },
+      ],
+      omitted: [],
+    });
+    expect(evidence.content).not.toContain(base.value.job.id);
+    expect(evidence.content).not.toContain("treeDigest");
+    expect(evidence.content).not.toContain("installedTreeDigest");
+  });
+
   it("revalidates reviewer Skill content before PR mutation or Provider", async () => {
     const skillSnapshot = jobSkillSnapshotSchema.parse({
       schemaVersion: 1,

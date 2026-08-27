@@ -3119,6 +3119,14 @@ async function resumeReview(
           requiresManualCause("review", "review_record_failed"),
         );
       }
+      if (rejectedReviewRecovery) {
+        return requiresManual(
+          record,
+          deps,
+          "review_not_approved_after_recovery",
+          requiresManualCause("review", "review_not_approved"),
+        );
+      }
       return transitionOrReport(deps, record, { stage: { kind: "fix_round" } }, () => ({
         jobId: record.jobId,
         outcome: "fix_round",

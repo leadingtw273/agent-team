@@ -498,7 +498,10 @@ export function createProgram(
     )
     .option("--final-review-epoch", "只救回 exact paused(retry_exhausted) 最終代碼審查")
     .option("--expect-checkpoint <checkpoint-id>", "final-review epoch 綁定的既有 checkpoint id")
-    .option("--fix-rejected-review", "同一 Job／PR 修正一次已發布的 changes_requested 並重新審查")
+    .option(
+      "--fix-rejected-review",
+      "同一 Job／PR 修正一次已發布的 changes_requested，或在 clarification 證據補齊後重新審查",
+    )
     .action(
       (options: {
         readonly job: string;

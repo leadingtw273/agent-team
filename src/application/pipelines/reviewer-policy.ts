@@ -240,6 +240,27 @@ export function evidenceForReviewerRole(
       mediaType: "application/json",
       content: JSON.stringify(checks),
     },
+    ...(request.skillSnapshots?.[role] === undefined
+      ? []
+      : [
+          {
+            kind: "text" as const,
+            source: "agent-team:skill-snapshot",
+            mediaType: "application/json",
+            content: JSON.stringify({
+              schemaVersion: 1,
+              role,
+              selectionSemantics:
+                "explicitSelections are required by this Job; selected optional entries are project role defaults and do not alter the explicit declaration",
+              explicitSelections: request.requirementSnapshot.issue.skillSelections ?? [],
+              selected: request.skillSnapshots[role].skills.map((skill) => ({
+                name: skill.name,
+                requirement: skill.requirement,
+              })),
+              omitted: request.skillSnapshots[role].omitted,
+            }),
+          },
+        ]),
     ...selected.map((block) =>
       block.kind === "text"
         ? {
