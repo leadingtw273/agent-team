@@ -99,7 +99,7 @@ export interface CliHandlers {
     input: Readonly<{ projectId: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerResume: (
-    input: Readonly<{ jobId: string }>,
+    input: Readonly<{ jobId: string; recoverReadyIdempotency?: boolean }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplay: (
     input: Readonly<{
@@ -453,8 +453,17 @@ export function createProgram(
         "也可窄恢復 requires_manual(review_begin_failed)；不釋放 admission，也不重跑 implementer",
     )
     .requiredOption("--job <job-id>", "job-progress 記錄的 job id")
-    .action((options: { readonly job: string }) =>
-      action(state, io, () => handlers.dispatchReviewerResume({ jobId: options.job }))(),
+    .option(
+      "--recover-ready-idempotency",
+      "只在 requires_manual(review_provider_failed) 且已有 confirmed pr_ready 證據時恢復",
+    )
+    .action((options: { readonly job: string; readonly recoverReadyIdempotency?: boolean }) =>
+      action(state, io, () =>
+        handlers.dispatchReviewerResume({
+          jobId: options.job,
+          ...(options.recoverReadyIdempotency === true ? { recoverReadyIdempotency: true } : {}),
+        }),
+      )(),
     );
 
   dispatch
