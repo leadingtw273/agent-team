@@ -1075,13 +1075,14 @@ export class ReviewerReplayCoordinator {
       if (inspected.workStatus !== "in_progress" && inspected.workStatus !== "in_review") {
         return { state: "blocked", jobId, reason: "job_not_eligible" };
       }
-      const statusReader = deps.sourceControl.getCommitStatuses;
-      const commentReader = this.dependencies.publication.sourceControl.getChangeRequestComment;
-      if (statusReader === undefined || commentReader === undefined) {
+      if (
+        deps.sourceControl.getCommitStatuses === undefined ||
+        this.dependencies.publication.sourceControl.getChangeRequestComment === undefined
+      ) {
         return { state: "blocked", jobId, reason: "runtime_unavailable" };
       }
       const readOptions = signal === undefined ? {} : { signal };
-      const statuses = await statusReader(
+      const statuses = await deps.sourceControl.getCommitStatuses(
         { project: deps.project },
         candidate.headSha,
         readOptions,
@@ -1113,7 +1114,11 @@ export class ReviewerReplayCoordinator {
       if (commentId === undefined) {
         return { state: "blocked", jobId, reason: "review_evidence_mismatch" };
       }
-      const comment = await commentReader({ project: deps.project }, commentId, readOptions);
+      const comment = await this.dependencies.publication.sourceControl.getChangeRequestComment(
+        { project: deps.project },
+        commentId,
+        readOptions,
+      );
       if (!comment.ok) {
         return {
           state: "blocked",

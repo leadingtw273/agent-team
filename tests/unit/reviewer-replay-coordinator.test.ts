@@ -1102,8 +1102,9 @@ async function harness(
           calls.push("pr-summary");
           return Promise.resolve(ok({ id: "comment", url: "url", createdAt: now }));
         },
-        getChangeRequestComment: () =>
-          Promise.resolve(
+        getChangeRequestComment() {
+          void this.appendChangeRequestComment;
+          return Promise.resolve(
             ok({
               id: "5435569980",
               url: "https://github.com/owner/replay-test/pull/42#issuecomment-5435569980",
@@ -1113,7 +1114,8 @@ async function harness(
                   ? "invalid evidence"
                   : rejectedReviewBody(snapshot.value.requirementsDigest),
             }),
-          ),
+          );
+        },
       },
       workManagement: {
         appendComment: (_ref, body) => {
