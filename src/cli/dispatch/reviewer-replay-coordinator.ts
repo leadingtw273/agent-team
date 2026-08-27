@@ -364,6 +364,7 @@ async function inspectReplay(
     deadlineAt: deadline.value,
     idempotencyKeyPrefix: `reviewer-replay:${record.jobId}:inspection`,
     attemptAccounting: "reviewer_replay",
+    ...(record.skillSnapshots === undefined ? {} : { skillSnapshots: record.skillSnapshots }),
     ...(signal === undefined ? {} : { signal }),
   };
   const inspect = deps.reviewer.inspect;
