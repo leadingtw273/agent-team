@@ -99,7 +99,11 @@ export interface CliHandlers {
     input: Readonly<{ projectId: string }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerResume: (
-    input: Readonly<{ jobId: string; recoverReadyIdempotency?: boolean }>,
+    input: Readonly<{
+      jobId: string;
+      recoverReadyIdempotency?: boolean;
+      recoverRecordPrepublication?: boolean;
+    }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchReviewerReplay: (
     input: Readonly<{
@@ -457,13 +461,25 @@ export function createProgram(
       "--recover-ready-idempotency",
       "只在 requires_manual(review_provider_failed) 且已有 confirmed pr_ready 證據時恢復",
     )
-    .action((options: { readonly job: string; readonly recoverReadyIdempotency?: boolean }) =>
-      action(state, io, () =>
-        handlers.dispatchReviewerResume({
-          jobId: options.job,
-          ...(options.recoverReadyIdempotency === true ? { recoverReadyIdempotency: true } : {}),
-        }),
-      )(),
+    .option(
+      "--recover-record-prepublication",
+      "只在 requires_manual(review_record_failed) 且沒有任何審查發布嘗試時恢復",
+    )
+    .action(
+      (options: {
+        readonly job: string;
+        readonly recoverReadyIdempotency?: boolean;
+        readonly recoverRecordPrepublication?: boolean;
+      }) =>
+        action(state, io, () =>
+          handlers.dispatchReviewerResume({
+            jobId: options.job,
+            ...(options.recoverReadyIdempotency === true ? { recoverReadyIdempotency: true } : {}),
+            ...(options.recoverRecordPrepublication === true
+              ? { recoverRecordPrepublication: true }
+              : {}),
+          }),
+        )(),
     );
 
   dispatch

@@ -292,4 +292,92 @@ describe("dispatch reviewer-resume", () => {
       reason: "job_not_waiting_for_reviewer",
     });
   });
+
+  it("recovers review_record_failed only before any review publication attempt", async () => {
+    const progress = await store();
+    await progress.compareAndSwap(jobId, null, {
+      ...record(),
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_record_failed",
+          attempts: { count: 1 },
+        },
+      },
+    });
+
+    await expect(
+      createReviewerResumeHandler({
+        progress,
+        stdin: stdin(reviewerResumeConfirmationPhrase),
+      })({ jobId }),
+    ).resolves.toMatchObject({ state: "failed" });
+    const result = await createReviewerResumeHandler({
+      progress,
+      stdin: stdin(reviewerResumeConfirmationPhrase),
+    })({ jobId, recoverRecordPrepublication: true });
+
+    expect(result.state).toBe("success");
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      nextStage: "awaiting_review",
+      recovery: "review_record_prepublication",
+      admissionReleased: false,
+      implementerRerun: false,
+    });
+  });
+
+  it("rejects record recovery after any review publication attempt", async () => {
+    const progress = await store();
+    const mutation = {
+      ...record(),
+      stage: {
+        kind: "requires_manual",
+        cause: {
+          stage: "review",
+          reasonCode: "review_record_failed",
+          attempts: { count: 1 },
+        },
+      },
+      controlFence: {
+        leaseId: "lease_018f47d2-77a4-7cc1-8ef2-0123456789ab" as never,
+        holderId: "reviewer-resume-test",
+        leaseEpoch: 1,
+        ownershipEpoch: 1,
+        state: "active",
+      },
+      mutationAttempts: [
+        {
+          operationKey: "managed:job:pr_comment:digest",
+          intent: "pr_comment",
+          identityDigest: "a".repeat(64),
+          attempts: [{ ordinal: 1, preparedAt: now, outcome: "prepared" as const }],
+        },
+      ],
+    } satisfies JobProgressRecordMutation;
+    const seeded = await progress.compareAndSwap(jobId, null, mutation);
+    if (!seeded.ok) throw new Error(seeded.error.code);
+    const confirmed = await progress.compareAndSwap(jobId, seeded.value.revision, {
+      ...mutation,
+      mutationAttempts: mutation.mutationAttempts.map((entry) => ({
+        ...entry,
+        attempts: entry.attempts.map((attempt) => ({ ...attempt, outcome: "confirmed" as const })),
+      })),
+    });
+    if (!confirmed.ok) throw new Error(confirmed.error.code);
+
+    const result = await createReviewerResumeHandler({
+      progress,
+      stdin: stdin(reviewerResumeConfirmationPhrase),
+    })({ jobId, recoverRecordPrepublication: true });
+
+    expect(result.state).toBe("failed");
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      reason: "job_not_waiting_for_reviewer",
+    });
+    await expect(progress.load(jobId)).resolves.toMatchObject({
+      ok: true,
+      value: { stage: { kind: "requires_manual" } },
+    });
+  });
 });
