@@ -420,6 +420,7 @@ async function harness(
     prCommentAttempt?: boolean;
     reviewerSkills?: boolean;
     rejectedFix?: boolean;
+    postFixContinuation?: boolean;
     rejectionEvidenceMismatch?: boolean;
   }> = {},
 ): Promise<Harness> {
@@ -513,19 +514,29 @@ async function harness(
     stage: {
       kind: "requires_manual",
       cause: {
-        stage: "review",
-        ...(overrides.rejectedFix === true
-          ? { reasonCode: "review_not_approved" as const, attempts: { count: 2 } }
-          : {
-              reasonCode: "review_report_contract" as const,
-              attempts: { count: 2, lastCategory: "missing_field" as const },
-            }),
+        ...(overrides.postFixContinuation === true
+          ? {
+              stage: "setup" as const,
+              reasonCode: "change_request_unavailable" as const,
+              attempts: { count: 1 },
+            }
+          : overrides.rejectedFix === true
+            ? {
+                stage: "review" as const,
+                reasonCode: "review_not_approved" as const,
+                attempts: { count: 2 },
+              }
+            : {
+                stage: "review" as const,
+                reasonCode: "review_report_contract" as const,
+                attempts: { count: 2, lastCategory: "missing_field" as const },
+              }),
       },
     },
     branch: "agent-team/replay",
     worktreePath: "/tmp/reviewer-replay-project",
     changeRequestId: "42",
-    headSha,
+    headSha: overrides.postFixContinuation === true ? repairedHeadSha : headSha,
     baseRevision,
     ...(overrides.reviewerSkills !== true
       ? {}
@@ -545,7 +556,9 @@ async function harness(
     overrides.seedReplay === undefined
       ? {
           ...baseProgress,
-          ...(overrides.rejectedFix === true ? { reviewerReplay: legacyReplay } : {}),
+          ...(overrides.rejectedFix === true || overrides.postFixContinuation === true
+            ? { reviewerReplay: legacyReplay }
+            : {}),
           ...(overrides.finalReview === true
             ? { stage: { kind: "paused" as const, checkpointId: finalCheckpointId } }
             : {}),
@@ -662,8 +675,15 @@ async function harness(
   let inspectIndex = 0;
   let reviewRecordCalls = 0;
   let reviewStatusState: "pending" | "success" = "pending";
-  let liveHeadSha = headSha;
-  const jobs = [job(overrides.finalReview === true)];
+  let liveHeadSha = overrides.postFixContinuation === true ? repairedHeadSha : headSha;
+  const jobs = [
+    overrides.postFixContinuation === true
+      ? jobSchema.parse({
+          ...job(),
+          attempts: { ...emptyAttemptCounters(), reviewerFixRounds: 1, reviewRuns: 3 },
+        })
+      : job(overrides.finalReview === true),
+  ];
   const reviewer = {
     inspect: (request: ReviewerPipelineRequest) => {
       calls.push("inspect");
@@ -968,7 +988,7 @@ async function harness(
     reviewStatus: {
       begin: () => {
         calls.push("reviewStatus.begin");
-        if (overrides.rejectedFix === true) {
+        if (overrides.rejectedFix === true || overrides.postFixContinuation === true) {
           return Promise.resolve({
             state: "not_ready" as const,
             reason: "ci_pending" as const,
@@ -1187,6 +1207,25 @@ describe("ReviewerReplayCoordinator", () => {
     const result = await value.coordinator.run(jobId, false, { fixRejectedReview: true });
 
     expect(result).toMatchObject({ state: "blocked", reason: "review_evidence_mismatch" });
+    expect(value.calls).not.toContain("reviewerRecovery.run");
+  });
+
+  it("resumes an exact post-push Head after GitHub read-back has converged without another fixer", async () => {
+    const value = await harness([], { postFixContinuation: true });
+    const preview = await value.coordinator.run(jobId, true, { fixRejectedReview: true });
+
+    expect(preview).toMatchObject({
+      state: "ready",
+      plannedMutations: ["resume-repaired-head", "fresh-review", "existing-merge-lifecycle"],
+    });
+    const result = await value.coordinator.run(jobId, false, { fixRejectedReview: true });
+
+    expect(result).toMatchObject({
+      state: "repaired",
+      sourceHeadSha: headSha,
+      repairedHeadSha,
+      outcome: { outcome: "still_ci_waiting" },
+    });
     expect(value.calls).not.toContain("reviewerRecovery.run");
   });
 

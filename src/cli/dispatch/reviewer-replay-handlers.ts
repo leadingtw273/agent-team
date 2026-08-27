@@ -160,8 +160,13 @@ export function createReviewerReplayHandlers(options: CreateReviewerReplayHandle
     const ordinaryEligible = isReviewerReplayCommandEligible(record.value);
     const rejectedFixEligible =
       record.value.stage.kind === "requires_manual" &&
-      record.value.stage.cause?.stage === "review" &&
-      record.value.stage.cause.reasonCode === "review_not_approved";
+      ((record.value.stage.cause?.stage === "review" &&
+        record.value.stage.cause.reasonCode === "review_not_approved") ||
+        (record.value.stage.cause?.stage === "setup" &&
+          record.value.stage.cause.reasonCode === "change_request_unavailable" &&
+          record.value.reviewerReplay?.state === "attempting" &&
+          record.value.headSha !== undefined &&
+          record.value.headSha !== record.value.reviewerReplay.identity.headSha));
     if (!finalReviewEpoch && !ordinaryEligible && !(fixRejectedReview && rejectedFixEligible)) {
       return outcome("blocked", {
         operation: "reviewer-replay",
