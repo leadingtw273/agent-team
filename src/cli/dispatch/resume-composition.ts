@@ -71,7 +71,7 @@ import {
   type HeadSha,
 } from "../../domain/review/index.js";
 import { checkpointIdSchema, type VisualManifest } from "../../domain/checkpoint/index.js";
-import { watchdogHardStopMs } from "../../domain/jobs/index.js";
+import { attemptLimits, watchdogHardStopMs } from "../../domain/jobs/index.js";
 import type { Project } from "../../domain/project/index.js";
 import {
   projectIssueByExternalId,
@@ -2651,6 +2651,11 @@ async function resumeReview(
   const expectedHeadSha = context.changeRequest.headSha;
   const reviewerReplayCheckpoint =
     record.reviewerReplay?.state === "review_succeeded" ? record.reviewerReplay : undefined;
+  const rejectedReviewRecovery =
+    record.reviewerReplay?.state === "attempting" &&
+    record.reviewerReplay.identity.headSha !== expectedHeadSha &&
+    context.job.attempts.reviewerFixRounds === 1 &&
+    context.job.attempts.reviewRuns >= attemptLimits.reviewRuns;
   const beginReview = async (): Promise<ResumeJobOutcome | undefined> => {
     const begin = await whileResumeLeaseHeld(deps, () =>
       deps.reviewStatus.begin({
@@ -2919,6 +2924,7 @@ async function resumeReview(
     ...(publicationDigest === undefined ? {} : { publicationDigest }),
     deadlineAt: reviewDeadline,
     idempotencyKeyPrefix: `${context.idempotencyKeyPrefix}:review`,
+    ...(rejectedReviewRecovery ? { attemptAccounting: "reviewer_replay" as const } : {}),
     ...(deps.signal === undefined ? {} : { signal: deps.signal }),
     ...(reportRetryFeedback === undefined ? {} : { reportRetryFeedback }),
     ...(record.skillSnapshots === undefined ? {} : { skillSnapshots: record.skillSnapshots }),
@@ -3137,6 +3143,14 @@ async function resumeReview(
           `review_record_failed:${record$.stage}:${record$.error.code}`,
           record$.error,
           requiresManualCause("review", "review_record_failed"),
+        );
+      }
+      if (rejectedReviewRecovery) {
+        return requiresManual(
+          record,
+          deps,
+          "review_not_approved_after_recovery",
+          requiresManualCause("review", "review_not_approved"),
         );
       }
       const fixLifecycleGate = await gateWorkStatusLifecycle(record, deps, {

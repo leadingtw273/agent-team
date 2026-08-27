@@ -12,6 +12,7 @@ export * from "./lifecycle.js";
 export * from "./merge-gate-model.js";
 export * from "./merge-gate.js";
 export * from "./reviewer-model.js";
+export * from "./review-evidence.js";
 export * from "./reviewer.js";
 export * from "./reviewer-report-diagnostics.js";
 export * from "./reviewer-recovery-model.js";

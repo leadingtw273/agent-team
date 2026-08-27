@@ -2013,6 +2013,81 @@ describe("runResumeCycle", () => {
     });
   });
 
+  it("re-reviews a repaired replay rejection once without consuming another Job review run or fixer", async () => {
+    const recoveryJob = job({
+      attempts: { ...emptyAttemptCounters(), reviewerFixRounds: 1, reviewRuns: 3 },
+    });
+    const repairedIdentity = {
+      requirementsDigest: "c".repeat(64) as never,
+      headSha: "e".repeat(40) as never,
+      diffDigest: "d".repeat(64) as never,
+    };
+    const { deps, progress, jobRepository, calls, reviewerRequests } = await harness({
+      changeRequestState: { headSha: repairedIdentity.headSha },
+      reviewerOutcome: {
+        state: "changes_requested",
+        job: recoveryJob,
+        changeRequest: changeRequest({ headSha: repairedIdentity.headSha }),
+        checks: {} as never,
+        identity: repairedIdentity,
+        reports: [],
+        findings: [],
+      },
+      recordOutcome: {
+        state: "rejected",
+        reason: "changes_requested",
+        evidenceComment: {} as never,
+      },
+    });
+    const sourceReplayIdentity = {
+      schemaVersion: 1 as const,
+      jobId,
+      projectId,
+      issueId,
+      externalIssueId,
+      changeRequestId: "42",
+      baseRevision,
+      requirementsDigest: "c".repeat(64),
+      headSha,
+      diffDigest: "d".repeat(64),
+    };
+    const sourceReplayDigest = sha256Digest(sourceReplayIdentity);
+    expect(sourceReplayDigest.ok).toBe(true);
+    if (!sourceReplayDigest.ok) return;
+    await seedProgressRecord(
+      progress,
+      { kind: "ci_waiting" },
+      {
+        headSha: repairedIdentity.headSha,
+        reviewerReplay: {
+          state: "attempting",
+          identity: sourceReplayIdentity,
+          identityDigest: sourceReplayDigest.value,
+          counters: { providerAttempts: 0, formatFailures: 0, transportFailures: 0 },
+        },
+      },
+    );
+    const jobs = await jobRepository.readAll();
+    expect(jobs.ok).toBe(true);
+    if (!jobs.ok || jobs.value[0] === undefined) return;
+    await jobRepository.update(recoveryJob, { idempotencyKey: "test:rejected-review-recovery" });
+
+    const result = await runResumeCycle(deps);
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [{ jobId, outcome: "requires_manual", reason: "review_not_approved_after_recovery" }],
+    });
+    expect(reviewerRequests).toHaveLength(1);
+    expect(reviewerRequests[0]).toMatchObject({ attemptAccounting: "reviewer_replay" });
+    expect(calls).not.toContain("reviewerRecovery.run");
+    const persistedJobs = await jobRepository.readAll();
+    expect(persistedJobs.ok && persistedJobs.value[0]?.attempts).toMatchObject({
+      reviewerFixRounds: 1,
+      reviewRuns: 3,
+    });
+  });
+
   it("clarification_required keeps the existing fix_round transition without reviewer recovery", async () => {
     const { deps, progress, calls } = await harness({
       reviewerOutcome: {

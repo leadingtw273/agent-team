@@ -1,5 +1,9 @@
 import {
   REVIEW_STATUS_CONTEXT,
+  parsePublishedReviewEvidence,
+  publishedIdentityMatches,
+  type PublishedReviewEvidence,
+  type ReviewFinding,
   type ReviewerPipelineOutcome,
   type ReviewerPipelineRequest,
   type VisualEvidenceBuildSuccess,
@@ -14,6 +18,7 @@ import { defaultLeaseDurationMs } from "../../application/leases/index.js";
 import { attemptLimits, leaseState, watchdogHardStopMs } from "../../domain/jobs/index.js";
 import {
   createRequirementSnapshot,
+  headShaSchema,
   sha256Digest,
   type ReviewIdentity,
 } from "../../domain/review/index.js";
@@ -40,11 +45,15 @@ import type {
 import type { FileReviewerReplayDiagnosticStore } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import type { ReviewerReplayDiagnosticEntry } from "../../adapters/dispatch/reviewer-replay-diagnostic-store.js";
 import type {
+  ChangeRequestCommentSnapshot,
   ChangeRequestSnapshot,
   CommitChecksSnapshot,
+  ReadOptions,
   SourceControlPort,
+  SourceControlRepositoryRef,
   WorkManagementPort,
 } from "../../application/ports/index.js";
+import type { AsyncPortResult } from "../../application/ports/common.js";
 import {
   createReviewerReplayIdentity,
   createReviewerReplayIdentityForCheckpoint,
@@ -59,6 +68,7 @@ import {
   type ResumeJobOutcome,
 } from "./resume-composition.js";
 import { isReviewRecordPrepublicationFailure } from "./reviewer-resume-handlers.js";
+import { buildDirective } from "./implementer-request.js";
 
 const maximumReplayAttempts = 2;
 const transportRetryBackoffMs = 1_000;
@@ -97,7 +107,11 @@ export type ReviewerReplayBlockedReason =
   | "final_review_not_supported"
   | "final_review_status_mismatch"
   | "final_pre_provider_failure"
-  | "final_provider_outcome_unknown";
+  | "final_provider_outcome_unknown"
+  | "review_evidence_unavailable"
+  | "review_evidence_mismatch"
+  | "fixer_budget_exhausted"
+  | "fixer_failed";
 
 export type ReviewerReplayOutcome =
   | Readonly<{
@@ -117,6 +131,13 @@ export type ReviewerReplayOutcome =
       outcome: ResumeJobOutcome;
     }>
   | Readonly<{
+      state: "repaired";
+      jobId: string;
+      sourceHeadSha: string;
+      repairedHeadSha: string;
+      outcome: ResumeJobOutcome;
+    }>
+  | Readonly<{
       state: "blocked";
       jobId: string;
       reason: ReviewerReplayBlockedReason;
@@ -127,7 +148,14 @@ export type ReviewerReplayOutcome =
     }>;
 
 export interface ReviewerReplayPublicationPorts {
-  readonly sourceControl: Pick<SourceControlPort, "appendChangeRequestComment">;
+  readonly sourceControl: Pick<SourceControlPort, "appendChangeRequestComment"> &
+    Readonly<{
+      getChangeRequestComment?: (
+        repository: SourceControlRepositoryRef,
+        commentId: string,
+        options?: ReadOptions,
+      ) => AsyncPortResult<ChangeRequestCommentSnapshot>;
+    }>;
   readonly workManagement: Pick<WorkManagementPort, "appendComment">;
 }
 
@@ -148,6 +176,7 @@ export interface ReviewerReplayRunOptions {
   readonly expectContractVersion?: number;
   readonly finalReviewEpoch?: boolean;
   readonly expectCheckpoint?: string;
+  readonly fixRejectedReview?: boolean;
 }
 
 interface ReplayInspection {
@@ -182,6 +211,49 @@ function exactReplayCause(record: JobProgressRecord): boolean {
     record.stage.cause?.stage === "review" &&
     record.stage.cause.reasonCode === "review_report_contract"
   );
+}
+
+function exactRejectedReviewCause(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "review" &&
+    record.stage.cause.reasonCode === "review_not_approved"
+  );
+}
+
+function sourceReviewIdentity(
+  record: JobProgressRecord,
+): PublishedReviewEvidence["identity"] | undefined {
+  const replay = record.reviewerReplay;
+  if (replay?.state !== "attempting") return undefined;
+  return {
+    requirementsDigest: replay.identity.requirementsDigest,
+    headSha: replay.identity.headSha,
+    diffDigest: replay.identity.diffDigest,
+    ...(replay.identity.evidenceDigest === undefined
+      ? {}
+      : { evidenceDigest: replay.identity.evidenceDigest }),
+    ...(replay.identity.publicationDigest === undefined
+      ? {}
+      : { publicationDigest: replay.identity.publicationDigest }),
+  };
+}
+
+function evidenceCommentId(
+  targetUrl: string,
+  repository: string,
+  changeRequestId: string,
+): string | undefined {
+  try {
+    const url = new URL(targetUrl);
+    if (url.protocol !== "https:" || url.hostname !== "github.com") return undefined;
+    const expectedPath = `/${repository}/pull/${changeRequestId}`;
+    if (url.pathname !== expectedPath) return undefined;
+    const match = /^#issuecomment-([1-9][0-9]{0,19})$/u.exec(url.hash);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
 }
 
 function lifecycleContinuationCause(record: JobProgressRecord): boolean {
@@ -942,6 +1014,249 @@ async function publishFormatExhaustion(
 export class ReviewerReplayCoordinator {
   constructor(readonly dependencies: ReviewerReplayCoordinatorDependencies) {}
 
+  async #runRejectedReviewFix(
+    jobId: string,
+    dryRun: boolean,
+  ): Promise<ReviewerReplayOutcome> {
+    const deps = this.dependencies.resume;
+    const loaded = await deps.progress.load(jobId);
+    if (!loaded.ok || loaded.value === undefined) {
+      return {
+        state: "blocked",
+        jobId,
+        reason: loaded.ok ? "job_not_found" : "authoritative_read_failed",
+        ...(!loaded.ok ? { errorCode: loaded.error.code } : {}),
+      };
+    }
+    let record = loaded.value;
+    if (!exactRejectedReviewCause(record)) {
+      return { state: "blocked", jobId, reason: "job_not_eligible" };
+    }
+    const policy = await deps.reviewerReplayPolicy?.load(record.projectId);
+    if (policy === undefined || !policy.ok || policy.value?.enabled !== true) {
+      return {
+        state: "blocked",
+        jobId,
+        reason: policy !== undefined && !policy.ok ? "policy_read_failed" : "policy_disabled",
+        ...(policy !== undefined && !policy.ok ? { errorCode: policy.error.code } : {}),
+      };
+    }
+    const claimFailure = await admissionCheck(record, deps);
+    if (claimFailure !== undefined) return { state: "blocked", jobId, reason: claimFailure };
+    if (deps.prepare !== undefined) {
+      try {
+        await deps.prepare();
+      } catch {
+        return { state: "blocked", jobId, reason: "runtime_unavailable" };
+      }
+    }
+
+    const inspect = async (
+      candidate: JobProgressRecord,
+      signal?: AbortSignal,
+    ): Promise<
+      | Readonly<{ inspection: ReplayInspection; findings: readonly ReviewFinding[] }>
+      | ReviewerReplayOutcome
+    > => {
+      const sourceIdentity = sourceReviewIdentity(candidate);
+      if (
+        sourceIdentity === undefined ||
+        candidate.changeRequestId === undefined ||
+        candidate.headSha === undefined ||
+        candidate.reviewerReplay?.state !== "attempting"
+      ) {
+        return { state: "blocked", jobId, reason: "job_not_eligible" };
+      }
+      const inspected = await inspectReplay(candidate, deps, signal);
+      if (replayBlocked(inspected)) return inspected;
+      if (
+        inspected.request.job.attempts.reviewerFixRounds !== 0 ||
+        inspected.request.job.attempts.reviewRuns < attemptLimits.reviewRuns
+      ) {
+        return { state: "blocked", jobId, reason: "fixer_budget_exhausted" };
+      }
+      if (inspected.workStatus !== "in_progress" && inspected.workStatus !== "in_review") {
+        return { state: "blocked", jobId, reason: "job_not_eligible" };
+      }
+      const statusReader = deps.sourceControl.getCommitStatuses;
+      const commentReader = this.dependencies.publication.sourceControl.getChangeRequestComment;
+      if (statusReader === undefined || commentReader === undefined) {
+        return { state: "blocked", jobId, reason: "runtime_unavailable" };
+      }
+      const readOptions = signal === undefined ? {} : { signal };
+      const statuses = await statusReader(
+        { project: deps.project },
+        candidate.headSha,
+        readOptions,
+      );
+      if (!statuses.ok) {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "review_evidence_unavailable",
+          errorCode: statuses.error.code,
+        };
+      }
+      const reviewStatuses = statuses.value.statuses.filter(
+        (status) => status.context === REVIEW_STATUS_CONTEXT,
+      );
+      const status = reviewStatuses[0];
+      if (
+        reviewStatuses.length !== 1 ||
+        status?.state !== "failure" ||
+        status.targetUrl === undefined
+      ) {
+        return { state: "blocked", jobId, reason: "review_evidence_mismatch" };
+      }
+      const commentId = evidenceCommentId(
+        status.targetUrl,
+        deps.project.sourceControl.repository,
+        candidate.changeRequestId,
+      );
+      if (commentId === undefined) {
+        return { state: "blocked", jobId, reason: "review_evidence_mismatch" };
+      }
+      const comment = await commentReader({ project: deps.project }, commentId, readOptions);
+      if (!comment.ok) {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "review_evidence_unavailable",
+          errorCode: comment.error.code,
+        };
+      }
+      const evidence = parsePublishedReviewEvidence(comment.value.body);
+      if (
+        !evidence.ok ||
+        comment.value.url !== status.targetUrl ||
+        evidence.value.verdict !== "changes_requested" ||
+        evidence.value.findings.length === 0 ||
+        evidence.value.findings.some((finding) => finding.severity !== "blocking") ||
+        !publishedIdentityMatches(evidence.value.identity, sourceIdentity)
+      ) {
+        return { state: "blocked", jobId, reason: "review_evidence_mismatch" };
+      }
+      return Object.freeze({ inspection: inspected, findings: evidence.value.findings });
+    };
+
+    const admission = await inspect(record);
+    if ("state" in admission) return admission;
+    if (dryRun) {
+      return {
+        state: "ready",
+        jobId,
+        identityDigest: record.reviewerReplay?.identityDigest ?? "",
+        providerAttemptsUsed: 0,
+        providerAttemptsRemaining: 1,
+        plannedMutations: Object.freeze([
+          "one-reviewer-fix",
+          "push-repair",
+          "fresh-review",
+          "existing-merge-lifecycle",
+        ]),
+      };
+    }
+
+    const lease = await deps.leases.acquire({
+      jobId: record.jobId,
+      issueId: record.issueId,
+      holderId: deps.holderId,
+    });
+    if (!lease.ok) return { state: "blocked", jobId, reason: "lease_conflict" };
+    const beat = heartbeat(deps, lease.value.value.id, this.dependencies.leaseHeartbeatIntervalMs);
+    const guardedDeps: ResumeCycleDependencies = { ...deps, signal: beat.signal };
+    try {
+      const current = await guardedDeps.progress.load(jobId, { signal: beat.signal });
+      if (!current.ok || current.value?.revision !== record.revision) {
+        return { state: "blocked", jobId, reason: "candidate_changed" };
+      }
+      record = current.value;
+      const claimUnderLease = await admissionCheck(record, guardedDeps);
+      if (claimUnderLease !== undefined) {
+        return { state: "blocked", jobId, reason: claimUnderLease };
+      }
+      const currentAdmission = await inspect(record, beat.signal);
+      if ("state" in currentAdmission) return currentAdmission;
+      const deadline = instantFromDate(
+        new Date(Date.parse(guardedDeps.clock.now()) + watchdogHardStopMs),
+      );
+      if (!deadline.ok || record.providerAssignments === undefined) {
+        return { state: "blocked", jobId, reason: "runtime_unavailable" };
+      }
+      const recovery = await guardedDeps.reviewerRecovery.run({
+        job: currentAdmission.inspection.request.job,
+        project: guardedDeps.project,
+        trustedConfig: guardedDeps.trustedConfig,
+        requirementSnapshot: currentAdmission.inspection.request.requirementSnapshot,
+        worktree: currentAdmission.inspection.request.worktree,
+        model: record.providerAssignments.execution.model,
+        remote: "origin",
+        commitMessage: `${currentAdmission.inspection.request.requirementSnapshot.issue.title} (${record.externalIssueId}) Review 修復`,
+        controllerDirective: buildDirective(
+          currentAdmission.inspection.request.requirementSnapshot.issue,
+        ),
+        findings: currentAdmission.findings,
+        externalData: Object.freeze([]),
+        deadlineAt: deadline.value,
+        idempotencyKeyPrefix: `reviewer-rejection-fix:${jobId}:${record.headSha}`,
+        allowExhaustedReviewRuns: true,
+        signal: beat.signal,
+      });
+      if (recovery.state !== "repair_pushed") {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "fixer_failed",
+          ...(recovery.state === "failed" ? { errorCode: recovery.error.code } : {}),
+        };
+      }
+      const sourceHeadSha = record.headSha;
+      if (sourceHeadSha === undefined) {
+        return { state: "blocked", jobId, reason: "identity_mismatch" };
+      }
+      const afterFix = await guardedDeps.progress.load(jobId, { signal: beat.signal });
+      const repairedHeadSha = headShaSchema.safeParse(recovery.push.sha);
+      if (
+        !repairedHeadSha.success ||
+        !afterFix.ok ||
+        afterFix.value === undefined ||
+        !exactRejectedReviewCause(afterFix.value) ||
+        afterFix.value.headSha !== sourceHeadSha
+      ) {
+        return { state: "blocked", jobId, reason: "candidate_changed" };
+      }
+      const advanced = await guardedDeps.progress.compareAndSwap(
+        jobId,
+        afterFix.value.revision,
+        {
+          ...mutationFrom(afterFix.value),
+          stage: { kind: "ci_waiting" },
+          headSha: repairedHeadSha.data,
+        },
+        { signal: beat.signal },
+      );
+      if (!advanced.ok) {
+        return {
+          state: "blocked",
+          jobId,
+          reason: "checkpoint_write_failed",
+          errorCode: advanced.error.code,
+        };
+      }
+      const continued = await resumeUnderLease(advanced.value, guardedDeps);
+      return {
+        state: "repaired",
+        jobId,
+        sourceHeadSha,
+        repairedHeadSha: repairedHeadSha.data,
+        outcome: continued,
+      };
+    } finally {
+      await beat.stop();
+      await deps.leases.release({ leaseId: lease.value.value.id, holderId: deps.holderId });
+    }
+  }
+
   async #runFinalReview(
     jobId: string,
     dryRun: boolean,
@@ -1529,6 +1844,9 @@ export class ReviewerReplayCoordinator {
     dryRun: boolean,
     options: ReviewerReplayRunOptions = {},
   ): Promise<ReviewerReplayOutcome> {
+    if (options.fixRejectedReview === true) {
+      return this.#runRejectedReviewFix(jobId, dryRun);
+    }
     if (options.finalReviewEpoch === true) {
       return this.#runFinalReview(jobId, dryRun, options.expectCheckpoint);
     }

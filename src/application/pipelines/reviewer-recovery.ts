@@ -126,7 +126,8 @@ export class ReviewerRecoveryPipeline {
 
     if (
       request.job.attempts.reviewerFixRounds >= attemptLimits.reviewerFixRounds ||
-      request.job.attempts.reviewRuns >= attemptLimits.reviewRuns
+      (request.job.attempts.reviewRuns >= attemptLimits.reviewRuns &&
+        request.allowExhaustedReviewRuns !== true)
     ) {
       return this.#checkpoint(request, request.job, "attempt_limit_reached");
     }

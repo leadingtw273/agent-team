@@ -249,6 +249,21 @@ describe("ReviewerRecoveryPipeline", () => {
     expect(setup.calls).toEqual(["checkpoint:attempt_limit_reached"]);
   });
 
+  it("uses the ordinary one-round fixer budget for an explicit rejected-review recovery", async () => {
+    const setup = fixture();
+    const outcome = await setup.pipeline.run(
+      request({
+        job: job({ reviewerFixRounds: 0, reviewRuns: 3 }),
+        allowExhaustedReviewRuns: true,
+      }),
+    );
+
+    expect(outcome.state).toBe("repair_pushed");
+    expect(setup.calls.filter((call) => call === "provider:start")).toHaveLength(1);
+    expect(setup.persistedJobs).toHaveLength(1);
+    expect(outcome.job.attempts).toMatchObject({ reviewerFixRounds: 1, reviewRuns: 3 });
+  });
+
   it("runs the original implementer in the same worktree and durably increments reviewerFixRounds", async () => {
     const setup = fixture();
     const outcome = await setup.pipeline.run(

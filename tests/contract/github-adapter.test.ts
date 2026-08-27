@@ -547,6 +547,44 @@ describe("GitHub source-control adapter", () => {
     transport.expectDone();
   });
 
+  it("reads one exact issue comment by numeric id without mutation", async () => {
+    const transport = new ScriptedTransport([
+      {
+        assert: (arguments_) => {
+          expect(arguments_).toContain("repos/owner/repository/issues/comments/5435569980");
+          expect(arguments_).not.toContain("POST");
+          expect(arguments_).not.toContain("PATCH");
+        },
+        value: {
+          id: "5435569980",
+          url: "https://github.com/owner/repository/pull/42#issuecomment-5435569980",
+          createdAt: timestamp,
+          body: "Agent Team review evidence",
+        },
+      },
+    ]);
+
+    const result = await new GitHubAdapter(transport).getChangeRequestComment(
+      { project },
+      "5435569980",
+    );
+
+    expect(result.ok && result.value.body).toBe("Agent Team review evidence");
+    expect(result.ok && result.value.id).toBe("5435569980");
+    transport.expectDone();
+  });
+
+  it("rejects a non-numeric issue comment id before transport", async () => {
+    const transport = new ScriptedTransport([]);
+    const result = await new GitHubAdapter(transport).getChangeRequestComment(
+      { project },
+      "../../pulls/42",
+    );
+
+    expect(result.ok ? "ok" : result.error.code).toBe("external_failure");
+    transport.expectDone();
+  });
+
   it("fails closed for wrong providers, stale comment Heads, bad SHAs, and empty mutation keys", async () => {
     const linearProject = {
       ...project,

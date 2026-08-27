@@ -277,6 +277,14 @@ describe("reviewer-replay CLI outcome", () => {
     });
     expect(mutuallyExclusive.state).toBe("rejected");
     expect(mutuallyExclusive.message).toContain("contract_epoch_options_invalid");
+    const rejectedFixMutuallyExclusive = await handlers.reviewerReplay({
+      jobId,
+      newContractEpoch: true,
+      expectContractVersion: 2,
+      fixRejectedReview: true,
+    });
+    expect(rejectedFixMutuallyExclusive.state).toBe("rejected");
+    expect(rejectedFixMutuallyExclusive.message).toContain("contract_epoch_options_invalid");
   });
 });
 
