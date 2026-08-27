@@ -223,10 +223,7 @@ function readModel(
   };
 }
 
-function changeRequest(
-  state: "open" | "merged" = "open",
-  currentHeadSha = headSha,
-) {
+function changeRequest(state: "open" | "merged" = "open", currentHeadSha = headSha) {
   return {
     id: "PR_node",
     number: 42,

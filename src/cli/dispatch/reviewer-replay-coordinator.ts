@@ -1014,10 +1014,7 @@ async function publishFormatExhaustion(
 export class ReviewerReplayCoordinator {
   constructor(readonly dependencies: ReviewerReplayCoordinatorDependencies) {}
 
-  async #runRejectedReviewFix(
-    jobId: string,
-    dryRun: boolean,
-  ): Promise<ReviewerReplayOutcome> {
+  async #runRejectedReviewFix(jobId: string, dryRun: boolean): Promise<ReviewerReplayOutcome> {
     const deps = this.dependencies.resume;
     const loaded = await deps.progress.load(jobId);
     if (!loaded.ok || loaded.value === undefined) {
