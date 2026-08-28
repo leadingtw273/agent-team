@@ -147,6 +147,9 @@ describe("human acceptance MVP handlers", () => {
 
     expect(test.setWorkStatusCalls()).toBe(1);
     expect(test.comments.size).toBe(1);
+    expect([...test.comments.keys()]).toEqual([
+      `human-acceptance:${test.created.identityDigest}:accepted-comment`,
+    ]);
     await expect(test.store.listPending(projectId)).resolves.toEqual({ ok: true, value: [] });
     await expect(test.store.listForIssue(projectId, externalIssueId)).resolves.toMatchObject({
       ok: true,
@@ -165,6 +168,9 @@ describe("human acceptance MVP handlers", () => {
     ).resolves.toMatchObject({ state: "success" });
 
     expect(test.comments.size).toBe(1);
+    expect([...test.comments.keys()]).toEqual([
+      `human-acceptance:${test.created.identityDigest}:same-issue-rework`,
+    ]);
     expect(test.setWorkStatusCalls()).toBe(1);
     await expect(test.store.listPending(projectId)).resolves.toEqual({ ok: true, value: [] });
     await expect(test.store.listForIssue(projectId, externalIssueId)).resolves.toMatchObject({

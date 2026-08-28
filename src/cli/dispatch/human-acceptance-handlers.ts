@@ -279,7 +279,7 @@ export function createHumanAcceptanceHandlers(
       const comment = await runtime.value.workManagement.appendComment(
         { project: runtime.value.project, externalIssueId: input.externalIssueId },
         "產品負責人要求調整；舊的人工驗收 checkpoint 已關閉，本工單已回到待執行並將在同一張單接續返工。",
-        { idempotencyKey: `human-acceptance:${record.identityDigest}:adjustment-requested` },
+        { idempotencyKey: `human-acceptance:${record.identityDigest}:same-issue-rework` },
       );
       if (!comment.ok) {
         return outcome("failed", {
