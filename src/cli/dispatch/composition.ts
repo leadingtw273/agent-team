@@ -29,15 +29,17 @@
  * Wiring a collector alone is therefore **not sufficient** to make a real `run` dispatch: the
  * Linear projection and provider runner/liveness boundaries must also be complete.
  *
- * `active` is likewise always the empty set here -- this composition has no source of "jobs
- * currently in flight" (that is `pipeline` state, and C015a stands up no pipeline). This is safe
+ * Model execution occupancy is empty in this single-Job composition because the current process
+ * has not started a Provider call yet. Repository reservations are supplied separately by the
+ * production handler from durable Job progress, so waiting CI/review/human work lines still block
+ * overlapping candidates without falsely consuming a model slot. This is safe
  * against duplicate dispatch of the *same* issue because the real guard against that is not
  * `active`, it is the per-issue `Lease`: `canAcquireLease` (src/domain/jobs/lease.ts) treats an
  * active lease with a matching `issueId` (not just `jobId`) as a conflict, and `dispatchOnce`
  * always constructs a real `LeaseCoordinator` over the ports it is given (a real
  * `FileLeaseRepository` for a genuine run, an ephemeral in-memory one for `--dry-run` --
  * see `tests/unit/dispatch-once-lease-conflict.test.ts` for a real-file-backed proof of this).
- * The one residual gap `active:[]` leaves open: once a lease *expires* (its holder is presumed
+ * The one residual gap an empty execution-occupancy set leaves open: once a lease *expires* (its holder is presumed
  * dead), and the underlying Linear issue is still `ready` (C015a runs no pipeline, so nothing
  * ever moves it out of ready), a later `run` will create a *second* `Job` record for the same
  * issue -- this is judged acceptable, not a defect, because lease expiry's whole semantic is "the
@@ -73,6 +75,7 @@ import {
   Dispatcher,
   type DispatcherCandidate,
   type DispatcherResult,
+  type RepositoryReservation,
 } from "../../application/dispatch/index.js";
 import { LeaseCoordinator, type LeaseRepository } from "../../application/leases/index.js";
 import type { IssueScopeLockPort } from "../../application/pipelines/index.js";
@@ -339,7 +342,7 @@ export type DispatchOnceOutcome =
  * identical engine call, so a dry-run's prediction can never drift from what a real run does.
  *
  * C015o decision 3: closes the duplicate-dispatch gap this file's own header already disclosed
- * (`active:[]`'s "one residual gap" paragraph) -- a lease only guards *this* dispatch attempt's
+ * (the header's "one residual gap" paragraph) -- a lease only guards *this* dispatch attempt's
  * own execution window, and once a job reaches `requires_manual` (still genuinely unresolved) the
  * lease has long since been released, leaving nothing durable blocking a second dispatch for the
  * same still-`ready` Linear issue. The sequence, matching the decision's own literal ordering
@@ -373,7 +376,10 @@ export async function dispatchOnce(
   ready: DispatchCompositionReady,
   ports: DispatchOncePorts,
   holderId: string,
-  options: Readonly<{ allowOperatorCanary?: boolean }> = {},
+  options: Readonly<{
+    allowOperatorCanary?: boolean;
+    repositoryReservations?: readonly RepositoryReservation[];
+  }> = {},
 ): Promise<DispatchOnceOutcome> {
   const configuredMode = resolveWorkStatusLifecycleMode(ready.trustedConfig);
   let lifecycle: DispatchBootstrapInput["lifecycle"] = Object.freeze({ mode: "off" });
@@ -603,7 +609,8 @@ export async function dispatchOnce(
         holderId,
         candidates: claimedCandidates,
         registry: ready.registry,
-        active: [],
+        executionOccupancy: [],
+        repositoryReservations: options.repositoryReservations ?? [],
         routingConfig: ready.routingConfig,
         routeObservations: routeObservationsForAdmission,
       });

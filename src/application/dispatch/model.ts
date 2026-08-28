@@ -67,64 +67,42 @@ const dispatchCandidateSchema = z
 
 export type DispatchCandidate = z.infer<typeof dispatchCandidateSchema>;
 
-const activeDispatchSchema = z
+const modelExecutionOccupancySchema = z
+  .object({
+    jobId: z.string().trim().min(1).max(255),
+    projectId: z.string().trim().min(1).max(255),
+    provider: modelProviderSchema,
+  })
+  .strict();
+
+export type ModelExecutionOccupancy = z.infer<typeof modelExecutionOccupancySchema>;
+
+const repositoryReservationSchema = z
   .object({
     jobId: z.string().trim().min(1).max(255),
     projectId: z.string().trim().min(1).max(255),
     repositoryId: z.string().trim().min(1).max(255),
-    workKind: dispatchWorkKindSchema,
     stage: dispatchStageSchema,
-    provider: modelProviderSchema.optional(),
     declaredRegions: z.array(changeRegionSchema).min(1).max(100).optional(),
   })
-  .strict()
-  .superRefine((active, context) => {
-    if (active.workKind === "model" && active.provider === undefined) {
-      context.addIssue({
-        code: "custom",
-        message: "Active model work must retain its assigned provider.",
-        path: ["provider"],
-      });
-    }
-    if (active.workKind === "mechanical" && active.provider !== undefined) {
-      context.addIssue({
-        code: "custom",
-        message: "Mechanical work cannot consume a provider slot.",
-        path: ["provider"],
-      });
-    }
-    if (active.workKind === "mechanical" && !["ci", "webhook", "health"].includes(active.stage)) {
-      context.addIssue({
-        code: "custom",
-        message: "Mechanical work is limited to CI, webhook, and health stages.",
-        path: ["stage"],
-      });
-    }
-    if (active.workKind === "model" && ["ci", "webhook", "health"].includes(active.stage)) {
-      context.addIssue({
-        code: "custom",
-        message: "CI, webhook, and health stages must be mechanical.",
-        path: ["workKind"],
-      });
-    }
-  });
+  .strict();
 
-export type ActiveDispatch = z.infer<typeof activeDispatchSchema>;
+export type RepositoryReservation = z.infer<typeof repositoryReservationSchema>;
 
 const positiveSlotLimitSchema = z.number().int().positive().max(1_000);
 
 export const dispatchSlotLimitsSchema = z
   .object({
-    globalModelJobs: positiveSlotLimitSchema.default(2),
+    globalModelJobs: positiveSlotLimitSchema.default(4),
     perProviderModelJobs: z
       .object({
-        codex: positiveSlotLimitSchema.default(1),
+        codex: positiveSlotLimitSchema.default(3),
         claude: positiveSlotLimitSchema.default(1),
         gemini: positiveSlotLimitSchema.default(1),
       })
       .strict()
-      .default({ codex: 1, claude: 1, gemini: 1 }),
-    perProjectModelJobs: positiveSlotLimitSchema.default(2),
+      .default({ codex: 3, claude: 1, gemini: 1 }),
+    perProjectModelJobs: positiveSlotLimitSchema.default(4),
     perRepositoryIntegrationJobs: z.literal(1).default(1),
   })
   .strict();
@@ -132,9 +110,9 @@ export const dispatchSlotLimitsSchema = z
 export type DispatchSlotLimits = z.infer<typeof dispatchSlotLimitsSchema>;
 
 export const DEFAULT_DISPATCH_SLOT_LIMITS: DispatchSlotLimits = Object.freeze({
-  globalModelJobs: 2,
-  perProviderModelJobs: Object.freeze({ codex: 1, claude: 1, gemini: 1 }),
-  perProjectModelJobs: 2,
+  globalModelJobs: 4,
+  perProviderModelJobs: Object.freeze({ codex: 3, claude: 1, gemini: 1 }),
+  perProjectModelJobs: 4,
   perRepositoryIntegrationJobs: 1,
 });
 
@@ -161,7 +139,8 @@ const candidateObservationSchema = z
 export const dispatchDecisionInputSchema = z
   .object({
     candidates: z.array(dispatchCandidateSchema).max(10_000),
-    active: z.array(activeDispatchSchema).max(10_000),
+    executionOccupancy: z.array(modelExecutionOccupancySchema).max(10_000),
+    repositoryReservations: z.array(repositoryReservationSchema).max(10_000),
     routingConfig: z.unknown(),
     routeObservations: z.array(candidateObservationSchema).max(1_000),
     rotation: rotationCursorSchema,
@@ -177,19 +156,28 @@ export const dispatchDecisionInputSchema = z
         path: ["candidates"],
       });
     }
-    const activeJobIds = input.active.map((active) => active.jobId);
-    if (new Set(activeJobIds).size !== activeJobIds.length) {
+    const occupancyJobIds = input.executionOccupancy.map((entry) => entry.jobId);
+    if (new Set(occupancyJobIds).size !== occupancyJobIds.length) {
       context.addIssue({
         code: "custom",
-        message: "Active job IDs must be unique.",
-        path: ["active"],
+        message: "Model execution occupancy Job IDs must be unique.",
+        path: ["executionOccupancy"],
+      });
+    }
+    const reservationJobIds = input.repositoryReservations.map((entry) => entry.jobId);
+    if (new Set(reservationJobIds).size !== reservationJobIds.length) {
+      context.addIssue({
+        code: "custom",
+        message: "Repository reservation Job IDs must be unique.",
+        path: ["repositoryReservations"],
       });
     }
   });
 
 export interface DispatchDecisionInput {
   readonly candidates: readonly DispatchCandidate[];
-  readonly active: readonly ActiveDispatch[];
+  readonly executionOccupancy: readonly ModelExecutionOccupancy[];
+  readonly repositoryReservations: readonly RepositoryReservation[];
   readonly routingConfig: ModelRoutingConfig;
   readonly routeObservations: readonly CandidateObservation[];
   readonly rotation?: RotationCursor;

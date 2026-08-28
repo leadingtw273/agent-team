@@ -111,6 +111,43 @@ function baseRecord(overrides: Partial<JobProgressRecordMutation> = {}): JobProg
 }
 
 describe("FileJobProgressStore", () => {
+  it("persists an admission reservation once and rejects later narrowing or removal", async () => {
+    const store = new FileJobProgressStore(
+      await temporaryDirectory(),
+      undefined,
+      createFixedClock(now),
+    );
+    const reservation = {
+      repositoryId: "github:leadingtw273/agent-team",
+      declaredRegions: [{ path: "src/application/dispatch", coverage: "subtree" as const }],
+    };
+    const created = await store.compareAndSwap(
+      jobId,
+      null,
+      baseRecord({ admissionReservation: reservation }),
+    );
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const narrowed = await store.compareAndSwap(
+      jobId,
+      created.value.revision,
+      baseRecord({
+        admissionReservation: {
+          ...reservation,
+          declaredRegions: [{ path: "src/application/dispatch/model.ts", coverage: "exact" }],
+        },
+      }),
+    );
+    expect(narrowed).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+    const legacyWriter = await store.compareAndSwap(jobId, created.value.revision, baseRecord());
+    expect(legacyWriter).toMatchObject({
+      ok: true,
+      value: { admissionReservation: reservation },
+    });
+  });
+
   describe("LEA-136 control fence and durable provider-attempt ledger", () => {
     const firstFence = {
       leaseId,

@@ -15,13 +15,14 @@ import type { ProjectRegistrySnapshot } from "../projects/index.js";
 import type { CandidateObservation, ModelRoutingConfig } from "../routing/index.js";
 import { decideNextDispatch } from "./decision.js";
 import type {
-  ActiveDispatch,
   DispatchBlocker,
   DispatchCandidate,
   DispatchDecision,
   DispatchSlotLimits,
   DispatchStage,
   DispatchWorkKind,
+  ModelExecutionOccupancy,
+  RepositoryReservation,
   RotationCursor,
 } from "./model.js";
 
@@ -57,7 +58,8 @@ export interface DispatchInput {
   readonly candidates: readonly DispatcherCandidate[];
   readonly registry: ProjectRegistrySnapshot;
   readonly dependencyContexts?: Readonly<Record<string, EligibilityContext>>;
-  readonly active: readonly ActiveDispatch[];
+  readonly executionOccupancy: readonly ModelExecutionOccupancy[];
+  readonly repositoryReservations: readonly RepositoryReservation[];
   readonly routingConfig: ModelRoutingConfig;
   readonly routeObservations: readonly CandidateObservation[];
   readonly rotation?: RotationCursor;
@@ -209,7 +211,8 @@ export class Dispatcher {
     while (remaining.length > 0) {
       const decision = decideNextDispatch({
         candidates: remaining.map((candidate) => candidate.dispatch),
-        active: input.active,
+        executionOccupancy: input.executionOccupancy,
+        repositoryReservations: input.repositoryReservations,
         routingConfig: input.routingConfig,
         routeObservations: input.routeObservations,
         ...(input.rotation === undefined ? {} : { rotation: input.rotation }),

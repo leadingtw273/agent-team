@@ -224,7 +224,8 @@ function input(candidates: readonly Issue[]) {
       workKind: "model" as const,
     })),
     registry: registry(),
-    active: [],
+    executionOccupancy: [],
+    repositoryReservations: [],
     routingConfig,
     routeObservations,
   };

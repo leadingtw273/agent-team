@@ -477,6 +477,14 @@ describe("createDispatchCliHandlers dry-run vs real-mode port isolation (C015a F
     const persistedJobs = await realJobs.readAll();
     expect(persistedJobs.ok).toBe(true);
     if (persistedJobs.ok) expect(persistedJobs.value).toHaveLength(1);
+    const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
+    const progressRecord = await progress.load(payload.jobId);
+    expect(progressRecord).toMatchObject({
+      ok: true,
+      value: {
+        admissionReservation: { repositoryId: "github:owner/sandbox" },
+      },
+    });
   });
 });
 
@@ -806,8 +814,9 @@ describe("createDispatchCliHandlers resume wiring (C015c item 2)", () => {
     expect(discoverSpy).toHaveBeenCalledTimes(1);
     expect(payload.admissionSkipped).toEqual([{ issueId, reason: "issue_claim_active" }]);
 
-    // The requires_manual record itself, and its admission claim, are untouched -- proving the
-    // predicate did not accidentally widen to "any requires_manual record".
+    // The requires_manual record and claim remain untouched. Because the injected composition
+    // deliberately has no Linear read-back, its conservative whole-repository fallback remains
+    // in-memory and is not permanently frozen.
     const progress = new FileJobProgressStore(join(stateRoot, "state", "dispatch", "progress"));
     const reloaded = await progress.load(jobId);
     expect(reloaded).toMatchObject({

@@ -8,6 +8,7 @@ export * from "./human-acceptance-handlers.js";
 export * from "./job-resume-handlers.js";
 export * from "./operator-canary-attestation.js";
 export * from "./quota-composition.js";
+export * from "./reservation-inventory.js";
 export * from "./reviewer-replay-handlers.js";
 export * from "./reviewer-replay-coordinator.js";
 export * from "./work-status-recovery-coordinator.js";
