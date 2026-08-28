@@ -3,10 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_DISPATCH_SLOT_LIMITS,
   decideNextDispatch,
-  type ActiveDispatch,
   type DispatchCandidate,
   type DispatchDecisionInput,
   type DispatchSlotLimits,
+  type ModelExecutionOccupancy,
+  type RepositoryReservation,
 } from "../../src/application/dispatch/index.js";
 import type {
   CandidateObservation,
@@ -66,14 +67,27 @@ function candidate(id: string, overrides: Partial<DispatchCandidate> = {}): Disp
   };
 }
 
-function active(jobId: string, overrides: Partial<ActiveDispatch> = {}): ActiveDispatch {
+function occupancy(
+  jobId: string,
+  overrides: Partial<ModelExecutionOccupancy> = {},
+): ModelExecutionOccupancy {
+  return {
+    jobId,
+    projectId: "active-project",
+    provider: "codex",
+    ...overrides,
+  };
+}
+
+function reservation(
+  jobId: string,
+  overrides: Partial<RepositoryReservation> = {},
+): RepositoryReservation {
   return {
     jobId,
     projectId: "active-project",
     repositoryId: "active-repo",
-    workKind: "model",
     stage: "implementation",
-    provider: "codex",
     declaredRegions: [{ path: `src/${jobId}.ts`, coverage: "exact" }],
     ...overrides,
   };
@@ -85,7 +99,8 @@ function input(
 ): DispatchDecisionInput {
   return {
     candidates,
-    active: [],
+    executionOccupancy: [],
+    repositoryReservations: [],
     routingConfig,
     routeObservations: readyObservations,
     ...overrides,
@@ -175,9 +190,39 @@ describe("dispatch candidate ordering", () => {
 });
 
 describe("model and project slots", () => {
+  it("uses the canonical four-wide defaults with three Codex and one Claude slots", () => {
+    expect(DEFAULT_DISPATCH_SLOT_LIMITS).toEqual({
+      globalModelJobs: 4,
+      perProviderModelJobs: { codex: 3, claude: 1, gemini: 1 },
+      perProjectModelJobs: 4,
+      perRepositoryIntegrationJobs: 1,
+    });
+
+    const decision = decideNextDispatch(
+      input([candidate("review", { role: "code_reviewer" })], {
+        executionOccupancy: [
+          occupancy("codex-one", { projectId: "project-a" }),
+          occupancy("codex-two", { projectId: "project-a" }),
+          occupancy("codex-three", { projectId: "project-a" }),
+        ],
+      }),
+    );
+
+    expect(decision).toMatchObject({
+      kind: "selected",
+      candidate: { id: "review" },
+      model: { candidate: { provider: "claude" } },
+    });
+  });
+
   it("does not cross providers when the Codex execution slot is occupied", () => {
     const decision = decideNextDispatch(
-      input([candidate("next")], { active: [active("running")] }),
+      input([candidate("next")], {
+        executionOccupancy: [occupancy("running")],
+        slotLimits: limits({
+          perProviderModelJobs: { codex: 1, claude: 1, gemini: 1 },
+        }),
+      }),
     );
 
     expect(decision).toMatchObject({
@@ -210,7 +255,11 @@ describe("model and project slots", () => {
           }),
         ],
         {
-          active: [active("one", { provider: "codex" }), active("two", { provider: "claude" })],
+          executionOccupancy: [
+            occupancy("one", { provider: "codex" }),
+            occupancy("two", { provider: "claude" }),
+          ],
+          slotLimits: limits({ globalModelJobs: 2 }),
         },
       ),
     );
@@ -237,8 +286,8 @@ describe("model and project slots", () => {
           }),
         ],
         {
-          active: [
-            active("running", {
+          repositoryReservations: [
+            reservation("running", {
               repositoryId: "shared",
               declaredRegions: undefined,
             }),
@@ -261,13 +310,14 @@ describe("model and project slots", () => {
   it("enforces a project limit independently from the wider global limit", () => {
     const decision = decideNextDispatch(
       input([candidate("same-project")], {
-        active: [
-          active("one", { projectId: "project-a", provider: "codex" }),
-          active("two", { projectId: "project-a", provider: "claude" }),
+        executionOccupancy: [
+          occupancy("one", { projectId: "project-a", provider: "codex" }),
+          occupancy("two", { projectId: "project-a", provider: "claude" }),
         ],
         slotLimits: limits({
           globalModelJobs: 4,
           perProviderModelJobs: { codex: 3, claude: 3, gemini: 1 },
+          perProjectModelJobs: 2,
         }),
       }),
     );
@@ -280,9 +330,11 @@ describe("model and project slots", () => {
   });
 
   it("does not preempt or reroute an active assignment when a primary recovers", () => {
-    const running = active("existing", { provider: "claude" });
+    const running = occupancy("existing", { provider: "claude" });
     const decision = decideNextDispatch(
-      input([candidate("new", { repositoryId: "new-repo" })], { active: [running] }),
+      input([candidate("new", { repositoryId: "new-repo" })], {
+        executionOccupancy: [running],
+      }),
     );
 
     expect(running.provider).toBe("claude");
@@ -295,6 +347,39 @@ describe("model and project slots", () => {
 });
 
 describe("repository concurrency", () => {
+  it("keeps a waiting work line reserved without consuming a model slot", () => {
+    const decision = decideNextDispatch(
+      input(
+        [
+          candidate("blocked", {
+            repositoryId: "shared",
+            declaredRegions: [{ path: "src/world", coverage: "subtree" }],
+          }),
+          candidate("safe", {
+            repositoryId: "shared",
+            declaredRegions: [{ path: "src/tank", coverage: "subtree" }],
+          }),
+        ],
+        {
+          executionOccupancy: [],
+          repositoryReservations: [
+            reservation("ci-waiting", {
+              repositoryId: "shared",
+              stage: "ci",
+              declaredRegions: [{ path: "src/world", coverage: "subtree" }],
+            }),
+          ],
+        },
+      ),
+    );
+
+    expect(decision).toMatchObject({
+      kind: "selected",
+      candidate: { id: "safe" },
+      skipped: [{ candidateId: "blocked", blocker: { code: "repository_scope_conflict" } }],
+    });
+  });
+
   it("allows declared non-overlapping exact regions in the same repository", () => {
     const decision = decideNextDispatch(
       input(
@@ -305,8 +390,8 @@ describe("repository concurrency", () => {
           }),
         ],
         {
-          active: [
-            active("running", {
+          repositoryReservations: [
+            reservation("running", {
               repositoryId: "shared",
               declaredRegions: [{ path: "src/running.ts", coverage: "exact" }],
             }),
@@ -332,8 +417,8 @@ describe("repository concurrency", () => {
           }),
         ],
         {
-          active: [
-            active("running", {
+          repositoryReservations: [
+            reservation("running", {
               repositoryId: "shared",
               declaredRegions: [{ path: "src/domain", coverage: "subtree" }],
             }),
@@ -363,8 +448,8 @@ describe("repository concurrency", () => {
   it("fails closed when either side lacks declared regions", () => {
     const decision = decideNextDispatch(
       input([candidate("unknown", { repositoryId: "shared", declaredRegions: undefined })], {
-        active: [
-          active("running", {
+        repositoryReservations: [
+          reservation("running", {
             repositoryId: "shared",
             declaredRegions: [{ path: "src/known.ts", coverage: "exact" }],
           }),
@@ -393,11 +478,11 @@ describe("repository concurrency", () => {
           }),
         ],
         {
-          active: [
-            active("integration", {
+          executionOccupancy: [occupancy("integration", { provider: "claude" })],
+          repositoryReservations: [
+            reservation("integration", {
               repositoryId: "shared",
               stage: "integration",
-              provider: "claude",
             }),
           ],
           slotLimits: limits({
@@ -432,7 +517,7 @@ describe("fail-closed input and blocked candidate handling", () => {
           }),
         ],
         {
-          active: [active("running", { repositoryId: "shared" })],
+          repositoryReservations: [reservation("running", { repositoryId: "shared" })],
           slotLimits: limits({
             globalModelJobs: 3,
             perProviderModelJobs: { codex: 2, claude: 1, gemini: 1 },
@@ -474,7 +559,14 @@ describe("fail-closed input and blocked candidate handling", () => {
 
   it.each([
     {},
-    { candidates: [], active: [], routingConfig, routeObservations: [], unknown: true },
+    {
+      candidates: [],
+      executionOccupancy: [],
+      repositoryReservations: [],
+      routingConfig,
+      routeObservations: [],
+      unknown: true,
+    },
     input([candidate("duplicate"), candidate("duplicate")]),
     input([candidate("bad-time", { readyAt: "not-a-time" })]),
     input([

@@ -2,15 +2,16 @@ import { selectModelRoute, type CandidateObservation } from "../routing/index.js
 import {
   PRIORITY_ORDER,
   dispatchDecisionInputSchema,
-  type ActiveDispatch,
   type ChangeRegion,
   type DispatchBlocker,
   type DispatchCandidate,
   type DispatchDecision,
   type DispatchSlotLimits,
   type ModelProvider,
+  type ModelExecutionOccupancy,
   type Priority,
   type RotationCursor,
+  type RepositoryReservation,
   type SkippedDispatchCandidate,
 } from "./model.js";
 
@@ -89,32 +90,39 @@ function regionsOverlap(left: ChangeRegion, right: ChangeRegion): boolean {
   return false;
 }
 
-function hasRepositoryConflict(candidate: DispatchCandidate, active: ActiveDispatch): boolean {
-  if (candidate.repositoryId !== active.repositoryId) return false;
+function hasRepositoryConflict(
+  candidate: DispatchCandidate,
+  reservation: RepositoryReservation,
+): boolean {
+  if (candidate.repositoryId !== reservation.repositoryId) return false;
   if (
     candidate.stage === "integration" ||
     candidate.stage === "merge" ||
-    active.stage === "integration" ||
-    active.stage === "merge"
+    reservation.stage === "integration" ||
+    reservation.stage === "merge"
   ) {
     return true;
   }
-  if (candidate.declaredRegions === undefined || active.declaredRegions === undefined) return true;
+  if (candidate.declaredRegions === undefined || reservation.declaredRegions === undefined) {
+    return true;
+  }
   return candidate.declaredRegions.some((candidateRegion) =>
-    active.declaredRegions?.some((activeRegion) => regionsOverlap(candidateRegion, activeRegion)),
+    reservation.declaredRegions?.some((activeRegion) =>
+      regionsOverlap(candidateRegion, activeRegion),
+    ),
   );
 }
 
-function countModelJobs(active: readonly ActiveDispatch[]): number {
-  return active.filter((job) => job.workKind === "model").length;
+function countModelJobs(occupancy: readonly ModelExecutionOccupancy[]): number {
+  return occupancy.length;
 }
 
 function providerCounts(
-  active: readonly ActiveDispatch[],
+  occupancy: readonly ModelExecutionOccupancy[],
 ): Readonly<Record<ModelProvider, number>> {
   const counts: Record<ModelProvider, number> = { codex: 0, claude: 0, gemini: 0 };
-  for (const job of active) {
-    if (job.workKind === "model" && job.provider !== undefined) counts[job.provider] += 1;
+  for (const job of occupancy) {
+    counts[job.provider] += 1;
   }
   return counts;
 }
@@ -134,13 +142,11 @@ function observationsWithSlotState(
 
 function repositoryBlocker(
   candidate: DispatchCandidate,
-  active: readonly ActiveDispatch[],
+  reservations: readonly RepositoryReservation[],
   limits: DispatchSlotLimits,
 ): DispatchBlocker | undefined {
   if (candidate.workKind === "mechanical") return undefined;
-  const sameRepository = active.filter(
-    (job) => job.workKind === "model" && job.repositoryId === candidate.repositoryId,
-  );
+  const sameRepository = reservations.filter((job) => job.repositoryId === candidate.repositoryId);
   if (candidate.stage === "integration" || candidate.stage === "merge") {
     const integrationCount = sameRepository.filter(
       (job) => job.stage === "integration" || job.stage === "merge",
@@ -179,15 +185,22 @@ export function decideNextDispatch(input: unknown): DispatchDecision {
   if (!parsed.success) {
     return Object.freeze({ kind: "waiting", reason: "invalid_input", skipped: Object.freeze([]) });
   }
-  const { candidates, active, routingConfig, routeObservations, rotation, slotLimits } =
-    parsed.data;
+  const {
+    candidates,
+    executionOccupancy,
+    repositoryReservations,
+    routingConfig,
+    routeObservations,
+    rotation,
+    slotLimits,
+  } = parsed.data;
   if (candidates.length === 0) {
     return Object.freeze({ kind: "waiting", reason: "no_candidates", skipped: Object.freeze([]) });
   }
 
   const ordered = orderCandidates(candidates, rotation);
-  const activeModelCount = countModelJobs(active);
-  const activeProviderCounts = providerCounts(active);
+  const activeModelCount = countModelJobs(executionOccupancy);
+  const activeProviderCounts = providerCounts(executionOccupancy);
   const observations = observationsWithSlotState(
     routeObservations,
     activeProviderCounts,
@@ -220,8 +233,8 @@ export function decideNextDispatch(input: unknown): DispatchDecision {
 
     if (
       candidate.workKind === "model" &&
-      active.filter((job) => job.workKind === "model" && job.projectId === candidate.projectId)
-        .length >= slotLimits.perProjectModelJobs
+      executionOccupancy.filter((job) => job.projectId === candidate.projectId).length >=
+        slotLimits.perProjectModelJobs
     ) {
       skip(
         skipped,
@@ -231,7 +244,7 @@ export function decideNextDispatch(input: unknown): DispatchDecision {
       continue;
     }
 
-    const repoBlocker = repositoryBlocker(candidate, active, slotLimits);
+    const repoBlocker = repositoryBlocker(candidate, repositoryReservations, slotLimits);
     if (repoBlocker !== undefined) {
       skip(skipped, candidate, repoBlocker);
       continue;

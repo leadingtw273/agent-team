@@ -128,6 +128,7 @@ import { DispatchResolveAuthority } from "./resolve-authority.js";
 import { ExternalMergeRecoveryAuthority } from "./external-merge-recovery-authority.js";
 import { createAcknowledgeExternalMergeHandler } from "./external-merge-recovery-handlers.js";
 import { checkPublicIssueAdmissionAuthority } from "./public-admission-authority.js";
+import { buildRepositoryReservationInventory } from "./reservation-inventory.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
 
 export interface CreateDispatchCliHandlersOptions {
@@ -971,6 +972,12 @@ export function createDispatchCliHandlers(
                 issueId: result.job.issueId,
                 externalIssueId: candidate.issue.externalId,
                 model,
+                admissionReservation: {
+                  repositoryId: `${build.value.project.sourceControl.provider}:${build.value.project.sourceControl.repository}`,
+                  ...(candidate.issue.changeRegions === undefined
+                    ? {}
+                    : { declaredRegions: candidate.issue.changeRegions }),
+                },
                 ...(providerAssignments === undefined ? {} : { providerAssignments }),
                 ...(skillSnapshots === undefined ? {} : { skillSnapshots: skillSnapshots.value }),
                 ...(humanDelivery.value === undefined
@@ -1049,8 +1056,41 @@ export function createDispatchCliHandlers(
         }
       }
 
+      const repositoryId = `${build.value.project.sourceControl.provider}:${build.value.project.sourceControl.repository}`;
+      const reservationInventory = await buildRepositoryReservationInventory({
+        projectId: build.value.project.id,
+        repositoryId,
+        progress,
+        persistLegacySnapshots: !dryRun,
+        readDeclaredRegions: async (externalIssueId) => {
+          // An injected composition is a test/canary seam and may deliberately expose no Linear
+          // reader. Preserve zero-external-call behavior and fail closed to whole-repository
+          // reservation; production always uses the authoritative read-back below.
+          if (options.buildComposition !== undefined) return err(domainError("unavailable"));
+          const issue = await projectIssueByExternalId(
+            build.value.project,
+            build.value.discovery.readModel,
+            build.value.discovery.teamId,
+            build.value.discovery.linearProjectId,
+            externalIssueId,
+          );
+          return issue.ok ? ok(issue.value.changeRegions) : err(issue.error);
+        },
+      });
+      if (!reservationInventory.ok) {
+        return outcome("failed", {
+          operation: "dispatch_run",
+          state: "blocked",
+          projectId: input.projectId,
+          reason: "reservation_inventory_unavailable",
+          message: "無法建立尚未收斂工作線的程式碼範圍保留清單。",
+          errorCode: reservationInventory.error.code,
+        });
+      }
+
       const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId, {
         allowOperatorCanary: !dryRun,
+        repositoryReservations: reservationInventory.value,
       });
       if (dispatchOnceOutcome.outcome === "capability_failed") {
         return outcome("blocked", {

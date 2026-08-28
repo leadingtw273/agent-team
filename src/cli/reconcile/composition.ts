@@ -16,8 +16,8 @@
  *   resumable, blocked or terminal. It does not invoke a model or any external provider.
  *
  * `jobs.listActive` always resolves to the empty set. This mirrors an already-disclosed pattern in
- * this exact codebase (`dispatch/composition.ts`'s own `dispatchOnce` passing `active: []` to
- * `Dispatcher.dispatch()`, "this composition has no source of 'jobs currently in flight'") -- not a
+ * this exact codebase (`dispatch/composition.ts` starts with empty in-process model execution
+ * occupancy because no Provider call exists yet) -- not a
  * new simplification invented for this ticket. The reason is structural, not a shortcut: turning a
  * `Job` (which carries no phase of its own -- see resume-composition.ts's own header) plus its
  * `FileJobProgressStore` record into a `ReconcileTarget` needs a `checkpointId` and an

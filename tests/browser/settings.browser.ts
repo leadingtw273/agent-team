@@ -360,11 +360,11 @@ test("raw YAML stays canonical on mobile and edit mode exposes the only save pat
   await expect(save).toBeEnabled();
   await expect(page.getByText("受控編輯已啟用；儲存前會重新驗證完整設定。")).toBeVisible();
   await editor.fill(
-    (await editor.inputValue()).replace("globalModelJobs: 2", "globalModelJobs: 3"),
+    (await editor.inputValue()).replace("globalModelJobs: 4", "globalModelJobs: 5"),
   );
   await page.keyboard.press("Control+s");
   await expect(page.getByText("設定已安全儲存。")).toBeVisible();
-  await expect(page.locator("#settings-global-jobs")).toHaveValue("3");
+  await expect(page.locator("#settings-global-jobs")).toHaveValue("5");
   await expect(editor).toHaveAttribute("readonly", "");
   await expect(edit).toBeVisible();
   await expect(save).toBeHidden();

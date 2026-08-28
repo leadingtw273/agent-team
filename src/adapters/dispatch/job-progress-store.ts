@@ -56,6 +56,7 @@ import {
   projectIdSchema,
 } from "../../domain/jobs/index.js";
 import {
+  changeRegionSchema,
   humanAcceptanceRequirementSchema,
   verificationLevelSchema,
 } from "../../domain/project/index.js";
@@ -774,6 +775,17 @@ export const providerMutationLedgerEntrySchema = z
   });
 export type ProviderMutationLedgerEntry = z.infer<typeof providerMutationLedgerEntrySchema>;
 
+/** Admission-time repository reservation. New Jobs persist this once; legacy Jobs may establish
+ * it once from an authoritative Linear read-back. An absent `declaredRegions` deliberately means
+ * whole-repository reservation, never "no reservation". */
+export const admissionReservationSnapshotSchema = z
+  .object({
+    repositoryId: z.string().trim().min(1).max(255),
+    declaredRegions: z.array(changeRegionSchema).min(1).max(100).optional(),
+  })
+  .strict();
+export type AdmissionReservationSnapshot = z.infer<typeof admissionReservationSnapshotSchema>;
+
 const providerMutationLedgerSchema = z
   .array(providerMutationLedgerEntrySchema)
   .max(128)
@@ -880,6 +892,9 @@ export const jobProgressRecordSchema = z
     /** Optional only for legacy Jobs. New human-directed Jobs persist this approved policy before
      * Provider execution; merge completion may attach one immutable acceptance identity digest. */
     humanDelivery: humanDeliveryCheckpointSchema.optional(),
+    /** Immutable scheduling authority for this Job's repository work line. Optional only for
+     * legacy records; once established it is write-once and cannot be narrowed or removed. */
+    admissionReservation: admissionReservationSnapshotSchema.optional(),
     updatedAt: instantSchema,
   })
   .strict()
@@ -1212,6 +1227,17 @@ export class FileJobProgressStore {
       return err(domainError("conflict"));
     }
 
+    // This optional field was introduced after many existing full-record mutation helpers. Treat
+    // omission by an older caller as "preserve the frozen snapshot", while still rejecting any
+    // explicit replacement/narrowing below. This keeps schema-v1 writers backward compatible
+    // without weakening the write-once authority.
+    if (
+      normalizedCurrent.value?.admissionReservation !== undefined &&
+      next.admissionReservation === undefined
+    ) {
+      next = { ...next, admissionReservation: normalizedCurrent.value.admissionReservation };
+    }
+
     // C015z decision (P0-5): `baseRevision`'s own field header above documents this as a
     // write-once invariant -- enforced here, the one place every CAS write funnels through,
     // rather than left as a convention each call site must remember (which is exactly how
@@ -1235,6 +1261,12 @@ export class FileJobProgressStore {
     if (
       normalizedCurrent.value?.skillSnapshots !== undefined &&
       !sameJson(next.skillSnapshots, normalizedCurrent.value.skillSnapshots)
+    ) {
+      return err(domainError("invariant_violation"));
+    }
+    if (
+      normalizedCurrent.value?.admissionReservation !== undefined &&
+      !sameJson(next.admissionReservation, normalizedCurrent.value.admissionReservation)
     ) {
       return err(domainError("invariant_violation"));
     }

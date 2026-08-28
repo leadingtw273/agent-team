@@ -162,7 +162,8 @@ function dispatchInput(holderId: string) {
     holderId,
     candidates: candidates(),
     registry: registry(),
-    active: [],
+    executionOccupancy: [],
+    repositoryReservations: [],
     routingConfig,
     routeObservations,
   };
