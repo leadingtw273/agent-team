@@ -13,7 +13,10 @@ export interface HumanAcceptanceRuntime {
 }
 
 export interface HumanAcceptanceHandlerOptions {
-  readonly store: Pick<HumanAcceptanceStorePort, "listPending" | "listForIssue" | "decide">;
+  readonly store: Pick<
+    HumanAcceptanceStorePort,
+    "listPending" | "listForIssue" | "decide" | "invalidate"
+  >;
   readonly runtime: (projectId: string) => Promise<Result<HumanAcceptanceRuntime, DomainError>>;
 }
 
@@ -183,15 +186,29 @@ export function createHumanAcceptanceHandlers(
           reason: "invalid_input",
         });
       }
-      const pending = await options.store.listForIssue(input.projectId, input.externalIssueId);
-      const record = pending.ok
-        ? [...pending.value].reverse().find((candidate) => candidate.state === "pending")
+      const records = await options.store.listForIssue(input.projectId, input.externalIssueId);
+      const record = records.ok
+        ? [...records.value].reverse().find((candidate) => {
+            const receiptId = `human-acceptance:${candidate.identityDigest}:request-adjustment`;
+            const requested = candidate.decisions.some(
+              (decision) =>
+                decision.decision === "request_adjustment" &&
+                decision.decisionReceiptId === receiptId,
+            );
+            return (
+              candidate.state === "pending" ||
+              (candidate.state === "adjustment_pending" && requested) ||
+              (candidate.state === "invalidated" &&
+                candidate.invalidation?.reason === "reopened" &&
+                requested)
+            );
+          })
         : undefined;
-      if (!pending.ok || record === undefined) {
-        return outcome(pending.ok ? "blocked" : "failed", {
+      if (!records.ok || record === undefined) {
+        return outcome(records.ok ? "blocked" : "failed", {
           operation: "human_acceptance_request_adjustment",
-          reason: pending.ok ? "pending_acceptance_not_found" : "state_unavailable",
-          ...(pending.ok ? {} : { errorCode: pending.error.code }),
+          reason: records.ok ? "pending_acceptance_not_found" : "state_unavailable",
+          ...(records.ok ? {} : { errorCode: records.error.code }),
         });
       }
       const runtime = await options.runtime(input.projectId);
@@ -210,16 +227,58 @@ export function createHumanAcceptanceHandlers(
         !workItem.ok ||
         workItem.value.issue.id !== record.identity.issueId ||
         workItem.value.issue.projectId !== record.identity.projectId ||
-        workItem.value.workStatus !== "in_review"
+        (workItem.value.workStatus !== "in_review" && workItem.value.workStatus !== "ready")
       ) {
         return outcome("blocked", {
           operation: "human_acceptance_request_adjustment",
           reason: "work_item_identity_conflict",
         });
       }
+      const receiptId = `human-acceptance:${record.identityDigest}:request-adjustment`;
+      const requested =
+        record.state === "pending"
+          ? await options.store.decide(
+              record.identity,
+              record.revision,
+              "request_adjustment",
+              receiptId,
+            )
+          : ok(record);
+      if (!requested.ok) {
+        return outcome("failed", {
+          operation: "human_acceptance_request_adjustment",
+          reason: "acceptance_write_failed",
+          errorCode: requested.error.code,
+        });
+      }
+      const invalidated = await options.store.invalidate(
+        requested.value.identity,
+        requested.value.revision,
+        "reopened",
+      );
+      if (!invalidated.ok) {
+        return outcome("failed", {
+          operation: "human_acceptance_request_adjustment",
+          reason: "acceptance_invalidation_failed",
+          errorCode: invalidated.error.code,
+        });
+      }
+      if (workItem.value.workStatus !== "ready") {
+        const ready = await runtime.value.workManagement.setWorkStatus(
+          { project: runtime.value.project, externalIssueId: input.externalIssueId },
+          "ready",
+          { idempotencyKey: `human-acceptance:${record.identityDigest}:return-ready` },
+        );
+        if (!ready.ok || ready.value.workStatus !== "ready") {
+          return outcome("failed", {
+            operation: "human_acceptance_request_adjustment",
+            reason: "work_status_projection_failed",
+          });
+        }
+      }
       const comment = await runtime.value.workManagement.appendComment(
         { project: runtime.value.project, externalIssueId: input.externalIssueId },
-        "產品負責人要求調整；本工單維持待驗收，Team Lead 將沿用既有建單流程安排修正。",
+        "產品負責人要求調整；舊的人工驗收 checkpoint 已關閉，本工單已回到待執行並將在同一張單接續返工。",
         { idempotencyKey: `human-acceptance:${record.identityDigest}:adjustment-requested` },
       );
       if (!comment.ok) {
@@ -231,9 +290,9 @@ export function createHumanAcceptanceHandlers(
       }
       return outcome("success", {
         operation: "human_acceptance_request_adjustment",
-        state: "pending",
-        next: "team_lead_create_adjustment_issue",
-        acceptance: publicHumanAcceptanceProjection(record),
+        state: "reopened",
+        next: "same_issue_rework",
+        acceptance: publicHumanAcceptanceProjection(invalidated.value),
       });
     },
   });

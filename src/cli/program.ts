@@ -371,7 +371,7 @@ export function createProgram(
     );
   acceptance
     .command("request-adjustment")
-    .description("記錄需要調整；原工單維持待驗收，由 Team Lead 沿用既有流程開修正單")
+    .description("記錄需要調整、關閉舊驗收 checkpoint，並讓同一張工單回到待執行")
     .requiredOption("--project <project-id>", "專案識別碼")
     .requiredOption("--issue <linear-issue-id>", "Linear 工單 id")
     .action((options: { readonly project: string; readonly issue: string }) =>

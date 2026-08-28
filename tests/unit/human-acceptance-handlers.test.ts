@@ -88,7 +88,7 @@ async function fixture() {
   });
   if (!created.ok) throw new Error(created.error.code);
 
-  let workStatus: "in_review" | "completed" = "in_review";
+  let workStatus: "in_review" | "ready" | "completed" = "in_review";
   let setWorkStatusCalls = 0;
   const comments = new Map<string, string>();
   const workManagement = {
@@ -101,7 +101,7 @@ async function fixture() {
           revision: "revision-1",
         }),
       ),
-    setWorkStatus: (_reference: unknown, status: "completed") => {
+    setWorkStatus: (_reference: unknown, status: "ready" | "completed") => {
       setWorkStatusCalls += 1;
       workStatus = status;
       return Promise.resolve(
@@ -154,7 +154,7 @@ describe("human acceptance MVP handlers", () => {
     });
   });
 
-  it("要求調整只留單一通知並維持 pending，交回既有 Team Lead 建單流程", async () => {
+  it("要求調整後關閉舊 checkpoint，並讓同一張工單回到待執行", async () => {
     const test = await fixture();
 
     await expect(
@@ -165,10 +165,18 @@ describe("human acceptance MVP handlers", () => {
     ).resolves.toMatchObject({ state: "success" });
 
     expect(test.comments.size).toBe(1);
-    expect(test.setWorkStatusCalls()).toBe(0);
-    await expect(test.store.listPending(projectId)).resolves.toMatchObject({
+    expect(test.setWorkStatusCalls()).toBe(1);
+    await expect(test.store.listPending(projectId)).resolves.toEqual({ ok: true, value: [] });
+    await expect(test.store.listForIssue(projectId, externalIssueId)).resolves.toMatchObject({
       ok: true,
-      value: [{ identityDigest: test.created.identityDigest, state: "pending" }],
+      value: [
+        {
+          identityDigest: test.created.identityDigest,
+          state: "invalidated",
+          decisions: [{ decision: "request_adjustment" }],
+          invalidation: { reason: "reopened" },
+        },
+      ],
     });
   });
 });
