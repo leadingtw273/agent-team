@@ -10,6 +10,7 @@ import {
   type Identifier,
 } from "../../src/domain/foundation/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
+import { sha256Digest } from "../../src/domain/review/index.js";
 import { createAgentCondition } from "../../src/domain/workflow/index.js";
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
@@ -43,6 +44,7 @@ const issue = issueSchema.parse({
 });
 const jobId = id("job", "job_018f47d2-77a4-7cc1-8ef2-0123456789ab");
 const headSha = "a".repeat(40);
+const repairedHeadSha = "d".repeat(40);
 
 function fixture(
   options: {
@@ -51,8 +53,17 @@ function fixture(
     failWorkStartOnce?: boolean;
     manualCause?: Readonly<{ stage: string; reasonCode: string }>;
     draft?: boolean;
+    staleRepair?: boolean;
+    confirmedRepairPush?: boolean;
+    worktreeClean?: boolean;
+    worktreeHeadSha?: string;
+    commitParents?: readonly string[];
+    prHeads?: readonly string[];
   } = {},
 ) {
+  const branch = `agent-team/${jobId}`;
+  const repairPushIdentity = sha256Digest({ branch, headSha, remote: "origin" });
+  if (!repairPushIdentity.ok) throw new Error(repairPushIdentity.error.code);
   let record = {
     schemaVersion: 1,
     revision: 10,
@@ -71,11 +82,30 @@ function fixture(
         attempts: { count: 1 },
       },
     },
-    branch: `agent-team/${jobId}`,
+    branch,
     worktreePath: `/tmp/${jobId}`,
     baseRevision: "b".repeat(40),
     headSha,
     changeRequestId: "26",
+    ...(options.staleRepair !== true
+      ? {}
+      : {
+          mutationAttempts: [
+            {
+              operationKey: `managed:${jobId}:git_push:${repairPushIdentity.value}`,
+              intent: "git_push",
+              identityDigest:
+                options.confirmedRepairPush === false ? "f".repeat(64) : repairPushIdentity.value,
+              attempts: [
+                {
+                  ordinal: 1,
+                  preparedAt: now,
+                  outcome: "confirmed",
+                },
+              ],
+            },
+          ],
+        }),
     workStatusLifecycle: {
       admissionMode: "enforce",
       capabilityDigest: "c".repeat(64),
@@ -115,6 +145,7 @@ function fixture(
   let agentCondition = createAgentCondition("blocked", ["integration_failure"]);
   let failClearOnce = options.failClearOnce === true;
   let failWorkStartOnce = options.failWorkStartOnce === true;
+  let changeRequestReads = 0;
   const compareAndSwap = vi.fn((_: string, expectedRevision: number, mutation: never) => {
     if (record.revision !== expectedRevision) throw new Error("unexpected_revision");
     record = {
@@ -245,9 +276,36 @@ function fixture(
         ),
     },
     lifecycle: { transitionWhileLockHeld },
-    sourceControl: {
-      getChangeRequest: () =>
+    git: {
+      inspectWorktree: vi.fn(() =>
         Promise.resolve(
+          ok({
+            rootPath: project.localRepositoryPath,
+            headSha: options.worktreeHeadSha ?? repairedHeadSha,
+            branch,
+            clean: options.worktreeClean ?? true,
+          }),
+        ),
+      ),
+      inspectCommit: vi.fn(() =>
+        Promise.resolve(
+          ok({
+            sha: repairedHeadSha,
+            treeSha: "e".repeat(40),
+            parentShas: options.commitParents ?? [headSha],
+            message: "CI repair",
+          }),
+        ),
+      ),
+    },
+    sourceControl: {
+      getChangeRequest: () => {
+        const configuredHeads = options.prHeads ?? [repairedHeadSha];
+        const configuredHead =
+          configuredHeads[Math.min(changeRequestReads, configuredHeads.length - 1)] ??
+          repairedHeadSha;
+        changeRequestReads += 1;
+        return Promise.resolve(
           ok({
             id: "pr-node-26",
             number: 26,
@@ -255,18 +313,19 @@ function fixture(
             state: "open",
             draft: options.draft ?? true,
             baseBranch: "main",
-            headBranch: `agent-team/${jobId}`,
-            headSha,
+            headBranch: branch,
+            headSha: options.staleRepair === true ? configuredHead : headSha,
             mergeability: "mergeable",
             mergeStateStatus: "blocked",
             autoMergeEnabled: false,
             updatedAt: now,
           }),
-        ),
-      getCommitChecks: () =>
+        );
+      },
+      getCommitChecks: (_: unknown, requestedHeadSha: string) =>
         Promise.resolve(
           ok({
-            headSha,
+            headSha: requestedHeadSha,
             aggregate: options.ci ?? "success",
             checks: [
               {
@@ -333,6 +392,89 @@ describe("exact-job CI resume", () => {
       "work_start",
     ]);
     expect(test.record().stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("dry-runs the exact confirmed stale repair Head without mutation", async () => {
+    const test = fixture({
+      staleRepair: true,
+      manualCause: { stage: "setup", reasonCode: "change_request_unavailable" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: true }),
+    ).resolves.toMatchObject({
+      state: "ready",
+      dryRun: true,
+      jobId,
+      headSha: repairedHeadSha,
+    });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.acquireLock).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
+  });
+
+  it("adopts the confirmed stale repair Head in the existing CI checkpoint", async () => {
+    const test = fixture({
+      staleRepair: true,
+      manualCause: { stage: "setup", reasonCode: "change_request_unavailable" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: false }),
+    ).resolves.toMatchObject({
+      state: "checkpointed",
+      jobId,
+      headSha: repairedHeadSha,
+    });
+    expect(test.record().headSha).toBe(repairedHeadSha);
+    expect(test.record().stage).toEqual({ kind: "ci_waiting" });
+  });
+
+  it("rejects a stale repair Head without the matching confirmed push identity", async () => {
+    const test = fixture({
+      staleRepair: true,
+      confirmedRepairPush: false,
+      manualCause: { stage: "setup", reasonCode: "change_request_unavailable" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: true }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "job_not_eligible" });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale repair Head that is not the managed worktree's direct child commit", async () => {
+    const test = fixture({
+      staleRepair: true,
+      commitParents: ["9".repeat(40)],
+      manualCause: { stage: "setup", reasonCode: "change_request_unavailable" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: true }),
+    ).resolves.toMatchObject({ state: "blocked", reason: "worktree_mismatch" });
+    expect(test.acquire).not.toHaveBeenCalled();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
+  });
+
+  it("revalidates the complete stale repair admission after taking the Lease and lock", async () => {
+    const test = fixture({
+      staleRepair: true,
+      prHeads: [repairedHeadSha, "8".repeat(40)],
+      manualCause: { stage: "setup", reasonCode: "change_request_unavailable" },
+    });
+
+    await expect(
+      test.coordinator.run({ jobId, holderId: "ci-resume:test", dryRun: false }),
+    ).resolves.toMatchObject({ state: "blocked" });
+    expect(test.acquire).toHaveBeenCalledOnce();
+    expect(test.acquireLock).toHaveBeenCalledOnce();
+    expect(test.transitionWhileLockHeld).not.toHaveBeenCalled();
+    expect(test.compareAndSwap).not.toHaveBeenCalled();
   });
 
   it("admits a ready PR for review repair in dry-run without mutation", async () => {
