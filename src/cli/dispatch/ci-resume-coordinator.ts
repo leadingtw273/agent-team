@@ -13,10 +13,14 @@ import {
   type WorkStatusLifecycleCoordinator,
   type WorkStatusLifecycleOutcome,
 } from "../../application/pipelines/index.js";
-import type { SourceControlPort, WorkManagementPort } from "../../application/ports/index.js";
+import type {
+  GitPort,
+  SourceControlPort,
+  WorkManagementPort,
+} from "../../application/ports/index.js";
 import type { DomainError } from "../../domain/foundation/index.js";
 import type { Project } from "../../domain/project/index.js";
-import { sha256Digest } from "../../domain/review/index.js";
+import { headShaSchema, sha256Digest } from "../../domain/review/index.js";
 import type { FileJobRepository } from "../../infrastructure/jobs/index.js";
 
 type CiResumeJobRepository = JobRepository & Pick<FileJobRepository, "readAll">;
@@ -28,6 +32,7 @@ export type CiResumeBlockedReason =
   | "job_identity_mismatch"
   | "claim_mismatch"
   | "change_request_mismatch"
+  | "worktree_mismatch"
   | "ci_not_successful"
   | "linear_identity_mismatch"
   | "linear_state_mismatch"
@@ -76,6 +81,7 @@ export interface CiResumeCoordinatorDependencies {
   readonly locks: IssueScopeLockPort;
   readonly workManagement: CiResumeWorkManagement;
   readonly lifecycle: Pick<WorkStatusLifecycleCoordinator, "transitionWhileLockHeld">;
+  readonly git: Pick<GitPort, "inspectWorktree" | "inspectCommit">;
   readonly sourceControl: Pick<SourceControlPort, "getChangeRequest" | "getCommitChecks">;
 }
 
@@ -88,6 +94,7 @@ interface Admission {
   readonly record: JobProgressRecord;
   readonly claimRevision: number;
   readonly identity: RecoveryIdentity;
+  readonly headSha: NonNullable<JobProgressRecord["headSha"]>;
 }
 
 function mutationFrom(record: JobProgressRecord): JobProgressRecordMutation {
@@ -120,7 +127,10 @@ function failed(
   });
 }
 
-function recoveryIdentity(record: JobProgressRecord): RecoveryIdentity | undefined {
+function recoveryIdentity(
+  record: JobProgressRecord,
+  headSha: string,
+): RecoveryIdentity | undefined {
   const checkpoint = record.workStatusLifecycle;
   const manualTransition = [...(checkpoint?.transitions ?? [])]
     .reverse()
@@ -134,8 +144,7 @@ function recoveryIdentity(record: JobProgressRecord): RecoveryIdentity | undefin
     checkpoint?.admissionMode !== "enforce" ||
     checkpoint.capabilityDigest === undefined ||
     manualTransition === undefined ||
-    record.changeRequestId === undefined ||
-    record.headSha === undefined
+    record.changeRequestId === undefined
   ) {
     return undefined;
   }
@@ -148,7 +157,7 @@ function recoveryIdentity(record: JobProgressRecord): RecoveryIdentity | undefin
     externalIssueId: record.externalIssueId,
     changeRequestId: record.changeRequestId,
     branch: record.branch,
-    headSha: record.headSha,
+    headSha,
     manualTransitionInstance: manualTransition.instance,
   });
   if (!authority.ok) return undefined;
@@ -193,7 +202,31 @@ function hasRecoverableCiManualCause(record: JobProgressRecord): boolean {
   const cause = record.stage.cause;
   return (
     (cause?.stage === "ci_recovery" && cause.reasonCode === "ci_recovery_paused") ||
-    (cause?.stage === "review" && cause.reasonCode === "ci_failed_after_ready")
+    (cause?.stage === "review" && cause.reasonCode === "ci_failed_after_ready") ||
+    (cause?.stage === "setup" && cause.reasonCode === "change_request_unavailable")
+  );
+}
+
+function isStaleCiRepairHeadCause(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "setup" &&
+    record.stage.cause.reasonCode === "change_request_unavailable"
+  );
+}
+
+function hasMatchingConfirmedRepairPush(record: JobProgressRecord): boolean {
+  if (record.headSha === undefined) return false;
+  const expected = sha256Digest({
+    branch: record.branch,
+    headSha: record.headSha,
+    remote: "origin",
+  });
+  if (!expected.ok) return false;
+  const latestPush = record.mutationAttempts?.filter((entry) => entry.intent === "git_push").at(-1);
+  return (
+    latestPush?.identityDigest === expected.value &&
+    latestPush.attempts.at(-1)?.outcome === "confirmed"
   );
 }
 
@@ -226,36 +259,28 @@ export class CiResumeCoordinator {
     ) {
       return blocked(jobId, "job_not_eligible");
     }
-    const identity = recoveryIdentity(record);
-    if (identity === undefined) return blocked(jobId, "job_not_eligible");
-    const [jobs, claim, changeRequest, checks, issue] = await Promise.all([
+    const [jobs, claim, changeRequest, issue] = await Promise.all([
       this.dependencies.jobs.readAll(),
       this.dependencies.admission.load(record.projectId, record.issueId),
       this.dependencies.sourceControl.getChangeRequest({
         project: this.dependencies.project,
         changeRequestId: record.changeRequestId,
       }),
-      this.dependencies.sourceControl.getCommitChecks(
-        { project: this.dependencies.project },
-        record.headSha,
-      ),
       this.dependencies.workManagement.getIssue({
         project: this.dependencies.project,
         externalIssueId: record.externalIssueId,
       }),
     ]);
-    if (!jobs.ok || !claim.ok || !changeRequest.ok || !checks.ok || !issue.ok) {
+    if (!jobs.ok || !claim.ok || !changeRequest.ok || !issue.ok) {
       const errorCode = !jobs.ok
         ? jobs.error.code
         : !claim.ok
           ? claim.error.code
           : !changeRequest.ok
             ? changeRequest.error.code
-            : !checks.ok
-              ? checks.error.code
-              : !issue.ok
-                ? issue.error.code
-                : "external_failure";
+            : !issue.ok
+              ? issue.error.code
+              : "external_failure";
       return failed(jobId, "authoritative_read_failed", errorCode);
     }
     const matchingJobs = jobs.value.filter(
@@ -274,19 +299,69 @@ export class CiResumeCoordinator {
     ) {
       return blocked(jobId, "claim_mismatch");
     }
+    const staleRepairHead = isStaleCiRepairHeadCause(record);
+    const parsedAdoptedHead = headShaSchema.safeParse(changeRequest.value.headSha);
+    if (!parsedAdoptedHead.success) return blocked(jobId, "change_request_mismatch");
+    const adoptedHeadSha = parsedAdoptedHead.data;
     if (
       changeRequest.value.state !== "open" ||
       (!changeRequest.value.draft && !isReviewRepairCiManualCause(record)) ||
       changeRequest.value.headBranch !== record.branch ||
-      changeRequest.value.headSha.toLowerCase() !== record.headSha.toLowerCase() ||
       changeRequest.value.mergeability === "conflicting" ||
       changeRequest.value.mergeStateStatus === "behind" ||
       changeRequest.value.mergeStateStatus === "dirty"
     ) {
       return blocked(jobId, "change_request_mismatch");
     }
+    if (staleRepairHead) {
+      if (
+        adoptedHeadSha.toLowerCase() === record.headSha.toLowerCase() ||
+        !hasMatchingConfirmedRepairPush(record)
+      ) {
+        return blocked(jobId, "job_not_eligible");
+      }
+      const worktree = {
+        repositoryRoot: this.dependencies.project.localRepositoryPath,
+        path: record.worktreePath,
+        branch: record.branch,
+        headSha: record.headSha,
+      };
+      const [snapshot, commit] = await Promise.all([
+        this.dependencies.git.inspectWorktree(worktree),
+        this.dependencies.git.inspectCommit(
+          { rootPath: this.dependencies.project.localRepositoryPath },
+          adoptedHeadSha,
+        ),
+      ]);
+      if (!snapshot.ok || !commit.ok) {
+        return failed(
+          jobId,
+          "authoritative_read_failed",
+          !snapshot.ok ? snapshot.error.code : !commit.ok ? commit.error.code : undefined,
+        );
+      }
+      if (
+        !snapshot.value.clean ||
+        snapshot.value.branch !== record.branch ||
+        snapshot.value.headSha.toLowerCase() !== adoptedHeadSha.toLowerCase() ||
+        commit.value.sha.toLowerCase() !== adoptedHeadSha.toLowerCase() ||
+        commit.value.parentShas.length !== 1 ||
+        commit.value.parentShas[0]?.toLowerCase() !== record.headSha.toLowerCase()
+      ) {
+        return blocked(jobId, "worktree_mismatch");
+      }
+    } else if (adoptedHeadSha.toLowerCase() !== record.headSha.toLowerCase()) {
+      return blocked(jobId, "change_request_mismatch");
+    }
+    const checks = await this.dependencies.sourceControl.getCommitChecks(
+      { project: this.dependencies.project },
+      adoptedHeadSha,
+    );
+    if (!checks.ok) {
+      return failed(jobId, "authoritative_read_failed", checks.error.code);
+    }
     if (
-      checks.value.headSha.toLowerCase() !== record.headSha.toLowerCase() ||
+      checks.value.headSha.toLowerCase() !== adoptedHeadSha.toLowerCase() ||
       checks.value.aggregate !== "success" ||
       checks.value.checks.length === 0
     ) {
@@ -302,6 +377,8 @@ export class CiResumeCoordinator {
     ) {
       return blocked(jobId, "linear_identity_mismatch");
     }
+    const identity = recoveryIdentity(record, adoptedHeadSha);
+    if (identity === undefined) return blocked(jobId, "job_not_eligible");
     const clearExists = hasTransition(record, identity.clearInstance);
     const workStartExists = hasTransition(record, identity.workStartInstance);
     const expectedStatuses = workStartExists
@@ -312,7 +389,12 @@ export class CiResumeCoordinator {
     if (!expectedStatuses.includes(issue.value.workStatus as never)) {
       return blocked(jobId, "linear_state_mismatch");
     }
-    return Object.freeze({ record, claimRevision: claim.value.revision, identity });
+    return Object.freeze({
+      record,
+      claimRevision: claim.value.revision,
+      identity,
+      headSha: adoptedHeadSha,
+    });
   }
 
   async #transition(
@@ -371,7 +453,7 @@ export class CiResumeCoordinator {
         dryRun: true,
         projectId: admitted.record.projectId,
         jobId: admitted.record.jobId,
-        headSha: admitted.record.headSha ?? "",
+        headSha: admitted.headSha,
         plannedMutations: [
           "linear-ready",
           "linear-in-progress",
@@ -406,7 +488,11 @@ export class CiResumeCoordinator {
 
     let result: CiResumeOutcome;
     const currentAdmission = await this.#inspect(input.jobId, admitted.record.revision);
-    if ("state" in currentAdmission || currentAdmission.claimRevision !== admitted.claimRevision) {
+    if (
+      "state" in currentAdmission ||
+      currentAdmission.claimRevision !== admitted.claimRevision ||
+      currentAdmission.headSha.toLowerCase() !== admitted.headSha.toLowerCase()
+    ) {
       result =
         "state" in currentAdmission ? currentAdmission : blocked(input.jobId, "candidate_changed");
     } else {
@@ -450,37 +536,42 @@ export class CiResumeCoordinator {
           result = blocked(input.jobId, "lifecycle_transition_failed");
         } else {
           const afterStart = await this.dependencies.progress.load(input.jobId);
-          const claim = await this.dependencies.admission.load(current.projectId, current.issueId);
-          if (!afterStart.ok || !claim.ok) {
-            const error = !afterStart.ok ? afterStart.error : !claim.ok ? claim.error : undefined;
-            result = failed(input.jobId, "authoritative_read_failed", error?.code);
-          } else if (
-            afterStart.value === undefined ||
-            !hasRecoverableCiManualCause(afterStart.value) ||
-            claim.value?.state !== "active" ||
-            claim.value.jobId !== input.jobId ||
-            claim.value.revision !== admitted.claimRevision
-          ) {
+          if (!afterStart.ok) {
+            result = failed(input.jobId, "authoritative_read_failed", afterStart.error.code);
+          } else if (afterStart.value === undefined) {
             result = blocked(input.jobId, "candidate_changed");
           } else {
-            const written = await this.dependencies.progress.compareAndSwap(
-              input.jobId,
-              afterStart.value.revision,
-              {
-                ...mutationFrom(afterStart.value),
-                stage: { kind: "ci_waiting" },
-              },
-            );
-            result = written.ok
-              ? Object.freeze({
-                  state: "checkpointed" as const,
-                  dryRun: false as const,
-                  projectId: written.value.projectId,
-                  jobId: written.value.jobId,
-                  headSha: written.value.headSha ?? "",
-                  revision: written.value.revision,
-                })
-              : blocked(input.jobId, "checkpoint_write_failed");
+            const finalAdmission = await this.#inspect(input.jobId, afterStart.value.revision);
+            if (
+              "state" in finalAdmission ||
+              finalAdmission.claimRevision !== admitted.claimRevision ||
+              finalAdmission.headSha.toLowerCase() !== admitted.headSha.toLowerCase()
+            ) {
+              result =
+                "state" in finalAdmission
+                  ? finalAdmission
+                  : blocked(input.jobId, "candidate_changed");
+            } else {
+              const written = await this.dependencies.progress.compareAndSwap(
+                input.jobId,
+                finalAdmission.record.revision,
+                {
+                  ...mutationFrom(finalAdmission.record),
+                  headSha: finalAdmission.headSha,
+                  stage: { kind: "ci_waiting" },
+                },
+              );
+              result = written.ok
+                ? Object.freeze({
+                    state: "checkpointed" as const,
+                    dryRun: false as const,
+                    projectId: written.value.projectId,
+                    jobId: written.value.jobId,
+                    headSha: written.value.headSha ?? "",
+                    revision: written.value.revision,
+                  })
+                : blocked(input.jobId, "checkpoint_write_failed");
+            }
           }
         }
       }

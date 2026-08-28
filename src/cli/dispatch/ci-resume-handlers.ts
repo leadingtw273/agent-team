@@ -5,6 +5,7 @@ import {
   FileIssueScopeLock,
   JobProgressWorkStatusLifecycleLedger,
 } from "../../adapters/dispatch/index.js";
+import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { GitHubAdapter, GhTransport } from "../../adapters/github/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
 import { WorkStatusLifecycleCoordinator } from "../../application/pipelines/index.js";
@@ -155,6 +156,7 @@ async function buildRuntime(
       locks,
       clock,
     }),
+    git: new LocalGitAdapter(),
     sourceControl: new GitHubAdapter(new GhTransport()),
   });
   return Object.freeze({
