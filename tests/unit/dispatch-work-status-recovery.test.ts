@@ -75,6 +75,8 @@ function stateIdFor(status: WorkStatus): string {
       return "state-progress";
     case "in_review":
       return "state-review";
+    case "requires_manual":
+      return "state-manual";
     default:
       return `state-${status}`;
   }
@@ -132,8 +134,8 @@ class FakeWorkManagement {
           canceled: "state-canceled",
         },
         entries: this.entries,
-        stateSpans: ["ready", "in_review", "in_progress"].map((status) => ({
-          id: `span-${status === "in_progress" ? "progress" : status === "in_review" ? "review" : "ready"}`,
+        stateSpans: ["ready", "in_review", "in_progress", "requires_manual"].map((status) => ({
+          id: `span-${status === "in_progress" ? "progress" : status === "in_review" ? "review" : status === "requires_manual" ? "manual" : "ready"}`,
           stateId: stateIdFor(status as WorkStatus),
           startedAt: now,
           endedAt: this.status === status ? null : now,
@@ -174,13 +176,120 @@ class FakeWorkManagement {
 async function harness(
   current: WorkStatus,
   onLockAcquire?: (workManagement: FakeWorkManagement) => void,
-  sourceShape: "sent_unknown" | "fix_start_intent" | "confirmed_manual_handoff" = "sent_unknown",
+  sourceShape:
+    | "sent_unknown"
+    | "fix_start_intent"
+    | "confirmed_manual_handoff"
+    | "complete_intent" = "sent_unknown",
   transitionOverrides: Partial<WorkStatusLifecycleTransition> = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "agent-team-work-status-recovery-"));
   const progress = new FileJobProgressStore(join(root, "progress"));
   const prefixDigest = sha256Digest({ schemaVersion: 1, entries: [] });
   if (!prefixDigest.ok) throw new Error(prefixDigest.error.code);
+  const isFixIntent = sourceShape === "fix_start_intent";
+  const isManualHandoff = sourceShape === "confirmed_manual_handoff";
+  const isCompleteIntent = sourceShape === "complete_intent";
+  const transition: WorkStatusLifecycleTransition = {
+    step: isFixIntent
+      ? "fix_start"
+      : isManualHandoff
+        ? "requires_manual"
+        : isCompleteIntent
+          ? "complete"
+          : "work_start",
+    instance: transitionInstance,
+    mainTarget: isManualHandoff
+      ? "requires_manual"
+      : isCompleteIntent
+        ? "in_review"
+        : "in_progress",
+    allowedMainSources: isFixIntent
+      ? ["in_review", "in_progress"]
+      : isManualHandoff
+        ? ["in_review"]
+        : isCompleteIntent
+          ? ["in_progress", "in_review", "requires_manual"]
+          : ["ready", "in_progress"],
+    agentTarget: isManualHandoff
+      ? { kind: "set", status: "blocked", blockingReason: "unknown_error" }
+      : isCompleteIntent
+        ? { kind: "clear" }
+        : { kind: "set", status: "executing" },
+    main:
+      isFixIntent || isCompleteIntent
+        ? { state: "intent", idempotencyKey: "old-main" }
+        : isManualHandoff
+          ? {
+              state: "confirmed",
+              idempotencyKey: "old-main",
+              confirmedAt: now,
+              observedRevision: "revision-0",
+            }
+          : { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
+    agent:
+      isFixIntent || isCompleteIntent
+        ? { state: "intent", idempotencyKey: "old-agent" }
+        : {
+            state: "confirmed",
+            idempotencyKey: "old-agent",
+            confirmedAt: now,
+            observedRevision: "revision-0",
+          },
+    mainFailures: {
+      count: 1,
+      lastErrorCode: isFixIntent || isCompleteIntent ? "conflict" : "timeout",
+      lastInvocation: "3".repeat(64),
+    },
+    agentFailures: { count: 0 },
+    historyEvidence: {
+      preStateId: isCompleteIntent
+        ? "state-manual"
+        : isFixIntent || isManualHandoff
+          ? "state-review"
+          : "state-ready",
+      targetStateId: isManualHandoff
+        ? "state-manual"
+        : isCompleteIntent
+          ? "state-review"
+          : "state-progress",
+      observedRevision: "revision-0",
+      historyPrefixDigest: prefixDigest.value,
+      historyEntryCount: 0,
+      preStateSpanId: isCompleteIntent
+        ? "span-manual"
+        : isFixIntent || isManualHandoff
+          ? "span-review"
+          : "span-ready",
+    },
+    ...transitionOverrides,
+  };
+  const precedingTransitions: WorkStatusLifecycleTransition[] = isCompleteIntent
+    ? [
+        {
+          step: "requires_manual",
+          instance: "9".repeat(64),
+          mainTarget: "requires_manual",
+          allowedMainSources: ["in_review"],
+          agentTarget: { kind: "set", status: "blocked", blockingReason: "unknown_error" },
+          main: {
+            state: "confirmed",
+            idempotencyKey: "manual-main",
+            confirmedAt: now,
+            observedRevision: "revision-manual",
+          },
+          agent: {
+            state: "confirmed",
+            idempotencyKey: "manual-agent",
+            confirmedAt: now,
+            observedRevision: "revision-manual",
+          },
+          mainFailures: { count: 0 },
+          agentFailures: { count: 0 },
+          historyEvidence: transition.historyEvidence,
+        },
+      ]
+    : [];
   const stored = await progress.compareAndSwap(job.id, null, {
     jobId: job.id,
     projectId: project.id,
@@ -190,7 +299,7 @@ async function harness(
     stage: {
       kind: "requires_manual",
       cause: {
-        stage: sourceShape === "confirmed_manual_handoff" ? "review" : "dispatch",
+        stage: isCompleteIntent ? "merge" : isManualHandoff ? "review" : "dispatch",
         reasonCode: "work_status_lifecycle_failed",
         attempts: { count: 1 },
       },
@@ -200,77 +309,12 @@ async function harness(
     workStatusLifecycle: {
       admissionMode: "enforce",
       capabilityDigest,
-      phase:
-        sourceShape === "fix_start_intent"
-          ? "fixing"
-          : sourceShape === "confirmed_manual_handoff"
-            ? "terminal"
-            : "work_start",
-      transitions: [
-        {
-          step:
-            sourceShape === "fix_start_intent"
-              ? "fix_start"
-              : sourceShape === "confirmed_manual_handoff"
-                ? "requires_manual"
-                : "work_start",
-          instance: transitionInstance,
-          mainTarget:
-            sourceShape === "confirmed_manual_handoff" ? "requires_manual" : "in_progress",
-          allowedMainSources:
-            sourceShape === "fix_start_intent"
-              ? ["in_review", "in_progress"]
-              : sourceShape === "confirmed_manual_handoff"
-                ? ["in_review"]
-                : ["ready", "in_progress"],
-          agentTarget:
-            sourceShape === "confirmed_manual_handoff"
-              ? { kind: "set", status: "blocked", blockingReason: "unknown_error" }
-              : { kind: "set", status: "executing" },
-          main:
-            sourceShape === "fix_start_intent"
-              ? { state: "intent", idempotencyKey: "old-main" }
-              : sourceShape === "confirmed_manual_handoff"
-                ? {
-                    state: "confirmed",
-                    idempotencyKey: "old-main",
-                    confirmedAt: now,
-                    observedRevision: "revision-0",
-                  }
-                : { state: "sent_unknown", idempotencyKey: "old-main", errorCode: "timeout" },
-          agent:
-            sourceShape === "fix_start_intent"
-              ? { state: "intent", idempotencyKey: "old-agent" }
-              : {
-                  state: "confirmed",
-                  idempotencyKey: "old-agent",
-                  confirmedAt: now,
-                  observedRevision: "revision-0",
-                },
-          mainFailures: {
-            count: 1,
-            lastErrorCode: sourceShape === "fix_start_intent" ? "conflict" : "timeout",
-            lastInvocation: "3".repeat(64),
-          },
-          agentFailures: { count: 0 },
-          historyEvidence: {
-            preStateId:
-              sourceShape === "fix_start_intent" || sourceShape === "confirmed_manual_handoff"
-                ? "state-review"
-                : "state-ready",
-            targetStateId:
-              sourceShape === "confirmed_manual_handoff" ? "state-manual" : "state-progress",
-            observedRevision: "revision-0",
-            historyPrefixDigest: prefixDigest.value,
-            historyEntryCount: 0,
-            preStateSpanId:
-              sourceShape === "fix_start_intent" || sourceShape === "confirmed_manual_handoff"
-                ? "span-review"
-                : "span-ready",
-          },
-          ...transitionOverrides,
-        },
-      ],
+      phase: isFixIntent
+        ? "fixing"
+        : isManualHandoff || isCompleteIntent
+          ? "terminal"
+          : "work_start",
+      transitions: [...precedingTransitions, transition],
       incident: { reasonCode: "mutation_unconfirmed", channel: "main" },
     },
   });
@@ -498,6 +542,55 @@ describe("dispatch work-status recovery", () => {
     expect(record.ok && record.value?.workStatusLifecycle?.transitions[0]?.main.state).toBe(
       "confirmed",
     );
+  });
+
+  it("reissues the exact failed complete intent after a confirmed manual handoff", async () => {
+    const test = await harness("requires_manual", undefined, "complete_intent");
+
+    const dryRun = await test.coordinator.run({
+      jobId: job.id,
+      transitionInstance,
+      holderId: "operator-dry-run",
+      dryRun: true,
+    });
+    expect(dryRun).toEqual({
+      state: "ready",
+      dryRun: true,
+      jobId: job.id,
+      transitionInstance,
+      disposition: "pre_state_reissued",
+      plannedMutation: "new_bounded_transition",
+    });
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: false,
+      }),
+    ).resolves.toMatchObject({ state: "recovered", disposition: "pre_state_reissued" });
+
+    const recovered = await test.progress.load(job.id);
+    expect(recovered.ok && recovered.value?.stage.kind).toBe("merging");
+    expect(recovered.ok && recovered.value?.workStatusLifecycle?.transitions).toHaveLength(3);
+    expect(test.workManagement.statusCauses).toEqual(["github_merge_observed"]);
+    expect(test.workManagement.status).toBe("in_review");
+  });
+
+  it("rejects a complete intent whose recovery source list is not the persisted merge shape", async () => {
+    const test = await harness("requires_manual", undefined, "complete_intent", {
+      allowedMainSources: ["in_review", "requires_manual"],
+    });
+
+    await expect(
+      test.coordinator.run({
+        jobId: job.id,
+        transitionInstance,
+        holderId: "operator",
+        dryRun: true,
+      }),
+    ).resolves.toEqual({ state: "blocked", reason: "transition_not_recoverable" });
+    expect(test.workManagement.setStatusCalls).toBe(0);
   });
 
   it("recovers an exact confirmed review manual handoff after the operator restores Linear to review", async () => {
