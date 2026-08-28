@@ -96,6 +96,33 @@ afterEach(async () => {
 });
 
 describe("local Git adapter", () => {
+  it("serializes two sibling worktree metadata mutations for one repository", async () => {
+    const fixture = await createFixture();
+    const inspected = await new LocalGitAdapter().inspectRepository({
+      rootPath: fixture.repository,
+    });
+    if (!inspected.ok) throw new Error(inspected.error.code);
+
+    const results = await Promise.all(
+      [1, 2].map((index) =>
+        new LocalGitAdapter().createWorktree(
+          {
+            rootPath: fixture.repository,
+            path: join(fixture.root, `parallel-worktree-${String(index)}`),
+            branch: `feature/parallel-${String(index)}`,
+            startPoint: inspected.value.headSha,
+          },
+          mutation(`create:parallel-${String(index)}`),
+        ),
+      ),
+    );
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    const listed = await runGit(fixture.repository, ["worktree", "list", "--porcelain"]);
+    expect(listed).toContain("parallel-worktree-1");
+    expect(listed).toContain("parallel-worktree-2");
+  });
+
   it("runs the worktree, diff, commit, push, and removal lifecycle without touching primary", async () => {
     const fixture = await createFixture();
     const adapter = new LocalGitAdapter();

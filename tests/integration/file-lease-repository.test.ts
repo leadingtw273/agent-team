@@ -89,6 +89,53 @@ describe("file lease repository", () => {
     expect((await stat(join(root, ".agent-team", "state", "leases"))).mode & 0o777).toBe(0o700);
   });
 
+  it("serializes four different sibling leases without false lock conflicts", async () => {
+    const root = await temporaryDirectory();
+    const location = paths(root);
+    const now = instant("2026-08-04T12:00:00.000Z");
+    const coordinators = [1, 2, 3, 4].map(
+      (index) =>
+        new LeaseCoordinator(new FileLeaseRepository(location.file, location.lock), {
+          clock: { now: () => now },
+          generateLeaseId: () =>
+            ok(id("lease", `lease_018f47d2-77a4-7cc1-8ef2-${String(index).padStart(12, "0")}`)),
+        }),
+    );
+
+    const results = await Promise.all(
+      coordinators.map((coordinator, index) =>
+        coordinator.acquire({
+          jobId: id("job", `job_018f47d2-77a4-7cc1-8ef2-${String(index + 1).padStart(12, "0")}`),
+          issueId: id(
+            "issue",
+            `issue_018f47d2-77a4-7cc1-8ef2-${String(index + 1).padStart(12, "0")}`,
+          ),
+          holderId: `dispatcher-${String(index + 1)}`,
+        }),
+      ),
+    );
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    const releases = await Promise.all(
+      results.map((result, index) => {
+        if (!result.ok) throw new Error(result.error.code);
+        const coordinator = coordinators[index];
+        if (coordinator === undefined) throw new Error("missing coordinator fixture");
+        return coordinator.release({
+          leaseId: result.value.value.id,
+          holderId: `dispatcher-${String(index + 1)}`,
+        });
+      }),
+    );
+    expect(releases.every((result) => result.ok)).toBe(true);
+    const persisted = await new FileLeaseRepository(location.file, location.lock).readAll();
+    expect(persisted.ok).toBe(true);
+    if (persisted.ok) {
+      expect(persisted.value).toHaveLength(4);
+      expect(persisted.value.every((lease) => lease.releasedAt !== undefined)).toBe(true);
+    }
+  });
+
   it("persists renew, release, expired reclaim, and read-back across instances", async () => {
     const root = await temporaryDirectory();
     const location = paths(root);

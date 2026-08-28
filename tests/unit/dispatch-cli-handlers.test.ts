@@ -54,6 +54,7 @@ import type { LinearReadModel } from "../../src/adapters/linear/read.js";
 import type { BuildResumeCompositionResult } from "../../src/cli/dispatch/resume-full-composition.js";
 
 const discoverSpy = vi.hoisted(() => vi.fn());
+const discoveryCandidatesOverride = vi.hoisted(() => vi.fn<() => readonly unknown[] | undefined>());
 
 vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/adapters/dispatch/index.js")>();
@@ -63,9 +64,10 @@ vi.mock("../../src/adapters/dispatch/index.js", async (importOriginal) => {
       ...args: Parameters<typeof actual.discoverReadyDispatchCandidates>
     ) => {
       discoverSpy(...args);
+      const override = discoveryCandidatesOverride();
       return Promise.resolve(
         ok({
-          candidates: [eligibleCandidate()],
+          candidates: override ?? [eligibleCandidate()],
           skipped: [
             Object.freeze({
               externalIssueId: "linear-issue-skipped",
@@ -137,6 +139,7 @@ describe("humanDeliveryForNewJob", () => {
 const temporaryDirectories: string[] = [];
 afterEach(async () => {
   discoverSpy.mockClear();
+  discoveryCandidatesOverride.mockReset();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -236,6 +239,21 @@ function eligibleCandidate() {
   return Object.freeze({
     issue: eligibleIssue(),
     readyAt: "2026-08-07T00:00:00.000Z",
+    stage: "ci" as const,
+    workKind: "mechanical" as const,
+  });
+}
+
+function batchCandidate(index: number) {
+  return Object.freeze({
+    issue: issueSchema.parse({
+      ...eligibleIssue(),
+      id: `issue_018f47d2-77a4-7cc1-8ef2-${String(index).padStart(12, "0")}`,
+      externalId: `linear-batch-${String(index)}`,
+      title: `Batch candidate ${String(index)}`,
+      changeRegions: [{ path: `src/batch-${String(index)}.ts`, coverage: "exact" }],
+    }),
+    readyAt: `2026-08-07T00:00:0${String(index)}.000Z`,
     stage: "ci" as const,
     workKind: "mechanical" as const,
   });
@@ -485,6 +503,56 @@ describe("createDispatchCliHandlers dry-run vs real-mode port isolation (C015a F
         admissionReservation: { repositoryId: "github:owner/sandbox" },
       },
     });
+  });
+
+  it("runs one bounded four-worker wave and leaves the fifth candidate for the next cycle", async () => {
+    const stateRoot = await temporaryStateRoot();
+    const { buildComposition, realJobs } = fakeBuildComposition(stateRoot);
+    let inFlight = 0;
+    let peakInFlight = 0;
+    let releaseBarrier: (() => void) | undefined;
+    const barrier = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const concurrentBuildComposition = async () => {
+      inFlight += 1;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      if (inFlight === 4) releaseBarrier?.();
+      await barrier;
+      inFlight -= 1;
+      return buildComposition();
+    };
+    discoveryCandidatesOverride.mockReturnValue(
+      Object.freeze([1, 2, 3, 4, 5].map((index) => batchCandidate(index))),
+    );
+    const handlers = createDispatchCliHandlers({
+      agentTeamHome: stateRoot,
+      buildComposition: concurrentBuildComposition,
+      projectBatchConcurrency: 4,
+    });
+
+    const result = await handlers.run({ projectId });
+
+    expect(result.state).toBe("success");
+    expect(peakInFlight).toBe(4);
+    expect(JSON.parse(result.message ?? "{}")).toMatchObject({
+      state: "batch",
+      workerCount: 4,
+      outcomes: [
+        { state: "success", outcome: "dispatched" },
+        { state: "success", outcome: "dispatched" },
+        { state: "success", outcome: "dispatched" },
+        { state: "success", outcome: "dispatched" },
+      ],
+    });
+    const jobs = await realJobs.readAll();
+    expect(jobs.ok).toBe(true);
+    if (!jobs.ok) return;
+    expect(jobs.value).toHaveLength(4);
+    expect(new Set(jobs.value.map((job) => job.issueId))).toEqual(
+      new Set([1, 2, 3, 4].map((index) => batchCandidate(index).issue.id)),
+    );
+    expect(jobs.value.map((job) => job.issueId)).not.toContain(batchCandidate(5).issue.id);
   });
 });
 

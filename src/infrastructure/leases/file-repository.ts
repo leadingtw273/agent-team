@@ -20,6 +20,7 @@ import {
   AtomicFileStore,
   readJsonWithSchema,
   writeJsonWithSchema,
+  runWithInProcessSerialization,
 } from "../files/index.js";
 
 const leaseCollectionSchema = z
@@ -81,13 +82,15 @@ export class FileLeaseRepository implements LeaseRepository {
     ) {
       return err(domainError("invariant_violation"));
     }
-    const lock = await acquireFileLock(this.lockPath, transactionHolderId);
-    if (!lock.ok) return lock;
+    return runWithInProcessSerialization(this.lockPath, async () => {
+      const lock = await acquireFileLock(this.lockPath, transactionHolderId);
+      if (!lock.ok) return lock;
 
-    const operation = await this.#transactLocked(mutate);
-    const released = await lock.value.release();
-    if (!operation.ok || released.ok) return operation;
-    return ok(Object.freeze({ ...operation.value, lockRelease: "unknown" as const }));
+      const operation = await this.#transactLocked(mutate);
+      const released = await lock.value.release();
+      if (!operation.ok || released.ok) return operation;
+      return ok(Object.freeze({ ...operation.value, lockRelease: "unknown" as const }));
+    });
   }
 
   async #transactLocked<Value>(

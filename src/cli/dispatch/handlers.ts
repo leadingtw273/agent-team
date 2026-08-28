@@ -30,6 +30,12 @@ import { GitHubAdapter } from "../../adapters/github/index.js";
 import { FileSkillRuntime } from "../../adapters/skills/index.js";
 import { admitJobSkillSnapshots, type SkillRuntimePort } from "../../application/skills/index.js";
 import { LeaseCoordinator } from "../../application/leases/index.js";
+import type {
+  DispatcherCandidate,
+  DispatchDecision,
+  ModelExecutionOccupancy,
+  RepositoryReservation,
+} from "../../application/dispatch/index.js";
 import {
   WorkStatusLifecycleCoordinator,
   createWorkStatusLifecycleTransitionInstance,
@@ -98,6 +104,8 @@ import {
   buildAutoMergePauseStore,
   buildIssueAdmissionStore,
   buildJobProgressStore,
+  isResumeCandidate,
+  type ResumeCycleSelection,
   type ResumeJobOutcome,
 } from "./resume-composition.js";
 import {
@@ -130,6 +138,7 @@ import { createAcknowledgeExternalMergeHandler } from "./external-merge-recovery
 import { checkPublicIssueAdmissionAuthority } from "./public-admission-authority.js";
 import { buildRepositoryReservationInventory } from "./reservation-inventory.js";
 import { buildLifecyclePipeline } from "./lifecycle-composition.js";
+import { runWithInProcessSerialization } from "../../infrastructure/files/index.js";
 
 export interface CreateDispatchCliHandlersOptions {
   readonly agentTeamHome: string;
@@ -180,6 +189,9 @@ export interface CreateDispatchCliHandlersOptions {
   ) => Pick<JobMutationRuntime, "ensureJobStarted" | "bindPullRequest" | "buildImplementer">;
   /** Narrow test seam. Production derives the guard from the real Linear/GitHub adapters. */
   readonly publicAdmissionAuthority?: DispatchOncePorts["publicAdmissionAuthority"];
+  /** Test seam for the bounded project wave. Production is fixed at four; injected legacy
+   * compositions stay single-worker unless a concurrency test opts in explicitly. */
+  readonly projectBatchConcurrency?: 1 | 2 | 3 | 4;
 }
 
 /** Preserve the adapter receiver when exposing its optional history method through the
@@ -595,6 +607,75 @@ export function createDispatchCliHandlers(
   });
   // Shared by resolve's external-merge convergence and the normal resume/auto-merge paths.
   const autoMergePause = buildAutoMergePauseStore(options.agentTeamHome);
+  const projectBatchConcurrency =
+    options.projectBatchConcurrency ?? (options.buildComposition === undefined ? 4 : 1);
+  type BatchEntry = Readonly<{ context: ProjectBatchContext; workerId: string }>;
+  const batchByInput = new WeakMap<object, BatchEntry>();
+
+  interface ProjectBatchContext {
+    readonly executionOccupancy: ModelExecutionOccupancy[];
+    readonly repositoryReservations: RepositoryReservation[];
+    readonly selectedResumeJobIds: Set<string>;
+    readonly admissionKey: string;
+    resumeInventory?: ReturnType<FileJobProgressStore["listForProject"]>;
+    bootstrapReconciliation?: ReturnType<typeof reconcileBootstrapClaims>;
+    reservationInventory?: ReturnType<typeof buildRepositoryReservationInventory>;
+    reservationInventoryLoaded?: boolean;
+    authoritativeBase?: ReturnType<typeof resolveAuthoritativeBaseRevision>;
+  }
+
+  const createProjectBatchContext = (): ProjectBatchContext => ({
+    executionOccupancy: [],
+    repositoryReservations: [],
+    selectedResumeJobIds: new Set<string>(),
+    admissionKey: `dispatch-project-batch:${randomUUID()}`,
+  });
+
+  const reserveBatchCandidate = (
+    context: ProjectBatchContext,
+    workerId: string,
+    project: Project,
+    candidate: DispatcherCandidate,
+    decision: Extract<DispatchDecision, { kind: "selected" }>,
+  ): (() => void) => {
+    const provisionalJobId = `batch:${workerId}:${candidate.issue.id}`;
+    const repositoryId = `${project.sourceControl.provider}:${project.sourceControl.repository}`;
+    context.repositoryReservations.push({
+      jobId: provisionalJobId,
+      projectId: project.id,
+      repositoryId,
+      stage: candidate.stage,
+      ...(candidate.issue.changeRegions === undefined
+        ? {}
+        : { declaredRegions: candidate.issue.changeRegions }),
+    });
+    if (candidate.workKind === "model" && decision.model !== undefined) {
+      context.executionOccupancy.push({
+        jobId: provisionalJobId,
+        projectId: project.id,
+        provider: decision.model.candidate.provider,
+      });
+    }
+    return () => {
+      const reservationIndex = context.repositoryReservations.findIndex(
+        (entry) => entry.jobId === provisionalJobId,
+      );
+      if (reservationIndex >= 0) context.repositoryReservations.splice(reservationIndex, 1);
+      const occupancyIndex = context.executionOccupancy.findIndex(
+        (entry) => entry.jobId === provisionalJobId,
+      );
+      if (occupancyIndex >= 0) context.executionOccupancy.splice(occupancyIndex, 1);
+    };
+  };
+
+  const releaseBatchExecution = (context: ProjectBatchContext, workerId: string): void => {
+    const prefix = `batch:${workerId}:`;
+    for (let index = context.executionOccupancy.length - 1; index >= 0; index -= 1) {
+      if (context.executionOccupancy[index]?.jobId.startsWith(prefix)) {
+        context.executionOccupancy.splice(index, 1);
+      }
+    }
+  };
 
   // C015o decision 4: `dispatch resolve` always operates on the real, durable job-progress/
   // admission stores -- there is no `--dry-run` concept for it (it is itself the manual escape
@@ -772,7 +853,7 @@ export function createDispatchCliHandlers(
     },
   });
 
-  return Object.freeze({
+  const singleHandlers = Object.freeze({
     dispatchResolve,
     dispatchAcknowledgeExternalMerge,
     dispatchResolveLegacyClaim,
@@ -785,7 +866,7 @@ export function createDispatchCliHandlers(
     dispatchJobResume,
     ...humanAcceptanceHandlers,
     quota,
-    async run(input) {
+    async run(input: Parameters<CliHandlers["run"]>[0]) {
       if (input.projectId === undefined || input.projectId.trim().length === 0) {
         return outcome("blocked", {
           operation: "dispatch_run",
@@ -794,6 +875,7 @@ export function createDispatchCliHandlers(
           message: "run 需要 --project <project-id>。",
         });
       }
+      const batchEntry = batchByInput.get(input);
       const build = await (options.buildComposition ?? buildDispatchComposition)({
         agentTeamHome: options.agentTeamHome,
         projectId: input.projectId,
@@ -807,6 +889,21 @@ export function createDispatchCliHandlers(
           message: blockedMessages[build.reason],
         });
       }
+      const resolveBase: typeof resolveAuthoritativeBaseRevision = (
+        project,
+        ports,
+        resolveOptions,
+      ) => {
+        const resolve = () =>
+          (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
+            project,
+            ports,
+            resolveOptions,
+          );
+        if (batchEntry === undefined) return resolve();
+        batchEntry.context.authoritativeBase ??= resolve();
+        return batchEntry.context.authoritativeBase;
+      };
 
       const holderId = generateHolderId();
       const dryRun = input.dryRun === true;
@@ -841,13 +938,17 @@ export function createDispatchCliHandlers(
       let bootstrapReconciliation: readonly BootstrapReconciliationOutcome[] = Object.freeze([]);
 
       if (!dryRun) {
-        const reconciled = await reconcileBootstrapClaims({
-          agentTeamHome: options.agentTeamHome,
-          project: build.value.project,
-          admission: durableAdmission,
-          progress,
-          jobs: build.value.jobs,
-        });
+        const reconcile = () =>
+          reconcileBootstrapClaims({
+            agentTeamHome: options.agentTeamHome,
+            project: build.value.project,
+            admission: durableAdmission,
+            progress,
+            jobs: build.value.jobs,
+          });
+        const reconciled = await (batchEntry === undefined
+          ? reconcile()
+          : (batchEntry.context.bootstrapReconciliation ??= reconcile()));
         if (!reconciled.ok) {
           return outcome("failed", {
             operation: "dispatch_run",
@@ -863,30 +964,63 @@ export function createDispatchCliHandlers(
       // Resume-only bridge shared with `reconcile --all`. It can converge to `none`, but never
       // falls through internally to discovery/new-Job admission.
       if (!dryRun) {
-        const resumed = await (options.resumeExistingProjectJobs ?? resumeExistingProjectJobs)({
-          agentTeamHome: options.agentTeamHome,
-          ready: build.value,
-          holderId,
-          clock,
-          autoMergePause,
-          ...(options.buildResumeComposition === undefined
-            ? {}
-            : { buildResumeComposition: options.buildResumeComposition }),
-          buildImplementerPipeline: buildPipelineComposition,
-          ...(options.resolveAuthoritativeBase === undefined
-            ? {}
-            : { resolveAuthoritativeBase: options.resolveAuthoritativeBase }),
-        });
-        if (resumed.state === "resumed") {
-          return outcome(
-            resumed.outcomes.some((job) => job.outcome === "failed") ? "failed" : "success",
-            {
+        let resumeSelections: ResumeCycleSelection["selections"] | undefined;
+        if (batchEntry !== undefined) {
+          batchEntry.context.resumeInventory ??= progress.listForProject(build.value.project.id);
+          const inventory = await batchEntry.context.resumeInventory;
+          if (!inventory.ok) {
+            return outcome("failed", {
               operation: "dispatch_run",
-              state: "resumed",
+              state: "blocked",
               projectId: input.projectId,
-              resumed: safeResumeOutcomes(resumed.outcomes),
-            },
+              reason: "job_progress_read_failed",
+              errorCode: inventory.error.code,
+            });
+          }
+          const selected = inventory.value.find(
+            (record) =>
+              isResumeCandidate(record) &&
+              !batchEntry.context.selectedResumeJobIds.has(record.jobId),
           );
+          if (selected !== undefined) {
+            batchEntry.context.selectedResumeJobIds.add(selected.jobId);
+            resumeSelections = Object.freeze([
+              Object.freeze({ jobId: selected.jobId, expectedRevision: selected.revision }),
+            ]);
+          }
+        }
+        const resumed =
+          batchEntry !== undefined && resumeSelections === undefined
+            ? Object.freeze({ state: "none" as const })
+            : await (options.resumeExistingProjectJobs ?? resumeExistingProjectJobs)({
+                agentTeamHome: options.agentTeamHome,
+                ready: build.value,
+                holderId,
+                clock,
+                autoMergePause,
+                ...(resumeSelections === undefined ? {} : { selections: resumeSelections }),
+                ...(options.buildResumeComposition === undefined
+                  ? {}
+                  : { buildResumeComposition: options.buildResumeComposition }),
+                buildImplementerPipeline: buildPipelineComposition,
+                resolveAuthoritativeBase: resolveBase,
+              });
+        if (resumed.state === "resumed") {
+          const onlyStaleSelections =
+            batchEntry !== undefined &&
+            resumed.outcomes.length > 0 &&
+            resumed.outcomes.every((job) => job.outcome === "candidate_changed");
+          if (!onlyStaleSelections) {
+            return outcome(
+              resumed.outcomes.some((job) => job.outcome === "failed") ? "failed" : "success",
+              {
+                operation: "dispatch_run",
+                state: "resumed",
+                projectId: input.projectId,
+                resumed: safeResumeOutcomes(resumed.outcomes),
+              },
+            );
+          }
         }
         if (resumed.state === "blocked") {
           switch (resumed.reason) {
@@ -1057,26 +1191,30 @@ export function createDispatchCliHandlers(
       }
 
       const repositoryId = `${build.value.project.sourceControl.provider}:${build.value.project.sourceControl.repository}`;
-      const reservationInventory = await buildRepositoryReservationInventory({
-        projectId: build.value.project.id,
-        repositoryId,
-        progress,
-        persistLegacySnapshots: !dryRun,
-        readDeclaredRegions: async (externalIssueId) => {
-          // An injected composition is a test/canary seam and may deliberately expose no Linear
-          // reader. Preserve zero-external-call behavior and fail closed to whole-repository
-          // reservation; production always uses the authoritative read-back below.
-          if (options.buildComposition !== undefined) return err(domainError("unavailable"));
-          const issue = await projectIssueByExternalId(
-            build.value.project,
-            build.value.discovery.readModel,
-            build.value.discovery.teamId,
-            build.value.discovery.linearProjectId,
-            externalIssueId,
-          );
-          return issue.ok ? ok(issue.value.changeRegions) : err(issue.error);
-        },
-      });
+      const buildReservationInventory = () =>
+        buildRepositoryReservationInventory({
+          projectId: build.value.project.id,
+          repositoryId,
+          progress,
+          persistLegacySnapshots: !dryRun,
+          readDeclaredRegions: async (externalIssueId) => {
+            // An injected composition is a test/canary seam and may deliberately expose no Linear
+            // reader. Preserve zero-external-call behavior and fail closed to whole-repository
+            // reservation; production always uses the authoritative read-back below.
+            if (options.buildComposition !== undefined) return err(domainError("unavailable"));
+            const issue = await projectIssueByExternalId(
+              build.value.project,
+              build.value.discovery.readModel,
+              build.value.discovery.teamId,
+              build.value.discovery.linearProjectId,
+              externalIssueId,
+            );
+            return issue.ok ? ok(issue.value.changeRegions) : err(issue.error);
+          },
+        });
+      const reservationInventory = await (batchEntry === undefined
+        ? buildReservationInventory()
+        : (batchEntry.context.reservationInventory ??= buildReservationInventory()));
       if (!reservationInventory.ok) {
         return outcome("failed", {
           operation: "dispatch_run",
@@ -1088,10 +1226,35 @@ export function createDispatchCliHandlers(
         });
       }
 
-      const dispatchOnceOutcome = await dispatchOnce(build.value, ports, holderId, {
-        allowOperatorCanary: !dryRun,
-        repositoryReservations: reservationInventory.value,
-      });
+      if (batchEntry !== undefined && batchEntry.context.reservationInventoryLoaded !== true) {
+        batchEntry.context.repositoryReservations.push(...reservationInventory.value);
+        batchEntry.context.reservationInventoryLoaded = true;
+      }
+      const activeReservations =
+        batchEntry?.context.repositoryReservations ?? reservationInventory.value;
+      const dispatch = () =>
+        dispatchOnce(build.value, ports, holderId, {
+          allowOperatorCanary: !dryRun,
+          ...(batchEntry === undefined
+            ? {}
+            : { executionOccupancy: batchEntry.context.executionOccupancy }),
+          repositoryReservations: activeReservations,
+          ...(batchEntry === undefined
+            ? {}
+            : {
+                onCandidateClaimed: (candidate, decision) =>
+                  reserveBatchCandidate(
+                    batchEntry.context,
+                    batchEntry.workerId,
+                    build.value.project,
+                    candidate,
+                    decision,
+                  ),
+              }),
+        });
+      const dispatchOnceOutcome = await (batchEntry === undefined
+        ? dispatch()
+        : runWithInProcessSerialization(batchEntry.context.admissionKey, dispatch));
       if (dispatchOnceOutcome.outcome === "capability_failed") {
         return outcome("blocked", {
           operation: "dispatch_run",
@@ -1436,7 +1599,7 @@ export function createDispatchCliHandlers(
                     });
               },
               resolveAuthoritativeBase: (project, resolveOptions) =>
-                (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
+                resolveBase(
                   project,
                   { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
                   resolveOptions,
@@ -1539,9 +1702,7 @@ export function createDispatchCliHandlers(
           // (missing both `inspectRepository` and the new `resolveAuthoritativeBranch`), and both
           // adapters are stateless CLI wrappers -- constructing fresh instances is cheap and does
           // not duplicate any state.
-          const authoritativeBase = await (
-            options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision
-          )(
+          const authoritativeBase = await resolveBase(
             build.value.project,
             { git: new LocalGitAdapter(), sourceControl: new GitHubAdapter() },
             { idempotencyKey: `cli-dispatch:${result.job.id}:authoritative-base` },
@@ -2101,6 +2262,87 @@ export function createDispatchCliHandlers(
             bootstrapReconciliation,
           });
       }
+    },
+  });
+
+  return Object.freeze({
+    ...singleHandlers,
+    async run(input: Parameters<CliHandlers["run"]>[0]) {
+      if (input.dryRun === true || input.projectId === undefined || input.projectId.trim() === "") {
+        return singleHandlers.run(input);
+      }
+      if (projectBatchConcurrency === 1) return singleHandlers.run(input);
+      const projectId = input.projectId;
+      const context = createProjectBatchContext();
+      const childInputs = Array.from({ length: projectBatchConcurrency }, (_, index) =>
+        Object.freeze({ projectId, dryRun: false, worker: index + 1 }),
+      );
+      const settled = await Promise.allSettled(
+        childInputs.map(async (childInput, index) => {
+          const workerId = String(index + 1);
+          batchByInput.set(childInput, { context, workerId });
+          try {
+            return await singleHandlers.run(childInput);
+          } finally {
+            releaseBatchExecution(context, workerId);
+            batchByInput.delete(childInput);
+          }
+        }),
+      );
+      const summaries = settled.map((entry, index) => {
+        if (entry.status === "rejected") {
+          return Object.freeze({ worker: index + 1, state: "failed", reason: "unexpected_error" });
+        }
+        let payload: Record<string, unknown> = {};
+        try {
+          const parsed = JSON.parse(entry.value.message) as unknown;
+          if (typeof parsed === "object" && parsed !== null)
+            payload = parsed as Record<string, unknown>;
+        } catch {
+          payload = {};
+        }
+        return Object.freeze({
+          worker: index + 1,
+          state: entry.value.state,
+          ...(typeof payload["state"] === "string" ? { outcome: payload["state"] } : {}),
+          ...(typeof payload["jobId"] === "string" ? { jobId: payload["jobId"] } : {}),
+          ...(typeof payload["issueId"] === "string" ? { issueId: payload["issueId"] } : {}),
+          ...(typeof payload["pipeline"] === "string" ? { pipeline: payload["pipeline"] } : {}),
+          ...(typeof payload["pipelineReason"] === "string"
+            ? { reason: payload["pipelineReason"] }
+            : typeof payload["reason"] === "string"
+              ? { reason: payload["reason"] }
+              : {}),
+          ...(Array.isArray(payload["resumed"])
+            ? {
+                resumed: payload["resumed"].slice(0, 1).map((resume) => {
+                  if (typeof resume !== "object" || resume === null) return {};
+                  const record = resume as Record<string, unknown>;
+                  return {
+                    ...(typeof record["jobId"] === "string" ? { jobId: record["jobId"] } : {}),
+                    ...(typeof record["outcome"] === "string"
+                      ? { outcome: record["outcome"] }
+                      : {}),
+                  };
+                }),
+              }
+            : {}),
+        });
+      });
+      const overallState = settled.some(
+        (entry) => entry.status === "rejected" || entry.value.state === "failed",
+      )
+        ? "failed"
+        : settled.every((entry) => entry.status === "fulfilled" && entry.value.state === "blocked")
+          ? "blocked"
+          : "success";
+      return outcome(overallState, {
+        operation: "dispatch_run",
+        state: "batch",
+        projectId,
+        workerCount: projectBatchConcurrency,
+        outcomes: summaries,
+      });
     },
   });
 }

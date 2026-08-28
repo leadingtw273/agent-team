@@ -217,23 +217,7 @@ export async function resumeExistingProjectJobs(
       mutationRuntime().bindPullRequest(record, prNumber, headSha),
     clock: options.clock,
     ensureWorktreeDirectory: () => ensureDispatchWorktreesDirectory(options.agentTeamHome),
-    buildPipeline: async () => {
-      const records = await progress.listForProject(options.ready.project.id);
-      const active = records.ok
-        ? records.value.filter(
-            (record) =>
-              record.controlFence?.state === "active" &&
-              record.controlFence.holderId === options.holderId &&
-              (record.stage.kind === "work_start_pending" || record.stage.kind === "implementing"),
-          )
-        : [];
-      return active.length === 1 && active[0] !== undefined
-        ? mutationRuntime().buildImplementer(active[0])
-        : Object.freeze({
-            state: "blocked" as const,
-            reason: "github_authentication_unavailable" as const,
-          });
-    },
+    buildPipeline: (record) => mutationRuntime().buildImplementer(record),
     resolveAuthoritativeBase: (project, resolveOptions) =>
       (options.resolveAuthoritativeBase ?? resolveAuthoritativeBaseRevision)(
         project,

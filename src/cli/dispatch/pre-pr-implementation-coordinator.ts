@@ -58,7 +58,9 @@ export interface PrePrImplementationCoordinatorDependencies {
   ) => Promise<Result<JobProgressRecord, DomainError>>;
   readonly clock: Clock;
   readonly ensureWorktreeDirectory: () => Promise<Result<void, DomainError>>;
-  readonly buildPipeline: () => Promise<
+  readonly buildPipeline: (
+    record: JobProgressRecord,
+  ) => Promise<
     | Readonly<{ state: "ready"; value: Pick<ImplementerPipeline, "run"> }>
     | Readonly<{ state: "blocked"; reason: string }>
   >;
@@ -415,7 +417,7 @@ export class PrePrImplementationCoordinator {
         "worktree_directory_unavailable",
       );
     }
-    const pipeline = await this.dependencies.buildPipeline();
+    const pipeline = await this.dependencies.buildPipeline(armed.value);
     if (pipeline.state !== "ready") {
       const persisted = await requiresManual(
         this.dependencies.progress,

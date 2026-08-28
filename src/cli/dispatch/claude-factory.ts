@@ -11,18 +11,27 @@ import { Redactor } from "../../infrastructure/redaction/index.js";
 import type { ProviderPort } from "../../application/ports/index.js";
 import type { DispatchProviderConfig } from "./provider-config-store.js";
 import { PolicyBoundProvider } from "./provider-policy.js";
+import {
+  defaultModelExecutionLimiter,
+  LimitedProvider,
+  type ModelExecutionLimiter,
+} from "./provider-limiter.js";
 
-export function buildClaudeRunner(config: DispatchProviderConfig["claude"]): ProviderPort {
+export function buildClaudeRunner(
+  config: DispatchProviderConfig["claude"],
+  limiter: ModelExecutionLimiter = defaultModelExecutionLimiter,
+): ProviderPort {
   const runner = new ClaudeRunner({
     process: new ChildProcessRunner(),
     redactor: new Redactor(),
     executable: config.executable,
     models: config.models,
   });
-  return new PolicyBoundProvider({
+  const policy = new PolicyBoundProvider({
     delegate: runner,
     provider: "claude",
     models: config.models,
     roles: ["code_reviewer"],
   });
+  return new LimitedProvider("claude", policy, limiter);
 }

@@ -37,6 +37,7 @@ import {
   type GitObjectId,
 } from "../../domain/review/index.js";
 import type { MutationOptions, ReadOptions } from "../../application/ports/common.js";
+import { runWithInProcessSerialization } from "../../infrastructure/files/index.js";
 
 const defaultTimeoutMs = 30_000;
 const defaultMaxOutputBytes = 64 * 1024 * 1024;
@@ -1043,73 +1044,75 @@ export class LocalGitAdapter implements GitPort {
     }
     const root = await this.#primaryRepositoryRoot(command, options);
     if (!root.ok) return root;
-    const target = await canonicalFuturePath(command.path);
-    if (target === undefined || target === root.value || isDescendant(root.value, target)) {
-      return failure("conflict");
-    }
-    const branchCheck = await this.#run(root.value, [
-      "check-ref-format",
-      "--branch",
-      command.branch,
-    ]);
-    if (!branchCheck.ok) return failure("external_failure");
+    return runWithInProcessSerialization(`git-worktree:${root.value}`, async () => {
+      const target = await canonicalFuturePath(command.path);
+      if (target === undefined || target === root.value || isDescendant(root.value, target)) {
+        return failure("conflict");
+      }
+      const branchCheck = await this.#run(root.value, [
+        "check-ref-format",
+        "--branch",
+        command.branch,
+      ]);
+      if (!branchCheck.ok) return failure("external_failure");
 
-    const existing = await canonicalPath(target);
-    if (existing !== undefined) {
-      // C015m: record this instance's own baseline for the pointer-readback check *before*
-      // establishing trust, not after -- an idempotent re-`createWorktree` call is this
-      // instance's first encounter with this worktree's `.git`, exactly like a fresh creation
-      // below; capturing it here (rather than opportunistically inside a passing check) keeps
-      // "baseline capture" a single, explicit, creation-time-only concept.
-      await this.#captureWorktreeGitPointerBaseline(existing);
-      const inspected = await this.#inspectVerifiedWorktree(
-        {
-          repositoryRoot: root.value,
-          path: existing,
-          branch: command.branch,
-          headSha: "",
-        },
-        options,
-      );
-      return inspected.ok
-        ? ok({
+      const existing = await canonicalPath(target);
+      if (existing !== undefined) {
+        // C015m: record this instance's own baseline for the pointer-readback check *before*
+        // establishing trust, not after -- an idempotent re-`createWorktree` call is this
+        // instance's first encounter with this worktree's `.git`, exactly like a fresh creation
+        // below; capturing it here (rather than opportunistically inside a passing check) keeps
+        // "baseline capture" a single, explicit, creation-time-only concept.
+        await this.#captureWorktreeGitPointerBaseline(existing);
+        const inspected = await this.#inspectVerifiedWorktree(
+          {
             repositoryRoot: root.value,
             path: existing,
-            branch: inspected.value.branch,
-            headSha: inspected.value.headSha,
-          })
-        : failure("conflict");
-    }
+            branch: command.branch,
+            headSha: "",
+          },
+          options,
+        );
+        return inspected.ok
+          ? ok({
+              repositoryRoot: root.value,
+              path: existing,
+              branch: inspected.value.branch,
+              headSha: inspected.value.headSha,
+            })
+          : failure("conflict");
+      }
 
-    const start = await this.#resolveCommit(root.value, command.startPoint, options);
-    if (!start.ok) return start;
-    const added = await this.#run(
-      root.value,
-      ["worktree", "add", "-b", command.branch, "--", target, start.value],
-      options,
-    );
-    if (!added.ok) return added;
-    // C015m: capture the exact bytes of the freshly created worktree's `.git` pointer file right
-    // now -- this is the one moment in the whole lifecycle guaranteed to be untouched by any
-    // provider (the worktree did not exist a moment ago). `#verifyWorktreeGitPointer` compares
-    // every later read against this, for the strictest possible check available within this
-    // process's lifetime.
-    const canonicalTarget = await canonicalPath(target);
-    if (canonicalTarget !== undefined) {
-      await this.#captureWorktreeGitPointerBaseline(canonicalTarget);
-    }
-    const snapshot = await this.#inspectVerifiedWorktree(
-      { repositoryRoot: root.value, path: target, branch: command.branch, headSha: "" },
-      options,
-    );
-    return snapshot.ok
-      ? ok({
-          repositoryRoot: root.value,
-          path: target,
-          branch: snapshot.value.branch,
-          headSha: snapshot.value.headSha,
-        })
-      : snapshot;
+      const start = await this.#resolveCommit(root.value, command.startPoint, options);
+      if (!start.ok) return start;
+      const added = await this.#run(
+        root.value,
+        ["worktree", "add", "-b", command.branch, "--", target, start.value],
+        options,
+      );
+      if (!added.ok) return added;
+      // C015m: capture the exact bytes of the freshly created worktree's `.git` pointer file right
+      // now -- this is the one moment in the whole lifecycle guaranteed to be untouched by any
+      // provider (the worktree did not exist a moment ago). `#verifyWorktreeGitPointer` compares
+      // every later read against this, for the strictest possible check available within this
+      // process's lifetime.
+      const canonicalTarget = await canonicalPath(target);
+      if (canonicalTarget !== undefined) {
+        await this.#captureWorktreeGitPointerBaseline(canonicalTarget);
+      }
+      const snapshot = await this.#inspectVerifiedWorktree(
+        { repositoryRoot: root.value, path: target, branch: command.branch, headSha: "" },
+        options,
+      );
+      return snapshot.ok
+        ? ok({
+            repositoryRoot: root.value,
+            path: target,
+            branch: snapshot.value.branch,
+            headSha: snapshot.value.headSha,
+          })
+        : snapshot;
+    });
   }
 
   async #captureWorktreeGitPointerBaseline(canonicalWorktreePath: string): Promise<void> {

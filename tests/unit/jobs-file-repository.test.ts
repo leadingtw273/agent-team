@@ -116,6 +116,40 @@ describe("FileJobRepository", () => {
     if (all.ok) expect(all.value.map((entry) => entry.id)).toHaveLength(2);
   });
 
+  it("serializes four sibling creates against the shared file without false lock conflicts", async () => {
+    const root = await temporaryDirectory();
+    const location = paths(root);
+    const jobs = [1, 2, 3, 4].map((index) =>
+      job({
+        id: id("job", `job_018f47d2-77a4-7cc1-8ef2-${String(index).padStart(12, "0")}`),
+        issueId: id("issue", `issue_018f47d2-77a4-7cc1-8ef2-${String(index).padStart(12, "0")}`),
+      }),
+    );
+
+    const results = await Promise.all(
+      jobs.map((entry) => new FileJobRepository(location.file, location.lock).create(entry)),
+    );
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    const updates = await Promise.all(
+      jobs.map((entry, index) =>
+        new FileJobRepository(location.file, location.lock).update(
+          { ...entry, attempts: { ...entry.attempts, reviewRuns: 1 } },
+          { idempotencyKey: `parallel-update-${String(index + 1)}` },
+        ),
+      ),
+    );
+    expect(updates.every((result) => result.ok)).toBe(true);
+    const persisted = await new FileJobRepository(location.file, location.lock).readAll();
+    expect(persisted.ok).toBe(true);
+    if (persisted.ok) {
+      expect(new Set(persisted.value.map((entry) => entry.id))).toEqual(
+        new Set(jobs.map((entry) => entry.id)),
+      );
+      expect(persisted.value.every((entry) => entry.attempts.reviewRuns === 1)).toBe(true);
+    }
+  });
+
   it("returns an empty list, not an error, when the file has never been written", async () => {
     const root = await temporaryDirectory();
     const location = paths(root);
