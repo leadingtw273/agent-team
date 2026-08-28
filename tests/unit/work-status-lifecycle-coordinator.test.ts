@@ -23,7 +23,11 @@ import {
   type Instant,
 } from "../../src/domain/foundation/index.js";
 import { issueSchema, projectSchema } from "../../src/domain/project/index.js";
-import { createAgentCondition, type WorkStatus } from "../../src/domain/workflow/index.js";
+import {
+  createAgentCondition,
+  transitionWorkStatus,
+  type WorkStatus,
+} from "../../src/domain/workflow/index.js";
 
 function id<Scope extends string>(scope: Scope, value: string): Identifier<Scope> {
   const parsed = parseIdentifier(scope, value);
@@ -80,6 +84,7 @@ class FakeWorkManagement {
   statusError: DomainError | undefined;
   agentError: DomainError | undefined;
   mutateBeforeStatusError = false;
+  enforceDomainTransitions = false;
 
   getIssue() {
     this.getCalls += 1;
@@ -94,6 +99,14 @@ class FakeWorkManagement {
         this.current = { ...this.current, workStatus: status, revision: "linear-revision-mutated" };
       }
       return Promise.resolve(err(this.statusError));
+    }
+    if (this.enforceDomainTransitions) {
+      if (options.cause === undefined) return Promise.resolve(err(domainError("conflict")));
+      const transition = transitionWorkStatus(this.current.workStatus, {
+        target: status,
+        cause: options.cause,
+      });
+      if (!transition.ok) return Promise.resolve(err(transition.error));
     }
     this.current = { ...this.current, workStatus: status, revision: "linear-revision-2" };
     return Promise.resolve(ok(this.current));
@@ -404,6 +417,51 @@ describe("WorkStatusLifecycleCoordinator", () => {
 
     expect(result).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
     expect(test.workManagement.statusCauses).toEqual(["ready_gate_passed"]);
+    expect(test.workManagement.clearAgentCalls).toBe(1);
+  });
+
+  it("restores a Controller-owned requires-manual issue to review after observing its GitHub merge", async () => {
+    const test = harness();
+    test.workManagement.enforceDomainTransitions = true;
+    test.workManagement.current = snapshot(
+      "requires_manual",
+      createAgentCondition("blocked", ["unknown_error"]),
+    );
+    test.ledger.checkpoint.transitions.push({
+      step: "requires_manual",
+      instance: "e".repeat(64),
+      mainTarget: "requires_manual",
+      allowedMainSources: ["in_review"],
+      agentTarget: { kind: "set", status: "blocked", blockingReason: "unknown_error" },
+      main: {
+        state: "confirmed",
+        idempotencyKey: "manual:main",
+        confirmedAt: now,
+        observedRevision: "linear-manual",
+      },
+      agent: {
+        state: "confirmed",
+        idempotencyKey: "manual:agent",
+        confirmedAt: now,
+        observedRevision: "linear-manual",
+      },
+      mainFailures: { count: 0 },
+      agentFailures: { count: 0 },
+    });
+
+    const result = await test.coordinator.transition(
+      request({
+        phase: "terminal",
+        step: "complete",
+        transitionInstance: "f".repeat(64),
+        mainTarget: "in_review",
+        allowedMainSources: ["in_progress", "in_review", "requires_manual"],
+        agentTarget: { kind: "clear" },
+      }),
+    );
+
+    expect(result).toMatchObject({ state: "permitted", main: "confirmed", agent: "confirmed" });
+    expect(test.workManagement.statusCauses).toEqual(["github_merge_observed"]);
     expect(test.workManagement.clearAgentCalls).toBe(1);
   });
 

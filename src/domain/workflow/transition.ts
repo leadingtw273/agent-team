@@ -24,6 +24,7 @@ const standardWorkTransitions = new Set([
   "in_progress>requires_manual:policy_requires_manual",
   "in_review>requires_manual:policy_requires_manual",
   "requires_manual>ready:ready_gate_passed",
+  "requires_manual>in_review:github_merge_observed",
   "in_progress>in_review:review_started",
   "in_review>in_progress:changes_requested",
   "ready>backlog:requirements_changed",
