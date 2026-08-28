@@ -23,17 +23,18 @@ const issueId = "issue_018f47d2-77a4-7cc1-8ef2-0123456789ab";
 const repositoryId = "github:leadingtw273/agent-team";
 
 function record(ordinal: number, overrides: Partial<JobProgressRecord> = {}): JobProgressRecord {
+  const ordinalText = String(ordinal);
   return jobProgressRecordSchema.parse({
     schemaVersion: 1,
     revision: 0,
     jobId: `job_018f47d2-77a4-7cc1-8ef2-${String(ordinal).padStart(12, "0")}`,
     projectId,
     issueId,
-    externalIssueId: `LEA-${ordinal}`,
+    externalIssueId: `LEA-${ordinalText}`,
     model: "gpt-5.6-terra",
     stage: { kind: "ci_waiting" },
-    branch: `feature/lea-${ordinal}`,
-    worktreePath: `/tmp/lea-${ordinal}`,
+    branch: `feature/lea-${ordinalText}`,
+    worktreePath: `/tmp/lea-${ordinalText}`,
     updatedAt: "2026-08-28T00:00:00.000Z",
     ...overrides,
   });
@@ -44,18 +45,18 @@ class MemoryProgress implements ReservationProgressPort {
 
   constructor(readonly records: JobProgressRecord[]) {}
 
-  async listForProject(): Promise<Result<readonly JobProgressRecord[], DomainError>> {
-    return ok(this.records);
+  listForProject(): Promise<Result<readonly JobProgressRecord[], DomainError>> {
+    return Promise.resolve(ok(this.records));
   }
 
-  async compareAndSwap(
+  compareAndSwap(
     jobId: string,
     expectedRevision: number,
     next: JobProgressRecordMutation,
   ): Promise<Result<JobProgressRecord, DomainError>> {
     const index = this.records.findIndex((entry) => entry.jobId === jobId);
     if (index < 0 || this.records[index]?.revision !== expectedRevision) {
-      return err(domainError("conflict"));
+      return Promise.resolve(err(domainError("conflict")));
     }
     const written = jobProgressRecordSchema.parse({
       ...next,
@@ -65,7 +66,7 @@ class MemoryProgress implements ReservationProgressPort {
     });
     this.records[index] = written;
     this.writes.push(jobId);
-    return ok(written);
+    return Promise.resolve(ok(written));
   }
 }
 
@@ -87,9 +88,9 @@ describe("repository reservation inventory", () => {
       repositoryId,
       progress,
       persistLegacySnapshots: true,
-      readDeclaredRegions: async () => {
+      readDeclaredRegions: () => {
         reads += 1;
-        return ok([{ path: "src/changed-later", coverage: "subtree" }]);
+        return Promise.resolve(ok([{ path: "src/changed-later", coverage: "subtree" }]));
       },
     });
 
@@ -119,15 +120,15 @@ describe("repository reservation inventory", () => {
       repositoryId,
       progress,
       persistLegacySnapshots: true,
-      readDeclaredRegions: async () => ok(regions),
+      readDeclaredRegions: () => Promise.resolve(ok(regions)),
     });
     const second = await buildRepositoryReservationInventory({
       projectId,
       repositoryId,
       progress,
       persistLegacySnapshots: true,
-      readDeclaredRegions: async () =>
-        ok([{ path: "src/application/dispatch/model.ts", coverage: "exact" }]),
+      readDeclaredRegions: () =>
+        Promise.resolve(ok([{ path: "src/application/dispatch/model.ts", coverage: "exact" }])),
     });
 
     expect(first.ok && first.value[0]?.declaredRegions).toEqual(regions);
@@ -143,7 +144,7 @@ describe("repository reservation inventory", () => {
       repositoryId,
       progress,
       persistLegacySnapshots: false,
-      readDeclaredRegions: async () => err(domainError("unavailable")),
+      readDeclaredRegions: () => Promise.resolve(err(domainError("unavailable"))),
     });
 
     expect(result).toEqual(
@@ -168,7 +169,7 @@ describe("repository reservation inventory", () => {
       repositoryId,
       progress,
       persistLegacySnapshots: true,
-      readDeclaredRegions: async () => err(domainError("unavailable")),
+      readDeclaredRegions: () => Promise.resolve(err(domainError("unavailable"))),
     });
 
     expect(result.ok && result.value[0]).toMatchObject({ repositoryId });
