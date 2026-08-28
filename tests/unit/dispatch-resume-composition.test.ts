@@ -3583,17 +3583,20 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
 
   it("reconciles a merged Job after its required acceptance checkpoint failed", async () => {
     const workIssue = humanWorkflowIssue("light");
+    const workStatusRequests: unknown[] = [];
     const { deps, progress, lifecycleRequests, admission } = await harness({
       changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
       workIssue,
-      workStatus: "ready",
-      workStatusTransition: () =>
-        Promise.resolve({
+      workStatus: "requires_manual",
+      workStatusTransition: (request) => {
+        workStatusRequests.push(request);
+        return Promise.resolve({
           state: "permitted",
-          mode: "observe",
-          main: "observed",
-          agent: "observed",
-        }),
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        });
+      },
     });
     const acceptance = new FileHumanAcceptanceStore(
       await temporaryDirectory("agent-team-human-acceptance-reconcile-"),
@@ -3613,7 +3616,7 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       {
         humanDelivery: humanDelivery(workIssue),
         workStatusLifecycle: {
-          admissionMode: "observe",
+          admissionMode: "enforce",
           capabilityDigest: "5".repeat(64),
           phase: "merging",
           transitions: [],
@@ -3629,7 +3632,62 @@ describe("C015t decisions 1-3: merge-outcome mapping, cause.stage, and narrow re
       value: [{ state: "pending", externalIssueId }],
     });
     expect(lifecycleRequests).toMatchObject([{ humanAcceptance: { state: "pending" } }]);
+    expect(workStatusRequests).toMatchObject([
+      {
+        step: "complete",
+        mainTarget: "in_review",
+        allowedMainSources: ["in_progress", "in_review", "requires_manual"],
+      },
+    ]);
     expect(admission.releaseCalls).toEqual([{ projectId, issueId, reason: "completed" }]);
+  });
+
+  it("does not reopen requires_manual for a different merge-reconciliation reason", async () => {
+    const workIssue = humanWorkflowIssue("light");
+    const fixture = await harness({
+      changeRequestState: { state: "merged", mergeCommitSha, mergedAt: now },
+      workIssue,
+      workStatus: "requires_manual",
+      workStatusTransition: () =>
+        Promise.resolve({
+          state: "permitted",
+          mode: "enforce",
+          main: "confirmed",
+          agent: "confirmed",
+        }),
+    });
+    const acceptance = new FileHumanAcceptanceStore(
+      await temporaryDirectory("agent-team-human-acceptance-wrong-reason-"),
+      undefined,
+      createFixedClock(now),
+    );
+    await seedProgressRecord(
+      fixture.progress,
+      {
+        kind: "requires_manual",
+        cause: { stage: "merge", reasonCode: "auto_merge_not_enabled", attempts: { count: 1 } },
+      },
+      {
+        humanDelivery: humanDelivery(workIssue),
+        workStatusLifecycle: {
+          admissionMode: "enforce",
+          capabilityDigest: "5".repeat(64),
+          phase: "merging",
+          transitions: [],
+        },
+      },
+    );
+
+    const result = await runResumeCycle({ ...fixture.deps, humanAcceptance: acceptance });
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: [{ outcome: "merge_reconcile_lifecycle_failed", error: { code: "conflict" } }],
+    });
+    expect(await acceptance.listPending(projectId)).toEqual(ok([]));
+    expect(fixture.lifecycleRequests).toHaveLength(0);
+    expect(fixture.calls).not.toContain("workStatusLifecycle.transition:complete");
+    expect(fixture.admission.releaseCalls).toHaveLength(0);
   });
 
   /**

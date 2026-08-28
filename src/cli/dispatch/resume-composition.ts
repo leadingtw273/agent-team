@@ -510,7 +510,7 @@ async function gateWorkStatusLifecycle(
     step: "review_start" | "fix_start" | "merge_start" | "complete";
     phase: "reviewing" | "fixing" | "merging" | "terminal";
     mainTarget: "in_review" | "in_progress" | "completed";
-    allowedMainSources: readonly ("in_progress" | "in_review" | "completed")[];
+    allowedMainSources: readonly ("in_progress" | "in_review" | "requires_manual" | "completed")[];
     agentTarget:
       | { readonly kind: "clear" }
       | { readonly kind: "set"; readonly status: "waiting" | "executing" };
@@ -1445,11 +1445,20 @@ interface PreparedHumanAcceptance {
   readonly lifecycle?: NonNullable<LifecyclePipelineRequest["humanAcceptance"]>;
 }
 
+function isHumanAcceptanceCheckpointRecovery(record: JobProgressRecord): boolean {
+  return (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "merge" &&
+    record.stage.cause.reasonCode === "human_acceptance_checkpoint_failed"
+  );
+}
+
 async function prepareHumanAcceptance(
   record: JobProgressRecord,
   deps: ResumeCycleDependencies,
   changeRequestId: string,
   mergedReadback?: ChangeRequestSnapshot,
+  options: Readonly<{ allowCheckpointRecovery?: boolean }> = {},
 ): Promise<Result<PreparedHumanAcceptance, DomainError>> {
   const policy = record.humanDelivery;
   if (policy?.acceptanceRequirement !== "required") return ok({ record });
@@ -1492,9 +1501,12 @@ async function prepareHumanAcceptance(
     workItem.value.issue.humanSummary === undefined
       ? undefined
       : sha256Digest(workItem.value.issue.humanSummary);
+  const checkpointRecoveryEligible =
+    options.allowCheckpointRecovery === true && isHumanAcceptanceCheckpointRecovery(record);
   const workStatusEligible =
     workItem.value.workStatus === "in_progress" ||
     workItem.value.workStatus === "in_review" ||
+    (checkpointRecoveryEligible && workItem.value.workStatus === "requires_manual") ||
     (record.workStatusLifecycle?.admissionMode === "observe" &&
       workItem.value.workStatus === "ready");
   if (
@@ -1603,7 +1615,9 @@ async function reconcileMergeStateUnderLease(
     };
   }
 
-  const acceptance = await prepareHumanAcceptance(record, deps, changeRequestId, current.value);
+  const acceptance = await prepareHumanAcceptance(record, deps, changeRequestId, current.value, {
+    allowCheckpointRecovery: true,
+  });
   if (!acceptance.ok) {
     return {
       jobId: record.jobId,
@@ -1613,13 +1627,17 @@ async function reconcileMergeStateUnderLease(
   }
   record = acceptance.value.record;
   const awaitingHumanAcceptance = acceptance.value.lifecycle !== undefined;
+  const recoveringHumanAcceptance =
+    awaitingHumanAcceptance && isHumanAcceptanceCheckpointRecovery(record);
 
   const terminalLifecycle = await gateWorkStatusLifecycle(record, deps, {
     step: "complete",
     phase: "terminal",
     mainTarget: awaitingHumanAcceptance ? "in_review" : "completed",
     allowedMainSources: awaitingHumanAcceptance
-      ? ["in_progress", "in_review"]
+      ? recoveringHumanAcceptance
+        ? ["in_progress", "in_review", "requires_manual"]
+        : ["in_progress", "in_review"]
       : ["in_progress", "in_review", "completed"],
     agentTarget: { kind: "clear" },
     causeStage: "merge",
