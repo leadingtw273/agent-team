@@ -34,6 +34,7 @@ import {
   AtomicFileStore,
   readJsonWithSchema,
   writeJsonWithSchema,
+  runWithInProcessSerialization,
 } from "../files/index.js";
 
 const jobCollectionSchema = z
@@ -91,11 +92,13 @@ export class FileJobRepository implements JobRepository {
     const parsedJob = jobSchema.safeParse(job);
     if (!parsedJob.success) return err(domainError("invariant_violation"));
 
-    const lock = await acquireFileLock(this.lockPath, `file-job-repository:${parsedJob.data.id}`);
-    if (!lock.ok) return lock;
-    const operation = await this.#createLocked(parsedJob.data);
-    await lock.value.release();
-    return operation;
+    return runWithInProcessSerialization(this.lockPath, async () => {
+      const lock = await acquireFileLock(this.lockPath, `file-job-repository:${parsedJob.data.id}`);
+      if (!lock.ok) return lock;
+      const operation = await this.#createLocked(parsedJob.data);
+      await lock.value.release();
+      return operation;
+    });
   }
 
   async #createLocked(job: Job): Promise<Result<JobWriteReceipt, DomainError>> {
@@ -130,14 +133,16 @@ export class FileJobRepository implements JobRepository {
     const parsedJob = jobSchema.safeParse(job);
     if (!parsedJob.success) return err(domainError("invariant_violation"));
 
-    const lock = await acquireFileLock(
-      this.lockPath,
-      `file-job-repository:update:${parsedJob.data.id}`,
-    );
-    if (!lock.ok) return lock;
-    const operation = await this.#updateLocked(parsedJob.data);
-    await lock.value.release();
-    return operation;
+    return runWithInProcessSerialization(this.lockPath, async () => {
+      const lock = await acquireFileLock(
+        this.lockPath,
+        `file-job-repository:update:${parsedJob.data.id}`,
+      );
+      if (!lock.ok) return lock;
+      const operation = await this.#updateLocked(parsedJob.data);
+      await lock.value.release();
+      return operation;
+    });
   }
 
   async #updateLocked(job: Job): Promise<Result<JobWriteReceipt, DomainError>> {

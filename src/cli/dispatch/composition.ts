@@ -29,9 +29,9 @@
  * Wiring a collector alone is therefore **not sufficient** to make a real `run` dispatch: the
  * Linear projection and provider runner/liveness boundaries must also be complete.
  *
- * Model execution occupancy is empty in this single-Job composition because the current process
- * has not started a Provider call yet. Repository reservations are supplied separately by the
- * production handler from durable Job progress, so waiting CI/review/human work lines still block
+ * A standalone single-Job call has no model execution occupancy yet. The bounded project batch
+ * supplies its in-process occupancy and reservations explicitly; durable Job progress supplies
+ * older work-line reservations. Waiting CI/review/human work lines therefore keep blocking
  * overlapping candidates without falsely consuming a model slot. This is safe
  * against duplicate dispatch of the *same* issue because the real guard against that is not
  * `active`, it is the per-issue `Lease`: `canAcquireLease` (src/domain/jobs/lease.ts) treats an
@@ -72,7 +72,10 @@ import { LocalGitAdapter } from "../../adapters/git/index.js";
 import { ChildProcessRunner } from "../../adapters/process/index.js";
 import { FileRegistrationSetupActivationRegistry } from "../../adapters/registration/index.js";
 import {
+  decideNextDispatch,
   Dispatcher,
+  type DispatchCandidate,
+  type ModelExecutionOccupancy,
   type DispatcherCandidate,
   type DispatcherResult,
   type RepositoryReservation,
@@ -348,29 +351,16 @@ export type DispatchOnceOutcome =
  * same still-`ready` Linear issue. The sequence, matching the decision's own literal ordering
  * ("先 claim...才呼叫 dispatch"):
  *
- * 1. Claim admission for *every* candidate discovery/eligibility produced, before
- *    `Dispatcher.dispatch()` (the unmodified engine call) ever runs -- this is what makes the fix
- *    crash-safe at "job created" (`Dispatcher.dispatch()` generates the job id internally and only
- *    once it has already selected a candidate, so the claim necessarily happens first and is
- *    updated with the real id afterward, never the reverse); a crash between claiming and
- *    `dispatch()` returning still leaves a durable claim blocking a future duplicate.
+ * 1. Purely select the next candidate, then claim that exact issue before
+ *    `Dispatcher.dispatch()` creates its Job. A crash between claim and Job creation still leaves
+ *    a conservative durable claim blocking a duplicate.
  * 2. A candidate whose issue already has an active claim (a *different*, still-unresolved job)
  *    never reaches `Dispatcher.dispatch()` at all -- reported via `admissionSkipped`, distinct
  *    from `discoverySkipped`.
- * 3. After `dispatch()` returns, reconcile: the one candidate it actually dispatched (if any) gets
- *    its claim updated with the real job id (`attachJob`); every other claimed-but-not-selected
- *    candidate has its claim released with reason `"not_dispatched"` (never `"completed"`/
- *    `"cancelled"`/`"superseded"` -- those are reserved for a job's own real lifecycle ending, see
- *    issue-admission-store.ts's own header).
- *
- * Disclosed residual gap (a deliberate, minimal-scope choice, not an oversight): `Dispatcher.
- * dispatch()` itself can retry across *multiple* candidates within one call (a lease conflict on
- * its first choice makes it try the next), and this composition cannot observe that internal
- * retry loop without modifying `Dispatcher.dispatch()` itself (`src/application`, out of this
- * ticket's authority). Claiming every candidate up front and reconciling by matching
- * `result.job.issueId` against the claims already made handles this correctly regardless of which
- * candidate `dispatch()` internally ends up selecting -- the reconcile step is keyed off the
- * actual result, never an assumption about which candidate would win.
+ * 3. A lease/Job failure releases only that selected claim as `"not_dispatched"` and re-evaluates
+ *    the remaining candidates. A successful Job attaches its real id to the same claim. This
+ *    one-claim-at-a-time shape lets sibling project workers claim other safe issues without one
+ *    worker temporarily monopolizing the whole candidate list.
  */
 export async function dispatchOnce(
   ready: DispatchCompositionReady,
@@ -378,7 +368,12 @@ export async function dispatchOnce(
   holderId: string,
   options: Readonly<{
     allowOperatorCanary?: boolean;
+    executionOccupancy?: readonly ModelExecutionOccupancy[];
     repositoryReservations?: readonly RepositoryReservation[];
+    onCandidateClaimed?: (
+      candidate: DispatcherCandidate,
+      decision: Extract<ReturnType<typeof decideNextDispatch>, { kind: "selected" }>,
+    ) => (() => void) | undefined;
   }> = {},
 ): Promise<DispatchOnceOutcome> {
   const configuredMode = resolveWorkStatusLifecycleMode(ready.trustedConfig);
@@ -518,8 +513,25 @@ export async function dispatchOnce(
     }
   }
 
-  const claimedRevisions = new Map<string, number>();
-  const claimedCandidates: DispatcherCandidate[] = [];
+  const asDispatchCandidate = (candidate: DispatcherCandidate): DispatchCandidate | undefined => {
+    const priority = candidate.issue.priority;
+    const role = candidate.issue.agentRole;
+    if (priority === undefined || role === undefined) return undefined;
+    return Object.freeze({
+      id: candidate.issue.id,
+      projectId: candidate.issue.projectId,
+      repositoryId: `${ready.project.sourceControl.provider}:${ready.project.sourceControl.repository}`,
+      priority,
+      readyAt: candidate.readyAt,
+      role,
+      workKind: candidate.workKind,
+      stage: candidate.stage,
+      ...(candidate.issue.changeRegions === undefined
+        ? {}
+        : { declaredRegions: candidate.issue.changeRegions }),
+    });
+  };
+  const routableCandidates: DispatcherCandidate[] = [];
   for (const candidate of candidatesForAdmission) {
     if (candidate.workKind === "model") {
       const route = selectModelRoute(
@@ -537,6 +549,52 @@ export async function dispatchOnce(
         continue;
       }
     }
+    routableCandidates.push(candidate);
+  }
+  let remaining = routableCandidates;
+  let result: DispatcherResult = Object.freeze({
+    kind: "waiting" as const,
+    reason: "no_dispatchable_candidate" as const,
+    skipped: Object.freeze([]),
+  });
+  let claimedRevision: number | undefined;
+  let claimedCandidate: DispatcherCandidate | undefined;
+
+  // Select first, then claim only that exact issue. This preserves claim-before-Job safety while
+  // allowing sibling workers in one bounded batch to claim the other non-conflicting issues.
+  while (remaining.length > 0) {
+    const decisionCandidates = remaining.map(asDispatchCandidate);
+    if (decisionCandidates.some((candidate) => candidate === undefined)) {
+      result = Object.freeze({
+        kind: "blocked" as const,
+        reason: "invalid_runtime_input" as const,
+        skipped: Object.freeze([]),
+      });
+      break;
+    }
+    const decision = decideNextDispatch({
+      candidates: decisionCandidates as DispatchCandidate[],
+      executionOccupancy: options.executionOccupancy ?? [],
+      repositoryReservations: options.repositoryReservations ?? [],
+      routingConfig: ready.routingConfig,
+      routeObservations: routeObservationsForAdmission,
+    });
+    if (decision.kind === "waiting") {
+      result = Object.freeze({
+        kind: "waiting" as const,
+        reason: "no_dispatchable_candidate" as const,
+        skipped: Object.freeze(
+          decision.skipped.map((entry) => ({
+            issueId: entry.candidateId,
+            reason: Object.freeze({ code: "dispatch_blocked" as const, blocker: entry.blocker }),
+          })),
+        ),
+      });
+      break;
+    }
+    const candidate = remaining.find((entry) => entry.issue.id === decision.candidate.id);
+    if (candidate === undefined) break;
+
     if (ports.publicAdmissionAuthority !== undefined) {
       const authority = await ports.publicAdmissionAuthority.check(candidate.issue);
       if (!authority.ok || authority.value !== "allowed") {
@@ -548,9 +606,11 @@ export async function dispatchOnce(
               : ("public_authority_unavailable" as const),
           }),
         );
+        remaining = remaining.filter((entry) => entry.issue.id !== candidate.issue.id);
         continue;
       }
     }
+
     const issueLock =
       ports.locks === undefined
         ? undefined
@@ -565,6 +625,7 @@ export async function dispatchOnce(
           reason: "issue_scope_lock_unavailable" as const,
         }),
       );
+      remaining = remaining.filter((entry) => entry.issue.id !== candidate.issue.id);
       continue;
     }
     const claimed = await ports.admission.claim(
@@ -580,60 +641,65 @@ export async function dispatchOnce(
           reason: "issue_scope_lock_unavailable" as const,
         }),
       );
+      remaining = remaining.filter((entry) => entry.issue.id !== candidate.issue.id);
       continue;
     }
     if (!claimed.ok) {
       admissionSkipped.push(
         Object.freeze({ issueId: candidate.issue.id, reason: "issue_claim_active" as const }),
       );
+      remaining = remaining.filter((entry) => entry.issue.id !== candidate.issue.id);
       continue;
     }
-    claimedRevisions.set(candidate.issue.id, claimed.value.revision);
-    claimedCandidates.push(candidate);
+
+    claimedRevision = claimed.value.revision;
+    claimedCandidate = candidate;
+    const executionAtDecision = [...(options.executionOccupancy ?? [])];
+    const reservationsAtDecision = [...(options.repositoryReservations ?? [])];
+    const rollbackBatchReservation = options.onCandidateClaimed?.(candidate, decision);
+    result = await new Dispatcher(ports).dispatch({
+      holderId,
+      candidates: [candidate],
+      registry: ready.registry,
+      executionOccupancy: executionAtDecision,
+      repositoryReservations: reservationsAtDecision,
+      routingConfig: ready.routingConfig,
+      routeObservations: routeObservationsForAdmission,
+    });
+    if (result.kind === "dispatched") break;
+
+    rollbackBatchReservation?.();
+    await ports.admission.release(
+      ready.project.id,
+      candidate.issue.id,
+      claimed.value.revision,
+      "not_dispatched",
+    );
+    claimedRevision = undefined;
+    claimedCandidate = undefined;
+    if (result.kind === "blocked") break;
+    remaining = remaining.filter((entry) => entry.issue.id !== candidate.issue.id);
   }
 
-  const quotaPreventedAllClaims =
-    claimedCandidates.length === 0 &&
-    admissionSkipped.some(
-      (candidate) =>
-        candidate.reason !== "issue_claim_active" &&
-        candidate.reason !== "issue_scope_lock_unavailable",
-    );
-  const result: DispatcherResult = quotaPreventedAllClaims
-    ? Object.freeze({
-        kind: "waiting" as const,
-        reason: "no_dispatchable_candidate" as const,
-        skipped: Object.freeze([]),
-      })
-    : await new Dispatcher(ports).dispatch({
-        holderId,
-        candidates: claimedCandidates,
-        registry: ready.registry,
-        executionOccupancy: [],
-        repositoryReservations: options.repositoryReservations ?? [],
-        routingConfig: ready.routingConfig,
-        routeObservations: routeObservationsForAdmission,
-      });
-
-  const dispatchedIssueId = result.kind === "dispatched" ? result.job.issueId : undefined;
   let bootstrap: DispatchBootstrapOutcome = Object.freeze({ state: "skipped" });
-  for (const [issueId, revision] of claimedRevisions) {
-    if (issueId === dispatchedIssueId && result.kind === "dispatched") {
-      const candidate = claimedCandidates.find((entry) => entry.issue.id === issueId);
-      if (ports.bootstrap !== undefined && candidate !== undefined) {
-        const initialized = await ports.bootstrap({ result, candidate, lifecycle });
-        if (!initialized.ok) {
-          bootstrap = Object.freeze({
-            state: "blocked",
-            reason: "job_progress_write_failed",
-            error: initialized.error,
-          });
-          continue;
-        }
+  if (
+    result.kind === "dispatched" &&
+    claimedCandidate !== undefined &&
+    claimedRevision !== undefined
+  ) {
+    if (ports.bootstrap !== undefined) {
+      const initialized = await ports.bootstrap({ result, candidate: claimedCandidate, lifecycle });
+      if (!initialized.ok) {
+        bootstrap = Object.freeze({
+          state: "blocked",
+          reason: "job_progress_write_failed",
+          error: initialized.error,
+        });
+      } else {
         const attached = await ports.admission.attachJob(
           ready.project.id,
-          issueId,
-          revision,
+          claimedCandidate.issue.id,
+          claimedRevision,
           result.job.id,
         );
         bootstrap = attached.ok
@@ -643,16 +709,14 @@ export async function dispatchOnce(
               reason: "claim_attach_failed",
               error: attached.error,
             });
-      } else {
-        // Dry-run/legacy test seam: no durable bootstrap capability exists, so preserve the old
-        // attach behavior but label it honestly as skipped rather than confirmed.
-        await ports.admission.attachJob(ready.project.id, issueId, revision, result.job.id);
       }
     } else {
-      // Best-effort release: if this fails, the claim stays active and simply blocks this one
-      // issue from being claimed again until it is retried or manually resolved -- safe
-      // (conservative), never a duplicate-dispatch risk.
-      await ports.admission.release(ready.project.id, issueId, revision, "not_dispatched");
+      await ports.admission.attachJob(
+        ready.project.id,
+        claimedCandidate.issue.id,
+        claimedRevision,
+        result.job.id,
+      );
     }
   }
 

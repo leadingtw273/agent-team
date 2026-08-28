@@ -15,8 +15,16 @@ import { Redactor } from "../../infrastructure/redaction/index.js";
 import type { ProviderPort } from "../../application/ports/index.js";
 import type { GeminiProviderConfig } from "./provider-config-store.js";
 import { PolicyBoundProvider } from "./provider-policy.js";
+import {
+  defaultModelExecutionLimiter,
+  LimitedProvider,
+  type ModelExecutionLimiter,
+} from "./provider-limiter.js";
 
-export function buildGeminiRunner(config: GeminiProviderConfig): ProviderPort {
+export function buildGeminiRunner(
+  config: GeminiProviderConfig,
+  limiter: ModelExecutionLimiter = defaultModelExecutionLimiter,
+): ProviderPort {
   const runner = new GeminiRunner({
     process: new ChildProcessRunner(),
     redactor: new Redactor(),
@@ -24,10 +32,11 @@ export function buildGeminiRunner(config: GeminiProviderConfig): ProviderPort {
     models: config.models,
     adminPolicyPath: config.adminPolicyPath,
   });
-  return new PolicyBoundProvider({
+  const policy = new PolicyBoundProvider({
     delegate: runner,
     provider: "gemini",
     models: config.models,
     roles: ["visual_reviewer"],
   });
+  return new LimitedProvider("gemini", policy, limiter);
 }
