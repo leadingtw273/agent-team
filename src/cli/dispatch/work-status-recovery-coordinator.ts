@@ -146,7 +146,8 @@ function historyPrefixMatches(
   );
 }
 
-type RecoverySourceShape = "sent_unknown" | "fix_start_intent" | "confirmed_manual_handoff";
+type RecoverySourceShape =
+  "sent_unknown" | "fix_start_intent" | "confirmed_manual_handoff" | "complete_intent";
 
 function recoverySourceShape(
   record: JobProgressRecord,
@@ -174,6 +175,33 @@ function recoverySourceShape(
     transition.agent.state === "confirmed"
   ) {
     return "confirmed_manual_handoff";
+  }
+  const prior = record.workStatusLifecycle?.transitions.at(-2);
+  if (
+    record.stage.kind === "requires_manual" &&
+    record.stage.cause?.stage === "merge" &&
+    record.workStatusLifecycle?.transitions.at(-1)?.instance === transition.instance &&
+    transition.step === "complete" &&
+    transition.mainTarget === "in_review" &&
+    transition.allowedMainSources?.length === 3 &&
+    transition.allowedMainSources[0] === "in_progress" &&
+    transition.allowedMainSources[1] === "in_review" &&
+    transition.allowedMainSources[2] === "requires_manual" &&
+    transition.agentTarget?.kind === "clear" &&
+    transition.main.state === "intent" &&
+    transition.agent.state === "intent" &&
+    transition.mainFailures.count > 0 &&
+    transition.mainFailures.count < 6 &&
+    transition.mainFailures.lastErrorCode === "conflict" &&
+    prior?.step === "requires_manual" &&
+    prior.mainTarget === "requires_manual" &&
+    prior.agentTarget?.kind === "set" &&
+    prior.agentTarget.status === "blocked" &&
+    prior.agentTarget.blockingReason === "unknown_error" &&
+    prior.main.state === "confirmed" &&
+    prior.agent.state === "confirmed"
+  ) {
+    return "complete_intent";
   }
   return undefined;
 }
