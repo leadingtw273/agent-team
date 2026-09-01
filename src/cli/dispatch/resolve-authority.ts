@@ -60,6 +60,8 @@ export interface DispatchResolveAuthorityOptions {
   readonly generateHolderId?: () => string;
 }
 
+type ResolveAuthorityMode = "cancellation" | "completion" | "supersede";
+
 function mutationFrom(record: JobProgressRecord) {
   const {
     schemaVersion: _schemaVersion,
@@ -141,11 +143,34 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     ) {
       return err(domainError("conflict"));
     }
-    if (input.as === "cancelled" && issue.value.workStatus !== "canceled") {
+    const completedNoChangesTakeover =
+      input.as === "cancelled" &&
+      issue.value.workStatus === "completed" &&
+      record.stage.kind === "paused" &&
+      record.stage.pauseReason === "no_changes" &&
+      record.changeRequestId === undefined;
+    const authorityMode: ResolveAuthorityMode = completedNoChangesTakeover
+      ? "completion"
+      : input.as === "cancelled"
+        ? "cancellation"
+        : "supersede";
+    if (
+      input.as === "cancelled" &&
+      issue.value.workStatus !== "canceled" &&
+      !completedNoChangesTakeover
+    ) {
       return err(domainError("permission_denied"));
     }
     if (input.as === "superseded" && ["canceled", "completed"].includes(issue.value.workStatus)) {
       return err(domainError("permission_denied"));
+    }
+    if (completedNoChangesTakeover) {
+      const existing = await this.options.sourceControl.findOpenChangeRequestsByHead(
+        { project: this.options.project },
+        record.branch,
+      );
+      if (!existing.ok) return existing;
+      if (existing.value.length > 0) return err(domainError("permission_denied"));
     }
 
     let events = comments.value.flatMap((comment) => {
@@ -153,11 +178,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
       return event === undefined ? [] : [event];
     });
     if (!events.some((event) => event.kind === "job_started" && event.jobId === record.jobId)) {
-      const repaired = await this.#publishJobStarted(
-        record,
-        issueRef,
-        input.as === "cancelled" ? "cancellation" : "supersede",
-      );
+      const repaired = await this.#publishJobStarted(record, issueRef, authorityMode);
       if (!repaired.ok) return repaired;
       record = repaired.value;
       const refreshedComments = await this.options.workManagement.listComments(issueRef);
@@ -174,6 +195,13 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
         record.branch,
       );
       if (!candidates.ok) return candidates;
+      // A completed issue and its obsolete no-changes Job have separate lifecycles: the issue may
+      // stay completed while the Job is cancelled after a Team Lead takeover. This exception is
+      // safe only when the original Job still has no PR of its own. An open PR discovered here
+      // invalidates that exact recovery shape instead of being closed behind a completed issue.
+      if (completedNoChangesTakeover && candidates.value.length > 0) {
+        return err(domainError("permission_denied"));
+      }
       if (candidates.value.length > 1) {
         return this.#conflict(record, input, "multiple_pr_candidates", {
           branch: record.branch,
@@ -182,7 +210,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
       }
       if (candidates.value.length === 0) {
         if (input.as === "superseded") return err(domainError("conflict"));
-        return this.#publishTerminal(record, input);
+        return this.#publishTerminal(record, input, authorityMode);
       }
       const candidate = candidates.value[0];
       const candidateHead = headShaSchema.safeParse(candidate?.headSha);
@@ -362,7 +390,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
   async #publishJobStarted(
     record: JobProgressRecord,
     issue: Readonly<{ project: Project; externalIssueId: string }>,
-    mode: "cancellation" | "supersede",
+    mode: ResolveAuthorityMode,
   ): Promise<Result<JobProgressRecord, DomainError>> {
     const authority = this.#authority(record, mode);
     if (!authority.ok) return authority;
@@ -499,7 +527,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
 
   #authority(
     record: JobProgressRecord,
-    mode: "cancellation" | "supersede",
+    mode: ResolveAuthorityMode,
     supersededByJobId?: string,
   ): Result<FileManagedMutationAuthority, DomainError> {
     const fence = record.controlFence;
@@ -540,6 +568,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
   async #publishTerminal(
     record: JobProgressRecord,
     input: DispatchResolveInput,
+    mode: ResolveAuthorityMode = input.as === "cancelled" ? "cancellation" : "supersede",
   ): Promise<Result<JobProgressRecord, DomainError>> {
     const successorId =
       input.as === "superseded" ? jobIdSchema.safeParse(input.supersededByJobId) : undefined;
@@ -550,11 +579,7 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     if (input.as === "superseded" && successorJobId === undefined) {
       return err(domainError("invariant_violation"));
     }
-    const authority = this.#authority(
-      record,
-      input.as === "cancelled" ? "cancellation" : "supersede",
-      input.supersededByJobId,
-    );
+    const authority = this.#authority(record, mode, input.supersededByJobId);
     if (!authority.ok) return authority;
     let event: ReturnType<typeof createJobPrLifecycleEvent>;
     if (input.as === "cancelled") {
