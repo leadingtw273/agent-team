@@ -143,13 +143,17 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     ) {
       return err(domainError("conflict"));
     }
-    const completedNoChangesTakeover =
+    const completedTakeoverStage =
+      (record.stage.kind === "paused" && record.stage.pauseReason === "no_changes") ||
+      (record.stage.kind === "requires_manual" &&
+        record.stage.cause?.stage === "dispatch" &&
+        record.stage.cause.reasonCode === "protected_region_requires_human");
+    const completedObsoleteTakeover =
       input.as === "cancelled" &&
       issue.value.workStatus === "completed" &&
-      record.stage.kind === "paused" &&
-      record.stage.pauseReason === "no_changes" &&
+      completedTakeoverStage &&
       record.changeRequestId === undefined;
-    const authorityMode: ResolveAuthorityMode = completedNoChangesTakeover
+    const authorityMode: ResolveAuthorityMode = completedObsoleteTakeover
       ? "completion"
       : input.as === "cancelled"
         ? "cancellation"
@@ -157,14 +161,14 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
     if (
       input.as === "cancelled" &&
       issue.value.workStatus !== "canceled" &&
-      !completedNoChangesTakeover
+      !completedObsoleteTakeover
     ) {
       return err(domainError("permission_denied"));
     }
     if (input.as === "superseded" && ["canceled", "completed"].includes(issue.value.workStatus)) {
       return err(domainError("permission_denied"));
     }
-    if (completedNoChangesTakeover) {
+    if (completedObsoleteTakeover) {
       const existing = await this.options.sourceControl.findOpenChangeRequestsByHead(
         { project: this.options.project },
         record.branch,
@@ -195,11 +199,11 @@ export class DispatchResolveAuthority implements DispatchResolveAuthorityPort {
         record.branch,
       );
       if (!candidates.ok) return candidates;
-      // A completed issue and its obsolete no-changes Job have separate lifecycles: the issue may
-      // stay completed while the Job is cancelled after a Team Lead takeover. This exception is
-      // safe only when the original Job still has no PR of its own. An open PR discovered here
-      // invalidates that exact recovery shape instead of being closed behind a completed issue.
-      if (completedNoChangesTakeover && candidates.value.length > 0) {
+      // A completed issue and an obsolete pre-implementation Job have separate lifecycles: the
+      // issue may stay completed after a Team Lead takeover while the original Job is cancelled.
+      // This exception is restricted to no-changes and protected-region dispatch exits, and is
+      // safe only while the original Job still has no PR of its own.
+      if (completedObsoleteTakeover && candidates.value.length > 0) {
         return err(domainError("permission_denied"));
       }
       if (candidates.value.length > 1) {

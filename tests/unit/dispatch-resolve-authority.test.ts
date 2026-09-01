@@ -50,110 +50,162 @@ async function* confirmation(): AsyncIterable<string> {
 }
 
 describe("DispatchResolveAuthority", () => {
-  it("cancels a completed issue's paused no-changes Job without changing public completion", async () => {
-    const root = await mkdtemp(join(tmpdir(), "agent-team-resolve-completed-no-changes-"));
-    directories.push(root);
-    const now = parseInstant("2026-09-01T08:00:00.000Z");
-    if (!now.ok) throw new Error(now.error.code);
-    const projectId = id("project", "project_718f47d2-77a4-7cc1-8ef2-0123456789ab");
-    const issueId = id("issue", "issue_718f47d2-77a4-7cc1-8ef2-0123456789ab");
-    const jobId = id("job", "job_718f47d2-77a4-7cc1-8ef2-0123456789ab");
-    const project = projectSchema.parse({
-      schemaVersion: 1,
-      id: projectId,
-      displayName: "Completed no-changes fixture",
-      localRepositoryPath: "/tmp/fixture",
-      defaultBranch: "main",
-      workManagement: { provider: "linear", containerId: "team", projectId: "linear-project" },
-      sourceControl: { provider: "github", repository: "owner/repository" },
-    });
-    const issue = issueSchema.parse({
-      schemaVersion: 1,
-      id: issueId,
-      projectId,
-      externalId: "ENG-NO-CHANGES",
-      title: "Completed by a Team Lead takeover",
-      acceptanceCriteria: ["Release only the obsolete no-changes Job"],
-      changeRegions: [{ path: "src", coverage: "subtree" }],
-    });
-    const branch = `agent-team/${projectId}/${issueId}/${jobId}`;
-    const progress = new FileJobProgressStore(
-      join(root, "progress"),
-      undefined,
-      createFixedClock(now.value),
-    );
-    await progress.compareAndSwap(jobId, null, {
-      jobId,
-      projectId,
-      issueId,
-      externalIssueId: issue.externalId,
-      model: "gpt-5.6-terra",
-      stage: { kind: "paused", pauseReason: "no_changes" },
-      branch,
-      worktreePath: "/tmp/worktree",
-    });
-    const comments: { id: string; body: string; createdAt: typeof now.value }[] = [];
-    const workManagement = {
-      getIssue: vi.fn(() =>
-        Promise.resolve(
-          ok({ issue, workStatus: "completed" as const, updatedAt: now.value, revision: "r1" }),
+  it.each([
+    {
+      name: "paused no-changes",
+      stage: { kind: "paused" as const, pauseReason: "no_changes" as const },
+      protectedRegionHandoff: undefined,
+    },
+    {
+      name: "protected-region dispatch",
+      stage: {
+        kind: "requires_manual" as const,
+        cause: {
+          stage: "dispatch" as const,
+          reasonCode: "protected_region_requires_human" as const,
+          attempts: { count: 1 },
+        },
+      },
+      protectedRegionHandoff: {
+        leaseId: "lease_618f47d2-77a4-7cc1-8ef2-0123456789ab",
+        holderId: "protected-region-fixture",
+        workflowState: "confirmed" as const,
+        agentCondition: "confirmed" as const,
+        comment: "confirmed" as const,
+        leaseRelease: "confirmed" as const,
+      },
+    },
+  ])(
+    "cancels a completed issue's $name Job without changing public completion",
+    async (testCase) => {
+      const root = await mkdtemp(join(tmpdir(), "agent-team-resolve-completed-no-changes-"));
+      directories.push(root);
+      const now = parseInstant("2026-09-01T08:00:00.000Z");
+      if (!now.ok) throw new Error(now.error.code);
+      const projectId = id("project", "project_718f47d2-77a4-7cc1-8ef2-0123456789ab");
+      const issueId = id("issue", "issue_718f47d2-77a4-7cc1-8ef2-0123456789ab");
+      const jobId = id("job", "job_718f47d2-77a4-7cc1-8ef2-0123456789ab");
+      const project = projectSchema.parse({
+        schemaVersion: 1,
+        id: projectId,
+        displayName: "Completed no-changes fixture",
+        localRepositoryPath: "/tmp/fixture",
+        defaultBranch: "main",
+        workManagement: { provider: "linear", containerId: "team", projectId: "linear-project" },
+        sourceControl: { provider: "github", repository: "owner/repository" },
+      });
+      const issue = issueSchema.parse({
+        schemaVersion: 1,
+        id: issueId,
+        projectId,
+        externalId: "ENG-NO-CHANGES",
+        title: "Completed by a Team Lead takeover",
+        acceptanceCriteria: ["Release only the obsolete no-changes Job"],
+        changeRegions: [{ path: "src", coverage: "subtree" }],
+      });
+      const branch = `agent-team/${projectId}/${issueId}/${jobId}`;
+      const progress = new FileJobProgressStore(
+        join(root, "progress"),
+        undefined,
+        createFixedClock(now.value),
+      );
+      await progress.compareAndSwap(jobId, null, {
+        jobId,
+        projectId,
+        issueId,
+        externalIssueId: issue.externalId,
+        model: "gpt-5.6-terra",
+        stage: testCase.stage,
+        branch,
+        worktreePath: "/tmp/worktree",
+        ...(testCase.protectedRegionHandoff === undefined
+          ? {}
+          : {
+              protectedRegionHandoff: {
+                ...testCase.protectedRegionHandoff,
+                leaseId: id("lease", testCase.protectedRegionHandoff.leaseId),
+              },
+            }),
+      });
+      const comments: { id: string; body: string; createdAt: typeof now.value }[] = [];
+      const workManagement = {
+        getIssue: vi.fn(() =>
+          Promise.resolve(
+            ok({ issue, workStatus: "completed" as const, updatedAt: now.value, revision: "r1" }),
+          ),
         ),
-      ),
-      listComments: vi.fn(() => Promise.resolve(ok([...comments]))),
-      appendComment: vi.fn((_reference, body: string) => {
-        const receipt = { id: `c${String(comments.length + 1)}`, body, createdAt: now.value };
-        comments.push(receipt);
-        return Promise.resolve(ok(receipt));
-      }),
-    };
-    const findOpenChangeRequestsByHead = vi.fn(() => Promise.resolve(ok([])));
-    const sourceControl = { findOpenChangeRequestsByHead } as unknown as SourceControlPort;
-    const admission = new FileIssueAdmissionStore(join(root, "admission"));
-    const claim = await admission.claim(projectId, issueId);
-    if (!claim.ok) throw new Error(claim.error.code);
-    await admission.attachJob(projectId, issueId, claim.value.revision, jobId);
-    const authority = new DispatchResolveAuthority({
-      project,
-      progress,
-      jobs: {} as never,
-      leases: new LeaseCoordinator(new InMemoryLeaseRepository(), {
+        listComments: vi.fn(() => Promise.resolve(ok([...comments]))),
+        appendComment: vi.fn((_reference, body: string) => {
+          const receipt = { id: `c${String(comments.length + 1)}`, body, createdAt: now.value };
+          comments.push(receipt);
+          return Promise.resolve(ok(receipt));
+        }),
+      };
+      const findOpenChangeRequestsByHead = vi.fn(() => Promise.resolve(ok([])));
+      const sourceControl = { findOpenChangeRequestsByHead } as unknown as SourceControlPort;
+      const admission = new FileIssueAdmissionStore(join(root, "admission"));
+      const claim = await admission.claim(projectId, issueId);
+      if (!claim.ok) throw new Error(claim.error.code);
+      await admission.attachJob(projectId, issueId, claim.value.revision, jobId);
+      const authority = new DispatchResolveAuthority({
+        project,
+        progress,
+        jobs: {} as never,
+        leases: new LeaseCoordinator(new InMemoryLeaseRepository(), {
+          clock: createFixedClock(now.value),
+          generateLeaseId: () => ok(id("lease", "lease_718f47d2-77a4-7cc1-8ef2-0123456789ab")),
+        }),
+        workManagement,
+        sourceControl,
         clock: createFixedClock(now.value),
-        generateLeaseId: () => ok(id("lease", "lease_718f47d2-77a4-7cc1-8ef2-0123456789ab")),
-      }),
-      workManagement,
-      sourceControl,
-      clock: createFixedClock(now.value),
-      generateHolderId: () => "resolve-controller",
-    });
-    const resolved = await createDispatchResolveHandler({
-      progress,
-      admission,
-      authority,
-      stdin: confirmation(),
-    })({ jobId, as: "cancelled" });
+        generateHolderId: () => "resolve-controller",
+      });
+      const resolved = await createDispatchResolveHandler({
+        progress,
+        admission,
+        authority,
+        stdin: confirmation(),
+      })({ jobId, as: "cancelled" });
 
-    expect(resolved.state).toBe("success");
-    expect(workManagement.getIssue).toHaveBeenCalled();
-    expect(findOpenChangeRequestsByHead).toHaveBeenCalledWith({ project }, branch);
-    expect(comments.map((comment) => parseJobPrLifecycleComment(comment.body)?.kind)).toEqual([
-      "job_started",
-      "job_cancelled",
-    ]);
-    await expect(progress.load(jobId)).resolves.toMatchObject({
-      ok: true,
-      value: { stage: { kind: "cancelled" }, controlFence: { state: "revoked" } },
-    });
-    await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
-      ok: true,
-      value: { state: "released", releaseReason: "cancelled" },
-    });
-  });
+      expect(resolved.state).toBe("success");
+      expect(workManagement.getIssue).toHaveBeenCalled();
+      expect(findOpenChangeRequestsByHead).toHaveBeenCalledWith({ project }, branch);
+      expect(comments.map((comment) => parseJobPrLifecycleComment(comment.body)?.kind)).toEqual([
+        "job_started",
+        "job_cancelled",
+      ]);
+      await expect(progress.load(jobId)).resolves.toMatchObject({
+        ok: true,
+        value: { stage: { kind: "cancelled" }, controlFence: { state: "revoked" } },
+      });
+      await expect(admission.load(projectId, issueId)).resolves.toMatchObject({
+        ok: true,
+        value: { state: "released", releaseReason: "cancelled" },
+      });
+    },
+  );
 
   it.each([
     {
       name: "non-no-changes stage",
       suffix: "8",
       stage: { kind: "requires_manual" as const },
+      workStatus: "completed" as const,
+      changeRequestId: undefined,
+      openCandidate: false,
+      expectedErrorCode: "permission_denied",
+    },
+    {
+      name: "another dispatch manual reason",
+      suffix: "5",
+      stage: {
+        kind: "requires_manual" as const,
+        cause: {
+          stage: "dispatch" as const,
+          reasonCode: "implementer_composition_blocked" as const,
+          attempts: { count: 1 },
+        },
+      },
       workStatus: "completed" as const,
       changeRequestId: undefined,
       openCandidate: false,
