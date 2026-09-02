@@ -47,6 +47,7 @@ export type LinearDiscoverySkipReason =
   | Readonly<{ code: "missing_human_acceptance_requirement" }>
   | Readonly<{ code: "missing_verification_level" }>
   | Readonly<{ code: "issue_invalid" }>
+  | Readonly<{ code: "directory_change_region_not_supported" }>
   | Readonly<{ code: "missing_change_regions" }>;
 
 export interface LinearDiscoverySkippedIssue {
@@ -205,6 +206,18 @@ export async function discoverReadyDispatchCandidates(
         Object.freeze({
           externalIssueId,
           reason: Object.freeze({ code: "skills_unparsed" as const }),
+        }),
+      );
+      continue;
+    }
+    if (
+      snapshot.value.agentRole === "implementer" &&
+      template.changeRegionsFormatError === "directory_not_supported"
+    ) {
+      skipped.push(
+        Object.freeze({
+          externalIssueId,
+          reason: Object.freeze({ code: "directory_change_region_not_supported" as const }),
         }),
       );
       continue;
