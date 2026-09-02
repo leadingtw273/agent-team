@@ -480,6 +480,62 @@ describe("discoverReadyDispatchCandidates", () => {
     ]);
   });
 
+  it("skips an implementer directory change region with its dedicated reason before admission", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              description: `## ${readyGateTemplateHeadings.changeRegions}\n- src/world/training_ground/`,
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      {
+        externalIssueId: "linear-issue-1",
+        reason: { code: "directory_change_region_not_supported" },
+      },
+    ]);
+  });
+
+  it("rejects an implementer mixed exact-and-directory list with the dedicated reason", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              description: `## ${readyGateTemplateHeadings.changeRegions}\n- src/a.ts\n- src/world/training_ground/`,
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.candidates).toHaveLength(0);
+    expect(result.value.skipped).toEqual([
+      {
+        externalIssueId: "linear-issue-1",
+        reason: { code: "directory_change_region_not_supported" },
+      },
+    ]);
+  });
+
   /**
    * C015j: the `missing_change_regions` skip is scoped to the implementer role specifically --
    * no other role currently drives a pipeline that reads `changeRegions` at all (see
@@ -494,6 +550,32 @@ describe("discoverReadyDispatchCandidates", () => {
             snapshot({
               agentRole: "code_reviewer",
               description: `## ${readyGateTemplateHeadings.goal}\n目標內容\n`,
+            }),
+          ),
+        ),
+    });
+    const result = await discoverReadyDispatchCandidates({
+      project: project(),
+      teamId: "team-1",
+      linearProjectId: "proj-1",
+      readModel,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.skipped).toHaveLength(0);
+    expect(result.value.candidates).toHaveLength(1);
+    expect(result.value.candidates[0]?.issue.agentRole).toBe("code_reviewer");
+    expect(result.value.candidates[0]?.issue.changeRegions).toBeUndefined();
+  });
+
+  it("does not block a non-implementer role for a trailing-slash directory region", async () => {
+    const readModel = fakeReadModel({
+      readIssue: () =>
+        Promise.resolve(
+          ok(
+            snapshot({
+              agentRole: "code_reviewer",
+              description: `## ${readyGateTemplateHeadings.changeRegions}\n- src/world/training_ground/`,
             }),
           ),
         ),

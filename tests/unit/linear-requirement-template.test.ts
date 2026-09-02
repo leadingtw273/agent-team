@@ -146,6 +146,23 @@ describe("parseReadyGateTemplate", () => {
     ]);
   });
 
+  it("rejects a trailing-slash directory without producing partial exact regions", () => {
+    const description = `## ${readyGateTemplateHeadings.changeRegions}
+- src/a.ts
+- src/world/training_ground/`;
+    const result = parseReadyGateTemplate(description);
+    expect(result.changeRegions).toBeUndefined();
+    expect(result.changeRegionsFormatError).toBe("directory_not_supported");
+  });
+
+  it("rejects a single trailing-slash directory region", () => {
+    const description = `## ${readyGateTemplateHeadings.changeRegions}
+- src/world/training_ground/`;
+    const result = parseReadyGateTemplate(description);
+    expect(result.changeRegions).toBeUndefined();
+    expect(result.changeRegionsFormatError).toBe("directory_not_supported");
+  });
+
   it("leaves changeRegions absent when the section is empty or only the placeholder", () => {
     const description = `## ${readyGateTemplateHeadings.changeRegions}
 - （請填寫）`;

@@ -46,7 +46,10 @@
  *   the template's own instruction asks for a bare minutes figure, and only a bare minutes figure
  *   is accepted.
  * - `changeRegions` uses the same bullet-list extraction as acceptance criteria/scope: each
- *   `- <path>` line under "預期變更區域" becomes one `{path, coverage:"exact"}` entry. This was
+ *   `- <path>` line under "預期變更區域" becomes one `{path, coverage:"exact"}` entry. A path
+ *   ending in `/` looks like a directory but this parser cannot safely express directory
+ *   coverage, so the whole field is rejected with `directory_not_supported` rather than
+ *   partially accepting the remaining bullets as exact paths. This was
  *   revised after discovering `ImplementerPipeline.run()` (src/application/pipelines/
  *   implementer.ts) hard-requires a non-empty `changeRegions` on the requirement snapshot's issue
  *   before it will do anything at all (`requestShapeValid`) -- without this, no real candidate
@@ -103,6 +106,7 @@ export interface ReadyGateTemplateFields {
   readonly constraints?: readonly string[];
   readonly risks?: readonly string[];
   readonly changeRegions?: readonly ReadyGateChangeRegion[];
+  readonly changeRegionsFormatError?: "directory_not_supported";
   /** Omitted for both a legacy missing heading and an explicit `無`. */
   readonly skillSelections?: ReadyGateSkillSelectionsField;
   readonly dependencies: ReadyGateDependenciesField;
@@ -274,12 +278,20 @@ function parseEstimatedMinutes(body: string | undefined): number | undefined {
   return Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
-function parseChangeRegions(
-  body: string | undefined,
-): readonly ReadyGateChangeRegion[] | undefined {
+function parseChangeRegions(body: string | undefined): Readonly<{
+  regions?: readonly ReadyGateChangeRegion[];
+  formatError?: "directory_not_supported";
+}> {
   const paths = parseBulletList(body);
-  if (paths === undefined) return undefined;
-  return Object.freeze(paths.map((path) => Object.freeze({ path, coverage: "exact" as const })));
+  if (paths === undefined) return Object.freeze({});
+  if (paths.some((path) => path.endsWith("/"))) {
+    return Object.freeze({ formatError: "directory_not_supported" as const });
+  }
+  return Object.freeze({
+    regions: Object.freeze(
+      paths.map((path) => Object.freeze({ path, coverage: "exact" as const })),
+    ),
+  });
 }
 
 /** `duplicated` is checked *before* looking at any body text: a repeated 依賴關係 heading is
@@ -376,7 +388,10 @@ export function parseReadyGateTemplate(description: string | undefined): ReadyGa
     ...(estimatedMinutes === undefined ? {} : { estimatedMinutes }),
     ...(constraints === undefined ? {} : { constraints }),
     ...(risks === undefined ? {} : { risks }),
-    ...(changeRegions === undefined ? {} : { changeRegions }),
+    ...(changeRegions.regions === undefined ? {} : { changeRegions: changeRegions.regions }),
+    ...(changeRegions.formatError === undefined
+      ? {}
+      : { changeRegionsFormatError: changeRegions.formatError }),
     ...(skillSelections === undefined ? {} : { skillSelections }),
     dependencies,
   });
