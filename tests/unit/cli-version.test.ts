@@ -226,6 +226,33 @@ describe("agent-team CLI contract", () => {
         metadata,
         [
           "dispatch",
+          "job-resume",
+          "--job",
+          "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+          "--adopt-pr",
+          "116",
+          "--expect-head",
+          "a".repeat(40),
+          "--expect-requirements-digest",
+          "b".repeat(64),
+          "--dry-run",
+        ],
+        commands,
+        sink.io,
+      ),
+    ).resolves.toBe(0);
+    expect(commands.dispatchJobResume).toHaveBeenLastCalledWith({
+      jobId: "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
+      dryRun: true,
+      adoptPr: 116,
+      expectHead: "a".repeat(40),
+      expectRequirementsDigest: "b".repeat(64),
+    });
+    await expect(
+      runCli(
+        metadata,
+        [
+          "dispatch",
           "reviewer-replay",
           "--job",
           "job_018f47d2-77a4-7cc1-8ef2-0123456789ab",
@@ -371,7 +398,7 @@ describe("agent-team CLI contract", () => {
     expect(commands.systemd).toHaveBeenNthCalledWith(1, { action: "install", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(2, { action: "uninstall", dryRun: true });
     expect(commands.systemd).toHaveBeenNthCalledWith(3, { action: "status" });
-    expect(sink.stdout()).toBe("完成\n".repeat(26));
+    expect(sink.stdout()).toBe("完成\n".repeat(27));
   });
 
   it("maps a blocked work-status recovery to exit 3", async () => {

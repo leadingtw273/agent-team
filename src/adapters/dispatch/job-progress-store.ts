@@ -116,6 +116,21 @@ const humanDeliveryCheckpointSchema = z
   })
   .strict();
 
+/** A one-time, operator-approved replacement for the two immutable human-delivery digests after
+ * an implementer pauses specifically because its approved scope overran.  This is an audit
+ * receipt, not a new policy source: the CAS transition below verifies both snapshots against the
+ * record it replaces and the record it creates. */
+const approvedScopeAdoptionSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    previousHumanDelivery: humanDeliveryCheckpointSchema,
+    approvedHumanDelivery: humanDeliveryCheckpointSchema,
+    changeRequestId: changeRequestNumberSchema,
+    headSha: headShaSchema,
+    approvedAt: instantSchema,
+  })
+  .strict();
+
 /**
  * C016 fix: mirrors `ImplementerPipelineOutcome`'s own `paused` `reason` union
  * (application/pipelines/implementer-model.ts) *by value*, not by import -- same rationale as
@@ -892,6 +907,8 @@ export const jobProgressRecordSchema = z
     /** Optional only for legacy Jobs. New human-directed Jobs persist this approved policy before
      * Provider execution; merge completion may attach one immutable acceptance identity digest. */
     humanDelivery: humanDeliveryCheckpointSchema.optional(),
+    /** One immutable receipt for the narrowly-controlled scope-overrun policy adoption. */
+    approvedScopeAdoption: approvedScopeAdoptionSchema.optional(),
     /** Immutable scheduling authority for this Job's repository work line. Optional only for
      * legacy records; once established it is write-once and cannot be narrowed or removed. */
     admissionReservation: admissionReservationSnapshotSchema.optional(),
@@ -1082,6 +1099,50 @@ function humanDeliveryCanAdvance(
     current.acceptanceIdentityDigest === next.acceptanceIdentityDigest ||
     (current.acceptanceIdentityDigest === undefined && next.acceptanceIdentityDigest !== undefined)
   );
+}
+
+function approvedScopeAdoptionIsValid(
+  current: JobProgressRecord,
+  next: JobProgressRecordMutation,
+): boolean {
+  const receipt = next.approvedScopeAdoption;
+  const previousHumanDelivery = current.humanDelivery;
+  const approvedHumanDelivery = next.humanDelivery;
+  return (
+    receipt !== undefined &&
+    current.stage.kind === "paused" &&
+    current.stage.pauseReason === "scope_overrun" &&
+    next.stage.kind === "awaiting_review" &&
+    current.changeRequestId === undefined &&
+    current.headSha === undefined &&
+    previousHumanDelivery !== undefined &&
+    previousHumanDelivery.acceptanceIdentityDigest === undefined &&
+    approvedHumanDelivery !== undefined &&
+    approvedHumanDelivery.acceptanceIdentityDigest === undefined &&
+    previousHumanDelivery.acceptanceRequirement === approvedHumanDelivery.acceptanceRequirement &&
+    previousHumanDelivery.verificationLevel === approvedHumanDelivery.verificationLevel &&
+    next.changeRequestId === receipt.changeRequestId &&
+    next.headSha === receipt.headSha &&
+    sameJson(receipt.previousHumanDelivery, previousHumanDelivery) &&
+    sameJson(receipt.approvedHumanDelivery, approvedHumanDelivery)
+  );
+}
+
+function humanDeliveryAndScopeAdoptionCanAdvance(
+  current: JobProgressRecord,
+  next: JobProgressRecordMutation,
+): boolean {
+  const currentReceipt = current.approvedScopeAdoption;
+  const nextReceipt = next.approvedScopeAdoption;
+  if (currentReceipt !== undefined) {
+    return (
+      nextReceipt !== undefined &&
+      sameJson(currentReceipt, nextReceipt) &&
+      humanDeliveryCanAdvance(current.humanDelivery, next.humanDelivery)
+    );
+  }
+  if (nextReceipt !== undefined) return approvedScopeAdoptionIsValid(current, next);
+  return humanDeliveryCanAdvance(current.humanDelivery, next.humanDelivery);
 }
 
 function controlFenceCanAdvance(
@@ -1278,9 +1339,12 @@ export class FileJobProgressStore {
     ) {
       return err(domainError("invariant_violation"));
     }
+    if (normalizedCurrent.value === undefined && next.approvedScopeAdoption !== undefined) {
+      return err(domainError("invariant_violation"));
+    }
     if (
       normalizedCurrent.value !== undefined &&
-      !humanDeliveryCanAdvance(normalizedCurrent.value.humanDelivery, next.humanDelivery)
+      !humanDeliveryAndScopeAdoptionCanAdvance(normalizedCurrent.value, next)
     ) {
       return err(domainError("invariant_violation"));
     }

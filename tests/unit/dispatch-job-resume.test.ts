@@ -32,6 +32,21 @@ function payload(message: string | undefined): Record<string, unknown> {
 }
 
 describe("exact-job resume handler", () => {
+  it.each([
+    { adoptPr: 116 },
+    { expectHead: "a".repeat(40) },
+    { adoptPr: 0, expectHead: "a".repeat(40), expectRequirementsDigest: "b".repeat(64) },
+    { adoptPr: 116, expectHead: "wrong", expectRequirementsDigest: "b".repeat(64) },
+    { adoptPr: 116, expectHead: "a".repeat(40), expectRequirementsDigest: "old" },
+  ])("rejects incomplete or malformed adoption identity before runtime (%j)", async (input) => {
+    const runtimeFactory = vi.fn();
+    const handler = createJobResumeHandler({ agentTeamHome: "/tmp/unused", runtimeFactory });
+    const result = await handler({ jobId, ...input, dryRun: true });
+    expect(result.state).toBe("rejected");
+    expect(payload(result.message)).toMatchObject({ reason: "invalid_adoption_input" });
+    expect(runtimeFactory).not.toHaveBeenCalled();
+  });
+
   it("rejects an invalid Job id before constructing runtime", async () => {
     const runtimeFactory = vi.fn();
     const handler = createJobResumeHandler({ agentTeamHome: "/tmp/unused", runtimeFactory });
