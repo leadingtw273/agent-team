@@ -458,6 +458,7 @@ export class JobPrAdoptionCoordinator {
         : undefined;
     const state =
       resumed.state === "resumed" &&
+      resumed.outcomes.length > 0 &&
       resumed.outcomes.every(
         (outcome) => outcome.outcome === "completed" || outcome.outcome === "merge_reconciled",
       )

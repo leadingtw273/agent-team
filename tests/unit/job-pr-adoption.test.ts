@@ -325,6 +325,13 @@ describe("JobPrAdoptionCoordinator", () => {
     expect(saved.ok && saved.value?.humanDelivery?.requirementDigest).toBe(digest);
   });
 
+  it("does not report success when resume returns no outcomes", async () => {
+    const h = await harness(true);
+    h.deps.resume.mockResolvedValue({ state: "resumed", outcomes: [] });
+    expect((await h.coordinator.run(input)).state).toBe("blocked");
+    expect(h.deps.resume).toHaveBeenCalledOnce();
+  });
+
   const matrix: [
     string,
     (h: Awaited<ReturnType<typeof harness>>) => void,
@@ -456,13 +463,32 @@ describe("JobPrAdoptionCoordinator", () => {
     expect(h.deps.leases.acquire).not.toHaveBeenCalled();
     noAdoption(h);
   });
-  it("rejects CAS failure without resume", async () => {
+  it("rejects fence CAS failure without resume", async () => {
     const h = await harness();
     h.compareAndSwap.mockResolvedValue(err(domainError("conflict")));
     expect(payload(await h.coordinator.run(input))).toMatchObject({
       reason: "adoption_write_failed",
     });
     expect(h.deps.resume).not.toHaveBeenCalled();
+  });
+  it("rejects adoption CAS failure after the fence succeeds without bind or resume", async () => {
+    const h = await harness();
+    const fenceWrite = h.compareAndSwap.getMockImplementation();
+    if (fenceWrite === undefined) throw new Error("Missing fence store implementation");
+    h.compareAndSwap
+      .mockImplementationOnce(fenceWrite)
+      .mockResolvedValueOnce(err(domainError("conflict")));
+    expect(payload(await h.coordinator.run(input))).toMatchObject({
+      reason: "adoption_write_failed",
+    });
+    expect(h.compareAndSwap).toHaveBeenCalledTimes(2);
+    expect(h.compareAndSwap.mock.calls[1]?.[2]).toMatchObject({
+      stage: { kind: "awaiting_review" },
+      approvedScopeAdoption: { headSha: head },
+    });
+    expect(h.deps.bind).not.toHaveBeenCalled();
+    expect(h.deps.resume).not.toHaveBeenCalled();
+    expect(h.deps.leases.release).toHaveBeenCalledOnce();
   });
   it("rejects second authority read drift before adoption CAS/resume", async () => {
     const h = await harness();
