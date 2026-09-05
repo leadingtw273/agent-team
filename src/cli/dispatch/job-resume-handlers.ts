@@ -20,6 +20,9 @@ import {
 export interface JobResumeHandlerInput {
   readonly jobId: string;
   readonly dryRun?: boolean;
+  readonly adoptPr?: number;
+  readonly expectHead?: string;
+  readonly expectRequirementsDigest?: string;
 }
 
 interface JobResumeRuntime {
@@ -34,6 +37,7 @@ export interface CreateJobResumeHandlerOptions {
   readonly agentTeamHome: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly clock?: Clock;
+  readonly stdin?: AsyncIterable<Uint8Array | string>;
   readonly generateHolderId?: () => string;
   readonly runtimeFactory?: (
     jobId: string,
@@ -202,6 +206,35 @@ export function createJobResumeHandler(options: CreateJobResumeHandlerOptions) {
         operation: "job-resume",
         state: "rejected",
         reason: "invalid_command_input",
+      });
+    }
+    if (
+      input.adoptPr !== undefined ||
+      input.expectHead !== undefined ||
+      input.expectRequirementsDigest !== undefined
+    ) {
+      if (
+        input.adoptPr === undefined ||
+        input.expectHead === undefined ||
+        input.expectRequirementsDigest === undefined ||
+        !Number.isSafeInteger(input.adoptPr) ||
+        (input.adoptPr ?? 0) <= 0 ||
+        !/^[a-f0-9]{40}$/.test(input.expectHead ?? "") ||
+        !/^[a-f0-9]{64}$/.test(input.expectRequirementsDigest ?? "")
+      ) {
+        return output("rejected", {
+          operation: "job-resume",
+          state: "rejected",
+          reason: "invalid_adoption_input",
+        });
+      }
+      const { createJobPrAdoptionHandler } = await import("./job-pr-adoption.js");
+      return createJobPrAdoptionHandler(options)({
+        jobId: input.jobId,
+        adoptPr: input.adoptPr,
+        expectHead: input.expectHead,
+        expectRequirementsDigest: input.expectRequirementsDigest,
+        ...(input.dryRun === true ? { dryRun: true } : {}),
       });
     }
     const holderId = options.generateHolderId?.() ?? `job-resume:${randomUUID()}`;

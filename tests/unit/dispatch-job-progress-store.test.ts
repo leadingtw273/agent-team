@@ -553,6 +553,254 @@ describe("FileJobProgressStore", () => {
     if (!migrated.ok) expect(migrated.error.code).toBe("invariant_violation");
   });
 
+  it("allows exactly one scope-overrun adoption receipt, then preserves it while acceptance advances", async () => {
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const previousHumanDelivery = {
+      acceptanceRequirement: "required" as const,
+      verificationLevel: "light" as const,
+      requirementDigest: "a".repeat(64),
+      humanSummaryDigest: "b".repeat(64),
+    };
+    const approvedHumanDelivery = {
+      ...previousHumanDelivery,
+      requirementDigest: "c".repeat(64),
+      humanSummaryDigest: "d".repeat(64),
+    };
+    const receipt = {
+      schemaVersion: 1 as const,
+      previousHumanDelivery,
+      approvedHumanDelivery,
+      changeRequestId: "42",
+      headSha: headSha("e".repeat(40)),
+      approvedAt: now,
+    };
+    const first = await store.compareAndSwap(
+      jobId,
+      null,
+      baseRecord({
+        stage: { kind: "paused", pauseReason: "scope_overrun" },
+        humanDelivery: previousHumanDelivery,
+      }),
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+
+    const adopted = await store.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        stage: { kind: "awaiting_review" },
+        changeRequestId: receipt.changeRequestId,
+        headSha: receipt.headSha,
+        humanDelivery: approvedHumanDelivery,
+        approvedScopeAdoption: receipt,
+      }),
+    );
+    expect(adopted).toMatchObject({ ok: true, value: { approvedScopeAdoption: receipt } });
+    if (!adopted.ok) return;
+
+    const accepted = await store.compareAndSwap(
+      jobId,
+      adopted.value.revision,
+      baseRecord({
+        stage: { kind: "awaiting_review" },
+        changeRequestId: receipt.changeRequestId,
+        headSha: receipt.headSha,
+        humanDelivery: { ...approvedHumanDelivery, acceptanceIdentityDigest: "f".repeat(64) },
+        approvedScopeAdoption: receipt,
+      }),
+    );
+    expect(accepted).toMatchObject({ ok: true, value: { approvedScopeAdoption: receipt } });
+  });
+
+  it("rejects every uncontrolled human-delivery scope adoption transition", async () => {
+    const previousHumanDelivery = {
+      acceptanceRequirement: "required" as const,
+      verificationLevel: "light" as const,
+      requirementDigest: "a".repeat(64),
+      humanSummaryDigest: "b".repeat(64),
+    };
+    const approvedHumanDelivery = {
+      ...previousHumanDelivery,
+      requirementDigest: "c".repeat(64),
+      humanSummaryDigest: "d".repeat(64),
+    };
+    const receipt = {
+      schemaVersion: 1 as const,
+      previousHumanDelivery,
+      approvedHumanDelivery,
+      changeRequestId: "42",
+      headSha: headSha("e".repeat(40)),
+      approvedAt: now,
+    };
+    const invalidCases = [
+      { name: "without receipt", mutate: () => ({}) },
+      {
+        name: "wrong stage",
+        mutate: () => ({ stage: { kind: "ci_waiting" as const }, approvedScopeAdoption: receipt }),
+      },
+      {
+        name: "already bound",
+        mutate: () => ({
+          approvedScopeAdoption: receipt,
+          changeRequestId: "43",
+          headSha: headSha("f".repeat(40)),
+        }),
+      },
+      {
+        name: "no human policy",
+        mutate: () => ({ humanDelivery: undefined, approvedScopeAdoption: receipt }),
+      },
+      {
+        name: "acceptance already attached",
+        mutate: () => ({
+          humanDelivery: { ...previousHumanDelivery, acceptanceIdentityDigest: "f".repeat(64) },
+          approvedScopeAdoption: receipt,
+        }),
+      },
+      {
+        name: "old policy mismatch",
+        mutate: () => ({
+          approvedScopeAdoption: { ...receipt, previousHumanDelivery: approvedHumanDelivery },
+        }),
+      },
+      {
+        name: "new policy mismatch",
+        mutate: () => ({
+          approvedScopeAdoption: { ...receipt, approvedHumanDelivery: previousHumanDelivery },
+        }),
+      },
+      {
+        name: "PR mismatch",
+        mutate: () => ({ approvedScopeAdoption: receipt, changeRequestId: "43" }),
+      },
+      {
+        name: "head mismatch",
+        mutate: () => ({ approvedScopeAdoption: receipt, headSha: headSha("f".repeat(40)) }),
+      },
+      {
+        name: "acceptance policy change",
+        mutate: () => ({
+          humanDelivery: {
+            ...approvedHumanDelivery,
+            acceptanceRequirement: "not_required" as const,
+          },
+          approvedScopeAdoption: receipt,
+        }),
+      },
+      {
+        name: "verification policy change",
+        mutate: () => ({
+          humanDelivery: { ...approvedHumanDelivery, verificationLevel: "standard" as const },
+          approvedScopeAdoption: receipt,
+        }),
+      },
+    ];
+
+    for (const testCase of invalidCases) {
+      const store = new FileJobProgressStore(
+        await temporaryDirectory(),
+        undefined,
+        createFixedClock(now),
+      );
+      const initialOverrides =
+        testCase.name === "already bound"
+          ? { changeRequestId: "41", headSha: headSha("9".repeat(40)) }
+          : {};
+      const first = await store.compareAndSwap(
+        jobId,
+        null,
+        baseRecord({
+          ...initialOverrides,
+          stage: { kind: "paused", pauseReason: "scope_overrun" },
+          humanDelivery: previousHumanDelivery,
+        }),
+      );
+      expect(first.ok, testCase.name).toBe(true);
+      if (!first.ok) continue;
+      const rejected = await store.compareAndSwap(
+        jobId,
+        first.value.revision,
+        baseRecord({
+          ...initialOverrides,
+          stage: { kind: "awaiting_review" },
+          changeRequestId: receipt.changeRequestId,
+          headSha: receipt.headSha,
+          humanDelivery: approvedHumanDelivery,
+          ...testCase.mutate(),
+        }),
+      );
+      expect(rejected, testCase.name).toMatchObject({
+        ok: false,
+        error: { code: "invariant_violation" },
+      });
+    }
+  });
+
+  it("rejects receipt injection on create and later receipt rewrite or removal", async () => {
+    const humanDelivery = {
+      acceptanceRequirement: "required" as const,
+      verificationLevel: "light" as const,
+      requirementDigest: "a".repeat(64),
+      humanSummaryDigest: "b".repeat(64),
+    };
+    const receipt = {
+      schemaVersion: 1 as const,
+      previousHumanDelivery: humanDelivery,
+      approvedHumanDelivery: { ...humanDelivery, requirementDigest: "c".repeat(64) },
+      changeRequestId: "42",
+      headSha: headSha("e".repeat(40)),
+      approvedAt: now,
+    };
+    const create = await new FileJobProgressStore(
+      await temporaryDirectory(),
+      undefined,
+      createFixedClock(now),
+    ).compareAndSwap(jobId, null, baseRecord({ humanDelivery, approvedScopeAdoption: receipt }));
+    expect(create).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+
+    const directory = await temporaryDirectory();
+    const store = new FileJobProgressStore(directory, undefined, createFixedClock(now));
+    const first = await store.compareAndSwap(
+      jobId,
+      null,
+      baseRecord({ stage: { kind: "paused", pauseReason: "scope_overrun" }, humanDelivery }),
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const adopted = await store.compareAndSwap(
+      jobId,
+      first.value.revision,
+      baseRecord({
+        stage: { kind: "awaiting_review" },
+        changeRequestId: receipt.changeRequestId,
+        headSha: receipt.headSha,
+        humanDelivery: receipt.approvedHumanDelivery,
+        approvedScopeAdoption: receipt,
+      }),
+    );
+    expect(adopted.ok).toBe(true);
+    if (!adopted.ok) return;
+    for (const approvedScopeAdoption of [
+      undefined,
+      { ...receipt, approvedAt: instant("2026-08-07T12:00:01.000Z") },
+    ]) {
+      const rejected = await store.compareAndSwap(
+        jobId,
+        adopted.value.revision,
+        baseRecord({
+          stage: { kind: "awaiting_review" },
+          changeRequestId: receipt.changeRequestId,
+          headSha: receipt.headSha,
+          humanDelivery: receipt.approvedHumanDelivery,
+          approvedScopeAdoption,
+        }),
+      );
+      expect(rejected).toMatchObject({ ok: false, error: { code: "invariant_violation" } });
+    }
+  });
+
   it("rejects a changeRequestId shaped like a GitHub node id instead of a decimal PR number (O009c)", () => {
     const parsed = jobProgressRecordSchema.safeParse({
       schemaVersion: 1,

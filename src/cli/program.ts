@@ -126,7 +126,13 @@ export interface CliHandlers {
     input: Readonly<{ jobId: string; dryRun?: boolean }>,
   ) => Promise<CliCommandOutcome>;
   readonly dispatchJobResume?: (
-    input: Readonly<{ jobId: string; dryRun?: boolean }>,
+    input: Readonly<{
+      jobId: string;
+      dryRun?: boolean;
+      adoptPr?: number;
+      expectHead?: string;
+      expectRequirementsDigest?: string;
+    }>,
   ) => Promise<CliCommandOutcome>;
   readonly ingest: (
     input: Readonly<{ provider: "github" | "linear"; headersFile: string }>,
@@ -553,16 +559,34 @@ export function createProgram(
     .description("只續跑一個既有 resumable Job 的精確 revision；不做 discovery、不建立新 Job")
     .requiredOption("--job <job-id>", "既有 job-progress 記錄的 job id")
     .option("--dry-run", "只做 Job、claim、revision 與 resumable admission 檢查")
-    .action((options: { readonly job: string; readonly dryRun?: boolean }) =>
-      action(
-        state,
-        io,
-        () =>
-          handlers.dispatchJobResume?.({
-            jobId: options.job,
-            ...(options.dryRun === true ? { dryRun: true } : {}),
-          }) ?? blocked("dispatch job-resume"),
-      )(),
+    .option(
+      "--adopt-pr <number>",
+      "明確採納 scope_overrun 原 Job 的既有 PR；須同時指定 Head 與已核可需求 digest",
+    )
+    .option("--expect-head <sha>", "採納時必須精確符合的 PR Head SHA")
+    .option("--expect-requirements-digest <digest>", "採納時必須精確符合的已核可需求 digest")
+    .action(
+      (options: {
+        readonly job: string;
+        readonly dryRun?: boolean;
+        readonly adoptPr?: string;
+        readonly expectHead?: string;
+        readonly expectRequirementsDigest?: string;
+      }) =>
+        action(
+          state,
+          io,
+          () =>
+            handlers.dispatchJobResume?.({
+              jobId: options.job,
+              ...(options.dryRun === true ? { dryRun: true } : {}),
+              ...(options.adoptPr === undefined ? {} : { adoptPr: Number(options.adoptPr) }),
+              ...(options.expectHead === undefined ? {} : { expectHead: options.expectHead }),
+              ...(options.expectRequirementsDigest === undefined
+                ? {}
+                : { expectRequirementsDigest: options.expectRequirementsDigest }),
+            }) ?? blocked("dispatch job-resume"),
+        )(),
     );
 
   dispatch
